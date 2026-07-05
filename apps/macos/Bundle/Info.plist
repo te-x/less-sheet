@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Info.plist for the assembled LessSheet.app (see scripts/assemble-app.sh).
+     Declares the CSV file-type association so Finder double-click and
+     `open -a LessSheet file.csv` route the file into the app as an open URL. -->
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>LessSheet</string>
+    <key>CFBundleDisplayName</key>
+    <string>LessSheet</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.lesssheet.app</string>
+    <key>CFBundleExecutable</key>
+    <string>LessSheet</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>15.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>CFBundleDocumentTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>Comma-Separated Values</string>
+            <key>CFBundleTypeRole</key>
+            <string>Viewer</string>
+            <key>LSHandlerRank</key>
+            <string>Alternate</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>public.comma-separated-values-text</string>
+            </array>
+        </dict>
+    </array>
+</dict>
+</plist>

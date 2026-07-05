@@ -5,10 +5,13 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     // Implementation module (implementer-owned, src/).
+    // Links libc: the core opens/stats files and mmaps their head via the
+    // POSIX/libc syscall layer (on macOS syscalls must go through libSystem).
     const core_mod = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
 
     // Frozen contract module (planner-owned, contracts/). It imports the
@@ -18,6 +21,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("contracts/api.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
     api_mod.addImport("core", core_mod);
     core_mod.addImport("api", api_mod);
@@ -37,6 +41,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("tests/all_tests.zig"),
             .target = target,
             .optimize = optimize,
+            .link_libc = true,
             .imports = &.{.{ .name = "api", .module = api_mod }},
         }),
     });

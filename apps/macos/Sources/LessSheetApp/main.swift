@@ -1,14 +1,13 @@
-// LessSheet macOS app — SEED placeholder (implementer-owned).
+// less-sheet macOS app entry point.
 //
-// The walking-skeleton implementer replaces this with the SwiftUI shell:
-// window + Table with sticky header, in-window error panel, File > Open…,
-// open-URL launch events, CLI path argument — all funneling into one
-// DocumentOpening.openHead(path:) call on a background task — plus the
-// "First Row Is Header" checkable menu item re-deriving via
-// TableDisplayDeriving, and the TimingMarker emission on the first data
-// frame. Bundle assembly (Info.plist with the CSV UTI association) is a
-// separate build step outside SwiftPM.
-import Contracts
-import LessSheetKit
+// This file is `main.swift`, so its top-level code is the executable entry:
+// mark process-start as early as possible, then hand off to the SwiftUI app.
+// (Using a `main.swift` file precludes `@main`; calling `App.main()` explicitly
+// is the supported equivalent.) The full UI — window, sticky-header Table,
+// in-window error panel, File › Open…, launch-with-file / CLI open, and the
+// checkable "First Row Is Header" menu item — lives in AppUI.swift; the
+// cold-start timing marker is emitted from LaunchTiming.swift.
+import Foundation
 
-print("LessSheet placeholder — the UI lands via the aidev pipeline.")
+LaunchTiming.begin()
+LessSheetApp.main()

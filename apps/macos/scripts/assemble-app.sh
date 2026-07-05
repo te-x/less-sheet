@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Assemble LessSheet.app from the SwiftPM release binary + Bundle/Info.plist.
+# Bundle assembly lives OUTSIDE SwiftPM (ARCH-walking-skeleton functional req 6):
+# it links the Zig core (release) then wraps the executable in a .app declaring
+# the CSV file-type association. Prints the bundle path on success.
+#
+# Usage: bash apps/macos/scripts/assemble-app.sh
+set -euo pipefail
+
+macos_dir="$(cd "$(dirname "$0")/.." && pwd)"   # apps/macos
+cd "$macos_dir"
+
+# 1) Build the statically-linked core (release), then the app (release).
+(cd ../../backend && zig build -Doptimize=ReleaseFast)
+swift build -c release
+
+bin_dir="$(swift build -c release --show-bin-path)"
+app="$bin_dir/LessSheet.app"
+
+# 2) Lay out the bundle: Contents/{MacOS,Resources,Info.plist}.
+rm -rf "$app"
+mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+cp "$bin_dir/LessSheet" "$app/Contents/MacOS/LessSheet"
+cp "$macos_dir/Bundle/Info.plist" "$app/Contents/Info.plist"
+
+# 3) SwiftPM copies target resources (the empty-bundle case has none) next to
+#    the binary; mirror any LessSheet_*.bundle so the app finds them at runtime.
+for res in "$bin_dir"/*.bundle; do
+    [ -e "$res" ] && cp -R "$res" "$app/Contents/MacOS/" || true
+done
+
+echo "Assembled $app"
