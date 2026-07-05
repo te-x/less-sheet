@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(bash .aidev/gate.sh)",
+      "Bash(bash .aidev/gate.sh:*)",
+      "Bash(bash .aidev/freeze.sh)",
+      "Bash(bash .aidev/freeze.sh:*)"
+    ]
+  }
+}

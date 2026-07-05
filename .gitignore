@@ -1,0 +1,9 @@
+.DS_Store
+zig-out/
+.zig-cache/
+zig-cache/
+.build/
+DerivedData/
+xcuserdata/
+*.o
+*.a
