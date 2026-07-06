@@ -1,3 +1,4 @@
+import AppKit
 import Contracts
 import SwiftUI
 
@@ -8,6 +9,9 @@ import SwiftUI
 
 extension EnvironmentValues {
     @Entry var overlayDumpChrome: Bool = false
+    /// Forces the jump field's rejected (red) styling in a headless dump so the
+    /// rejection moment can be captured off-screen (item 4).
+    @Entry var overlayJumpRejected: Bool = false
 }
 
 private struct GlassChrome<S: Shape>: ViewModifier {
@@ -110,8 +114,12 @@ struct OverlayView: View {
 struct JumpControlView: View {
     @Bindable var model: DocumentModel
     @Environment(\.overlayDumpChrome) private var dumpChrome
+    @Environment(\.overlayJumpRejected) private var dumpRejected
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @FocusState private var fieldFocused: Bool
     @State private var text = ""
+    @State private var shake: CGFloat = 0        // 0…1 drives the reject shake
+    @State private var rejectedFlash = false     // red blink while true
 
     private var popupVisible: Bool {
         if model.jumpFieldActive { return true }
@@ -119,17 +127,21 @@ struct JumpControlView: View {
         return false
     }
 
+    /// The field shows its rejected (red) styling on a live blink or when a
+    /// headless dump forces it.
+    private var rejected: Bool { rejectedFlash || dumpRejected }
+
     var body: some View {
         Button {
             model.openJumpField()
             model.revealOverlay()
             DispatchQueue.main.async { fieldFocused = true }
         } label: {
-            // A curved point-to-point arrow reads as "jump from here to there"
-            // (item 4); the plain down-arrow read as "jump to end". VoiceOver
-            // label stays "Jump to row".
-            Image(systemName: "point.topleft.down.curvedto.point.bottomright.up")
-                .font(.callout.weight(.semibold))
+            // A custom "jump from here to there" glyph (item 4): two stacked
+            // circles joined by an arc that bulges right and arrows into the
+            // lower circle. SF Symbols had nothing that read correctly.
+            JumpArrowGlyph(lineWidth: 1.1)
+                .foregroundStyle(.primary)
                 .frame(width: OverlayMetrics.controlSize, height: OverlayMetrics.controlSize)
                 .contentShape(Circle())
         }
@@ -138,28 +150,55 @@ struct JumpControlView: View {
         .overlay(alignment: .top) {
             if popupVisible {
                 // Float the popup above the button (expands upward); fixedSize
-                // so it uses its own width, not the button's small frame.
-                popup.fixedSize().offset(y: -(OverlayMetrics.jumpPopupHeight + OverlayMetrics.popupGap))
+                // so it uses its own width, not the button's small frame. The
+                // shake is applied here so a rejection nudges the whole popup.
+                popup
+                    .fixedSize()
+                    .modifier(Shake(animatableData: shake))
+                    .offset(y: -(OverlayMetrics.jumpPopupHeight + OverlayMetrics.popupGap))
             }
         }
         .help("Jump to row")
         .accessibilityLabel("Jump to row")
         .onChange(of: model.jumpFlow) { _, flow in
-            // Landing or cancelling collapses the popup back to the button.
             switch flow {
-            case .landed, .cancelled, .idle: model.jumpFieldActive = false
+            // Landing or cancelling collapses the popup back to the button.
+            case .landed, .cancelled: model.jumpFieldActive = false
+            // A rejection also lands the flow on .idle, but the field must STAY
+            // open for correction — so .idle does NOT close it (item 4).
+            case .idle: break
             case .scanning:
                 // The scanning progress state reached the view layer — evidence
                 // (main-actor) that progress rendered right after submit.
                 JumpProbe.noteScanningShown()
             }
         }
+        .onChange(of: model.jumpRejections) { _, _ in reject() }
         .onChange(of: model.jumpFocusRequests) { _, _ in
             // ⌘J: open the field and focus it (keyboard reveal path).
             if case .scanning = model.jumpFlow { return }
             model.openJumpField()
             DispatchQueue.main.async { fieldFocused = true }
         }
+    }
+
+    /// A rejected jump (item 4): keep the field open with its text selected for
+    /// correction, blink it red, and — unless Reduce Motion — shake it briefly.
+    private func reject() {
+        model.jumpFieldActive = true
+        fieldFocused = true
+        DispatchQueue.main.async {   // select the text so a retype replaces it
+            (NSApp.keyWindow?.firstResponder as? NSText)?.selectAll(nil)
+        }
+        rejectedFlash = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+            withAnimation(.easeOut(duration: 0.5)) { rejectedFlash = false }
+        }
+        if !reduceMotion {
+            shake = 0
+            withAnimation(.linear(duration: 0.4)) { shake = 1 }
+        }
+        JumpProbe.noteRejectionShown()
     }
 
     @ViewBuilder
@@ -180,12 +219,13 @@ struct JumpControlView: View {
                 if dumpChrome {
                     // ImageRenderer can't snapshot a live TextField; show its state.
                     Text(text.isEmpty ? "Row" : text)
-                        .foregroundStyle(text.isEmpty ? Color.secondary : Color.primary)
+                        .foregroundStyle(rejected ? Color.red : (text.isEmpty ? Color.secondary : Color.primary))
                         .frame(width: 84, alignment: .leading)
                 } else {
                     TextField("Row", text: $text)
                         .textFieldStyle(.plain)
                         .frame(width: 84)
+                        .foregroundStyle(rejected ? Color.red : Color.primary)
                         .focused($fieldFocused)
                         .onSubmit(submit)
                 }
@@ -193,13 +233,16 @@ struct JumpControlView: View {
             .font(.callout.monospacedDigit())
             Text(RowCountText.summary(model.rowCountInfo))
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(rejected ? Color.red : Color.secondary)
                 .lineLimit(1)
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
+        // Red blink on rejection (item 4): a red ring over the capsule.
+        .overlay { if rejected { Capsule().strokeBorder(Color.red, lineWidth: 2) } }
         .onExitCommand { model.dismissPopups() }      // Esc closes the field
         .accessibilityLabel("Jump to row, \(RowCountText.summary(model.rowCountInfo))")
+        .accessibilityValue(rejected ? "No such row. Enter a row from 1 to \(model.rowCountInfo.count)." : "")
     }
 
     @ViewBuilder
@@ -238,6 +281,89 @@ struct JumpControlView: View {
             if case .scanning = model.jumpFlow {} else { model.jumpFieldActive = false }
         }
         // Invalid input: keep the field open for correction (no re-open).
+    }
+}
+
+/// The custom jump glyph (item 4): two circles stacked and horizontally
+/// aligned; an arrow leaves the TOP circle heading south-east, arcs out to the
+/// right, curves back south-west and arrows into the BOTTOM circle — "jump from
+/// this row to that row". Drawn as stroked paths (no fill) so it adapts to
+/// light/dark via the inherited foreground style; stroke weight matches the
+/// neighbouring SF Symbols (~semibold).
+struct JumpArrowGlyph: View {
+    var lineWidth: CGFloat = 2
+    /// Fraction of the (square) frame the glyph height fills (~10% up from the
+    /// previous tuning).
+    var fill: CGFloat = 0.43
+    // TRUE content bounding box in design coords (NOT an outer design box):
+    // circle-left … arc-right, top-circle-top … bottom-circle-bottom. Centering
+    // THIS box in the frame centers the visible glyph exactly (the stroke adds a
+    // symmetric outset, so it doesn't shift the centre).
+    private let bMinX: CGFloat = 19, bMaxX: CGFloat = 56
+    private let bMinY: CGFloat = 7,  bMaxY: CGFloat = 93
+
+    var body: some View {
+        GeometryReader { geo in
+            let bw = bMaxX - bMinX, bh = bMaxY - bMinY
+            let k = min(geo.size.width / bw, geo.size.height / bh) * fill
+            // Center the content bbox in the frame on BOTH axes (no eyeballed
+            // padding): map bbox-centre → frame-centre.
+            let ox = (geo.size.width - bw * k) / 2 - bMinX * k
+            let oy = (geo.size.height - bh * k) / 2 - bMinY * k
+            let P = { (x: CGFloat, y: CGFloat) in CGPoint(x: ox + x * k, y: oy + y * k) }
+
+            let rr: CGFloat = 11 * k          // small circles
+            let topC = P(30, 18), botC = P(30, 82)
+            let start = P(40, 26), end = P(40, 74)
+            // A TRUE circular arc (constant radius) bulging right: its centre
+            // sits to the LEFT of the vertical start→end chord, so the arc bows
+            // out to the right — smoother than a Bézier.
+            let arcCenter = P(30, 50)
+            let arcR = hypot(start.x - arcCenter.x, start.y - arcCenter.y)
+            let a1 = atan2(start.y - arcCenter.y, start.x - arcCenter.x)
+            let a2 = atan2(end.y - arcCenter.y, end.x - arcCenter.x)
+
+            ZStack {
+                Path { p in
+                    p.addEllipse(in: CGRect(x: topC.x - rr, y: topC.y - rr, width: 2 * rr, height: 2 * rr))
+                    p.addEllipse(in: CGRect(x: botC.x - rr, y: botC.y - rr, width: 2 * rr, height: 2 * rr))
+                }
+                .stroke(style: StrokeStyle(lineWidth: lineWidth, lineCap: .round))
+
+                Path { p in
+                    p.addArc(center: arcCenter, radius: arcR,
+                             startAngle: .radians(a1), endAngle: .radians(a2), clockwise: false)
+                    // Arrowhead at the arrival: tangent to the arc at `end`
+                    // (perpendicular to the end radius), pointing south-west into
+                    // the bottom circle.
+                    let dx = -(end.y - arcCenter.y), dy = (end.x - arcCenter.x)   // SW travel direction
+                    let len = max(0.001, (dx * dx + dy * dy).squareRoot())
+                    let bx = -dx / len, by = -dy / len         // unit vector back along the arc
+                    let barb = 12 * k
+                    let a: CGFloat = 0.55                       // ~31° half-spread
+                    let ca = cos(a), sa = sin(a)
+                    let b1 = CGPoint(x: end.x + barb * (bx * ca - by * sa),
+                                     y: end.y + barb * (bx * sa + by * ca))
+                    let b2 = CGPoint(x: end.x + barb * (bx * ca + by * sa),
+                                     y: end.y + barb * (-bx * sa + by * ca))
+                    p.move(to: b1); p.addLine(to: end); p.addLine(to: b2)
+                }
+                .stroke(style: StrokeStyle(lineWidth: lineWidth, lineCap: .round, lineJoin: .round))
+            }
+        }
+    }
+}
+
+/// A short horizontal shake for the rejected jump field (item 4); Reduce Motion
+/// callers simply never drive it (blink only).
+struct Shake: GeometryEffect {
+    var amount: CGFloat = 5
+    var shakes: CGFloat = 3
+    var animatableData: CGFloat = 0     // animate 0 → 1 for one burst
+
+    func effectValue(size: CGSize) -> ProjectionTransform {
+        ProjectionTransform(CGAffineTransform(
+            translationX: amount * sin(animatableData * .pi * shakes * 2), y: 0))
     }
 }
 

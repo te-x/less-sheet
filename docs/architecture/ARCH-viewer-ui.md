@@ -54,7 +54,13 @@ The walking skeleton proved the pipeline (Zig core → C ABI → Swift UI) but i
 - Open failures: unchanged (not-found / permission / other-IO), same in-window error panel.
 - A dialect override that yields zero columns (e.g. separator not present) is NOT an error:
   the file renders as a single column, exactly as a wrong guess would.
-- Jump target beyond the last row: clamps to the last row (discovered by scanning to EOF).
+- Jump target beyond the last row: the UI REJECTS the jump — the input field blinks red and
+  shakes slightly, staying open for correction (amended by the author 2026-07-06; supersedes the
+  original clamp-to-last-row UX). When the total is exact, validation is upfront (no scan).
+  When the total is still estimated, the scan runs with progress; if EOF arrives short of the
+  target, the field rejects the same way and the viewport returns to the pre-jump position
+  (the scan's index gains are kept). The CORE still clamps (frozen ABI semantics — it reports
+  the landed row); rejection is app-layer interpretation of a landing short of the target.
 - Cancelled jump-scan: the viewport returns to where it was when the jump started; the
   frontier keeps whatever the scan indexed (paid once, kept). No error.
 

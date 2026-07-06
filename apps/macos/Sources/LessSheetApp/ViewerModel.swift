@@ -84,6 +84,9 @@ final class DocumentModel {
     /// Bumped by the ⌘J command to ask the overlay to reveal + focus the jump
     /// field (the keyboard reveal path).
     private(set) var jumpFocusRequests = 0
+    /// Bumped whenever a jump is REJECTED (target past the last row, or invalid
+    /// input): the jump field re-arms and the overlay blinks/shakes it (item 4).
+    private(set) var jumpRejections = 0
 
     // MARK: Collaborators (pure view-model logic; pinned by frozen tests)
 
@@ -294,13 +297,39 @@ final class DocumentModel {
 
     // MARK: - Jump-to-row
 
-    /// Parse + start a jump from the 1-based field text. Returns false when the
-    /// input is not a valid 1-based row number (the field rejects the submit).
+    /// Parse + start a jump from the 1-based field text. Returns false — with a
+    /// rejection (field blink + shake, no viewport move) — when the input is not
+    /// a valid 1-based row number, OR when the total is already EXACT and the
+    /// target is past the last row (upfront validation, no scan). When the total
+    /// is still estimated, an out-of-range target can only be discovered by
+    /// scanning to EOF; that rejection happens in `foldJump` (ARCH error case,
+    /// amended 2026-07-06 — reject, don't clamp).
     @discardableResult
     func submitJump(_ text: String) -> Bool {
-        guard let target = jumpControl.parseTarget(text) else { return false }
+        guard let target = jumpControl.parseTarget(text) else {
+            rejectJump(restoreTo: nil, scanned: false)   // empty / "0" / non-digit / > UInt64.max
+            return false
+        }
+        // (a) Total exact: valid 0-based rows are 0..<count; anything at/beyond
+        // count is rejected immediately, no scan.
+        if rowCountInfo.isExact && target >= rowCountInfo.count {
+            rejectJump(restoreTo: nil, scanned: false)
+            return false
+        }
         beginJump(to: target)
         return true
+    }
+
+    /// Reject the current jump: keep the field open (re-armed for correction),
+    /// restore the viewport to `restoreTo` if a scan had started, and pulse the
+    /// rejection nonce so the overlay blinks/shakes the field. The core is left
+    /// alone — its frontier gains (from any scan) are kept.
+    private func rejectJump(restoreTo: UInt64?, scanned: Bool) {
+        jumpFlow = .idle
+        if let restoreTo { pendingScrollRow = restoreTo }
+        jumpFieldActive = true
+        jumpRejections += 1
+        if JumpProbe.active { JumpProbe.rejected(model: self, scanned: scanned, restoredTo: restoreTo) }
     }
 
     func beginJump(to target: UInt64) {
@@ -327,7 +356,19 @@ final class DocumentModel {
             JumpProbe.noteProgress(progress)
         }
         if case let .landed(row) = next, previous != next {
+            // App-layer interpretation of the core's (frozen) clamp: if the scan
+            // ended SHORT of the requested target, the target was past the last
+            // row — reject and restore the pre-jump viewport, rather than land on
+            // the clamped last row (ARCH error case, amended 2026-07-06). The
+            // frozen JumpControl.resolve() is unchanged — it still says .landed;
+            // the reject decision lives here, above it.
+            if case let .scanning(target, preJumpFirstRow, _) = previous, row < target {
+                rejectJump(restoreTo: preJumpFirstRow, scanned: true)   // sets jumpFlow = .idle
+                return
+            }
+            jumpFlow = next          // mark landed FIRST so a later poll doesn't re-fire
             landOn(row)
+            return
         }
         jumpFlow = next
     }

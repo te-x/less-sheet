@@ -123,6 +123,13 @@ struct GridView: View {
         .onScrollGeometryChange(for: CGPoint.self) { $0.contentOffset } action: { _, offset in
             ScrollProbe.note(offset)      // inert unless LESSSHEET_LOG_OFFSET is set
         }
+        .onScrollGeometryChange(for: CGFloat.self) { $0.contentInsets.top } action: { _, top in
+            // Item 1: the top content inset equals the title-bar safe area, so
+            // row 1 rests fully below the title-bar region at (0,0) while
+            // scrolled content still travels under it (native chrome). Logged
+            // for headless verification; inert unless LESSSHEET_LOG_OFFSET is set.
+            ScrollProbe.noteInsets(top: top, label: "contentInset")
+        }
         .onChange(of: model.pendingScrollRow) { _, row in
             guard let row else { return }
             scrollPos.scrollTo(y: CGFloat(row) * rowH)

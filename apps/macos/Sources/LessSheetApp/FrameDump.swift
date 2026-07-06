@@ -59,6 +59,8 @@ enum FrameDump {
             render(overlayScene(model, expandedPill: .quote, jumpFlow: .idle), size: gridSize, to: path)
         case "jump":
             render(overlayScene(model, expandedPill: nil, jumpFlow: .idle, jumpFieldActive: true), size: gridSize, to: path)
+        case "reject":
+            render(rejectScene(model), size: gridSize, to: path)
         case "progress":
             let flow = JumpFlow.scanning(target: model.rowCountInfo.count, preJumpFirstRow: 0, progress: 0.42)
             render(overlayScene(model, expandedPill: nil, jumpFlow: flow), size: gridSize, to: path)
@@ -88,6 +90,14 @@ enum FrameDump {
         render(DumpGrid(model: model), size: gridSize, to: path)
     }
 
+    /// Renders the jump field in its REJECTED (red) state over the grid — the
+    /// jump verification hook uses this to capture the rejection moment (item 4).
+    @MainActor
+    static func dumpReject(for model: DocumentModel) {
+        guard let path = dumpPath else { return }
+        render(rejectScene(model), size: gridSize, to: path)
+    }
+
     /// Headless run aid: when `LESSSHEET_DUMP_EXIT` is set, quit shortly after the
     /// first frame so a launched instance self-closes (works with OR without a
     /// dump path — the latter lets `time -l` measure RSS with the dump hook off).
@@ -114,6 +124,22 @@ enum FrameDump {
         .environment(\.overlayDumpChrome, true)
     }
 
+    /// The rejected-jump state (item 4): the jump field re-armed and styled red
+    /// (blink), showing the exact total in its copy so the user sees the valid
+    /// range. The live blink+shake is animated; the dump captures the red field.
+    @MainActor
+    private static func rejectScene(_ model: DocumentModel) -> some View {
+        let snapshot = DocumentModel.dumpSnapshot(
+            from: model, revealed: true, expandedPill: nil, jumpFlow: .idle, jumpFieldActive: true
+        )
+        return ZStack(alignment: .bottomTrailing) {
+            DumpGrid(model: model)
+            OverlayView(model: snapshot)
+        }
+        .environment(\.overlayDumpChrome, true)
+        .environment(\.overlayJumpRejected, true)
+    }
+
     /// The revealed title-bar state (req. 1): the grid with the document title +
     /// traffic lights shown, plus the bottom-right control row. The real title
     /// bar is NSWindow chrome ImageRenderer can't capture, so it is simulated
@@ -121,8 +147,13 @@ enum FrameDump {
     @MainActor
     private static func titleBarScene(_ model: DocumentModel) -> some View {
         let snapshot = DocumentModel.dumpSnapshot(from: model, revealed: true, expandedPill: nil, jumpFlow: .idle)
+        // Mirror the live chrome (item 1): the grid content is inset by the
+        // title-bar height, so at rest the header + row 1 sit fully BELOW the
+        // title-bar region (never hidden under it); scrolled content travels
+        // under the region and frosts (the native scroll-edge effect — live
+        // only, can't be captured off-screen).
         return ZStack(alignment: .top) {
-            DumpGrid(model: model)
+            DumpGrid(model: model, topInset: DumpTitleBar.height)
             DumpTitleBar(title: (model.path as NSString).lastPathComponent)
         }
         .overlay(alignment: .bottomTrailing) { OverlayView(model: snapshot) }
@@ -187,6 +218,10 @@ enum FrameDump {
 /// uses (with stickiness disabled: there is no ScrollView to counter here).
 struct DumpGrid: View {
     let model: DocumentModel
+    /// A top inset (title-bar height) used by the title-bar scene so the header
+    /// + row 1 render BELOW the simulated title bar, mirroring the live safe-area
+    /// inset (item 1). Zero for the normal grid dump.
+    var topInset: CGFloat = 0
     private static let maxRows = 40
 
     var body: some View {
@@ -199,10 +234,11 @@ struct DumpGrid: View {
         )
         let fillerCols = fillerColumnCount(dataWidth: dataWidth, gutterWidth: gutterWidth)
         let usedRows = loaded + 1 // + header
-        let capacity = Int(ceil(FrameDump_gridHeight / GridMetrics.rowHeight))
+        let capacity = Int(ceil((FrameDump_gridHeight - topInset) / GridMetrics.rowHeight))
         let fillerRows = max(0, capacity - usedRows)
 
         VStack(alignment: .leading, spacing: 0) {
+            if topInset > 0 { Color.clear.frame(height: topInset) }
             SheetRow(rowNumber: nil, rowNumberWidth: gutterWidth, stickyRowNumber: false,
                      cells: model.headerLabels(), widths: widths, fillerColumns: fillerCols, isHeader: true)
             ForEach(0..<loaded, id: \.self) { i in
@@ -289,6 +325,8 @@ struct DumpEndGrid: View {
 /// translucent band standing in for the real chrome's top-of-window blur.
 struct DumpTitleBar: View {
     let title: String
+    /// Title-bar band height — matches the window's top safe area (item 1).
+    static let height: CGFloat = 32
 
     var body: some View {
         ZStack {
@@ -303,7 +341,7 @@ struct DumpTitleBar: View {
             }
             .padding(.leading, 20)
         }
-        .frame(height: 28)
+        .frame(height: Self.height)
         .frame(maxWidth: .infinity)
         .background(Color(nsColor: .windowBackgroundColor).opacity(0.72))
         .overlay(alignment: .bottom) {

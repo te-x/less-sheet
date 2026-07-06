@@ -153,39 +153,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.isMovableByWindowBackground = true
         window.isReleasedWhenClosed = false
         window.contentMinSize = NSSize(width: 520, height: 360)
-
-        // Content = the SwiftUI viewer, plus an always-present titlebar-area
-        // blur band pinned to the very top edge (item 3). Grid content (rows +
-        // the sticky header) scrolls UNDER it and blurs — the look the author liked.
-        // It lives in the window hierarchy (not SwiftUI) so it is independent of
-        // the reveal/fade `titleVisibility` toggle that had removed it, and it
-        // shows in BOTH the idle and overlay-revealed states. `.withinWindow`
-        // blends with the hosting view beneath it; `.active` keeps the blur even
-        // when the window is not key.
-        let hosting = NSHostingView(rootView: ContentView(model: .shared))
-        hosting.autoresizingMask = [.width, .height]
-        let container = NSView()
-        container.addSubview(hosting)
-        window.contentView = container
-        hosting.frame = container.bounds
-
+        // Native chromeless content (as the first viewer-ui build had it): the
+        // transparent full-size-content title bar lets grid content scroll UNDER
+        // it, and macOS 26's ScrollView scroll-edge effect frosts that content
+        // through the title-bar region — the look the author liked. NO custom
+        // opaque strip (that was the regression). The grid insets its top by the
+        // title-bar height (see GridView) so at rest row 1 sits fully below the
+        // title-bar region while scrolled content still travels under it.
+        window.contentView = NSHostingView(rootView: ContentView(model: .shared))
         window.setFrameAutosaveName("LessSheetMain")
         if !window.setFrameUsingName("LessSheetMain") {
             window.center()
         }
-
-        hosting.frame = container.bounds
-        let rawTitlebar = container.bounds.height - window.contentLayoutRect.height
-        let titlebarHeight: CGFloat = (rawTitlebar > 0 && rawTitlebar < 120) ? rawTitlebar : 28
-        let blur = PassthroughEffectView()
-        blur.material = .titlebar
-        blur.blendingMode = .withinWindow
-        blur.state = .active
-        blur.autoresizingMask = [.width, .minYMargin]   // pinned to the top edge
-        blur.frame = NSRect(x: 0, y: container.bounds.height - titlebarHeight,
-                            width: container.bounds.width, height: titlebarHeight)
-        container.addSubview(blur, positioned: .above, relativeTo: hosting)
-
         // Traffic lights hidden at rest; revealed with the overlay.
         for type in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
             window.standardWindowButton(type)?.alphaValue = 0
@@ -228,14 +207,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.makeKeyAndOrderFront(nil)
         settingsWindow = window
     }
-}
-
-/// The titlebar-area blur band. A visual-effect view that is purely decorative:
-/// it never intercepts events, so scroll/clicks in the top strip pass straight
-/// through to the grid beneath (content still scrolls under — and blurs behind —
-/// it).
-final class PassthroughEffectView: NSVisualEffectView {
-    override func hitTest(_ point: NSPoint) -> NSView? { nil }
 }
 
 /// Clears `settingsOpen` when the Settings window closes (so the overlay can
