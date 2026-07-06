@@ -410,7 +410,12 @@ test "c2: an exact consistency tie breaks toward comma" {
 }
 
 test "c2: a candidate that splits consistently beats single-field candidates" {
-    var od = try openBytes("x;y\nz;w\n");
+    // All-numeric record 1 keeps the header OFF, so the dims assertion reads
+    // purely as "the winning candidate split the document into a 2x2 DATA
+    // grid". (DECISION-1: the original fixture "x;y\nz;w\n" tripped the header
+    // rule, which excludes record 1 from row counts -- expectDims(2, 2) was
+    // unsatisfiable together with the api/lesssheet.h header grammar.)
+    var od = try openBytes("1;2\n3;4\n");
     defer od.deinit();
     try std.testing.expectEqual(@as(u8, ';'), api.ls_dialect_get(od.doc).separator);
     try expectDims(od.doc, 2, 2);
