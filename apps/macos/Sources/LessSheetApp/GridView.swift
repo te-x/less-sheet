@@ -81,6 +81,7 @@ struct GridView: View {
                     fillerColumns: fillerColumns,
                     isHeader: true
                 )
+                .modifier(HeaderGlassBand())             // Liquid Glass band (y 0→54)
                 .modifier(StickyTop())
                 .zIndex(1)
                 .frameLog("header")                      // live overlap diagnosis (item 1)
@@ -124,12 +125,6 @@ struct GridView: View {
                 }
             }
         }
-        // Item 2: the deliberate macOS 26 scroll-edge effect. `.automatic`
-        // (the default) is emergent — it keys off title-bar/toolbar state and
-        // stopped frosting once title-visibility toggling was added — so we make
-        // the top-edge frost EXPLICIT: content scrolling under the transparent
-        // title-bar region is softly blurred, independent of the title reveal.
-        .scrollEdgeEffectStyle(.soft, for: .top)
         .frameLog("scrollview")                          // window-space viewport top (item 1)
         .scrollPosition($scrollPos)
         // Item 2: rest the initial content offset at the top-left corner (not a
@@ -221,6 +216,7 @@ struct SheetRow: View {
     let widths: [CGFloat]
     let fillerColumns: Int
     let isHeader: Bool
+    @Environment(\.overlayDumpChrome) private var dumpChrome
 
     var body: some View {
         HStack(spacing: 0) {
@@ -241,8 +237,12 @@ struct SheetRow: View {
             }
         }
         .frame(height: GridMetrics.rowHeight)
-        .background(isHeader ? Color(nsColor: .windowBackgroundColor) : Color.clear)
-        .overlay(alignment: .bottom) { hairline.frame(height: 1) }
+        // The header is transparent in the live app so the Liquid Glass band
+        // behind it shows through (data frosts through the glass); it falls back
+        // to an opaque background only in headless dumps, where glass can't be
+        // captured. Data/filler rows are always clear (over the grid fill).
+        .background(isHeader && dumpChrome ? Color(nsColor: .windowBackgroundColor) : Color.clear)
+        .overlay(alignment: .bottom) { hairline.frame(height: 1) }   // hairline ON TOP of the glass
     }
 
     /// The leftmost fixed cell: the 1-based row number (right-aligned, faded), or
@@ -255,7 +255,10 @@ struct SheetRow: View {
             .lineLimit(1)
             .padding(.horizontal, GridMetrics.rowNumberHPadding)
             .frame(width: rowNumberWidth, height: GridMetrics.rowHeight, alignment: .trailing)
-            .background(Color(nsColor: .windowBackgroundColor))
+            // Data/filler gutter is opaque (occludes data scrolled horizontally
+            // behind the pinned gutter); the HEADER corner is transparent live so
+            // the glass band is continuous across the full header width.
+            .background(isHeader && !dumpChrome ? Color.clear : Color(nsColor: .windowBackgroundColor))
             .overlay(alignment: .trailing) { hairline.frame(width: 1) }
             .modifier(StickyLeading(enabled: stickyRowNumber))
             .accessibilityHidden(true)
@@ -304,6 +307,26 @@ private struct StickyTop: ViewModifier {
         content.visualEffect { effect, proxy in
             let minY = proxy.frame(in: .scrollView).minY
             return effect.offset(y: max(0, inset - minY))
+        }
+    }
+}
+
+/// Gives the pinned header a Liquid Glass band that extends UPWARD over the
+/// transparent title-bar region — one continuous band from the window top edge
+/// down through the header row (y 0 → header.maxY). Data rows scrolling beneath
+/// it frost through the material — within-window compositing, the SAME mechanism
+/// as the floating glass buttons (deterministic; not the abandoned NSWindow
+/// scroll-edge effect). `glassEffect` degrades to an opaque material under Reduce
+/// Transparency automatically; the header text stays semibold `.primary`, legible
+/// on either. The band is the header's background, so the header text + hairlines
+/// render ON TOP of it. Its frame is logged for LESSSHEET_LOG_LAYOUT.
+private struct HeaderGlassBand: ViewModifier {
+    func body(content: Content) -> some View {
+        content.background(alignment: .bottom) {
+            Color.clear
+                .frame(height: GridMetrics.rowHeight + GridMetrics.titleBarInset)
+                .glassEffect(.regular, in: Rectangle())
+                .frameLog("band")
         }
     }
 }

@@ -263,6 +263,7 @@ struct DumpGrid: View {
         .frame(width: 900, height: 600, alignment: .topLeading)
         .background(Color(nsColor: .textBackgroundColor))
         .clipped()
+        .environment(\.overlayDumpChrome, true)   // header uses its opaque fallback off-screen
     }
 
     private func fillerColumnCount(dataWidth: CGFloat, gutterWidth: CGFloat) -> Int {
@@ -314,6 +315,7 @@ struct DumpEndGrid: View {
         .frame(width: 900, height: 600, alignment: .topLeading)
         .background(Color(nsColor: .textBackgroundColor))
         .clipped()
+        .environment(\.overlayDumpChrome, true)   // header uses its opaque fallback off-screen
     }
 
     private func fillerColumnCount(dataWidth: CGFloat, gutterWidth: CGFloat) -> Int {
