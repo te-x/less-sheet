@@ -159,7 +159,19 @@ enum JumpProbe {
 @MainActor
 enum ScrollProbe {
     static let enabled = ProcessInfo.processInfo.environment["LESSSHEET_LOG_OFFSET"] != nil
+    /// Live window-space frame logging for the pinned header / row 1 / scroll
+    /// view (item 1 overlap diagnosis). Inert unless LESSSHEET_LOG_LAYOUT is set.
+    static let layoutEnabled = ProcessInfo.processInfo.environment["LESSSHEET_LOG_LAYOUT"] != nil
     private static var last: CGPoint?
+    private static let start = DispatchTime.now()
+
+    static func noteFrame(_ label: String, _ r: CGRect) {
+        guard layoutEnabled else { return }
+        let ms = Int((DispatchTime.now().uptimeNanoseconds &- start.uptimeNanoseconds) / 1_000_000)
+        FileHandle.standardError.write(Data(String(
+            format: "lesssheet.layout.\(label) minY=%.1f maxY=%.1f minX=%.1f height=%.1f at_ms=%d\n",
+            r.minY, r.maxY, r.minX, r.height, ms).utf8))
+    }
 
     static func note(_ offset: CGPoint) {
         guard enabled else { return }

@@ -105,7 +105,10 @@ enum FrameDump {
     @MainActor
     static func terminateIfRequested() {
         guard ProcessInfo.processInfo.environment["LESSSHEET_DUMP_EXIT"] != nil else { return }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { NSApp.terminate(nil) }
+        // Layout-logging runs need the elastic scroll + safe-area to fully
+        // settle before we read the final frames; other runs quit promptly.
+        let delay = ScrollProbe.layoutEnabled ? 1.5 : 0.15
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { NSApp.terminate(nil) }
     }
 
     // MARK: - Scene composition

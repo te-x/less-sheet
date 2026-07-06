@@ -285,6 +285,11 @@ struct ContentView: View {
             GridView(model: model)
             OverlayView(model: model)
         }
+        // Extend the grid UNDER the transparent title-bar region so content
+        // scrolls beneath it and the scroll-edge effect frosts it (item 2). The
+        // grid re-insets its own content by the title-bar height so row 1 rests
+        // below the region at rest (item 1) — see GridView.contentMargins.
+        .ignoresSafeArea(.container, edges: .top)
         .contentShape(Rectangle())
         .onContinuousHover { phase in
             if case .active = phase { model.revealOverlay() }
@@ -390,13 +395,16 @@ struct WindowConfigurator: NSViewRepresentable {
 
     private func apply(to window: NSWindow?) {
         guard let window else { return }
+        // Keep the document title current for Mission Control / the Window menu
+        // / the Dock (ARCH req 1) — but NEVER toggle `titleVisibility`. Making the
+        // title visible flips AppKit into "titled" layout: it insets the content
+        // view BELOW the title bar (so grid content no longer scrolls under it —
+        // killing the scroll-edge frost) and misaligns the pinned header vs row 1
+        // (the 6 pt overlap). be86b2a kept it statically `.hidden`; that is what
+        // preserved the blur and the clean top edge, so we restore that. Only the
+        // traffic lights fade in/out with the overlay reveal.
         window.title = title
-        // Reveal the standard title bar — the document title next to the traffic
-        // lights (req. 1) — together with the overlay, and hide it again when the
-        // pointer idles. The transparent full-size-content title bar and its
-        // top-of-window blur stay put; only the title text and window buttons
-        // fade with the overlay's reveal/fade cycle.
-        window.titleVisibility = revealed ? .visible : .hidden
+        window.titleVisibility = .hidden
         for type in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
             window.standardWindowButton(type)?.animator().alphaValue = revealed ? 1 : 0
         }

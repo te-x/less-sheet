@@ -33,6 +33,11 @@ enum GridMetrics {
     /// control cluster (36 pt button + 24 pt inset ≈ 60 pt) with margin. Pure
     /// fill — never counted as data (row count / scrollbar estimate ignore it).
     static let overscrollRows = 5
+    /// Height of the transparent title-bar region (the window's top safe area on
+    /// this chromeless titled window). The grid extends UNDER it (so content
+    /// scrolls beneath and frosts) but insets its scrollable content by this much
+    /// so row 1 rests fully below it at (0,0). Matches the measured safe-area top.
+    static let titleBarInset: CGFloat = 32
 }
 
 @MainActor

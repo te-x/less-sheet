@@ -55,8 +55,37 @@ struct GridView: View {
         let bottomSpacer = atEnd ? 0 : CGFloat(total - bandEnd + belowRows) * rowH
 
         ScrollView([.vertical, .horizontal]) {
-            LazyVStack(alignment: .leading, spacing: 0, pinnedViews: [.sectionHeaders]) {
-                Section {
+            // Outer VStack (NOT lazy): its children are always realized, so the
+            // frozen header never gets deallocated when the data is scrolled far
+            // away (a lazy header vanishes past its buffer). The data lives in a
+            // nested LazyVStack that keeps the O(viewport) virtualization.
+            VStack(alignment: .leading, spacing: 0) {
+                // Fixed title-bar inset: a plain spacer that scrolls away, so the
+                // header rests BELOW the transparent title-bar region at (0,0)
+                // while content still scrolls up under it. Fully manual (no
+                // safe-area / contentMargins guessing — those measured 45 pt).
+                Color.clear.frame(width: rowWidth, height: GridMetrics.titleBarInset)
+                // Frozen header row, vertically pinned by a GPU visual effect
+                // (the gutter's horizontal-pin trick applied to the vertical
+                // axis) instead of LazyVStack `pinnedViews` — which floated the
+                // header OVER row 1 (the persistent overlap). It reserves its own
+                // 22 pt slot (so row 1 sits BELOW it, never under it), scrolls
+                // horizontally with its columns, and is opaque so data rows
+                // scroll behind it. zIndex keeps it on top.
+                SheetRow(
+                    rowNumber: nil,                      // the corner cell above the gutter
+                    rowNumberWidth: gutterWidth,
+                    stickyRowNumber: true,
+                    cells: model.headerLabels(),
+                    widths: widths,
+                    fillerColumns: fillerColumns,
+                    isHeader: true
+                )
+                .modifier(StickyTop())
+                .zIndex(1)
+                .frameLog("header")                      // live overlap diagnosis (item 1)
+
+                LazyVStack(alignment: .leading, spacing: 0) {
                     if topSpacer > 0 {
                         Color.clear.frame(width: rowWidth, height: topSpacer)
                     }
@@ -72,6 +101,7 @@ struct GridView: View {
                             fillerColumns: fillerColumns,
                             isHeader: false
                         )
+                        .frameLog("row1", if: row == 0)  // live overlap diagnosis (item 1)
                     }
                     // End-of-file fill: rendered as grid rows only once the band
                     // reaches the last data row. Empty grid rows — never data.
@@ -91,19 +121,16 @@ struct GridView: View {
                     if bottomSpacer > 0 {
                         Color.clear.frame(width: rowWidth, height: bottomSpacer)
                     }
-                } header: {
-                    SheetRow(
-                        rowNumber: nil,                  // the corner cell above the gutter
-                        rowNumberWidth: gutterWidth,
-                        stickyRowNumber: true,
-                        cells: model.headerLabels(),
-                        widths: widths,
-                        fillerColumns: fillerColumns,
-                        isHeader: true
-                    )
                 }
             }
         }
+        // Item 2: the deliberate macOS 26 scroll-edge effect. `.automatic`
+        // (the default) is emergent — it keys off title-bar/toolbar state and
+        // stopped frosting once title-visibility toggling was added — so we make
+        // the top-edge frost EXPLICIT: content scrolling under the transparent
+        // title-bar region is softly blurred, independent of the title reveal.
+        .scrollEdgeEffectStyle(.soft, for: .top)
+        .frameLog("scrollview")                          // window-space viewport top (item 1)
         .scrollPosition($scrollPos)
         // Item 2: rest the initial content offset at the top-left corner (not a
         // drifted/elastic position), so the grid opens at exactly (0,0) with the
@@ -162,6 +189,20 @@ struct GridView: View {
         let overscroll = Double(GridMetrics.overscrollRows) * rowH
         let extra = max(overscroll, Double(viewportSize.height) - dataHeight)
         return max(GridMetrics.overscrollRows, Int(ceil(extra / rowH)))
+    }
+}
+
+private extension View {
+    /// Logs this view's window-space (.global) frame whenever it changes — for
+    /// diagnosing the header/row-1 overlap on the LIVE hierarchy (dumps use a
+    /// separate eager grid and cannot). Inert unless LESSSHEET_LOG_LAYOUT is set.
+    @ViewBuilder
+    func frameLog(_ label: String, if condition: Bool = true) -> some View {
+        if condition && ScrollProbe.layoutEnabled {
+            onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { ScrollProbe.noteFrame(label, $0) }
+        } else {
+            self
+        }
     }
 }
 
@@ -247,6 +288,22 @@ private struct StickyLeading: ViewModifier {
             }
         } else {
             content
+        }
+    }
+}
+
+/// Pins the header row to the TOP of the enclosing ScrollView by counter-
+/// translating the vertical scroll (GPU-composited via `visualEffect`, same
+/// technique as `StickyLeading`). Replaces LazyVStack `pinnedViews`, which
+/// floated the header over row 1. `inset` keeps it parked at the title-bar
+/// content inset (so it never rides up under the title-bar region).
+private struct StickyTop: ViewModifier {
+    var inset: CGFloat = GridMetrics.titleBarInset
+
+    func body(content: Content) -> some View {
+        content.visualEffect { effect, proxy in
+            let minY = proxy.frame(in: .scrollView).minY
+            return effect.offset(y: max(0, inset - minY))
         }
     }
 }
