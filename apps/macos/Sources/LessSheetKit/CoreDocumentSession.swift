@@ -14,8 +14,30 @@ import Foundation
 public struct CoreSessionOpener: DocumentSessionOpening {
     public init() {}
 
+    /// A dedicated background queue for the core's O(head) open. Keeps the
+    /// blocking `ls_open` (up to LS_OPEN_HEAD_MAX_BYTES of file I/O) off the
+    /// calling actor so a main-actor caller's run loop is never blocked during
+    /// cold start — structurally, not by relying on a nonisolated-async
+    /// executor default that a future language mode could change.
+    private static let openQueue = DispatchQueue(label: "less-sheet.core-open", qos: .userInitiated)
+
     public func open(path: String, forcing override: DialectOverride) async throws(DocumentOpenError) -> any DocumentSession {
-        try CoreDocumentSession(path: path, forcing: override)
+        do {
+            return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<CoreDocumentSession, any Error>) in
+                Self.openQueue.async {
+                    do {
+                        continuation.resume(returning: try CoreDocumentSession(path: path, forcing: override))
+                    } catch {
+                        continuation.resume(throwing: error)
+                    }
+                }
+            }
+        } catch let error as DocumentOpenError {
+            throw error
+        } catch {
+            // Unreachable: CoreDocumentSession.init throws only DocumentOpenError.
+            throw DocumentOpenError.io
+        }
     }
 }
 

@@ -161,3 +161,43 @@ disputed test (48/49 green, stable across 3 seeded runs; every ARCH core criteri
 met, measured where measurable). The sole failure is a contract defect in the frozen test, now
 two-key co-signed for the planner to adjudicate. Findings 2–4 are non-blocking [impl] items for a
 follow-up round or slice 3.
+
+---
+
+## Addendum — re-verification after DECISION-1 and nit fixes (2026-07-06)
+
+**State re-checked:** DECISION-1 (commit aad62c1) amended only `backend/tests/all_tests.zig`
+(+ pipeline docs) — the two-key-approved fixture repair `"1;2\n3;4\n"` keeping
+`expectDims(od.doc, 2, 2)` at the c2 splits test, exactly the alternative my original probe
+verified on the shipping core (`sep=';' header=false count=2 cols=2`; all-numeric record 1 keeps
+the header OFF, so the dims assertion is now grammar-consistent). Implementation delta since my
+PASS: `backend/src/root.zig` only, 965 → 981 lines, two hunks matching my findings 3 and 4;
+grep confirms no other new call sites.
+
+**Hunk 1 — fail-open jump when the worker never spawned (`ls_jump_start`, lines 647-657):**
+correct and safe. Runs under the document mutex (lock at entry, defer unlock); placed after the
+behind-frontier and complete branches, so it catches exactly the previously-livelocking case
+(target ≥ frontier, not complete, `worker == null`) and leaves the normal path untouched.
+Invariants hold: DONE ⇒ progress exactly 1.0 (header pin); `landed_row = frontier_rows - 1`
+is a valid, servable 0-based DATA-row index (frontier_rows counts data rows from `data_start`,
+so no off-by-one against the header-exclusion row-count rule), 0 when there are no data rows —
+matching the header's no-data-rows convention. `d.worker` is written once at open before the
+handle escapes, so no race. Strict-letter caveat noted: in this degraded mode `landed_row` may
+be short of the target without an EOF clamp — acceptable, since the alternative (SCANNING
+forever with frozen progress) violates the completion promise worse and hangs pollers; the
+branch is reachable only on thread-spawn resource exhaustion and is untestable in fixtures
+(code-review-only).
+
+**Hunk 2 — primitive destruction (`freeDoc`, lines 368-381):** correct and safe.
+`pthread_cond_destroy` + `pthread_mutex_destroy` before `gpa.destroy(doc)` (destroy before
+freeing backing memory; cond/mutex mutual order immaterial with no waiters). Quiescence verified
+at both call sites: ls_close joins the worker first (worker's final unlock happens-before thread
+exit happens-before join returns — the POSIX-sanctioned unlock-then-destroy pattern), and the
+open-failure paths call freeDoc before the spawn line, so the statically-initialized primitives
+were never contended. Return values ignored is fine for non-pshared primitives here.
+
+**Gate re-run by reviewer:** `bash backend/.aidev/gate.sh backend` → conformance PASS,
+behavior PASS (49/49). No frozen paths touched by the implementer (git: `M backend/src/root.zig`
+only).
+
+### Final verdict: PASS

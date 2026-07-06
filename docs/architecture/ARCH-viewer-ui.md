@@ -70,8 +70,10 @@ The walking skeleton proved the pipeline (Zig core → C ABI → Swift UI) but i
 3. Launch with no document: the empty window immediately presents the native open panel;
    cancel leaves the empty grid with the menu bar available. `File › Open` remains a menu
    item; the temp shell's duplicate "View" menu and reachable empty Settings window are gone.
-4. Drag & drop of a file onto the window or Dock icon opens it (replacing the document, as
-   today).
+4. Files opened via the standard open-document events (Finder double-click / drop on the
+   Dock icon) replace the current document, as today. Drag & drop onto the WINDOW is a
+   non-goal — descoped by the author on 2026-07-06 after round-1 review ("I don't see the
+   point"); no dedicated drop-target code exists or is required.
 
 **Floating controls (the overlay)**
 5. At rest the window shows only data. Mouse movement over the window reveals the overlay;
