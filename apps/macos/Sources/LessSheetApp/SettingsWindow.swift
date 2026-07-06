@@ -1,14 +1,15 @@
 import Contracts
 import SwiftUI
 
-// The Configure window's content (ARCH req. 9): a normal titled window with the
-// SAME three parse parameters as the pills — bound to the same session state,
-// so a change here re-opens the document exactly as a pill would — plus
-// per-column visibility checkboxes (the last visible column's box disabled).
-// The form leaves obvious room for future datatype/formatting sections and
-// ships no dead controls.
+// The Settings window's content (ARCH req. 9): a normal titled window with the
+// SAME three parse parameters as the overlay controls — bound to the same
+// session state, so a change here re-opens the document exactly as a popup would
+// — plus per-column visibility checkboxes (the last visible column's box
+// disabled). The parameter terms are identical to the popups' ("First row is
+// header", "Separator", "Quote character"). The form leaves obvious room for
+// future datatype/formatting sections and ships no dead controls.
 
-struct ConfigureView: View {
+struct SettingsView: View {
     @Bindable var model: DocumentModel
 
     var body: some View {

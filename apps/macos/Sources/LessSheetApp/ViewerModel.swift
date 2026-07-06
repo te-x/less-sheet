@@ -22,6 +22,17 @@ enum GridMetrics {
     /// Rows kept behind the scan frontier as scroll buffer each direction
     /// (well under LS_WINDOW_MAX_ROWS so a window request never over-asks).
     static let scrollBufferRows = 600
+    /// Row-number gutter: inner horizontal padding, and a floor on the digit
+    /// count so the gutter never looks cramped. The gutter is fixed against
+    /// horizontal scroll and sized to the largest VISIBLE 1-based number.
+    static let rowNumberHPadding: CGFloat = 8
+    static let rowNumberMinDigits = 2
+    /// End-of-file overscroll: rows of empty filler grid kept BELOW the last
+    /// data row so the user can scroll a little past it and the bottom-right
+    /// floating controls never cover the final rows. 5 rows (110 pt) clears the
+    /// control cluster (36 pt button + 24 pt inset ≈ 60 pt) with margin. Pure
+    /// fill — never counted as data (row count / scrollbar estimate ignore it).
+    static let overscrollRows = 5
 }
 
 @MainActor
@@ -69,7 +80,7 @@ final class DocumentModel {
     var overlayRevealed = false
     var expandedPill: PillKind?
     var jumpFieldActive = false
-    var configureOpen = false
+    var settingsOpen = false
     /// Bumped by the ⌘J command to ask the overlay to reveal + focus the jump
     /// field (the keyboard reveal path).
     private(set) var jumpFocusRequests = 0
@@ -153,7 +164,7 @@ final class DocumentModel {
     }
 
     /// Re-open the current document with one dialect parameter changed
-    /// (pill / Configure edit). Returns false — with no re-open — when the
+    /// (popup / Settings edit). Returns false — with no re-open — when the
     /// selection is invalid (`DialectComposing` rejected it).
     @discardableResult
     func applyDialectChange(_ change: DialectChange) -> Bool {
@@ -218,6 +229,30 @@ final class DocumentModel {
         Int(min(rowCountInfo.count, UInt64(Int.max)))
     }
 
+    // MARK: - Row-number gutter (fixed leftmost column; 1-based)
+
+    /// Width of the fixed row-number gutter, sized to fit the largest 1-based
+    /// row number currently in view (ARCH: "width fits the largest visible
+    /// number"). Stable per digit count — it only steps when the visible range
+    /// crosses a power-of-ten — and never below a 2-digit floor. Uses tabular
+    /// digits so the width is exact.
+    func rowNumberColumnWidth() -> CGFloat {
+        // Clamp to the last data row so scrolling into the overscroll strip
+        // (whose filler rows carry no number) never inflates the gutter.
+        let maxVisible = min(firstVisibleRow + max(lastVisibleCount, 1), max(displayRowCount, 1))
+        return Self.rowNumberWidth(digits: Self.rowNumberDigits(forMaxNumber: maxVisible))
+    }
+
+    static func rowNumberDigits(forMaxNumber n: Int) -> Int {
+        max(GridMetrics.rowNumberMinDigits, String(max(1, n)).count)
+    }
+
+    static func rowNumberWidth(digits: Int) -> CGFloat {
+        let font = NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
+        let sample = String(repeating: "8", count: max(1, digits)) as NSString
+        return ceil(sample.size(withAttributes: [.font: font]).width) + GridMetrics.rowNumberHPadding * 2
+    }
+
     // MARK: - Grid view helpers (shared by the live grid and the dump grid)
 
     /// Frozen widths of the visible columns, in render order.
@@ -249,7 +284,7 @@ final class DocumentModel {
     }
 
     /// The label for a column (effective header name, else generic A/B/C…),
-    /// used by the grid header and the Configure checkboxes.
+    /// used by the grid header and the Settings checkboxes.
     func columnLabel(_ column: Int) -> String {
         if let headerCells, column < headerCells.count, !headerCells[column].isEmpty {
             return headerCells[column]
@@ -286,20 +321,65 @@ final class DocumentModel {
     }
 
     private func foldJump(_ status: JumpStatus) {
+        let previous = jumpFlow
         let next = jumpControl.resolve(jumpFlow, with: status)
-        if case let .landed(row) = next, jumpFlow != next { pendingScrollRow = row }
+        if case let .scanning(_, _, progress) = next, JumpProbe.active {
+            JumpProbe.noteProgress(progress)
+        }
+        if case let .landed(row) = next, previous != next {
+            landOn(row)
+        }
         jumpFlow = next
+    }
+
+    /// A completed jump lands here: page the core window to the target BEFORE
+    /// the viewport scrolls, so the rows are already materialized when it
+    /// arrives (the virtual band anchors on the landed row) and a headless
+    /// arrival dump shows the target row immediately. Then ask the grid to
+    /// scroll the landed row into view.
+    private func landOn(_ row: UInt64) {
+        firstVisibleRow = Int(min(row, UInt64(Int.max)))
+        materialize(start: row, count: GridMetrics.scrollBufferRows * 2)
+        pendingScrollRow = row
+        if JumpProbe.active { JumpProbe.arrived(model: self, landed: row) }
     }
 
     // MARK: - Overlay reveal / fade
 
     /// Whether the overlay is currently pinned open (interaction in progress):
-    /// a pill is expanded, the jump field is active, a scan is running, or the
-    /// Configure window is open.
+    /// a dialect popup is expanded, the jump field is active, a scan is
+    /// running, or the Settings window is open.
     var overlayPinned: Bool {
-        if expandedPill != nil || jumpFieldActive || configureOpen { return true }
+        if expandedPill != nil || jumpFieldActive || settingsOpen { return true }
         if case .scanning = jumpFlow { return true }
         return false
+    }
+
+    // MARK: - Overlay popups (single active popup; Esc / click-away dismiss)
+
+    /// A dialect popup or the jump field is open — drives the click-away scrim
+    /// (a running scan keeps its popup up independently, so it is excluded).
+    var anyPopupOpen: Bool { expandedPill != nil || jumpFieldActive }
+
+    /// Dismiss the open dialect popup / jump field (Esc or click-away). A
+    /// running jump scan is left alone: its popup stays reachable (cancel)
+    /// until the scan ends or the user cancels it.
+    func dismissPopups() {
+        expandedPill = nil
+        jumpFieldActive = false
+    }
+
+    /// Open (or re-close) a dialect popup, closing the jump field so at most
+    /// one popup is ever open at a time.
+    func toggleExpandedPill(_ kind: PillKind) {
+        expandedPill = (expandedPill == kind) ? nil : kind
+        jumpFieldActive = false
+    }
+
+    /// Open the jump field, closing any dialect popup.
+    func openJumpField() {
+        jumpFieldActive = true
+        expandedPill = nil
     }
 
     func revealOverlay() {
@@ -346,7 +426,8 @@ final class DocumentModel {
         from live: DocumentModel,
         revealed: Bool,
         expandedPill: PillKind?,
-        jumpFlow: JumpFlow
+        jumpFlow: JumpFlow,
+        jumpFieldActive: Bool = false
     ) -> DocumentModel {
         let snapshot = DocumentModel(opener: live.opener)
         snapshot.path = live.path
@@ -362,7 +443,17 @@ final class DocumentModel {
         snapshot.overlayRevealed = revealed
         snapshot.expandedPill = expandedPill
         snapshot.jumpFlow = jumpFlow
+        snapshot.jumpFieldActive = jumpFieldActive
         return snapshot
+    }
+
+    /// Verification-only: page the live window to `startRow` before a headless
+    /// dump so a grid dump can exhibit larger row numbers / the widened gutter
+    /// (mirrors the `LESSSHEET_HIDE_COLS` pre-hide hook). Inert in normal use.
+    func dumpMaterialize(startRow: UInt64) {
+        firstVisibleRow = Int(min(startRow, UInt64(Int.max)))
+        lastVisibleCount = 40
+        materialize(start: startRow, count: 120)
     }
 
     // MARK: - Polling (off the main actor; stops when idle)

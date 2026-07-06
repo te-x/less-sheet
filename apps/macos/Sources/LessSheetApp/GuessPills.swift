@@ -1,171 +1,250 @@
 import Contracts
 import SwiftUI
 
-// The guess-pills: one compact circular glass control per guessed parameter
-// (header · separator · quote), each showing the CURRENT effective value and
-// visually distinguishing guessed from user-overridden. Clicking a pill
-// expands a vertical list of candidate values (plus a single-ASCII "custom…"
-// entry for separator/quote); selecting one re-opens with the forced dialect.
+// The dialect controls that sit in the bottom-right overlay bar: a header toggle
+// and two dialect popups (separator, quote). All three are consistent-size glass
+// circles showing the CURRENT effective value and visually distinguishing a
+// guessed value from a user-overridden one (accent ring).
+//
+// - Header (req. 4): NO popup — a click toggles the header on/off immediately;
+//   the glyph swaps "H" ↔ "H with a slash"; the tooltip (also the VoiceOver
+//   hint) reads "File contains header" / "File contains no header".
+// - Separator / Quote (req. 5): a click opens a small pill-shaped popup the same
+//   width as the button, expanding UPWARD — a vertical stack of candidate glyphs
+//   (plus Custom…), the current one marked. Selecting one applies immediately
+//   through the existing re-open flow; Esc / click-away dismisses.
+//
+// Shared vocabulary with the Settings window is pinned in `DialectGlyph`
+// ("First row is header", "Separator", "Quote character").
 
-struct PillsCluster: View {
+/// The header toggle (req. 4): immediate on/off, no popup.
+struct HeaderButton: View {
     @Bindable var model: DocumentModel
 
-    var body: some View {
-        VStack(alignment: .trailing, spacing: 8) {
-            HStack(spacing: 8) {
-                GuessPill(kind: .header, glyph: DialectGlyph.header(model.dialect.hasHeader),
-                          overridden: model.dialect.headerForced, model: model)
-                GuessPill(kind: .separator, glyph: DialectGlyph.separator(model.dialect.separator),
-                          overridden: model.dialect.separatorForced, model: model)
-                GuessPill(kind: .quote, glyph: DialectGlyph.quote(model.dialect.quote),
-                          overridden: model.dialect.quoteForced, model: model)
-            }
-            if let kind = model.expandedPill {
-                PillOptions(kind: kind, model: model)
-                    .transition(.opacity)
-            }
-        }
-        .animation(.easeOut(duration: 0.15), value: model.expandedPill)
-    }
-}
-
-/// One circular guess-pill. Overridden pills are tinted (accent) so a glance
-/// separates "the core guessed this" from "I set this".
-struct GuessPill: View {
-    let kind: PillKind
-    let glyph: String
-    let overridden: Bool
-    @Bindable var model: DocumentModel
+    private var on: Bool { model.dialect.hasHeader }
+    private var tooltip: String { on ? "File contains header" : "File contains no header" }
 
     var body: some View {
         Button {
-            model.expandedPill = (model.expandedPill == kind) ? nil : kind
+            model.applyDialectChange(.header(!on))
+            model.revealOverlay()
+        } label: {
+            HeaderGlyph(on: on)
+                .frame(width: OverlayMetrics.controlSize, height: OverlayMetrics.controlSize)
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .glassChrome(model.dialect.headerForced ? .regular.tint(.accentColor).interactive() : .regular.interactive(), in: Circle())
+        .overlay { if model.dialect.headerForced { Circle().strokeBorder(Color.accentColor, lineWidth: 2) } }
+        .help(tooltip)
+        .accessibilityLabel(DialectGlyph.pillLabel(.header))
+        .accessibilityValue(on ? "on" : "off")
+        .accessibilityHint(tooltip)
+    }
+}
+
+/// "H", or "H" struck through with a diagonal slash when the header is off.
+struct HeaderGlyph: View {
+    let on: Bool
+
+    var body: some View {
+        Text("H")
+            .font(.callout.weight(.semibold))
+            .foregroundStyle(.primary)
+            .overlay {
+                if !on {
+                    Capsule()
+                        .fill(.primary)
+                        .frame(width: 2, height: 24)
+                        .rotationEffect(.degrees(45))
+                }
+            }
+    }
+}
+
+/// A separator / quote control (req. 5): a glass button showing the current
+/// value that opens a narrow pill popup of candidates above it.
+struct DialectPopupButton: View {
+    let kind: PillKind          // .separator or .quote
+    @Bindable var model: DocumentModel
+
+    private var isOpen: Bool { model.expandedPill == kind }
+
+    private var glyph: String {
+        switch kind {
+        case .separator: return DialectGlyph.separator(model.dialect.separator)
+        case .quote: return DialectGlyph.quote(model.dialect.quote)
+        case .header: return ""
+        }
+    }
+
+    private var overridden: Bool {
+        switch kind {
+        case .separator: return model.dialect.separatorForced
+        case .quote: return model.dialect.quoteForced
+        case .header: return model.dialect.headerForced
+        }
+    }
+
+    var body: some View {
+        Button {
+            model.toggleExpandedPill(kind)
             model.revealOverlay()
         } label: {
             Text(glyph)
                 .font(.callout.weight(.semibold))
-                .frame(width: 36, height: 36)
+                .frame(width: OverlayMetrics.controlSize, height: OverlayMetrics.controlSize)
                 .contentShape(Circle())
         }
         .buttonStyle(.plain)
         .glassChrome(overridden ? .regular.tint(.accentColor).interactive() : .regular.interactive(), in: Circle())
         .overlay {
-            // Overridden pills carry a persistent accent ring ("you set this");
-            // an expanded, still-guessed pill gets a neutral selection ring.
-            // The ring also renders in frame dumps, where glass tint cannot.
             if overridden {
                 Circle().strokeBorder(Color.accentColor, lineWidth: 2)
-            } else if model.expandedPill == kind {
+            } else if isOpen {
                 Circle().strokeBorder(Color.secondary, lineWidth: 1.5)
             }
         }
+        .overlay(alignment: .top) {
+            if isOpen {
+                DialectPopup(kind: kind, model: model)
+                    .fixedSize()   // size to content, not the button's frame
+                    // Float the popup fully above the button — it expands upward
+                    // (offset, so it never disturbs the button-row layout).
+                    .offset(y: -(DialectPopup.height(for: kind) + OverlayMetrics.popupGap))
+            }
+        }
+        .help(DialectGlyph.pillLabel(kind))
         .accessibilityLabel(DialectGlyph.pillLabel(kind))
         .accessibilityValue(DialectGlyph.pillValue(kind, model.dialect))
         .accessibilityHint(overridden ? "Set by you" : "Guessed")
     }
 }
 
-/// The vertical candidate list for the expanded pill; selecting a value applies
-/// it immediately (a dialect re-open). A checkmark marks the effective value.
-struct PillOptions: View {
+/// The narrow (button-width) pill of candidate values for a separator / quote
+/// control, stacked vertically and expanding upward. The current value is
+/// marked; selecting one applies immediately (a dialect re-open). Esc dismisses.
+struct DialectPopup: View {
     let kind: PillKind
     @Bindable var model: DocumentModel
     @Environment(\.overlayDumpChrome) private var dumpChrome
     @State private var custom = ""
     @FocusState private var customFocused: Bool
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            switch kind {
-            case .header:
-                row("First row is header", selected: model.dialect.hasHeader) { apply(.header(true)) }
-                row("No header", selected: !model.dialect.hasHeader) { apply(.header(false)) }
+    /// The popup's exact rendered height, so the button can float it a fixed
+    /// distance above itself (no measure-then-reflow). Kept in step with the
+    /// body's row count, `optionSize`, VStack spacing (4) and padding (4).
+    static func height(for kind: PillKind) -> CGFloat {
+        let rows: Int
+        switch kind {
+        case .separator: rows = DialectCandidates.separators.count + 1  // candidates + Custom
+        case .quote: rows = DialectCandidates.quotes.count + 2           // candidates + None + Custom
+        case .header: rows = 0
+        }
+        guard rows > 0 else { return 0 }
+        return CGFloat(rows) * OverlayMetrics.optionSize
+            + CGFloat(rows - 1) * 4   // inter-row spacing
+            + 2 * 4                   // top + bottom padding
+    }
 
+    var body: some View {
+        VStack(spacing: 4) {
+            switch kind {
             case .separator:
                 ForEach(DialectCandidates.separators, id: \.self) { byte in
-                    row(DialectGlyph.separatorName(byte),
-                        selected: model.dialect.separator == byte) { apply(.separator(byte)) }
+                    option(DialectGlyph.charGlyph(byte),
+                           label: DialectGlyph.separatorName(byte),
+                           selected: model.dialect.separator == byte) { apply(.separator(byte)) }
                 }
-                customField(placeholder: "Custom…") { byte in apply(.separator(byte)) }
+                customEntry { apply(.separator($0)) }
 
             case .quote:
                 ForEach(DialectCandidates.quotes, id: \.self) { byte in
-                    row(DialectGlyph.quoteName(byte),
-                        selected: model.dialect.quote == byte) { apply(.quote(byte)) }
+                    option(DialectGlyph.charGlyph(byte),
+                           label: DialectGlyph.quoteName(byte),
+                           selected: model.dialect.quote == byte) { apply(.quote(byte)) }
                 }
-                row("None", selected: model.dialect.quote == nil) { apply(.quote(nil)) }
-                customField(placeholder: "Custom…") { byte in apply(.quote(byte)) }
+                option("∅", label: "None", selected: model.dialect.quote == nil) { apply(.quote(nil)) }
+                customEntry { apply(.quote($0)) }
+
+            case .header:
+                EmptyView()
             }
         }
-        .padding(10)
-        .frame(width: 220, alignment: .leading)
-        .glassChrome(.regular, in: RoundedRectangle(cornerRadius: 16))
+        .padding(4)
+        .frame(width: OverlayMetrics.controlSize)
+        .glassChrome(.regular, in: RoundedRectangle(cornerRadius: OverlayMetrics.controlSize / 2, style: .continuous))
+        .onExitCommand { model.dismissPopups() }        // Esc dismisses
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("\(DialectGlyph.pillLabel(kind)) options")
     }
 
-    private func row(_ title: String, selected: Bool, action: @escaping () -> Void) -> some View {
+    private func option(_ glyph: String, label: String, selected: Bool, action: @escaping () -> Void) -> some View {
         Button(action: action) {
-            HStack {
-                Text(title).font(.callout)
-                Spacer(minLength: 8)
-                if selected { Image(systemName: "checkmark").font(.caption.weight(.semibold)) }
-            }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 5)
-            .contentShape(Rectangle())
+            Text(glyph)
+                .font(.callout.monospaced())
+                .frame(width: OverlayMetrics.optionSize, height: OverlayMetrics.optionSize)
+                .background { if selected { Circle().fill(Color.accentColor.opacity(0.25)) } }
+                .overlay { if selected { Circle().strokeBorder(Color.accentColor, lineWidth: 1.5) } }
+                .contentShape(Circle())
         }
         .buttonStyle(.plain)
+        .help(label)
+        .accessibilityLabel(label)
         .accessibilityAddTraits(selected ? [.isSelected] : [])
     }
 
+    /// A single-ASCII-character custom entry. In frame dumps (where a live
+    /// TextField can't be snapshotted) it renders as a static "＋".
     @ViewBuilder
-    private func customField(placeholder: String, apply: @escaping (UInt8) -> Void) -> some View {
-        HStack(spacing: 6) {
-            Image(systemName: "character.cursor.ibeam").font(.caption).foregroundStyle(.secondary)
-            if dumpChrome {
-                // ImageRenderer can't snapshot a live TextField; show its label.
-                Text(placeholder).font(.callout).foregroundStyle(.secondary)
-                Spacer(minLength: 0)
-            } else {
-                TextField(placeholder, text: $custom)
-                    .textFieldStyle(.plain)
-                    .font(.callout.monospaced())
-                    .focused($customFocused)
-                    .onChange(of: custom) { _, value in
-                        // Exactly one ASCII character.
-                        if let last = value.unicodeScalars.last, last.isASCII {
-                            custom = String(last)
-                        } else {
-                            custom = ""
-                        }
+    private func customEntry(apply: @escaping (UInt8) -> Void) -> some View {
+        if dumpChrome {
+            Text("＋")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .frame(width: OverlayMetrics.optionSize, height: OverlayMetrics.optionSize)
+                .help("Custom character")
+                .accessibilityLabel("Custom single character")
+        } else {
+            TextField("", text: $custom)
+                .textFieldStyle(.plain)
+                .font(.callout.monospaced())
+                .multilineTextAlignment(.center)
+                .frame(width: OverlayMetrics.optionSize, height: OverlayMetrics.optionSize)
+                .focused($customFocused)
+                .overlay { RoundedRectangle(cornerRadius: 6).strokeBorder(.secondary.opacity(0.4)) }
+                .onChange(of: custom) { _, value in
+                    // Keep at most one ASCII character.
+                    if let last = value.unicodeScalars.last, last.isASCII {
+                        custom = String(last)
+                    } else {
+                        custom = ""
                     }
-                    .onSubmit {
-                        if let scalar = custom.unicodeScalars.first, scalar.isASCII {
-                            apply(UInt8(scalar.value))
-                        }
-                    }
-            }
+                }
+                .onSubmit {
+                    if let scalar = custom.unicodeScalars.first, scalar.isASCII { apply(UInt8(scalar.value)) }
+                }
+                .help("Custom character")
+                .accessibilityLabel("Custom single character")
         }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 5)
-        .accessibilityLabel("Custom single character")
     }
 
     private func apply(_ change: DialectChange) {
-        // A valid selection re-opens and collapses the pill; an invalid custom
-        // byte (out of domain / colliding) leaves the list open for correction.
+        // A valid selection re-opens and dismisses; an invalid custom byte
+        // (out of domain / colliding) leaves the popup open for correction.
         if model.applyDialectChange(change) {
             custom = ""
-            model.expandedPill = nil
+            model.dismissPopups()
         }
     }
 }
 
 /// Compact glyphs + user-vocabulary names for dialect values (identical terms
-/// in pill, expanded list, and Configure — "Separator", "Quote character").
+/// in the popups and the Settings window — "First row is header", "Separator",
+/// "Quote character").
 enum DialectGlyph {
     static func separator(_ byte: UInt8) -> String { charGlyph(byte) }
     static func quote(_ byte: UInt8?) -> String { byte.map(charGlyph) ?? "∅" }
-    static func header(_ on: Bool) -> String { on ? "H" : "—" }
 
     static func charGlyph(_ byte: UInt8) -> String {
         switch byte {

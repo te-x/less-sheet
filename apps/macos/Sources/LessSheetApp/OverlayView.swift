@@ -33,39 +33,62 @@ extension View {
     }
 }
 
+/// Shared sizing for the overlay controls so all five read as one consistent
+/// row (req. 3), plus the gap a popup floats above its button.
+enum OverlayMetrics {
+    static let controlSize: CGFloat = 36
+    static let optionSize: CGFloat = 28
+    static let popupGap: CGFloat = 10
+    /// Height of the single-row jump popup (field / progress), used to float it
+    /// above the button; a slight overestimate only widens the gap (never
+    /// overlaps).
+    static let jumpPopupHeight: CGFloat = 40
+}
+
 // The floating overlay — the one signature element over a data-first window.
-// A vertical Liquid Glass cluster (filename · jump-to-row · guess-pills ·
-// Configure) revealed on pointer movement or keyboard focus and faded after
-// ~2 s idle. 8pt spacing rhythm; one orchestrated reveal (fade + slight rise);
-// Reduce Motion honored; every control accessibility-labelled.
+// A single horizontal Liquid Glass row in the BOTTOM-RIGHT (req. 3), left→right:
+// [Jump] [Header] [Separator] [Quote] [Settings]. Jump, Separator and Quote open
+// small popups that expand UPWARD from their button; Header toggles immediately;
+// Settings opens the Settings window. Revealed on pointer movement or keyboard
+// focus, faded after ~2 s idle (the window title + traffic lights ride the same
+// reveal). A click-away scrim dismisses any open popup. 8pt rhythm; one
+// orchestrated reveal (fade + slight rise); Reduce Motion honored; every control
+// accessibility-labelled.
 
 struct OverlayView: View {
     @Bindable var model: DocumentModel
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        GlassEffectContainer(spacing: 8) {
-            VStack(alignment: .trailing, spacing: 8) {
-                FilenameChip(name: filename)
-                JumpControlView(model: model)
-                PillsCluster(model: model)
-                ConfigureButton { AppDelegate.shared?.presentConfigure() }
+        ZStack(alignment: .bottomTrailing) {
+            // Click-away scrim — present ONLY while a popup is open, so ordinary
+            // scrolling is never intercepted. Invisible; a tap dismisses.
+            if model.anyPopupOpen {
+                Color.clear
+                    .contentShape(Rectangle())
+                    .onTapGesture { model.dismissPopups() }
+                    .accessibilityHidden(true)
             }
+
+            GlassEffectContainer(spacing: 8) {
+                HStack(alignment: .bottom, spacing: 8) {
+                    JumpControlView(model: model)
+                    HeaderButton(model: model)
+                    DialectPopupButton(kind: .separator, model: model)
+                    DialectPopupButton(kind: .quote, model: model)
+                    SettingsButton { AppDelegate.shared?.presentSettings() }
+                }
+            }
+            .fixedSize()                 // hug the row; don't fill the window
+            .padding(.trailing, 24)
+            .padding(.bottom, 24)
         }
-        .fixedSize()                 // hug the cluster; don't fill the window
-        .padding(.trailing, 24)
-        .padding(.bottom, 24)
         .opacity(model.overlayRevealed ? 1 : 0)
         .offset(y: revealOffset)
         .allowsHitTesting(model.overlayRevealed)
         .animation(revealAnimation, value: model.overlayRevealed)
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Viewer controls")
-    }
-
-    private var filename: String {
-        let name = (model.path as NSString).lastPathComponent
-        return name.isEmpty ? "Untitled" : name
     }
 
     private var revealOffset: CGFloat {
@@ -80,84 +103,94 @@ struct OverlayView: View {
     }
 }
 
-/// The document filename, display-only, on a glass capsule.
-struct FilenameChip: View {
-    let name: String
-
-    var body: some View {
-        Text(name)
-            .font(.callout.weight(.medium))
-            .foregroundStyle(.primary)
-            .lineLimit(1)
-            .truncationMode(.middle)
-            .frame(maxWidth: 260)
-            .padding(.horizontal, 14)
-            .padding(.vertical, 8)
-            .glassChrome(.regular, in: Capsule())
-            .accessibilityLabel("File \(name)")
-    }
-}
-
-/// Jump-to-row: a glass button that opens a digits-only field showing the
-/// current row-count knowledge; while a scan runs it shows progress with an
-/// Esc-cancel affordance (ARCH req. 7).
+/// Jump-to-row (req. 6): a glass button that opens an upward popup with a
+/// digits-only field showing the current row-count knowledge; while a scan runs
+/// the popup shows progress with an Esc-cancel affordance (ARCH req. 7). Jump
+/// behavior itself is unchanged — only its presentation moved into the popup.
 struct JumpControlView: View {
     @Bindable var model: DocumentModel
     @Environment(\.overlayDumpChrome) private var dumpChrome
     @FocusState private var fieldFocused: Bool
     @State private var text = ""
-    @State private var expanded = false
+
+    private var popupVisible: Bool {
+        if model.jumpFieldActive { return true }
+        if case .scanning = model.jumpFlow { return true }
+        return false
+    }
 
     var body: some View {
-        Group {
-            if case let .scanning(_, _, progress) = model.jumpFlow {
-                scanning(progress: progress)
-            } else if expanded {
-                field
-            } else {
-                button
+        Button {
+            model.openJumpField()
+            model.revealOverlay()
+            DispatchQueue.main.async { fieldFocused = true }
+        } label: {
+            // A curved point-to-point arrow reads as "jump from here to there"
+            // (item 4); the plain down-arrow read as "jump to end". VoiceOver
+            // label stays "Jump to row".
+            Image(systemName: "point.topleft.down.curvedto.point.bottomright.up")
+                .font(.callout.weight(.semibold))
+                .frame(width: OverlayMetrics.controlSize, height: OverlayMetrics.controlSize)
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .glassChrome(.regular.interactive(), in: Circle())
+        .overlay(alignment: .top) {
+            if popupVisible {
+                // Float the popup above the button (expands upward); fixedSize
+                // so it uses its own width, not the button's small frame.
+                popup.fixedSize().offset(y: -(OverlayMetrics.jumpPopupHeight + OverlayMetrics.popupGap))
             }
         }
-        .glassChrome(.regular, in: Capsule())
-        .onChange(of: expanded) { _, now in model.jumpFieldActive = now }
+        .help("Jump to row")
+        .accessibilityLabel("Jump to row")
         .onChange(of: model.jumpFlow) { _, flow in
-            // Landing or cancelling collapses the field back to the button.
+            // Landing or cancelling collapses the popup back to the button.
             switch flow {
-            case .landed, .cancelled, .idle: expanded = false
-            case .scanning: break
+            case .landed, .cancelled, .idle: model.jumpFieldActive = false
+            case .scanning:
+                // The scanning progress state reached the view layer — evidence
+                // (main-actor) that progress rendered right after submit.
+                JumpProbe.noteScanningShown()
             }
         }
         .onChange(of: model.jumpFocusRequests) { _, _ in
             // ⌘J: open the field and focus it (keyboard reveal path).
             if case .scanning = model.jumpFlow { return }
-            expanded = true
+            model.openJumpField()
             DispatchQueue.main.async { fieldFocused = true }
         }
     }
 
-    private var button: some View {
-        Button {
-            expanded = true
-            model.revealOverlay()
-            DispatchQueue.main.async { fieldFocused = true }
-        } label: {
-            Text("Jump to row")
-                .font(.callout)
-                .padding(.horizontal, 14)
-                .padding(.vertical, 8)
+    @ViewBuilder
+    private var popup: some View {
+        Group {
+            if case let .scanning(_, _, progress) = model.jumpFlow {
+                scanning(progress: progress)
+            } else {
+                field
+            }
         }
-        .buttonStyle(.plain)
-        .accessibilityLabel("Jump to row")
+        .glassChrome(.regular, in: Capsule())
     }
 
     private var field: some View {
         HStack(spacing: 8) {
-            TextField("Row", text: $text)
-                .textFieldStyle(.plain)
-                .font(.callout.monospacedDigit())
-                .frame(width: 92)
-                .focused($fieldFocused)
-                .onSubmit(submit)
+            Group {
+                if dumpChrome {
+                    // ImageRenderer can't snapshot a live TextField; show its state.
+                    Text(text.isEmpty ? "Row" : text)
+                        .foregroundStyle(text.isEmpty ? Color.secondary : Color.primary)
+                        .frame(width: 84, alignment: .leading)
+                } else {
+                    TextField("Row", text: $text)
+                        .textFieldStyle(.plain)
+                        .frame(width: 84)
+                        .focused($fieldFocused)
+                        .onSubmit(submit)
+                }
+            }
+            .font(.callout.monospacedDigit())
             Text(RowCountText.summary(model.rowCountInfo))
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -165,7 +198,7 @@ struct JumpControlView: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
-        .onExitCommand { expanded = false }          // Esc closes the field
+        .onExitCommand { model.dismissPopups() }      // Esc closes the field
         .accessibilityLabel("Jump to row, \(RowCountText.summary(model.rowCountInfo))")
     }
 
@@ -202,26 +235,28 @@ struct JumpControlView: View {
     private func submit() {
         if model.submitJump(text) {
             text = ""
-            if case .scanning = model.jumpFlow {} else { expanded = false }
+            if case .scanning = model.jumpFlow {} else { model.jumpFieldActive = false }
         }
         // Invalid input: keep the field open for correction (no re-open).
     }
 }
 
-/// A glass button opening the Configure window.
-struct ConfigureButton: View {
+/// A glass gear button opening the Settings window (req. 7): no word, its
+/// meaning carried by the tooltip and VoiceOver label.
+struct SettingsButton: View {
     let action: () -> Void
 
     var body: some View {
         Button(action: action) {
-            Text("Configure")
-                .font(.callout)
-                .padding(.horizontal, 14)
-                .padding(.vertical, 8)
+            Image(systemName: "gearshape")
+                .font(.callout.weight(.semibold))
+                .frame(width: OverlayMetrics.controlSize, height: OverlayMetrics.controlSize)
+                .contentShape(Circle())
         }
         .buttonStyle(.plain)
-        .glassChrome(.regular, in: Capsule())
-        .accessibilityLabel("Configure")
+        .glassChrome(.regular.interactive(), in: Circle())
+        .help("Settings")
+        .accessibilityLabel("Settings")
     }
 }
 

@@ -94,7 +94,7 @@ public struct JumpControl: JumpControlling {
 
 /// Implements `DialectComposing` (see its pinned semantics).
 ///
-/// Turns one pill/Configure selection into the next open's override: carry
+/// Turns one overlay-control / Settings selection into the next open's override: carry
 /// forward every already-forced parameter as forced, leave sniffed parameters
 /// to be re-sniffed, then force the changed parameter — rejecting bytes out of
 /// the ASCII domain or colliding with a *carried forced* value of the other.

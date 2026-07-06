@@ -8,10 +8,10 @@ import SwiftUI
 // architecture — a single window created deterministically by the app delegate
 // (never a SwiftUI WindowGroup, which routes argv/file launches
 // non-deterministically) — and layers on the real chromeless viewer: a
-// full-window spreadsheet grid, the floating Liquid Glass overlay, guess-pills,
-// a separate Configure window, jump-to-row, and the timing marker + frame-dump
-// hooks. All opens (panel, launch, CLI, drag, dialect re-open) funnel through
-// DocumentModel.open(path:).
+// full-window spreadsheet grid, the floating Liquid Glass overlay, dialect
+// controls, a separate Settings window, jump-to-row, and the timing marker +
+// frame-dump hooks. All opens (panel, launch, CLI, drag, dialect re-open) funnel
+// through DocumentModel.open(path:).
 
 // MARK: - Launch argument parsing
 
@@ -74,7 +74,7 @@ func launchForcedOverride() -> DialectOverride {
     return DialectOverride(separator: separator, quote: quote, header: header)
 }
 
-// MARK: - App delegate (deterministic single window + open routing + Configure)
+// MARK: - App delegate (deterministic single window + open routing + Settings)
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -82,7 +82,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var routedLaunchOpen = false
     private var mainWindow: NSWindow?
-    private var configureWindow: NSWindow?
+    private var settingsWindow: NSWindow?
 
     override init() {
         super.init()
@@ -153,11 +153,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.isMovableByWindowBackground = true
         window.isReleasedWhenClosed = false
         window.contentMinSize = NSSize(width: 520, height: 360)
-        window.contentView = NSHostingView(rootView: ContentView(model: .shared))
+
+        // Content = the SwiftUI viewer, plus an always-present titlebar-area
+        // blur band pinned to the very top edge (item 3). Grid content (rows +
+        // the sticky header) scrolls UNDER it and blurs — the look the author liked.
+        // It lives in the window hierarchy (not SwiftUI) so it is independent of
+        // the reveal/fade `titleVisibility` toggle that had removed it, and it
+        // shows in BOTH the idle and overlay-revealed states. `.withinWindow`
+        // blends with the hosting view beneath it; `.active` keeps the blur even
+        // when the window is not key.
+        let hosting = NSHostingView(rootView: ContentView(model: .shared))
+        hosting.autoresizingMask = [.width, .height]
+        let container = NSView()
+        container.addSubview(hosting)
+        window.contentView = container
+        hosting.frame = container.bounds
+
         window.setFrameAutosaveName("LessSheetMain")
         if !window.setFrameUsingName("LessSheetMain") {
             window.center()
         }
+
+        hosting.frame = container.bounds
+        let rawTitlebar = container.bounds.height - window.contentLayoutRect.height
+        let titlebarHeight: CGFloat = (rawTitlebar > 0 && rawTitlebar < 120) ? rawTitlebar : 28
+        let blur = PassthroughEffectView()
+        blur.material = .titlebar
+        blur.blendingMode = .withinWindow
+        blur.state = .active
+        blur.autoresizingMask = [.width, .minYMargin]   // pinned to the top edge
+        blur.frame = NSRect(x: 0, y: container.bounds.height - titlebarHeight,
+                            width: container.bounds.width, height: titlebarHeight)
+        container.addSubview(blur, positioned: .above, relativeTo: hosting)
+
         // Traffic lights hidden at rest; revealed with the overlay.
         for type in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
             window.standardWindowButton(type)?.alphaValue = 0
@@ -177,11 +205,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// The Configure button opens a separate, normal titled window bound to the
+    /// The Settings gear opens a separate, normal titled window bound to the
     /// same document state (ARCH req 9).
-    func presentConfigure() {
-        if let window = configureWindow {
-            DocumentModel.shared.configureOpen = true
+    func presentSettings() {
+        if let window = settingsWindow {
+            DocumentModel.shared.settingsOpen = true
             window.makeKeyAndOrderFront(nil)
             return
         }
@@ -191,24 +219,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             backing: .buffered,
             defer: false
         )
-        window.title = "Configure"
+        window.title = "Settings"
         window.isReleasedWhenClosed = false
-        window.contentView = NSHostingView(rootView: ConfigureView(model: .shared))
+        window.contentView = NSHostingView(rootView: SettingsView(model: .shared))
         window.center()
-        window.delegate = ConfigureWindowObserver.shared
-        DocumentModel.shared.configureOpen = true
+        window.delegate = SettingsWindowObserver.shared
+        DocumentModel.shared.settingsOpen = true
         window.makeKeyAndOrderFront(nil)
-        configureWindow = window
+        settingsWindow = window
     }
 }
 
-/// Clears `configureOpen` when the Configure window closes (so the overlay can
+/// The titlebar-area blur band. A visual-effect view that is purely decorative:
+/// it never intercepts events, so scroll/clicks in the top strip pass straight
+/// through to the grid beneath (content still scrolls under — and blurs behind —
+/// it).
+final class PassthroughEffectView: NSVisualEffectView {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+}
+
+/// Clears `settingsOpen` when the Settings window closes (so the overlay can
 /// resume its idle fade).
 @MainActor
-final class ConfigureWindowObserver: NSObject, NSWindowDelegate {
-    static let shared = ConfigureWindowObserver()
+final class SettingsWindowObserver: NSObject, NSWindowDelegate {
+    static let shared = SettingsWindowObserver()
     func windowWillClose(_ notification: Notification) {
-        DocumentModel.shared.configureOpen = false
+        DocumentModel.shared.settingsOpen = false
     }
 }
 
@@ -288,8 +324,15 @@ struct ContentView: View {
             // discoverable, then dump the requested frame for verification.
             model.markFirstRowsVisible()
             model.revealOverlay()
-            FrameDump.dumpIfRequested(for: model)
-            FrameDump.terminateIfRequested()
+            if JumpProbe.active {
+                // Verification: drive the real jump path AFTER first paint. The
+                // arrival dumps + terminates itself, so skip the first-frame
+                // dump/terminate (which would quit before the jump completes).
+                JumpProbe.run(model: model)
+            } else {
+                FrameDump.dumpIfRequested(for: model)
+                FrameDump.terminateIfRequested()
+            }
         }
     }
 
@@ -377,6 +420,12 @@ struct WindowConfigurator: NSViewRepresentable {
     private func apply(to window: NSWindow?) {
         guard let window else { return }
         window.title = title
+        // Reveal the standard title bar — the document title next to the traffic
+        // lights (req. 1) — together with the overlay, and hide it again when the
+        // pointer idles. The transparent full-size-content title bar and its
+        // top-of-window blur stay put; only the title text and window buttons
+        // fade with the overlay's reveal/fade cycle.
+        window.titleVisibility = revealed ? .visible : .hidden
         for type in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
             window.standardWindowButton(type)?.animator().alphaValue = revealed ? 1 : 0
         }
