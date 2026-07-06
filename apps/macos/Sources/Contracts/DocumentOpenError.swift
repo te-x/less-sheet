@@ -10,6 +10,11 @@ public enum DocumentOpenError: Error, Equatable, Sendable {
     /// LS_ERROR_IO (3): any other open/read failure, including paths that
     /// exist but cannot be read as a file (e.g. a directory).
     case io
+    /// LS_ERROR_INVALID_ARGUMENT (4): the open options broke the API
+    /// contract (a field outside its domain, or forced separator == forced
+    /// quote). A correct UI never triggers this — `DialectComposing`
+    /// validates selections first — but the mapping is total.
+    case invalidArgument
 
     /// Maps a raw ABI status code to the Swift error.
     /// Returns nil for LS_OK (0) and for unknown codes.
@@ -18,6 +23,7 @@ public enum DocumentOpenError: Error, Equatable, Sendable {
         case 1: self = .notFound
         case 2: self = .permissionDenied
         case 3: self = .io
+        case 4: self = .invalidArgument
         default: return nil
         }
     }

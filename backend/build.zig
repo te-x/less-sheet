@@ -33,7 +33,26 @@ pub fn build(b: *std.Build) void {
         .linkage = .static,
         .root_module = api_mod,
     });
-    b.installArtifact(lib);
+
+    // Zig's self-hosted archiver only guarantees 2-byte member alignment,
+    // but Apple's ld64 requires 64-bit mach-o archive members to be 8-byte
+    // aligned (whether a given build trips this depends on member sizes).
+    // Re-pack the archive with Apple libtool so the installed
+    // zig-out/lib/liblesssheet.a always links from Swift.
+    // (The archiver also writes mode-000 member headers, so the objects are
+    // extracted and chmod-ed before libtool re-archives them.)
+    const repack = b.addSystemCommand(&.{
+        "/bin/sh", "-c",
+        "set -eu; " ++
+            "case \"$0\" in /*) src=\"$0\";; *) src=\"$PWD/$0\";; esac; " ++
+            "case \"$1\" in /*) out=\"$1\";; *) out=\"$PWD/$1\";; esac; " ++
+            "tmp=$(mktemp -d); trap 'rm -rf \"$tmp\"' EXIT; " ++
+            "cd \"$tmp\"; ar x \"$src\"; chmod 644 *.o; libtool -static -o \"$out\" ./*.o",
+    });
+    repack.addArtifactArg(lib);
+    const repacked = repack.addOutputFileArg("liblesssheet.a");
+    const install_lib = b.addInstallFile(repacked, "lib/liblesssheet.a");
+    b.getInstallStep().dependOn(&install_lib.step);
 
     // Behavior tests (planner-owned, tests/) import only the contract module.
     const behavior_tests = b.addTest(.{

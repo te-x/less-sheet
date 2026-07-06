@@ -4,17 +4,28 @@ import LessSheetKit
 import Observation
 import SwiftUI
 
+// STATUS: viewer-ui SEED shell. The walking-skeleton table UI was superseded
+// by the windowed session contract; this file keeps the pinned launch
+// architecture (delegate-owned single window, argv/open-event routing, timing
+// marker, LESSSHEET_DUMP_FRAME hook, in-window error panel) compiling over
+// the new `DocumentSession` API with a naive fixed head window. The build
+// cell replaces the shell with the real chromeless UI: full-file virtual
+// scrolling, hover overlay (Liquid Glass), guess-pills, Configure window,
+// jump-to-row with progress, scrollbar estimation (ARCH-viewer-ui reqs 1–16).
+
+// MARK: - Grid content (presentation value)
+
+struct GridContent: Equatable {
+    let columnNames: [String]
+    let rows: [[String]]
+
+    static let empty = GridContent(columnNames: [], rows: [])
+}
+
 // MARK: - View model
 
-/// Owns presentation state: the immutable head snapshot from the core, the
-/// "First Row Is Header" override (initialized to the core's suggestion), and
-/// the derived `DisplayTable`. Every open — dialog, launch-with-file, and CLI —
-/// funnels through `open(path:)`; the header toggle re-derives from the SAME
-/// snapshot without touching the core.
-///
-/// A single shared instance is referenced by both the SwiftUI scene and the
-/// `AppDelegate`, so launch-time opens routed by the delegate reach the same
-/// state the window renders.
+/// Owns presentation state over one live `DocumentSession`. Every open —
+/// dialog, launch-with-file, CLI, drag & drop — funnels through `open(path:)`.
 @MainActor
 @Observable
 final class DocumentModel {
@@ -22,68 +33,49 @@ final class DocumentModel {
 
     enum Content: Equatable {
         case launch // nothing opened yet
-        case table(DisplayTable) // may be DisplayTable.empty for an empty file
+        case table(GridContent) // may be .empty for an empty file
         case failure(DocumentOpenError, path: String)
     }
 
     private(set) var content: Content = .launch
-    private(set) var canToggleHeader = false
-    private(set) var firstRowIsHeader = false
     /// Bumped on every completed open; keys the first-frame timing marker.
     private(set) var openGeneration = 0
 
     private var markedGeneration = -1
-    private var snapshot: HeadSnapshot = .empty
-    private let opener: any DocumentOpening
-    private let deriver: any TableDisplayDeriving
+    private var session: (any DocumentSession)?
+    private let opener: any DocumentSessionOpening
 
-    init(
-        opener: any DocumentOpening = CoreDocumentOpener(),
-        deriver: any TableDisplayDeriving = TableDisplayDeriver()
-    ) {
+    init(opener: any DocumentSessionOpening = CoreSessionOpener()) {
         self.opener = opener
-        self.deriver = deriver
     }
 
-    /// The single internal open path shared by dialog, launch-with-file, and CLI.
+    /// The single internal open path shared by dialog, launch-with-file, CLI.
     func open(path: String) async {
+        session?.close()
+        session = nil
         do {
-            apply(try await opener.openHead(path: path))
+            let session = try await opener.open(path: path, forcing: .sniffAll)
+            self.session = session
+            // SEED: one fixed head window; the build cell replaces this with
+            // viewport-driven paging over the whole file.
+            let window = session.setWindow(firstRow: 0, rowCount: 200)
+            let names = session.headerCells ?? GenericColumnName.names(count: session.columnCount)
+            content = .table(session.columnCount == 0
+                ? .empty
+                : GridContent(columnNames: names, rows: window.rows))
         } catch {
-            snapshot = .empty
-            firstRowIsHeader = false
-            canToggleHeader = false
             content = .failure(error, path: path)
-            openGeneration += 1
         }
+        openGeneration += 1
     }
 
-    /// Applies the "First Row Is Header" override; re-derives immediately.
-    func setFirstRowIsHeader(_ on: Bool) {
-        guard firstRowIsHeader != on else { return }
-        firstRowIsHeader = on
-        rederive()
-    }
-
-    /// Emits the cold-start marker for the first frame that actually shows data.
-    /// Called from the data table's `.task` (view attached to the hierarchy);
-    /// guarded so exactly one marker is emitted per open that reaches the table.
+    /// Emits the cold-start marker for the first frame that actually shows
+    /// data; guarded so exactly one marker is emitted per open that reaches
+    /// the table.
     func markFirstRowsVisible() {
         guard markedGeneration != openGeneration else { return }
         markedGeneration = openGeneration
         LaunchTiming.markFirstRowsVisible()
-    }
-
-    private func apply(_ snap: HeadSnapshot) {
-        snapshot = snap
-        firstRowIsHeader = snap.headerSuggested
-        canToggleHeader = snap.columnCount > 0
-        rederive()
-        openGeneration += 1
-    }
-
-    private func rederive() {
-        content = .table(deriver.derive(from: snapshot, firstRowIsHeader: firstRowIsHeader))
     }
 }
 
@@ -116,14 +108,10 @@ enum LaunchArguments {
 // MARK: - App delegate (deterministic single window + open routing)
 
 /// The main window is created HERE, deterministically, for every launch mode —
-/// not by a SwiftUI `WindowGroup`. A `WindowGroup` reacts to file/CLI launches
-/// non-deterministically (0, 1, or even 2 windows depending on whether AppKit
-/// delivers the file via `openFiles`, an open-URL event, or plain argv), which
-/// made CLI launch (`open --args` / direct exec) flaky — sometimes no window at
-/// all. So the app uses a windowless `Settings` scene (menu only) and this
-/// delegate owns exactly one `NSHostingView`-backed window. All open paths —
-/// argv (CLI), `open <file>` / Finder / drag (open events) — funnel into the one
-/// shared model that the single window renders.
+/// not by a SwiftUI `WindowGroup` (which routes file/CLI launches
+/// non-deterministically). All open paths — argv (CLI), `open <file>` /
+/// Finder / drag (open events) — funnel into the one shared model that the
+/// single window renders.
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var routedLaunchOpen = false
@@ -145,8 +133,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     // `open -a LessSheet file.csv`, Finder double-click, and drag-onto-icon.
-    // These fire before applicationDidFinishLaunching; they only route (the
-    // window is created there). Opening a file while running reuses the window.
     func application(_ application: NSApplication, open urls: [URL]) {
         routedLaunchOpen = true
         for url in urls { route(url.path(percentEncoded: false)) }
@@ -188,8 +174,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.contentMinSize = NSSize(width: 520, height: 360)
         window.contentView = NSHostingView(rootView: ContentView(model: .shared))
         window.setFrameAutosaveName("LessSheetMain")
-        // Restore the saved frame if one exists; only center on first-ever launch
-        // (centering unconditionally would discard the restored position).
+        // Restore the saved frame if one exists; only center on first-ever launch.
         if !window.setFrameUsingName("LessSheetMain") {
             window.center()
         }
@@ -213,24 +198,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 struct LessSheetApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
-    @State private var model = DocumentModel.shared
 
     var body: some Scene {
         // No WindowGroup: the main window is created deterministically by the
-        // delegate. `Settings` adds no window at launch — it only carries the
-        // app's menu commands into the menu bar.
+        // delegate; this scene only carries the menu commands.
         Settings { EmptyView() }
             .commands {
                 CommandGroup(after: .newItem) {
                     Button("Open…") { AppDelegate.openViaPanel() }
                         .keyboardShortcut("o", modifiers: .command)
-                }
-                CommandMenu("View") {
-                    Toggle("First Row Is Header", isOn: Binding(
-                        get: { model.firstRowIsHeader },
-                        set: { model.setFirstRowIsHeader($0) }
-                    ))
-                    .disabled(!model.canToggleHeader)
                 }
             }
     }
@@ -251,9 +227,9 @@ struct ContentView: View {
             } else {
                 DataTableView(table: table)
                     // First frame that shows document data: emit the cold-start
-                    // marker, then (opt-in) dump the frame for headless verification.
-                    // The dump uses an eager copy (ImageRenderer cannot capture a
-                    // ScrollView/LazyVStack off-screen); same cells, same rule.
+                    // marker, then (opt-in) dump the frame for headless
+                    // verification (eager copy: ImageRenderer cannot capture a
+                    // ScrollView/LazyVStack off-screen).
                     .task(id: model.openGeneration) {
                         model.markFirstRowsVisible()
                         FrameDump.dumpIfRequested(DumpTableView(table: table))
@@ -269,18 +245,11 @@ struct ContentView: View {
 }
 
 /// The on-screen table: a spreadsheet-style grid that fills the whole window.
-/// Data is anchored top-left; columns keep their fixed natural width; empty
-/// filler cells (same grid lines) extend right and down to the window edges,
-/// and re-extend on resize (onGeometryChange re-reports the viewport). Big
-/// files that overflow the viewport scroll instead (no filler in that axis).
-/// Slice 1: no virtual scrolling — the head window (≤ N rows) renders directly.
+/// Data is anchored top-left; empty filler cells (same grid lines) extend
+/// right and down to the window edges. SEED: renders the fixed head window
+/// only — the build cell replaces this with core-backed virtual scrolling.
 struct DataTableView: View {
-    let table: DisplayTable
-    // The ScrollView's own size (the viewport). Read via onGeometryChange rather
-    // than a root GeometryReader: a GeometryReader at the window-content root
-    // prevents the WindowGroup window from materializing on an openFiles/CLI
-    // launch. Starts .zero (grid renders at content size); the first geometry
-    // callback fills it out, and each resize re-extends the filler.
+    let table: GridContent
     @State private var viewport: CGSize = .zero
 
     var body: some View {
@@ -292,11 +261,9 @@ struct DataTableView: View {
 }
 
 /// Eager (non-lazy, no ScrollView) grid used ONLY by the opt-in frame dump so
-/// `ImageRenderer` can capture it off-screen (it cannot render a
-/// ScrollView/LazyVStack). Same cells, grid lines, and fill as `DataTableView`,
-/// sized to the dump canvas.
+/// `ImageRenderer` can capture it off-screen.
 struct DumpTableView: View {
-    let table: DisplayTable
+    let table: GridContent
     static let dumpSize = CGSize(width: 900, height: 600)
 
     var body: some View {
@@ -305,32 +272,21 @@ struct DumpTableView: View {
     }
 }
 
-/// Spreadsheet grid shared by the on-screen and dump paths. Renders the header
-/// row plus data rows, then pads with empty filler columns/rows so the grid
-/// always covers at least `viewport`. Filler cells are pure UI — no core calls.
-///
-/// Rows are DIRECT children of the `LazyVStack` (a `ForEach`, not one wrapping
-/// container), so only the visible rows materialize — O(viewport) memory even
-/// for the full head window. Grid lines are drawn PER ROW: each row owns one
-/// full-width bottom hairline plus per-column vertical hairlines. Because every
-/// row's geometry is identical, the per-row lines stack into a seamless grid
-/// (including the data→filler boundary) with no full-height Canvas backing store.
+/// Spreadsheet grid shared by the on-screen and dump paths (unchanged
+/// walking-skeleton fill: rows own their hairlines; filler cells are pure UI).
 struct SpreadsheetGrid: View {
-    let table: DisplayTable
+    let table: GridContent
     let viewport: CGSize
     var lazy: Bool = true
 
     private let cellWidth: CGFloat = 150
     private let rowHeight: CGFloat = 28
 
-    /// Total columns = real columns, extended to cover the viewport width.
     private var columnCount: Int {
         let fit = viewport.width > 0 ? Int(ceil(viewport.width / cellWidth)) : 0
         return max(table.columnNames.count, fit)
     }
 
-    /// Empty rows appended below the data to cover the viewport height (0 when
-    /// the content — header + data — already overflows it).
     private var fillerRowCount: Int {
         let contentRows = table.rows.count + 1 // + header row
         let fit = viewport.height > 0 ? Int(ceil(viewport.height / rowHeight)) : 0
@@ -352,7 +308,6 @@ struct SpreadsheetGrid: View {
         }
     }
 
-    // Data rows then empty filler rows, emitted as direct lazy children.
     private var bodyRows: some View {
         let dataCount = table.rows.count
         return ForEach(Array(0 ..< bodyRowCount), id: \.self) { index in
@@ -368,8 +323,7 @@ struct SpreadsheetGrid: View {
 }
 
 /// One grid row: cells (text) plus its own hairlines — a single full-width
-/// bottom line (so the horizontal line can never seam, unlike per-cell segments)
-/// and per-column vertical lines. Self-contained, so it works as a lazy child.
+/// bottom line and per-column vertical lines.
 struct SheetRow: View {
     let cells: [String]
     let columns: Int
@@ -386,12 +340,10 @@ struct SheetRow: View {
                     .font(isHeader ? .headline : .body)
                     .padding(.horizontal, 8)
                     .frame(width: cellWidth, height: rowHeight, alignment: .leading)
-                    // Per-column vertical hairline on the trailing edge.
                     .overlay(alignment: .trailing) { line.frame(width: 1) }
             }
         }
         .background(isHeader ? Color(nsColor: .windowBackgroundColor) : Color.clear)
-        // One full-width bottom hairline for the whole row (seamless).
         .overlay(alignment: .bottom) { line.frame(height: 1) }
     }
 
@@ -421,7 +373,7 @@ struct ErrorPanel: View {
         switch error {
         case .notFound: "File not found"
         case .permissionDenied: "Permission denied"
-        case .io: "Could not read the file"
+        case .io, .invalidArgument: "Could not read the file"
         }
     }
 }

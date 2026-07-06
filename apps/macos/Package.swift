@@ -1,8 +1,8 @@
 // swift-tools-version: 6.1
-// FROZEN by the planner (walking-skeleton contract): target/dependency changes
-// go through the change-request process. Implementer-owned code lives in
-// Sources/LessSheetKit and Sources/LessSheetApp; Sources/Contracts and Tests
-// are planner-owned.
+// FROZEN by the planner (viewer-ui contract): target/dependency/platform
+// changes go through the change-request process. Implementer-owned code lives
+// in Sources/LessSheetKit and Sources/LessSheetApp; Sources/Contracts and
+// Tests are planner-owned.
 import PackageDescription
 
 // The Zig core is built by the component gate BEFORE swift build (see
@@ -15,7 +15,9 @@ let backendLibDir = "\(Context.packageDirectory)/../../backend/zig-out/lib"
 
 let package = Package(
     name: "LessSheetMac",
-    platforms: [.macOS(.v15)],
+    // macOS 26 minimum: the viewer-ui overlay uses the Liquid Glass
+    // materials (glassEffect family). Part of the frozen contract.
+    platforms: [.macOS("26.0")],
     products: [
         .executable(name: "LessSheet", targets: ["LessSheetApp"])
     ],
@@ -24,7 +26,7 @@ let package = Package(
         .target(name: "CLessSheet"),
         // Planner-owned contract surface: protocols + types the UI consumes.
         .target(name: "Contracts"),
-        // Swift wrapper over the core C ABI + view-model derivation
+        // Swift wrapper over the core C ABI + view-model logic
         // (implementer-owned; conformances pinned by frozen tests).
         .target(
             name: "LessSheetKit",
@@ -34,7 +36,7 @@ let package = Package(
                 .unsafeFlags(["-L\(backendLibDir)"]),
             ]
         ),
-        // Thin SwiftUI shell placeholder (implementer-owned).
+        // Thin SwiftUI shell (implementer-owned).
         .executableTarget(
             name: "LessSheetApp",
             dependencies: ["LessSheetKit", "Contracts"]
