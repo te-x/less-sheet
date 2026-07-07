@@ -2,8 +2,8 @@
 /// data in the viewer-ui slice (supersedes the walking skeleton's
 /// copy-and-close head snapshot). A session wraps one open core handle
 /// (`ls_doc`) for its whole lifetime; rows are paged through `setWindow` as
-/// the user scrolls, and background indexing / jump scans are observed by
-/// polling.
+/// the user scrolls, and background indexing / jump scans / match-scans are
+/// observed by polling.
 ///
 /// Contract (mirrors api/lesssheet.h; see it for full semantics):
 /// - All strings returned by a session OWN their storage: implementations
@@ -14,9 +14,10 @@
 ///   threading rules. Poll methods never block; `setWindow` is the
 ///   synchronous-fast path (O(window), never scans, never blocks on I/O
 ///   proportional to file size).
-/// - `close()` releases the core handle (cancelling/joining core threads);
-///   it is idempotent. No other member may be called after `close()`.
-///   Implementations also close on deinit as a safety net.
+/// - `close()` releases the core handle (cancelling/joining core threads —
+///   safe during jump-scans and match-scans); it is idempotent. No other
+///   member may be called after `close()`. Implementations also close on
+///   deinit as a safety net.
 
 /// Row-count knowledge (mirrors `ls_row_count`): `count` is exact when
 /// `isExact`, otherwise the core's converging estimate (> 0 for any
@@ -102,13 +103,40 @@ public protocol DocumentSession: AnyObject, Sendable {
 
     /// Start (or retarget) the async jump-scan toward a 0-based data row.
     /// Never blocks; if the target is behind the frontier the jump is
-    /// already `.done` when this returns.
+    /// already `.done` when this returns (and does not disturb a running
+    /// search — only a jump that must scan takes the core's single scan
+    /// slot, cancelling the search's scan).
     func startJump(to targetRow: UInt64)
     /// Cancel the active jump (no-op otherwise). Frontier gains are kept;
     /// restoring the viewport is the caller's affair (see `JumpControlling`).
     func cancelJump()
     /// Current jump status (poll; never blocks).
     func jumpStatus() -> JumpStatus
+
+    /// Start a new search for `request` (mirrors `ls_search_start`),
+    /// REPLACING any previous search (counts reset) and cancelling a
+    /// scanning jump (the single scan slot). Returns false iff the core
+    /// rejects the request — empty text query, invalid scope, out-of-range
+    /// column, or an ordering operator with a non-numeric value — in which
+    /// case NOTHING changes (`FindControlling.submit` validates first; the
+    /// core enforces). Performs NO navigation: issue `.fromTop` for "first
+    /// match in the file". Never blocks (the match-scan is asynchronous;
+    /// poll `searchStatus`).
+    func startSearch(_ request: SearchRequest) -> Bool
+    /// Request the nearest match per `nav` (mirrors `ls_search_nav`; anchor
+    /// semantics pinned at `SearchNav`). Completes synchronously when the
+    /// counted region already determines the answer — always, once the scan
+    /// is done — and otherwise is served by the scan (resuming a cancelled
+    /// one if needed). Replaces any pending navigation. Never blocks.
+    func navigateSearch(_ nav: SearchNav)
+    /// Stop the match-scan (mirrors `ls_search_cancel`): counts, landings,
+    /// and progress freeze at their last values (kept, exact for the
+    /// counted region). No-op when idle or done. Never blocks.
+    func cancelSearch()
+    /// Current search snapshot, or nil when no search was started on this
+    /// session — a fresh session, including a dialect RE-OPEN, is nil (all
+    /// search state dies with the old handle). Poll; never blocks.
+    func searchStatus() -> SearchSnapshot?
 
     /// Release the core handle. Idempotent; nothing else may be called
     /// afterwards.
@@ -130,7 +158,9 @@ public protocol DocumentSession: AnyObject, Sendable {
 ///   code (including `.invalidArgument` for an out-of-domain override).
 /// - A dialect change is a RE-OPEN: open the same path again with the
 ///   composed override and close the old session (ARCH req. 10 — the index
-///   restarts; hidden-column state is handled per `ColumnVisibilityManaging`).
+///   restarts; hidden-column state is handled per `ColumnVisibilityManaging`,
+///   and find state per `FindControlling.invalidated` — results clear, the
+///   typed query survives).
 public protocol DocumentSessionOpening: Sendable {
     func open(path: String, forcing override: DialectOverride) async throws(DocumentOpenError) -> any DocumentSession
 }

@@ -1,4 +1,5 @@
-//! Frozen Zig-side contract for the less-sheet core (viewer-ui slice).
+//! Frozen Zig-side contract for the less-sheet core (viewer-ui + find-seek
+//! slices).
 //!
 //! This file is planner-owned. It mirrors the workspace-frozen C header
 //! `api/lesssheet.h` EXACTLY — names, types, values, and semantics; the two
@@ -9,27 +10,37 @@
 //!
 //! Semantics are documented in full in api/lesssheet.h (format neutrality,
 //! ownership & the eviction-safe borrow rule, O(head) open cost, the scan
-//! frontier, threading lanes, dialect grammar, sniffing, header rule).
-//! Summary of the implementation obligations:
+//! frontier, the SEARCH job model, threading lanes, dialect grammar,
+//! sniffing, header rule). Summary of the implementation obligations:
 //!   - `ls_*` symbols are `pub export fn` with the C calling convention and
 //!     implement the header exactly.
 //!   - `ls_open` must behave exactly like `openWithAllocator` called with the
 //!     implementation's default allocator.
 //!   - Every heap allocation for a document goes through the allocator the
 //!     document was opened with, and `ls_close` returns all of it to that
-//!     allocator (after cancelling + joining core-owned threads). Mapping the
-//!     source file itself (mmap) is exempt.
-//!   - Only `ls_open` and `ls_window_set` may allocate. All accessors and
-//!     polls perform ZERO allocator calls and never fail; once a scan has
-//!     reported completion, no further internal allocation happens until the
-//!     next mutating call.
+//!     allocator (after cancelling + joining core-owned threads — safe during
+//!     jump-scans AND match-scans). Mapping the source file itself (mmap) is
+//!     exempt.
+//!   - Only `ls_open`, `ls_window_set`, `ls_search_start`, and
+//!     `ls_search_nav` may allocate as calls (running background scans may
+//!     allocate internally for index/count storage). All accessors and polls
+//!     — including `ls_search_poll` — and the two cancels perform ZERO
+//!     allocator calls and never fail; once every scan has reported a
+//!     terminal state, no further internal allocation happens until the next
+//!     mutating call.
 //!   - `ls_open` consumes at most `open_head_max_bytes` of the file and
 //!     leaves the frontier covering at least min(total rows,
-//!     `open_ready_min_rows`) when they fit that budget.
+//!     `open_ready_min_rows`) when they fit that budget. The search
+//!     machinery is lazy: zero cost until the first `ls_search_start`.
 //!   - `ls_window_set` never advances the frontier; the frontier is monotone
 //!     and advances only via open's head scan, the AUTO background indexer,
-//!     and jump-scans. The core may own background threads (std.Thread);
-//!     tests pin observable behavior, never scheduling.
+//!     jump-scans, and match-scans. Search count storage is O(index
+//!     checkpoints), independent of match density — never a match-row list.
+//!   - Search jobs and jump jobs share the document's single background-scan
+//!     slot; the pinned interaction (mutual cancellation, kept gains,
+//!     terminal states, nav resume) is in api/lesssheet.h SEARCH.
+//!   - The core may own background threads (std.Thread); tests pin
+//!     observable behavior, never scheduling.
 
 const std = @import("std");
 const core = @import("core");
@@ -148,6 +159,75 @@ pub const JumpStatus = extern struct {
     landed_row: u64,
 };
 
+/// Mirrors `ls_search_kind`.
+pub const SearchKind = enum(c_int) {
+    text = 0,
+    predicate = 1,
+};
+
+/// Mirrors `ls_search_op`: eq/ne are byte-exact; lt/gt/le/ge are numeric
+/// under the pinned grammar with EXACT mathematical comparison (see the
+/// header's ls_search_request).
+pub const SearchOp = enum(c_int) {
+    eq = 0,
+    ne = 1,
+    lt = 2,
+    gt = 3,
+    le = 4,
+    ge = 5,
+};
+
+/// Mirrors `ls_search_dir` (see `ls_search_nav` for the pinned anchor
+/// semantics: forward = first match AT-OR-AFTER anchor; backward = last
+/// match STRICTLY BEFORE anchor).
+pub const SearchDir = enum(c_int) {
+    forward = 0,
+    backward = 1,
+};
+
+/// Mirrors `ls_search_state`.
+pub const SearchState = enum(c_int) {
+    idle = 0,
+    scanning = 1,
+    done = 2,
+    cancelled = 3,
+};
+
+/// Mirrors `ls_search_nav_state`.
+pub const SearchNavState = enum(c_int) {
+    none = 0,
+    searching = 1,
+    found = 2,
+    exhausted = 3,
+};
+
+/// Mirrors `ls_search_request`. Borrowed only for the duration of
+/// `ls_search_start` (the core copies what it keeps). Validity rules and the
+/// pinned per-kind matching semantics (smart case, byte-exact eq/ne, exact
+/// numeric ordering, scope) are in api/lesssheet.h.
+pub const SearchRequest = extern struct {
+    kind: SearchKind,
+    op: SearchOp = .eq,
+    column: u32 = 0,
+    value_ptr: ?[*]const u8 = null,
+    value_len: usize = 0,
+    scope_ptr: ?[*]const u32 = null,
+    scope_len: usize = 0,
+};
+
+/// Mirrors `ls_search_status` (see it for every field's validity rule).
+/// IDLE means "no search since open": every other field is zero.
+pub const SearchStatus = extern struct {
+    state: SearchState,
+    nav: SearchNavState,
+    progress: f64,
+    found_row: u64,
+    found_col: u32,
+    position: u64,
+    total: u64,
+    total_exact: bool,
+};
+
 // ---------------------------------------------------------------------------
 // Public surface (re-exported from the implementation; tests use only these).
 // ---------------------------------------------------------------------------
@@ -165,13 +245,18 @@ pub const ls_header_cell = core.ls_header_cell;
 pub const ls_jump_start = core.ls_jump_start;
 pub const ls_jump_cancel = core.ls_jump_cancel;
 pub const ls_jump_poll = core.ls_jump_poll;
+pub const ls_search_start = core.ls_search_start;
+pub const ls_search_nav = core.ls_search_nav;
+pub const ls_search_cancel = core.ls_search_cancel;
+pub const ls_search_poll = core.ls_search_poll;
 
 /// Zig-level seam for tests: identical to `ls_open` but with an explicit
 /// allocator. `ls_open` == `openWithAllocator(default allocator, ...)`.
 /// All heap allocation for the document — including its background scan
-/// threads' document-owned state — goes through `gpa` (file mapping is
-/// exempt) and `ls_close` returns it to the same allocator, so tests can
-/// count allocations (zero-allocation access paths) and detect leaks.
+/// threads' document-owned state and all search/count storage — goes through
+/// `gpa` (file mapping is exempt) and `ls_close` returns it to the same
+/// allocator, so tests can count allocations (zero-allocation access paths),
+/// measure search memory (O(checkpoints) count storage), and detect leaks.
 pub const openWithAllocator = core.openWithAllocator;
 
 // ---------------------------------------------------------------------------
@@ -202,6 +287,14 @@ comptime {
         @compileError("signature drift: ls_jump_cancel");
     if (@TypeOf(core.ls_jump_poll) != fn (*const Doc) callconv(.c) JumpStatus)
         @compileError("signature drift: ls_jump_poll");
+    if (@TypeOf(core.ls_search_start) != fn (*Doc, *const SearchRequest) callconv(.c) bool)
+        @compileError("signature drift: ls_search_start");
+    if (@TypeOf(core.ls_search_nav) != fn (*Doc, u64, SearchDir) callconv(.c) void)
+        @compileError("signature drift: ls_search_nav");
+    if (@TypeOf(core.ls_search_cancel) != fn (*Doc) callconv(.c) void)
+        @compileError("signature drift: ls_search_cancel");
+    if (@TypeOf(core.ls_search_poll) != fn (*const Doc) callconv(.c) SearchStatus)
+        @compileError("signature drift: ls_search_poll");
     if (@TypeOf(core.openWithAllocator) != fn (std.mem.Allocator, [*:0]const u8, ?*const OpenOptions, *?*Doc) Status)
         @compileError("signature drift: openWithAllocator");
 }

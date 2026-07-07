@@ -3,8 +3,8 @@ import Contracts
 import Foundation
 
 /// Swift bridge over the core C ABI (`api/lesssheet.h` via CLessSheet):
-/// opens live windowed sessions, maps the option/report/progress/jump types,
-/// and copies every borrowed cell out of the core before returning
+/// opens live windowed sessions, maps the option/report/progress/jump/search
+/// types, and copies every borrowed cell out of the core before returning
 /// (respecting the eviction-safe borrow rule; invalid UTF-8 becomes U+FFFD).
 ///
 /// Threading: the C contract makes the poll/control lane internally
@@ -126,6 +126,29 @@ public final class CoreDocumentSession: DocumentSession, @unchecked Sendable {
         default:
             return .idle
         }
+    }
+
+    // MARK: - Search bridge (find-seek) — SEED STUBS ONLY.
+    // The contract lives in Sources/Contracts (frozen) over ls_search_* in
+    // api/lesssheet.h; these placeholders keep conformance compiling while
+    // the behavior suite is RED (rejecting start + nil snapshot — the
+    // terminal-placeholder pattern, so no frozen test can hang polling).
+
+    public func startSearch(_ request: SearchRequest) -> Bool {
+        _ = request
+        return false // NOT IMPLEMENTED (find-seek seed)
+    }
+
+    public func navigateSearch(_ nav: SearchNav) {
+        _ = nav // NOT IMPLEMENTED (find-seek seed)
+    }
+
+    public func cancelSearch() {
+        // NOT IMPLEMENTED (find-seek seed)
+    }
+
+    public func searchStatus() -> SearchSnapshot? {
+        nil // NOT IMPLEMENTED (find-seek seed)
     }
 
     public func close() {

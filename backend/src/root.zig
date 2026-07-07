@@ -979,3 +979,45 @@ pub fn isNumeric(raw: []const u8) bool {
     }
     return i == s.len;
 }
+
+// ---------------------------------------------------------------------------
+// Search (find-seek slice) — SEED STUBS ONLY.
+// The contract is frozen in api/lesssheet.h + contracts/api.zig; these
+// placeholders keep conformance green (signatures match) while the behavior
+// suite is RED. They follow the terminal-poll-placeholder pattern: rejecting
+// start + an IDLE snapshot, so no frozen test can hang on a poll loop.
+// ---------------------------------------------------------------------------
+
+/// See api/lesssheet.h `ls_search_start`. NOT IMPLEMENTED (find-seek seed).
+pub export fn ls_search_start(doc: *api.Doc, request: *const api.SearchRequest) callconv(.c) bool {
+    _ = doc;
+    _ = request;
+    return false;
+}
+
+/// See api/lesssheet.h `ls_search_nav`. NOT IMPLEMENTED (find-seek seed).
+pub export fn ls_search_nav(doc: *api.Doc, anchor_row: u64, dir: api.SearchDir) callconv(.c) void {
+    _ = doc;
+    _ = anchor_row;
+    _ = dir;
+}
+
+/// See api/lesssheet.h `ls_search_cancel`. NOT IMPLEMENTED (find-seek seed).
+pub export fn ls_search_cancel(doc: *api.Doc) callconv(.c) void {
+    _ = doc;
+}
+
+/// See api/lesssheet.h `ls_search_poll`. NOT IMPLEMENTED (find-seek seed).
+pub export fn ls_search_poll(doc: *const api.Doc) callconv(.c) api.SearchStatus {
+    _ = doc;
+    return .{
+        .state = .idle,
+        .nav = .none,
+        .progress = 0.0,
+        .found_row = 0,
+        .found_col = 0,
+        .position = 0,
+        .total = 0,
+        .total_exact = false,
+    };
+}

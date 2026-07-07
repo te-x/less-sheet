@@ -1,4 +1,4 @@
-//! Frozen behavior tests — viewer-ui slice (planner-owned).
+//! Frozen behavior tests — viewer-ui + find-seek slices (planner-owned).
 //! Every core acceptance criterion of ARCH-viewer-ui (1–8) maps to at least
 //! one test below, and the walking-skeleton dialect/error coverage is carried
 //! over onto the windowed surface. Tests exercise the PUBLIC C ABI through
@@ -1162,4 +1162,848 @@ test "abi: the exported C symbols are callable through extern linkage" {
     try std.testing.expectEqual(api.JumpState.done, c_linked.ls_jump_poll(doc).state);
     c_linked.ls_jump_cancel(doc); // no-op after done
     try std.testing.expectEqual(api.JumpState.done, c_linked.ls_jump_poll(doc).state);
+}
+
+// ===========================================================================
+// find-seek slice (ARCH-find-seek core criteria 1–6). Frozen; planner-owned.
+// Naming: f<criterion>. Semantics under test are pinned in api/lesssheet.h
+// (SEARCH section + ls_search_* contracts) and mirrored in contracts/api.zig.
+// Determinism: generated needle fixtures force header OFF so record i is data
+// row i; every test asserts ls_search_start's `true` BEFORE any poll loop, so
+// unimplemented seeds fail fast instead of hanging.
+// ===========================================================================
+
+const manualNoHeader: api.OpenOptions = .{ .header = api.header_off, .index_mode = api.index_manual };
+
+fn textReq(query: []const u8) api.SearchRequest {
+    return .{ .kind = .text, .value_ptr = query.ptr, .value_len = query.len };
+}
+
+fn textReqScoped(query: []const u8, scope: []const u32) api.SearchRequest {
+    return .{
+        .kind = .text,
+        .value_ptr = query.ptr,
+        .value_len = query.len,
+        .scope_ptr = scope.ptr,
+        .scope_len = scope.len,
+    };
+}
+
+fn predReq(column: u32, op: api.SearchOp, value: []const u8) api.SearchRequest {
+    return .{ .kind = .predicate, .op = op, .column = column, .value_ptr = value.ptr, .value_len = value.len };
+}
+
+fn startSearch(doc: *api.Doc, req: api.SearchRequest) !void {
+    try std.testing.expectEqual(true, api.ls_search_start(doc, &req));
+}
+
+fn expectRejected(doc: *api.Doc, req: api.SearchRequest) !void {
+    try std.testing.expectEqual(false, api.ls_search_start(doc, &req));
+}
+
+/// Poll until the search job reports DONE (<= 15 s); returns the snapshot.
+/// Errors immediately on IDLE (a started search never polls IDLE).
+fn waitSearchDone(doc: *api.Doc) !api.SearchStatus {
+    const io = std.testing.io;
+    const t0: std.Io.Clock.Timestamp = .now(io, .awake);
+    while (true) {
+        const s = api.ls_search_poll(doc);
+        if (s.state == .done) return s;
+        if (s.state == .idle) return error.SearchNotStarted;
+        if (elapsedMs(t0) > 15_000) return error.SearchTimeout;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+}
+
+/// Poll until the nav slot is terminal (FOUND or EXHAUSTED; <= 15 s).
+fn waitNavTerminal(doc: *api.Doc) !api.SearchStatus {
+    const io = std.testing.io;
+    const t0: std.Io.Clock.Timestamp = .now(io, .awake);
+    while (true) {
+        const s = api.ls_search_poll(doc);
+        if (s.nav == .found or s.nav == .exhausted) return s;
+        if (s.state == .idle) return error.SearchNotStarted;
+        if (elapsedMs(t0) > 15_000) return error.NavTimeout;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+}
+
+fn navAndWait(doc: *api.Doc, anchor: u64, dir: api.SearchDir) !api.SearchStatus {
+    api.ls_search_nav(doc, anchor, dir);
+    return waitNavTerminal(doc);
+}
+
+fn expectFound(s: api.SearchStatus, row: u64, col: u32, position: u64) !void {
+    try std.testing.expectEqual(api.SearchNavState.found, s.nav);
+    try std.testing.expectEqual(row, s.found_row);
+    try std.testing.expectEqual(col, s.found_col);
+    try std.testing.expectEqual(position, s.position);
+    try std.testing.expect(s.total >= s.position); // n always exact, m >= n
+}
+
+/// Run `req` to completion; returns the final exact total (m).
+fn searchTotal(doc: *api.Doc, req: api.SearchRequest) !u64 {
+    try startSearch(doc, req);
+    const s = try waitSearchDone(doc);
+    try std.testing.expectEqual(true, s.total_exact);
+    try std.testing.expectEqual(@as(f64, 1.0), s.progress);
+    return s.total;
+}
+
+/// n fixed-width 18-byte records "{i:0>8},XXXXXXXX\n"; the second cell is the
+/// 8-byte marker "needle{seq:0>2}" on the rows listed in `matches` (ascending)
+/// and the digits "{2i:0>8}" elsewhere. Digits never contain "needle", so the
+/// text query "needle" matches exactly `matches`. Open with manualNoHeader.
+fn genNeedleRows(gpa: std.mem.Allocator, n: u64, matches: []const u64) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(gpa);
+    var line: [32]u8 = undefined;
+    var mi: usize = 0;
+    var i: u64 = 0;
+    while (i < n) : (i += 1) {
+        if (mi < matches.len and matches[mi] == i) {
+            try buf.appendSlice(gpa, try std.fmt.bufPrint(&line, "{d:0>8},needle{d:0>2}\n", .{ i, mi % 100 }));
+            mi += 1;
+        } else {
+            try buf.appendSlice(gpa, try std.fmt.bufPrint(&line, "{d:0>8},{d:0>8}\n", .{ i, 2 * i }));
+        }
+    }
+    return buf.toOwnedSlice(gpa);
+}
+
+/// The ascending multiples of `step` below `n` (0, step, 2*step, …).
+fn ascending(gpa: std.mem.Allocator, n: u64, step: u64) ![]u64 {
+    var list: std.ArrayList(u64) = .empty;
+    errdefer list.deinit(gpa);
+    var i: u64 = 0;
+    while (i < n) : (i += step) try list.append(gpa, i);
+    return list.toOwnedSlice(gpa);
+}
+
+// ---------------------------------------------------------------------------
+// f1 — text matcher: smart case, substring positions, byte-exact non-ASCII,
+// header exclusion, scope, request validation.
+// ---------------------------------------------------------------------------
+
+test "f1: smart case — lowercase query folds ASCII; any uppercase byte demands exact bytes" {
+    var od = try openBytes("w\nHello\nHELLO\nhello\nshell\nhelp\n");
+    defer od.deinit();
+    // All-lowercase query: ASCII-case-insensitive substring match.
+    try std.testing.expectEqual(@as(u64, 3), try searchTotal(od.doc, textReq("hello")));
+    var s = try navAndWait(od.doc, 0, .forward);
+    try expectFound(s, 0, 0, 1); // "Hello"
+    s = try navAndWait(od.doc, 1, .forward);
+    try expectFound(s, 1, 0, 2); // "HELLO"
+    s = try navAndWait(od.doc, 2, .forward);
+    try expectFound(s, 2, 0, 3); // "hello"
+    s = try navAndWait(od.doc, 3, .forward);
+    try std.testing.expectEqual(api.SearchNavState.exhausted, s.nav); // "shell", "help" lack "hello"
+    // One ASCII uppercase byte -> the whole query is byte-exact.
+    try std.testing.expectEqual(@as(u64, 1), try searchTotal(od.doc, textReq("Hello")));
+    s = try navAndWait(od.doc, 0, .forward);
+    try expectFound(s, 0, 0, 1);
+    try std.testing.expectEqual(@as(u64, 1), try searchTotal(od.doc, textReq("HELLO")));
+    s = try navAndWait(od.doc, 0, .forward);
+    try expectFound(s, 1, 0, 1);
+    // Exact mode matching nothing: zero total, exact, no movement to offer.
+    try std.testing.expectEqual(@as(u64, 0), try searchTotal(od.doc, textReq("hELLO")));
+    s = try navAndWait(od.doc, 0, .forward);
+    try std.testing.expectEqual(api.SearchNavState.exhausted, s.nav);
+}
+
+test "f1: substring matches at cell start, middle, and end" {
+    var od = try openBytes("h\nneedle-start\nmid-needle-mid\nend-needle\nno-match\n");
+    defer od.deinit();
+    try std.testing.expectEqual(@as(u64, 3), try searchTotal(od.doc, textReq("needle")));
+    var s = try navAndWait(od.doc, 0, .forward);
+    try expectFound(s, 0, 0, 1);
+    s = try navAndWait(od.doc, 1, .forward);
+    try expectFound(s, 1, 0, 2);
+    s = try navAndWait(od.doc, 2, .forward);
+    try expectFound(s, 2, 0, 3);
+}
+
+test "f1: UTF-8 beyond ASCII matches byte-exactly in both smart-case modes" {
+    var od = try openBytes("h\ncafé\nCAFÉ\ncafe\nCAFE\n");
+    defer od.deinit();
+    // Lowercase mode folds the ASCII c/a/f; the é bytes never fold, so the
+    // all-lowercase query "café" does NOT match "CAFÉ".
+    try std.testing.expectEqual(@as(u64, 1), try searchTotal(od.doc, textReq("café")));
+    const s = try navAndWait(od.doc, 0, .forward);
+    try expectFound(s, 0, 0, 1);
+    // A plain-ASCII lowercase query folds against both ASCII casings.
+    try std.testing.expectEqual(@as(u64, 2), try searchTotal(od.doc, textReq("cafe")));
+    // ASCII uppercase C/A/F flips the query to exact mode: only "CAFÉ".
+    try std.testing.expectEqual(@as(u64, 1), try searchTotal(od.doc, textReq("CAFÉ")));
+}
+
+test "f1: the header record is never searched" {
+    var od = try openBytes("needle,also needle\nx,y\nz,needle\n");
+    defer od.deinit();
+    try std.testing.expectEqual(true, api.ls_dialect_get(od.doc).header);
+    // Both header cells contain the query but are never evaluated.
+    try std.testing.expectEqual(@as(u64, 1), try searchTotal(od.doc, textReq("needle")));
+    const s = try navAndWait(od.doc, 0, .forward);
+    try expectFound(s, 1, 1, 1); // data row 1, column 1
+}
+
+test "f1: text scope excludes columns exactly; the lowest in-scope match column is reported" {
+    var od = try openBytes("a,b,c\nneedle,x,x\nx,needle,x\nx,x,needle\nx,needle,needle\n");
+    defer od.deinit();
+    // NULL scope = all columns.
+    try std.testing.expectEqual(@as(u64, 4), try searchTotal(od.doc, textReq("needle")));
+    var s = try navAndWait(od.doc, 3, .forward);
+    try expectFound(s, 3, 1, 4); // row 3 matches in cols 1 and 2: lowest wins
+    // Scope {1}: only column-1 cells are evaluated.
+    try std.testing.expectEqual(@as(u64, 2), try searchTotal(od.doc, textReqScoped("needle", &.{1})));
+    s = try navAndWait(od.doc, 0, .forward);
+    try expectFound(s, 1, 1, 1);
+    s = try navAndWait(od.doc, 2, .forward);
+    try expectFound(s, 3, 1, 2);
+    // Scope {0,2}: rows 0, 2, 3 — and row 3's match column is 2 under it.
+    try std.testing.expectEqual(@as(u64, 3), try searchTotal(od.doc, textReqScoped("needle", &.{ 0, 2 })));
+    s = try navAndWait(od.doc, 3, .forward);
+    try expectFound(s, 3, 2, 3);
+}
+
+test "f1: invalid requests are rejected with zero state change" {
+    var od = try openBytes("a,b\nneedle,2\n");
+    defer od.deinit();
+    // Rejections on a fresh document leave it IDLE (all-zero snapshot).
+    try expectRejected(od.doc, textReq("")); // the empty query means "no search"
+    try expectRejected(od.doc, textReqScoped("x", &.{ 0, 7 })); // out-of-range scope column
+    const dummy: [1]u32 = .{0};
+    try expectRejected(od.doc, .{
+        .kind = .text,
+        .value_ptr = "x",
+        .value_len = 1,
+        .scope_ptr = &dummy,
+        .scope_len = 0, // non-NULL empty scope is invalid
+    });
+    var s = api.ls_search_poll(od.doc);
+    try std.testing.expectEqual(api.SearchState.idle, s.state);
+    try std.testing.expectEqual(api.SearchNavState.none, s.nav);
+    // A nav without an active search is a no-op.
+    api.ls_search_nav(od.doc, 0, .forward);
+    s = api.ls_search_poll(od.doc);
+    try std.testing.expectEqual(api.SearchState.idle, s.state);
+    try std.testing.expectEqual(api.SearchNavState.none, s.nav);
+
+    // After a real search, a rejected start leaves it fully intact.
+    try std.testing.expectEqual(@as(u64, 1), try searchTotal(od.doc, textReq("needle")));
+    try expectRejected(od.doc, textReq(""));
+    s = api.ls_search_poll(od.doc);
+    try std.testing.expectEqual(api.SearchState.done, s.state);
+    try std.testing.expectEqual(@as(u64, 1), s.total);
+    try std.testing.expectEqual(true, s.total_exact);
+}
+
+// ---------------------------------------------------------------------------
+// f2 — predicate matcher: byte-exact =/≠, numeric ordering under the pinned
+// grammar with EXACT comparison, non-numeric-never-matches, value validation.
+// ---------------------------------------------------------------------------
+
+test "f2: = and ≠ compare byte-exactly (no folding, no trimming); = '' matches empty and padded cells" {
+    var od = try openBytes("h1,h2\nx,abc\ny,Abc\nz, abc\nw,abc\nv\n");
+    defer od.deinit();
+    try std.testing.expectEqual(@as(u64, 2), try searchTotal(od.doc, predReq(1, .eq, "abc"))); // rows 0, 3
+    var s = try navAndWait(od.doc, 0, .forward);
+    try expectFound(s, 0, 1, 1);
+    s = try navAndWait(od.doc, 1, .forward);
+    try expectFound(s, 3, 1, 2);
+    // "Abc" (case) and " abc" (padding) are unequal bytes -> they are ≠.
+    try std.testing.expectEqual(@as(u64, 3), try searchTotal(od.doc, predReq(1, .ne, "abc")));
+    // The ragged row 4 pads column 1 with the empty cell: = "" finds it.
+    try std.testing.expectEqual(@as(u64, 1), try searchTotal(od.doc, predReq(1, .eq, "")));
+    s = try navAndWait(od.doc, 0, .forward);
+    try expectFound(s, 4, 1, 1);
+}
+
+test "f2: ordering operators — grammar acceptance, boundary equality for ≤ ≥, non-numeric never matches" {
+    var od = try openBytes("v\n1\n2\n2.0\n10\n2.5\n-3\n+4\n1e2\n 12 \n0x1F\nabc\n\n.5\n5.\nNaN\n");
+    defer od.deinit();
+    try expectDims(od.doc, 15, 1);
+    try std.testing.expectEqual(@as(u64, 3), try searchTotal(od.doc, predReq(0, .lt, "2"))); // 1, -3, .5
+    try std.testing.expectEqual(@as(u64, 6), try searchTotal(od.doc, predReq(0, .gt, "2"))); // 10, 2.5, +4, 1e2, " 12 ", 5.
+    try std.testing.expectEqual(@as(u64, 5), try searchTotal(od.doc, predReq(0, .le, "2"))); // lt + {2, 2.0}
+    try std.testing.expectEqual(@as(u64, 8), try searchTotal(od.doc, predReq(0, .ge, "2"))); // gt + {2, 2.0}
+    // "2.0" equals 2 by mathematical value: ≤/≥ include it, </> exclude it —
+    // while byte-exact = still distinguishes the two representations.
+    try std.testing.expectEqual(@as(u64, 1), try searchTotal(od.doc, predReq(0, .eq, "2")));
+    try std.testing.expectEqual(@as(u64, 1), try searchTotal(od.doc, predReq(0, .eq, "2.0")));
+    try std.testing.expectEqual(@as(u64, 5), try searchTotal(od.doc, predReq(0, .le, "2.0")));
+    // Every numeric cell and only the numeric cells ("0x1F", "abc", the empty
+    // record, and "NaN" never match an ordering operator).
+    try std.testing.expectEqual(@as(u64, 11), try searchTotal(od.doc, predReq(0, .ge, "-3")));
+    try std.testing.expectEqual(@as(u64, 0), try searchTotal(od.doc, predReq(0, .lt, "-3")));
+}
+
+test "f2: signed zeros and exponent forms compare equal by mathematical value" {
+    var od = try openBytes("v\n0\n+0\n-0\n0.0\n0e5\n");
+    defer od.deinit();
+    try std.testing.expectEqual(@as(u64, 5), try searchTotal(od.doc, predReq(0, .le, "0")));
+    try std.testing.expectEqual(@as(u64, 5), try searchTotal(od.doc, predReq(0, .ge, "0")));
+    try std.testing.expectEqual(@as(u64, 0), try searchTotal(od.doc, predReq(0, .lt, "0")));
+    try std.testing.expectEqual(@as(u64, 0), try searchTotal(od.doc, predReq(0, .gt, "0")));
+
+    var od2 = try openBytes("v\n1e-2\n0.01\n100\n1e2\n");
+    defer od2.deinit();
+    try std.testing.expectEqual(@as(u64, 2), try searchTotal(od2.doc, predReq(0, .le, "0.01")));
+    try std.testing.expectEqual(@as(u64, 2), try searchTotal(od2.doc, predReq(0, .ge, "1e2")));
+    try std.testing.expectEqual(@as(u64, 0), try searchTotal(od2.doc, predReq(0, .gt, "100")));
+    try std.testing.expectEqual(@as(u64, 4), try searchTotal(od2.doc, predReq(0, .ge, "0.01")));
+}
+
+test "f2: ordering comparison is exact beyond double precision" {
+    // Adjacent 39-digit integers (u128-scale ids) order correctly; a double
+    // would collapse them.
+    var od = try openBytes("v\n340282366920938463463374607431768211455\n340282366920938463463374607431768211454\n");
+    defer od.deinit();
+    try std.testing.expectEqual(@as(u64, 1), try searchTotal(od.doc, predReq(0, .gt, "340282366920938463463374607431768211454")));
+    const s = try navAndWait(od.doc, 0, .forward);
+    try expectFound(s, 0, 0, 1);
+    try std.testing.expectEqual(@as(u64, 2), try searchTotal(od.doc, predReq(0, .ge, "340282366920938463463374607431768211454")));
+    // 2^53 and 2^53 + 1 are distinct (both round to the same double).
+    var od2 = try openBytes("v\n9007199254740993\n9007199254740992\n");
+    defer od2.deinit();
+    try std.testing.expectEqual(@as(u64, 1), try searchTotal(od2.doc, predReq(0, .gt, "9007199254740992")));
+    // Magnitudes beyond double range still order.
+    var od3 = try openBytes("v\n1e400\n1e399\n");
+    defer od3.deinit();
+    try std.testing.expectEqual(@as(u64, 1), try searchTotal(od3.doc, predReq(0, .gt, "1e399")));
+    try std.testing.expectEqual(@as(u64, 2), try searchTotal(od3.doc, predReq(0, .le, "1e400")));
+    // Long fractions are not truncated.
+    var od4 = try openBytes("v\n0.1\n0.10000000000000000000000001\n");
+    defer od4.deinit();
+    try std.testing.expectEqual(@as(u64, 1), try searchTotal(od4.doc, predReq(0, .gt, "0.1")));
+}
+
+test "f2: ordering with a non-numeric value is rejected; the predicate column must exist" {
+    var od = try openBytes("a,b\n1,2\n");
+    defer od.deinit();
+    try expectRejected(od.doc, predReq(0, .lt, "abc"));
+    try expectRejected(od.doc, predReq(0, .le, "")); // empty is not numeric
+    try expectRejected(od.doc, predReq(0, .ge, "1,000"));
+    try expectRejected(od.doc, predReq(0, .gt, "1e"));
+    try expectRejected(od.doc, predReq(99, .eq, "x")); // no column 99
+    try std.testing.expectEqual(api.SearchState.idle, api.ls_search_poll(od.doc).state);
+    // ...while = with the same non-numeric value is a legal byte comparison,
+    // and grammar-accepted values (" 12 ", ".5", "+1e5") drive ordering.
+    try std.testing.expectEqual(@as(u64, 0), try searchTotal(od.doc, predReq(0, .eq, "abc")));
+    try std.testing.expectEqual(@as(u64, 1), try searchTotal(od.doc, predReq(0, .lt, " 12 ")));
+    try std.testing.expectEqual(@as(u64, 1), try searchTotal(od.doc, predReq(1, .gt, ".5")));
+    try std.testing.expectEqual(@as(u64, 1), try searchTotal(od.doc, predReq(0, .lt, "+1e5")));
+}
+
+// ---------------------------------------------------------------------------
+// f3 — streaming navigation: exact landings both directions, behind and
+// beyond the frontier; the shared frontier advances (paid once); monotone
+// progress to 1.0.
+// ---------------------------------------------------------------------------
+
+test "f3: navigation anchors are inclusive-forward / strictly-before-backward" {
+    const gpa = std.testing.allocator;
+    const fixture = try genNeedleRows(gpa, 8, &.{ 0, 5 });
+    defer gpa.free(fixture);
+    var od = try openWith(fixture, manualNoHeader);
+    defer od.deinit();
+    try startSearch(od.doc, textReq("needle"));
+    var s = try navAndWait(od.doc, 0, .forward);
+    try expectFound(s, 0, 1, 1); // forward includes the anchor row itself
+    s = try navAndWait(od.doc, 5, .forward);
+    try expectFound(s, 5, 1, 2);
+    s = try navAndWait(od.doc, 6, .forward);
+    try std.testing.expectEqual(api.SearchNavState.exhausted, s.nav);
+    s = try navAndWait(od.doc, 5, .backward);
+    try expectFound(s, 0, 1, 1); // backward is strictly before the anchor
+    s = try navAndWait(od.doc, 0, .backward);
+    try std.testing.expectEqual(api.SearchNavState.exhausted, s.nav); // nothing before row 0
+    s = try navAndWait(od.doc, std.math.maxInt(u64), .backward);
+    try expectFound(s, 5, 1, 2); // last-in-file
+    const done = try waitSearchDone(od.doc);
+    try std.testing.expectEqual(@as(u64, 2), done.total);
+}
+
+test "f3: streaming navigation is exact behind and beyond the frontier; the shared frontier advances" {
+    const gpa = std.testing.allocator;
+    const fixture = try genNeedleRows(gpa, 300_000, &.{ 100, 150_000, 290_000 });
+    defer gpa.free(fixture);
+    var od = try openWith(fixture, manualNoHeader);
+    defer od.deinit();
+    try startSearch(od.doc, textReq("needle"));
+
+    // Within the open head frontier.
+    var s = try navAndWait(od.doc, 0, .forward);
+    try expectFound(s, 100, 1, 1);
+    s = try navAndWait(od.doc, 101, .forward);
+    try expectFound(s, 150_000, 1, 2); // byte 2.7 MB: still inside the head
+    // Row 290,000 starts at byte 5.22 MB — beyond any legal MANUAL open
+    // frontier: serving it must advance the SHARED frontier.
+    s = try navAndWait(od.doc, 150_001, .forward);
+    try expectFound(s, 290_000, 1, 3);
+    try std.testing.expect(api.ls_index_poll(od.doc).bytes_scanned >= 290_000 * 18);
+    // Paid once: a jump into the searched region is now synchronous-instant,
+    // and it must NOT disturb the running search (no scan needed).
+    api.ls_jump_start(od.doc, 290_000);
+    const j = api.ls_jump_poll(od.doc);
+    try std.testing.expectEqual(api.JumpState.done, j.state);
+    try std.testing.expectEqual(@as(u64, 290_000), j.landed_row);
+    const r = api.ls_window_set(od.doc, 290_000, 1);
+    try std.testing.expectEqual(@as(u64, 1), r.row_count);
+    try expectCell(od.doc, 290_000, 1, "needle02");
+
+    // Backward, across the whole file.
+    s = try navAndWait(od.doc, 290_000, .backward);
+    try expectFound(s, 150_000, 1, 2);
+    s = try navAndWait(od.doc, 150_000, .backward);
+    try expectFound(s, 100, 1, 1);
+    s = try navAndWait(od.doc, 100, .backward);
+    try std.testing.expectEqual(api.SearchNavState.exhausted, s.nav);
+    s = try navAndWait(od.doc, std.math.maxInt(u64), .backward);
+    try expectFound(s, 290_000, 1, 3);
+
+    const done = try waitSearchDone(od.doc);
+    try std.testing.expectEqual(@as(u64, 3), done.total);
+    try std.testing.expectEqual(true, done.total_exact);
+}
+
+test "f3: search progress and totals are monotone; progress is exactly 1.0 at DONE" {
+    const gpa = std.testing.allocator;
+    const fixture = try genNeedleRows(gpa, 300_000, &.{ 100, 200_000 });
+    defer gpa.free(fixture);
+    var od = try openWith(fixture, manualNoHeader);
+    defer od.deinit();
+    try startSearch(od.doc, textReq("needle"));
+    const io = std.testing.io;
+    const t0: std.Io.Clock.Timestamp = .now(io, .awake);
+    var last_progress: f64 = 0.0;
+    var last_total: u64 = 0;
+    while (true) {
+        const s = api.ls_search_poll(od.doc);
+        try std.testing.expect(s.progress >= 0.0 and s.progress <= 1.0);
+        try std.testing.expect(s.progress >= last_progress);
+        try std.testing.expect(s.total >= last_total);
+        last_progress = s.progress;
+        last_total = s.total;
+        if (s.state == .done) {
+            try std.testing.expectEqual(@as(f64, 1.0), s.progress);
+            try std.testing.expectEqual(@as(u64, 2), s.total);
+            try std.testing.expectEqual(true, s.total_exact);
+            break;
+        }
+        if (elapsedMs(t0) > 15_000) return error.SearchTimeout;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// f4 — bounded counts: exact totals and positions on known layouts (zero,
+// dense, checkpoint-straddling); O(checkpoints) memory; zero-alloc polls.
+// ---------------------------------------------------------------------------
+
+test "f4: counts are exact on known layouts — zero, dense, and checkpoint-straddling" {
+    const gpa = std.testing.allocator;
+    { // Zero matches: "No matches" is a DONE with total 0 and no movement.
+        const fixture = try genNeedleRows(gpa, 10_000, &.{});
+        defer gpa.free(fixture);
+        var od = try openWith(fixture, manualNoHeader);
+        defer od.deinit();
+        try std.testing.expectEqual(@as(u64, 0), try searchTotal(od.doc, textReq("needle")));
+        const s = try navAndWait(od.doc, 0, .forward);
+        try std.testing.expectEqual(api.SearchNavState.exhausted, s.nav);
+    }
+    { // Every row matches.
+        const all = try ascending(gpa, 10_000, 1);
+        defer gpa.free(all);
+        const fixture = try genNeedleRows(gpa, 10_000, all);
+        defer gpa.free(fixture);
+        var od = try openWith(fixture, manualNoHeader);
+        defer od.deinit();
+        try std.testing.expectEqual(@as(u64, 10_000), try searchTotal(od.doc, textReq("needle")));
+        var s = try navAndWait(od.doc, 0, .forward);
+        try expectFound(s, 0, 1, 1);
+        s = try navAndWait(od.doc, 5_000, .forward);
+        try expectFound(s, 5_000, 1, 5_001);
+        s = try navAndWait(od.doc, 9_999, .forward);
+        try expectFound(s, 9_999, 1, 10_000);
+        s = try navAndWait(od.doc, 9_999, .backward);
+        try expectFound(s, 9_998, 1, 9_999);
+    }
+    { // Matches straddling likely checkpoint boundaries: walk every match in
+      // both directions; positions stay exact across block edges.
+        const matches = [_]u64{ 1023, 1024, 2047, 2048, 2049, 4095, 4096, 6143, 6144, 8191, 8192 };
+        const fixture = try genNeedleRows(gpa, 10_000, &matches);
+        defer gpa.free(fixture);
+        var od = try openWith(fixture, manualNoHeader);
+        defer od.deinit();
+        try std.testing.expectEqual(@as(u64, matches.len), try searchTotal(od.doc, textReq("needle")));
+        var i: usize = 0;
+        var anchor: u64 = 0;
+        while (i < matches.len) : (i += 1) {
+            const s = try navAndWait(od.doc, anchor, .forward);
+            try expectFound(s, matches[i], 1, i + 1);
+            anchor = matches[i] + 1;
+        }
+        var s = try navAndWait(od.doc, anchor, .forward);
+        try std.testing.expectEqual(api.SearchNavState.exhausted, s.nav);
+        i = matches.len;
+        var back: u64 = std.math.maxInt(u64);
+        while (i > 0) : (i -= 1) {
+            s = try navAndWait(od.doc, back, .backward);
+            try expectFound(s, matches[i - 1], 1, i);
+            back = matches[i - 1];
+        }
+        s = try navAndWait(od.doc, back, .backward);
+        try std.testing.expectEqual(api.SearchNavState.exhausted, s.nav);
+    }
+}
+
+/// Accumulates every requested allocation size (alloc len + resize/remap
+/// new_len) while delegating to a parent allocator. Monotone and coarse:
+/// storage that grew with match COUNT would show up here.
+const BytesAllocator = struct {
+    parent: std.mem.Allocator,
+    bytes: std.atomic.Value(u64) = .init(0),
+
+    fn allocator(self: *BytesAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable: std.mem.Allocator.VTable = .{
+        .alloc = alloc,
+        .resize = resize,
+        .remap = remap,
+        .free = free,
+    };
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self = self_of(ctx);
+        _ = self.bytes.fetchAdd(len, .monotonic);
+        return self.parent.vtable.alloc(self.parent.ptr, len, alignment, ret_addr);
+    }
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self = self_of(ctx);
+        _ = self.bytes.fetchAdd(new_len, .monotonic);
+        return self.parent.vtable.resize(self.parent.ptr, memory, alignment, new_len, ret_addr);
+    }
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self = self_of(ctx);
+        _ = self.bytes.fetchAdd(new_len, .monotonic);
+        return self.parent.vtable.remap(self.parent.ptr, memory, alignment, new_len, ret_addr);
+    }
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        return self_of(ctx).parent.vtable.free(self_of(ctx).parent.ptr, memory, alignment, ret_addr);
+    }
+    fn self_of(ctx: *anyopaque) *BytesAllocator {
+        return @ptrCast(@alignCast(ctx));
+    }
+};
+
+test "f4: dense-match count storage is O(checkpoints) — independent of match density" {
+    const gpa = std.testing.allocator;
+    const n: u64 = 200_000; // 3.6 MB: fully indexed at open (head budget), so
+    // the deltas below measure SEARCH allocations only.
+    const sparse_rows = try ascending(gpa, n, 20_000); // 10 matches
+    defer gpa.free(sparse_rows);
+    const dense_rows = try ascending(gpa, n, 1); // every row matches
+    defer gpa.free(dense_rows);
+
+    const sets = [2][]const u64{ sparse_rows, dense_rows };
+    const expected = [2]u64{ 10, n };
+    var deltas: [2]u64 = undefined;
+    for (sets, 0..) |match_set, idx| {
+        const fixture = try genNeedleRows(gpa, n, match_set);
+        defer gpa.free(fixture);
+        var fx = try makeFixture(fixture, 0o644);
+        defer fx.deinit();
+        var tracking: BytesAllocator = .{ .parent = std.testing.allocator };
+        var doc_opt: ?*api.Doc = null;
+        try std.testing.expectEqual(api.Status.ok, api.openWithAllocator(tracking.allocator(), fx.path.ptr, &manualNoHeader, &doc_opt));
+        const doc = doc_opt.?;
+        defer api.ls_close(doc);
+        const before = tracking.bytes.load(.monotonic);
+        try startSearch(doc, textReq("needle"));
+        const s = try waitSearchDone(doc);
+        try std.testing.expectEqual(expected[idx], s.total);
+        deltas[idx] = tracking.bytes.load(.monotonic) - before;
+    }
+    // A materialized match-row list would grow the dense search by ~200k
+    // entries (>= 1.6 MB); per-block counters are identical for both layouts.
+    try std.testing.expect(deltas[1] <= deltas[0] + 64 * 1024);
+}
+
+test "f4: search polls and cancel are zero-allocation; DONE navs complete synchronously" {
+    var counting: CountingAllocator = .{ .parent = std.testing.allocator };
+    var fx = try makeFixture("h\nneedle\nplain\n", 0o644);
+    defer fx.deinit();
+    var doc_opt: ?*api.Doc = null;
+    try std.testing.expectEqual(api.Status.ok, api.openWithAllocator(counting.allocator(), fx.path.ptr, &manual, &doc_opt));
+    const doc = doc_opt.?;
+    defer api.ls_close(doc);
+    // The search machinery is lazy: an IDLE poll allocates nothing.
+    const before_any = counting.count;
+    _ = api.ls_search_poll(doc);
+    try std.testing.expectEqual(before_any, counting.count);
+    // Run a search to DONE (start/nav/scan may allocate)...
+    try startSearch(doc, textReq("needle"));
+    _ = try waitSearchDone(doc);
+    // After DONE, every navigation completes before ls_search_nav returns.
+    api.ls_search_nav(doc, 0, .forward);
+    const instant = api.ls_search_poll(doc);
+    try expectFound(instant, 0, 0, 1);
+    // ...and the poll/cancel paths are allocation-free afterwards.
+    const after_setup = counting.count;
+    _ = api.ls_search_poll(doc);
+    api.ls_search_cancel(doc); // no-op after DONE
+    const s = api.ls_search_poll(doc);
+    try std.testing.expectEqual(api.SearchState.done, s.state);
+    try std.testing.expectEqual(after_setup, counting.count);
+}
+
+// ---------------------------------------------------------------------------
+// f5 — job discipline: the single scan slot (search <-> jump mutual
+// cancellation, kept gains, terminal states, nav resume), search replacement,
+// close-during-search safety, AUTO-mode coexistence.
+// ---------------------------------------------------------------------------
+
+test "f5: a new search replaces the previous one — counts and navigation reset" {
+    var od = try openBytes("h\nfoo\nbar\nfoo\nfoobar\n");
+    defer od.deinit();
+    try std.testing.expectEqual(@as(u64, 3), try searchTotal(od.doc, textReq("foo")));
+    var s = try navAndWait(od.doc, 0, .forward);
+    try expectFound(s, 0, 0, 1);
+    // Replace: the snapshot resets (nav NONE, found/position zeroed)...
+    try startSearch(od.doc, textReq("bar"));
+    s = api.ls_search_poll(od.doc);
+    try std.testing.expect(s.state == .scanning or s.state == .done);
+    try std.testing.expectEqual(api.SearchNavState.none, s.nav);
+    try std.testing.expectEqual(@as(u64, 0), s.found_row);
+    try std.testing.expectEqual(@as(u64, 0), s.position);
+    // ...and the new counts converge to the new query's exact total.
+    const done = try waitSearchDone(od.doc);
+    try std.testing.expectEqual(@as(u64, 2), done.total);
+    s = try navAndWait(od.doc, 0, .forward);
+    try expectFound(s, 1, 0, 1);
+}
+
+test "f5: ls_search_cancel is terminal — counts freeze; DONE persists; pending nav resolves" {
+    const gpa = std.testing.allocator;
+    const fixture = try genNeedleRows(gpa, 300_000, &.{ 10, 250_000 });
+    defer gpa.free(fixture);
+    var od = try openWith(fixture, manualNoHeader);
+    defer od.deinit();
+    try startSearch(od.doc, textReq("needle"));
+    api.ls_search_nav(od.doc, 200_000, .forward);
+    api.ls_search_cancel(od.doc);
+    const s = api.ls_search_poll(od.doc);
+    try std.testing.expect(s.state == .cancelled or s.state == .done);
+    try std.testing.expect(s.nav != .searching); // pending nav resolved (NONE) or already terminal
+    // Frozen: a later snapshot is identical (nothing scans anymore).
+    try std.testing.io.sleep(.fromMilliseconds(25), .awake);
+    const s2 = api.ls_search_poll(od.doc);
+    try std.testing.expectEqual(s.state, s2.state);
+    try std.testing.expectEqual(s.total, s2.total);
+    try std.testing.expectEqual(s.progress, s2.progress);
+    try std.testing.expectEqual(s.nav, s2.nav);
+    if (s2.state == .cancelled) {
+        try std.testing.expectEqual(false, s2.total_exact);
+        try std.testing.expect(s2.progress < 1.0);
+    }
+    // Cancel after completion: DONE persists.
+    var od2 = try openBytes("h\nneedle\n");
+    defer od2.deinit();
+    try std.testing.expectEqual(@as(u64, 1), try searchTotal(od2.doc, textReq("needle")));
+    api.ls_search_cancel(od2.doc);
+    const s3 = api.ls_search_poll(od2.doc);
+    try std.testing.expectEqual(api.SearchState.done, s3.state);
+    try std.testing.expectEqual(true, s3.total_exact);
+}
+
+test "f5: the single scan slot — search and jump cancel each other; instant jumps do not disturb" {
+    const gpa = std.testing.allocator;
+    const fixture = try genNeedleRows(gpa, 2_000_000, &.{ 5, 1_999_990 });
+    defer gpa.free(fixture);
+    var od = try openWith(fixture, manualNoHeader);
+    defer od.deinit();
+
+    // (a) ls_search_start cancels a scanning jump (36 MB target: it cannot
+    // finish in the microseconds before the search starts) to IDLE.
+    api.ls_jump_start(od.doc, 1_900_000);
+    try std.testing.expectEqual(api.JumpState.scanning, api.ls_jump_poll(od.doc).state);
+    const b0 = api.ls_index_poll(od.doc).bytes_scanned;
+    try startSearch(od.doc, textReq("needle"));
+    try std.testing.expectEqual(api.JumpState.idle, api.ls_jump_poll(od.doc).state);
+    try std.testing.expect(api.ls_index_poll(od.doc).bytes_scanned >= b0); // gains kept
+
+    // (b) an instant (behind-frontier) jump does NOT disturb the search.
+    const s0 = api.ls_search_poll(od.doc);
+    api.ls_jump_start(od.doc, 3);
+    const j = api.ls_jump_poll(od.doc);
+    try std.testing.expectEqual(api.JumpState.done, j.state);
+    try std.testing.expectEqual(@as(u64, 3), j.landed_row);
+    if (s0.state == .scanning) {
+        const s1 = api.ls_search_poll(od.doc);
+        try std.testing.expect(s1.state == .scanning or s1.state == .done);
+    }
+
+    // (c) a jump that must scan cancels the search terminally; counts, found
+    // results, and frontier gains are kept.
+    var s = try navAndWait(od.doc, 0, .forward);
+    try expectFound(s, 5, 1, 1);
+    api.ls_jump_start(od.doc, 1_950_000);
+    s = api.ls_search_poll(od.doc);
+    try std.testing.expect(s.state == .cancelled or s.state == .done);
+    try expectFound(s, 5, 1, 1); // the landing persists across the cancellation
+    if (s.state == .cancelled) {
+        try std.testing.expectEqual(false, s.total_exact);
+        const frozen = api.ls_search_poll(od.doc);
+        try std.testing.expectEqual(s.total, frozen.total);
+        try std.testing.expectEqual(s.progress, frozen.progress);
+    }
+    const jd = try waitJumpDone(od.doc);
+    try std.testing.expectEqual(@as(u64, 1_950_000), jd.landed_row);
+
+    // (d) a nav needing uncovered rows RESUMES the cancelled search and takes
+    // the slot back (cancelling a scanning jump); the resumed scan reaches
+    // EOF here, so the search finishes DONE with the exact final total.
+    api.ls_jump_start(od.doc, 1_999_999);
+    const j2 = api.ls_jump_poll(od.doc);
+    api.ls_search_nav(od.doc, std.math.maxInt(u64), .backward);
+    if (j2.state == .scanning) {
+        const j3 = api.ls_jump_poll(od.doc);
+        try std.testing.expect(j3.state == .idle or j3.state == .done);
+    }
+    s = try waitNavTerminal(od.doc);
+    try expectFound(s, 1_999_990, 1, 2);
+    const done = api.ls_search_poll(od.doc);
+    try std.testing.expectEqual(api.SearchState.done, done.state);
+    try std.testing.expectEqual(@as(u64, 2), done.total);
+    try std.testing.expectEqual(true, done.total_exact);
+    try std.testing.expectEqual(@as(f64, 1.0), done.progress);
+}
+
+test "f5: ls_close during an active match-scan is safe (MANUAL and AUTO)" {
+    const gpa = std.testing.allocator;
+    const fixture = try genNeedleRows(gpa, 300_000, &.{ 7, 200_000 });
+    defer gpa.free(fixture);
+    for ([_]i32{ api.index_manual, api.index_auto }) |mode| {
+        var fx = try makeFixture(fixture, 0o644);
+        defer fx.deinit();
+        var doc_opt: ?*api.Doc = null;
+        const opts: api.OpenOptions = .{ .header = api.header_off, .index_mode = mode };
+        try std.testing.expectEqual(api.Status.ok, api.openWithAllocator(std.testing.allocator, fx.path.ptr, &opts, &doc_opt));
+        const doc = doc_opt.?;
+        try startSearch(doc, textReq("needle"));
+        api.ls_search_nav(doc, std.math.maxInt(u64), .backward);
+        // Close mid-scan: must cancel + join core threads; the testing
+        // allocator fails the test on any leak.
+        api.ls_close(doc);
+    }
+}
+
+test "f5: a search under AUTO indexing reaches the same exact counts" {
+    const gpa = std.testing.allocator;
+    const fixture = try genNeedleRows(gpa, 300_000, &.{ 100, 150_000, 299_999 });
+    defer gpa.free(fixture);
+    var od = try openWith(fixture, .{ .header = api.header_off }); // AUTO index
+    defer od.deinit();
+    try startSearch(od.doc, textReq("needle"));
+    const done = try waitSearchDone(od.doc);
+    try std.testing.expectEqual(@as(u64, 3), done.total);
+    try std.testing.expectEqual(true, done.total_exact);
+    const s = try navAndWait(od.doc, 150_001, .forward);
+    try expectFound(s, 299_999, 1, 3);
+}
+
+// ---------------------------------------------------------------------------
+// f6 — document identity: search state is per-handle; a dialect re-open
+// starts from zero.
+// ---------------------------------------------------------------------------
+
+test "f6: a dialect re-open starts with zero search state" {
+    var fx = try makeFixture("needle,x\nfoo,needle\n", 0o644);
+    defer fx.deinit();
+    // First open: sniffed header ON -> 1 data row, 1 match.
+    var doc_opt: ?*api.Doc = null;
+    try std.testing.expectEqual(api.Status.ok, api.ls_open(fx.path.ptr, &manual, &doc_opt));
+    var doc = doc_opt.?;
+    var s = api.ls_search_poll(doc);
+    try std.testing.expectEqual(api.SearchState.idle, s.state); // fresh handle: all-zero
+    try std.testing.expectEqual(api.SearchNavState.none, s.nav);
+    try std.testing.expectEqual(@as(f64, 0.0), s.progress);
+    try std.testing.expectEqual(@as(u64, 0), s.total);
+    try std.testing.expectEqual(false, s.total_exact);
+    try std.testing.expectEqual(@as(u64, 1), try searchTotal(doc, textReq("needle")));
+    api.ls_close(doc);
+
+    // Re-open with a forced dialect change (header OFF): zero search state,
+    // and a fresh search sees the re-dialected document (2 data rows match).
+    const opts: api.OpenOptions = .{ .header = api.header_off, .index_mode = api.index_manual };
+    doc_opt = null;
+    try std.testing.expectEqual(api.Status.ok, api.ls_open(fx.path.ptr, &opts, &doc_opt));
+    doc = doc_opt.?;
+    defer api.ls_close(doc);
+    s = api.ls_search_poll(doc);
+    try std.testing.expectEqual(api.SearchState.idle, s.state);
+    try std.testing.expectEqual(api.SearchNavState.none, s.nav);
+    try std.testing.expectEqual(@as(u64, 0), s.total);
+    try std.testing.expectEqual(false, s.total_exact);
+    try std.testing.expectEqual(@as(u64, 2), try searchTotal(doc, textReq("needle")));
+}
+
+// ---------------------------------------------------------------------------
+// Public C ABI: the search symbols are callable through extern linkage, and
+// the enum values are pinned to the header.
+// ---------------------------------------------------------------------------
+
+const c_linked_search = struct {
+    extern fn ls_search_start(doc: *api.Doc, request: *const api.SearchRequest) bool;
+    extern fn ls_search_nav(doc: *api.Doc, anchor_row: u64, dir: api.SearchDir) void;
+    extern fn ls_search_cancel(doc: *api.Doc) void;
+    extern fn ls_search_poll(doc: *const api.Doc) api.SearchStatus;
+};
+
+test "abi: the search C symbols are callable through extern linkage; enum values pinned" {
+    try std.testing.expectEqual(@as(c_int, 0), @intFromEnum(api.SearchKind.text));
+    try std.testing.expectEqual(@as(c_int, 1), @intFromEnum(api.SearchKind.predicate));
+    try std.testing.expectEqual(@as(c_int, 0), @intFromEnum(api.SearchOp.eq));
+    try std.testing.expectEqual(@as(c_int, 1), @intFromEnum(api.SearchOp.ne));
+    try std.testing.expectEqual(@as(c_int, 2), @intFromEnum(api.SearchOp.lt));
+    try std.testing.expectEqual(@as(c_int, 3), @intFromEnum(api.SearchOp.gt));
+    try std.testing.expectEqual(@as(c_int, 4), @intFromEnum(api.SearchOp.le));
+    try std.testing.expectEqual(@as(c_int, 5), @intFromEnum(api.SearchOp.ge));
+    try std.testing.expectEqual(@as(c_int, 0), @intFromEnum(api.SearchDir.forward));
+    try std.testing.expectEqual(@as(c_int, 1), @intFromEnum(api.SearchDir.backward));
+    try std.testing.expectEqual(@as(c_int, 0), @intFromEnum(api.SearchState.idle));
+    try std.testing.expectEqual(@as(c_int, 1), @intFromEnum(api.SearchState.scanning));
+    try std.testing.expectEqual(@as(c_int, 2), @intFromEnum(api.SearchState.done));
+    try std.testing.expectEqual(@as(c_int, 3), @intFromEnum(api.SearchState.cancelled));
+    try std.testing.expectEqual(@as(c_int, 0), @intFromEnum(api.SearchNavState.none));
+    try std.testing.expectEqual(@as(c_int, 1), @intFromEnum(api.SearchNavState.searching));
+    try std.testing.expectEqual(@as(c_int, 2), @intFromEnum(api.SearchNavState.found));
+    try std.testing.expectEqual(@as(c_int, 3), @intFromEnum(api.SearchNavState.exhausted));
+
+    var od = try openBytes("h\nneedle\nplain\n");
+    defer od.deinit();
+    const req = textReq("needle");
+    try std.testing.expectEqual(true, c_linked_search.ls_search_start(od.doc, &req));
+    c_linked_search.ls_search_nav(od.doc, 0, .forward);
+    const io = std.testing.io;
+    const t0: std.Io.Clock.Timestamp = .now(io, .awake);
+    while (true) {
+        const s = c_linked_search.ls_search_poll(od.doc);
+        if (s.state == .done and s.nav == .found) {
+            try std.testing.expectEqual(@as(u64, 0), s.found_row);
+            try std.testing.expectEqual(@as(u32, 0), s.found_col);
+            try std.testing.expectEqual(@as(u64, 1), s.position);
+            try std.testing.expectEqual(@as(u64, 1), s.total);
+            try std.testing.expectEqual(true, s.total_exact);
+            break;
+        }
+        if (s.state == .idle) return error.SearchNotStarted;
+        if (elapsedMs(t0) > 15_000) return error.SearchTimeout;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    c_linked_search.ls_search_cancel(od.doc); // no-op after DONE
+    try std.testing.expectEqual(api.SearchState.done, c_linked_search.ls_search_poll(od.doc).state);
 }

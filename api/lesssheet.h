@@ -7,24 +7,28 @@
  * library. It is frozen by the workspace-root planner: implementers on either
  * side may not change it (two-key change-request process only).
  *
- * Scope (viewer-ui slice): open a document with an optionally forced parse
- * profile (separator / quote / header), read the effective dialect report,
- * access any contiguous row window over a file of any size (64-bit row
- * addressing), observe background indexing and row-count knowledge
- * (count + exact/estimated), and run cancellable jump-scans with progress.
- * The walking-skeleton head-window surface (LS_HEAD_MAX_DATA_ROWS, fixed head
- * accessors) is superseded by this surface.
+ * Scope (viewer-ui + find-seek slices): open a document with an optionally
+ * forced parse profile (separator / quote / header), read the effective
+ * dialect report, access any contiguous row window over a file of any size
+ * (64-bit row addressing), observe background indexing and row-count
+ * knowledge (count + exact/estimated), run cancellable jump-scans with
+ * progress, and run streaming content SEARCHES: text and column-predicate
+ * match-scans with bounded per-block match counts, match navigation
+ * (next/previous), and pollable progress — sharing the single scan slot with
+ * jumps. The walking-skeleton head-window surface is superseded.
  *
  * FORMAT NEUTRALITY
  *   - Nothing here promises that a document is a text file. The document /
- *     window / index / jump / row-count surface is format-agnostic; the
- *     dialect options and report describe the DELIMITED-TEXT parse profile
- *     (the only format this slice ships). Future formats (XLSX, Parquet)
- *     ignore the dialect options and are specified at their slices.
+ *     window / index / jump / row-count / search surface is format-agnostic;
+ *     the dialect options and report describe the DELIMITED-TEXT parse
+ *     profile (the only format this slice ships). Future formats (XLSX,
+ *     Parquet) ignore the dialect options and are specified at their slices.
  *   - Row addressing is view-relative (see ls_cell): a row index addresses
  *     the document's current row set (today: the identity view — all data
  *     rows in file order), never a physical file line. Filtered views can be
- *     added later without breaking the addressing model.
+ *     added later without breaking the addressing model. The search-job
+ *     handle is deliberately opaque state on the document so a later slice
+ *     can promote a search into a view definition.
  *
  * OWNERSHIP AND VALIDITY (the eviction-safe borrow rule)
  *   - The core owns ALL storage behind a document handle. Cell text crosses
@@ -33,27 +37,34 @@
  *     valid until the NEXT ls_window_set() call on that document or until
  *     ls_close(), whichever comes first. ls_window_set may evict; nothing
  *     else invalidates borrows — in particular the core's own background
- *     scanning NEVER invalidates a borrow. Callers copy at their own
- *     boundary; they never free anything obtained from the core.
- *   - Allocation discipline: ls_open and ls_window_set are the only calls
- *     that may allocate. Every accessor and poll (ls_dialect_get,
- *     ls_column_count, ls_row_count_get, ls_index_poll, ls_cell,
- *     ls_header_cell, ls_jump_poll) performs ZERO heap allocation and never
- *     fails; out-of-range access returns the empty string / a well-defined
- *     value. Additionally, once a scan has reported completion (index
- *     complete, or jump state LS_JUMP_DONE with no other scan active), the
- *     core performs no further internal allocation on that document until
- *     the next mutating call.
+ *     scanning (indexing, jump-scans, AND match-scans) NEVER invalidates a
+ *     borrow. Callers copy at their own boundary; they never free anything
+ *     obtained from the core.
+ *   - Allocation discipline: ls_open, ls_window_set, ls_search_start, and
+ *     ls_search_nav are the only CALLS that may allocate (running background
+ *     scans may also allocate internally for index/count storage). Every
+ *     accessor and poll (ls_dialect_get, ls_column_count, ls_row_count_get,
+ *     ls_index_poll, ls_cell, ls_header_cell, ls_jump_poll, ls_search_poll)
+ *     and ls_jump_cancel / ls_search_cancel performs ZERO heap allocation and
+ *     never fails; out-of-range access returns the empty string / a
+ *     well-defined value. Additionally, once every scan has reported a
+ *     terminal state (index complete or idle, jump slot not LS_JUMP_SCANNING,
+ *     search not LS_SEARCH_SCANNING), the core performs no further internal
+ *     allocation on that document until the next mutating call
+ *     (ls_window_set, ls_jump_start, ls_search_start, ls_search_nav).
  *   - Source files are read-only to the core: never modified, locked, or
  *     copied. Steady-state memory is O(materialized window + index
- *     checkpoints), never O(file) and never O(rows).
+ *     checkpoints), never O(file) and never O(rows). A search adds
+ *     O(index checkpoints) count storage + O(1) job state — see SEARCH.
  *
  * OPEN COST (the cold-start contract)
  *   - ls_open performs O(head) work regardless of file size: it consumes at
  *     most LS_OPEN_HEAD_MAX_BYTES of the file (sniffing, column count,
  *     header decision, and the initial index frontier all come from this
  *     head region) and never blocks on file length. A 10 GB document opens
- *     as fast as a 10 KB one.
+ *     as fast as a 10 KB one. The search machinery is lazy: it costs nothing
+ *     (no storage, no threads, no scan work) until the first
+ *     ls_search_start on the document.
  *   - After a successful open the scan frontier covers at least
  *     min(total rows, LS_OPEN_READY_MIN_ROWS) rows, provided those rows fit
  *     within LS_OPEN_HEAD_MAX_BYTES — so a window at the top of the document
@@ -68,39 +79,108 @@
  *   - The core maintains a sparse row index (row -> byte offset at safe
  *     record boundaries, correct across quoted embedded newlines) and a scan
  *     FRONTIER: the point up to which records have been indexed. The
- *     frontier only ever advances (monotone) and survives jump cancellation:
+ *     frontier only ever advances (monotone) and survives job cancellation:
  *     work behind it is paid once and rows behind it are permanently
  *     servable. Index memory is O(checkpoints), never O(rows).
  *   - With LS_INDEX_AUTO (default) a core-owned background thread starts at
  *     open and advances the frontier to EOF without blocking any accessor.
  *     With LS_INDEX_MANUAL there is no automatic advance; the frontier moves
- *     only through jump-scans (ls_jump_start). MANUAL exists for
+ *     only through jump-scans and match-scans. MANUAL exists for
  *     deterministic testing and cost measurement; interactive frontends use
  *     AUTO.
  *   - A jump-scan (ls_jump_start) advances the SAME frontier toward a target
  *     row, asynchronously, with pollable progress and cancellation. Targets
  *     are reached by scanning — never guessed from byte offsets.
  *
+ * SEARCH (MATCH-SCANS, COUNTS, AND NAVIGATION — find-seek slice)
+ *   - A document has at most ONE active search: the request passed to the
+ *     most recent successful ls_search_start. Starting a new search replaces
+ *     the previous one ENTIRELY: counts reset, the navigation slot resets to
+ *     LS_SEARCH_NAV_NONE with found/position fields zeroed, and the match-
+ *     scan restarts from row 0. A failed (rejected) start changes NOTHING.
+ *   - Matching is defined PER CELL on raw cell text — exactly the bytes
+ *     ls_cell serves (quoting removed, truncate/pad applied: a missing cell
+ *     of a ragged record is the empty string). Only DATA rows are evaluated;
+ *     the effective header record is never searched. A row matches when any
+ *     in-scope cell matches (TEXT) or the target column's cell matches
+ *     (PREDICATE). The match column reported for a row is the lowest-indexed
+ *     in-scope matching column (TEXT) / the predicate column (PREDICATE).
+ *     Matching semantics per kind are pinned at ls_search_request.
+ *   - THE MATCH-SCAN (started by ls_search_start) sweeps data rows from row
+ *     0 toward EOF, evaluating the matcher per row and maintaining match
+ *     COUNTS per index block (the sparse row-index checkpoint granularity).
+ *     It never materializes a list of match rows: search memory is
+ *     O(index checkpoints) + O(1) job state, independent of match density.
+ *     The counted region is contiguous from row 0; counts are exact for the
+ *     counted region, never estimated. `total` (m) is the number of matching
+ *     rows counted so far — monotone within one search — and is final
+ *     exactly when the scan completes (state LS_SEARCH_DONE, total_exact
+ *     true). Behind the byte frontier the match-scan re-lexes from the mmap
+ *     (disk-bound, fast); beyond it, it advances the SHARED frontier exactly
+ *     like a jump-scan (paid once, kept — every byte feeds the row index).
+ *   - NAVIGATION (ls_search_nav) is streaming: find the nearest matching row
+ *     from an anchor in a direction (semantics pinned at ls_search_nav),
+ *     asynchronously. When the answer is already determined by the counted
+ *     region, the nav completes BEFORE the call returns (O(one block
+ *     re-lex), never O(file)); otherwise the match-scan serves it as it
+ *     advances, keeping the counted region contiguous — which is why a found
+ *     match ALWAYS has an exact 1-based `position` (n) among all matching
+ *     rows, with total >= position. Found results persist in the poll until
+ *     the next ls_search_nav or ls_search_start.
+ *   - THE SINGLE SCAN SLOT: search jobs and jump jobs share the document's
+ *     one background-scan slot. Pinned interaction with ls_jump_*:
+ *       - A successful ls_search_start takes the slot: a jump in
+ *         LS_JUMP_SCANNING is cancelled (its poll reports LS_JUMP_IDLE, its
+ *         frontier gains are kept); a completed jump's LS_JUMP_DONE persists.
+ *       - An ls_jump_start that must SCAN (target beyond the frontier with
+ *         an inexact count) takes the slot: a search in LS_SEARCH_SCANNING
+ *         becomes LS_SEARCH_CANCELLED (terminal; counts, found results, and
+ *         frontier gains are kept; a pending LS_SEARCH_NAV_SEARCHING resolves
+ *         to LS_SEARCH_NAV_NONE). A jump that completes before returning
+ *         (target behind the frontier, or EOF clamp with an exact count)
+ *         does NOT disturb a running search.
+ *       - An ls_search_nav that must scan re-engages the slot for the search
+ *         (cancelling a scanning jump as above). On a CANCELLED search this
+ *         RESUMES the match-scan — state returns to LS_SEARCH_SCANNING —
+ *         but only as far as the nav needs: at the nav's terminal the state
+ *         is LS_SEARCH_DONE if the scan reached EOF, else LS_SEARCH_CANCELLED
+ *         again. Counts are never lost; progress stays monotone.
+ *       - ls_search_cancel stops the search's scanning (state
+ *         LS_SEARCH_CANCELLED; LS_SEARCH_DONE persists; a pending
+ *         LS_SEARCH_NAV_SEARCHING resolves to LS_SEARCH_NAV_NONE). It never
+ *         affects the jump slot. The AUTO background indexer is independent
+ *         of the slot and continues regardless.
+ *   - PROGRESS: ls_search_status.progress is the fraction of the match-scan's
+ *     total work covered so far, in [0.0, 1.0] — monotone non-decreasing
+ *     within one search (including across cancel/resume), exactly 1.0 when
+ *     state is LS_SEARCH_DONE, frozen at its last value when CANCELLED (the
+ *     measurement axis is implementation detail, as for jumps).
+ *   - Search state belongs to the document handle. A dialect change is a
+ *     re-open (ls_close + ls_open) and therefore invalidates ALL search
+ *     state: a fresh handle polls LS_SEARCH_IDLE with an all-zero snapshot.
+ *
  * THREADING
  *   - ls_open / ls_close: exclusive. Do not call anything on a document
  *     concurrently with its open or close. ls_close may be called while
- *     scans are running: it cancels and joins all core-owned threads for
- *     that document before releasing storage.
+ *     scans are running (jump-scans AND match-scans): it cancels and joins
+ *     all core-owned threads for that document before releasing storage.
  *   - Window lane — ls_window_set, ls_cell, ls_header_cell: one caller
  *     thread at a time (callers serialize these among themselves). They are
  *     safe to call concurrently with the poll/control lane and with the
  *     core's own background scanning.
  *   - Poll/control lane — ls_dialect_get, ls_column_count, ls_row_count_get,
- *     ls_index_poll, ls_jump_start, ls_jump_cancel, ls_jump_poll: safe from
- *     any thread at any time (internally synchronized), except concurrently
- *     with ls_open/ls_close on the same document.
+ *     ls_index_poll, ls_jump_start, ls_jump_cancel, ls_jump_poll,
+ *     ls_search_start, ls_search_nav, ls_search_cancel, ls_search_poll: safe
+ *     from any thread at any time (internally synchronized), except
+ *     concurrently with ls_open/ls_close on the same document.
  *   - Distinct documents are fully independent.
  *
  * TEXT AND ENCODING
  *   - Cell bytes are the raw file bytes with quoting removed per the
  *     effective dialect. They are assumed UTF-8 but NOT validated by the
  *     core; consumers replace invalid sequences (U+FFFD) at the display
- *     boundary.
+ *     boundary. Search matches over these same raw bytes (see
+ *     ls_search_request for the pinned byte-level semantics).
  *   - A leading UTF-8 BOM (EF BB BF) at the start of the file is stripped
  *     before parsing and never appears in cell text.
  *
@@ -153,6 +233,8 @@
  *     '.' only. Examples: "1", "-2", "+1e5", ".5", "5.", " 12 " are numeric;
  *     "", "0x1F", "1,000", "1e", "e5", "--1", "1 2", "NaN", "inf" are not.
  *     An empty cell is NOT numeric.
+ *     This grammar is shared verbatim by the search surface: the ordering
+ *     predicates (see ls_search_op) parse cells and values with it.
  *   - A forced header (LS_HEADER_ON / LS_HEADER_OFF) bypasses the grammar.
  *     An empty document reports header false regardless of forcing.
  *   - When the effective header is on, record 1 is served by ls_header_cell
@@ -304,7 +386,7 @@ typedef struct ls_row_range {
 /*
  * Background-index progress. bytes_scanned counts file bytes behind the
  * frontier (monotone non-decreasing over the document's lifetime, including
- * across cancelled jumps); bytes_total is the file size. complete is true
+ * across cancelled jobs); bytes_total is the file size. complete is true
  * iff every record is indexed (bytes_scanned == bytes_total) — from then on
  * ls_row_count_get reports exact. Empty file: {0, 0, true}.
  */
@@ -316,7 +398,8 @@ typedef struct ls_scan_progress {
 
 /* State of the document's (single) jump slot. */
 typedef enum ls_jump_state {
-    /* No jump since open, or the last jump was cancelled. */
+    /* No jump since open, or the last jump was cancelled (by ls_jump_cancel
+     * or by a search taking the scan slot). */
     LS_JUMP_IDLE = 0,
     /* A scan toward the target is running. */
     LS_JUMP_SCANNING = 1,
@@ -340,6 +423,158 @@ typedef struct ls_jump_status {
 } ls_jump_status;
 
 /* ------------------------------------------------------------------------- */
+/* Search types (see the SEARCH section above for the job model)              */
+/* ------------------------------------------------------------------------- */
+
+/* The two match kinds of ls_search_request. */
+typedef enum ls_search_kind {
+    /* Substring text match over a set of columns, with smart case. */
+    LS_SEARCH_TEXT = 0,
+    /* Single-column typed predicate (operator + value). */
+    LS_SEARCH_PREDICATE = 1,
+} ls_search_kind;
+
+/*
+ * Predicate operators. EQ/NE compare BYTE-EXACTLY; LT/GT/LE/GE compare
+ * NUMERICALLY (see ls_search_request for the pinned semantics).
+ */
+typedef enum ls_search_op {
+    LS_SEARCH_OP_EQ = 0, /* =  */
+    LS_SEARCH_OP_NE = 1, /* ≠  */
+    LS_SEARCH_OP_LT = 2, /* <  */
+    LS_SEARCH_OP_GT = 3, /* >  */
+    LS_SEARCH_OP_LE = 4, /* ≤  */
+    LS_SEARCH_OP_GE = 5, /* ≥  */
+} ls_search_op;
+
+/* Navigation direction (see ls_search_nav for the pinned anchor semantics). */
+typedef enum ls_search_dir {
+    LS_SEARCH_FORWARD = 0,
+    LS_SEARCH_BACKWARD = 1,
+} ls_search_dir;
+
+/* State of the document's (single) search job. */
+typedef enum ls_search_state {
+    /* No search since open. The whole snapshot is zero. */
+    LS_SEARCH_IDLE = 0,
+    /* The match-scan (and/or a navigation it serves) is running. */
+    LS_SEARCH_SCANNING = 1,
+    /* The match-scan covered every data row: `total` is final
+     * (total_exact true), progress is exactly 1.0. Terminal until the next
+     * ls_search_start. */
+    LS_SEARCH_DONE = 2,
+    /* The match-scan stopped before EOF (ls_search_cancel, or a jump-scan
+     * took the slot). Counts, found results, progress, and frontier gains
+     * are kept, frozen at their last values. Terminal — except that an
+     * ls_search_nav needing uncovered rows resumes scanning (see SEARCH). */
+    LS_SEARCH_CANCELLED = 3,
+} ls_search_state;
+
+/* State of the search job's (single) navigation slot. */
+typedef enum ls_search_nav_state {
+    /* No navigation requested since this search started. */
+    LS_SEARCH_NAV_NONE = 0,
+    /* A navigation is pending (being served by the scan). */
+    LS_SEARCH_NAV_SEARCHING = 1,
+    /* The navigation found a match: found_row / found_col / position are
+     * valid and persist until the next ls_search_nav or ls_search_start. */
+    LS_SEARCH_NAV_FOUND = 2,
+    /* The navigation exhausted its direction: no matching row exists
+     * at-or-after (FORWARD) / strictly-before (BACKWARD) the anchor.
+     * Terminal for that navigation. */
+    LS_SEARCH_NAV_EXHAUSTED = 3,
+} ls_search_nav_state;
+
+/*
+ * A search request. The struct and every buffer it points to are borrowed
+ * only for the DURATION of the ls_search_start call: the core copies what it
+ * keeps; the caller retains ownership. `request` semantics:
+ *
+ *   kind == LS_SEARCH_TEXT — substring match with SMART CASE:
+ *     - value_ptr/value_len: the UTF-8 query bytes (len > 0 required; the
+ *       empty query means "no search" and is rejected).
+ *     - A cell matches when the query occurs as a byte substring of the cell
+ *       text. If the query contains at least one ASCII uppercase byte
+ *       (0x41..0x5A) the comparison is byte-exact. Otherwise it is
+ *       case-insensitive over ASCII ONLY: bytes 0x41..0x5A compare equal to
+ *       their lowercase forms; every other byte — including all bytes >=
+ *       0x80, i.e. all non-ASCII UTF-8 — compares exactly. (Full Unicode
+ *       folding is out of scope; ASCII smart case is the pinned v1 rule.)
+ *     - scope_ptr/scope_len: the set of column indices to evaluate (each <
+ *       ls_column_count; duplicates permitted and redundant). NULL scope_ptr
+ *       means ALL columns. A non-NULL scope with scope_len == 0, or any
+ *       out-of-range index, rejects the request. Frontends pass their
+ *       visible-column set; the scope is FIXED for the search's lifetime
+ *       (visibility changes apply from the next ls_search_start).
+ *     - column / op are ignored.
+ *
+ *   kind == LS_SEARCH_PREDICATE — single-column typed comparison:
+ *     - column: the target column (< ls_column_count, else rejected). Any
+ *       column may be targeted (hidden ones included — hiding is a frontend
+ *       presentation concept).
+ *     - value_ptr/value_len: the comparison value bytes.
+ *     - LS_SEARCH_OP_EQ / NE: the cell matches iff its bytes are exactly
+ *       equal / not equal to the value bytes. NO case folding, NO whitespace
+ *       trimming. The empty value is legal (EQ matches empty cells,
+ *       including the padded cells of ragged records).
+ *     - LS_SEARCH_OP_LT / GT / LE / GE: numeric. The cell matches iff BOTH
+ *       the cell and the value parse under the pinned numeric grammar (see
+ *       HEADER RULE — the same grammar, verbatim) AND the parsed values
+ *       compare accordingly. A non-numeric cell NEVER matches an ordering
+ *       operator. A non-numeric VALUE rejects the request at
+ *       ls_search_start (frontends validate first; the core enforces).
+ *       Comparison is by MATHEMATICAL value and EXACT: sign, digits, and
+ *       exponent are compared arithmetically, never rounded through binary
+ *       floating point — "2.0" equals "2", "1e2" equals "100", a 40-digit
+ *       integer orders correctly against its neighbor, and "1e400" > "1e399"
+ *       even though both overflow a double. (Sole documented latitude:
+ *       exponent values beyond int64 may saturate.)
+ *     - scope_ptr/scope_len are ignored.
+ *
+ *   value_ptr may be NULL only when value_len is 0.
+ */
+typedef struct ls_search_request {
+    ls_search_kind kind;
+    ls_search_op op;
+    uint32_t column;
+    const uint8_t *value_ptr;
+    size_t value_len;
+    const uint32_t *scope_ptr;
+    size_t scope_len;
+} ls_search_request;
+
+/*
+ * Search job snapshot (see the SEARCH section for the full model).
+ *   state       — job state; IDLE means "no search since open" (all other
+ *                 fields zero).
+ *   nav         — navigation slot state.
+ *   progress    — match-scan work fraction in [0.0, 1.0]; monotone within
+ *                 one search (across cancel/resume); exactly 1.0 when DONE;
+ *                 frozen when CANCELLED.
+ *   found_row   — the matched data row; valid only when nav is FOUND.
+ *   found_col   — the matched column (lowest in-scope matching column for
+ *                 TEXT; the predicate column for PREDICATE); valid only when
+ *                 nav is FOUND.
+ *   position    — 1-based position (n) of found_row among ALL matching rows
+ *                 in file order; valid only when nav is FOUND, and then
+ *                 always exact, with total >= position.
+ *   total       — matching rows counted so far (m); exact for the counted
+ *                 region; monotone within one search.
+ *   total_exact — true iff the match-scan completed (state DONE): `total`
+ *                 is the final match count and stops growing.
+ */
+typedef struct ls_search_status {
+    ls_search_state state;
+    ls_search_nav_state nav;
+    double progress;
+    uint64_t found_row;
+    uint32_t found_col;
+    uint64_t position;
+    uint64_t total;
+    bool total_exact;
+} ls_search_status;
+
+/* ------------------------------------------------------------------------- */
 /* Lifecycle                                                                  */
 /* ------------------------------------------------------------------------- */
 
@@ -358,15 +593,17 @@ typedef struct ls_jump_status {
  *
  * A dialect change is a re-open: close the document and open the same path
  * with the new forced options (the index restarts — that is the documented
- * cost of changing the parse profile).
+ * cost of changing the parse profile — and all search state is gone: the
+ * new handle polls LS_SEARCH_IDLE).
  */
 ls_status ls_open(const char *path, const ls_open_options *options, ls_doc **out_doc);
 
 /*
  * Release the document and all storage owned by it, first cancelling and
- * joining any core-owned scan threads. Every ls_str borrowed from this
- * document becomes invalid. `doc` must be a handle returned by a successful
- * ls_open, closed exactly once.
+ * joining any core-owned scan threads (background index, jump-scans, and
+ * match-scans — calling ls_close during any of them is safe). Every ls_str
+ * borrowed from this document becomes invalid. `doc` must be a handle
+ * returned by a successful ls_open, closed exactly once.
  */
 void ls_close(ls_doc *doc);
 
@@ -407,10 +644,11 @@ ls_scan_progress ls_index_poll(const ls_doc *doc);
  * O(window bytes) re-lexing from the nearest index checkpoint, so it is the
  * only synchronous-fast path and is safe to call on the UI thread. Rows
  * beyond the frontier become servable by advancing the frontier (background
- * index or ls_jump_start) and then re-issuing ls_window_set with the same
- * range. May allocate (through the document's allocator); on internal
- * failure it degrades to a shorter (possibly empty) returned range — it
- * never fails. Invalidates all previously borrowed ls_str of this document.
+ * index, ls_jump_start, or a match-scan) and then re-issuing ls_window_set
+ * with the same range. May allocate (through the document's allocator); on
+ * internal failure it degrades to a shorter (possibly empty) returned range
+ * — it never fails. Invalidates all previously borrowed ls_str of this
+ * document.
  *
  * Eviction guarantee: a row evicted and later re-materialized serves
  * byte-identical cell text (re-lexed from the same file bytes).
@@ -449,11 +687,15 @@ ls_str ls_header_cell(const ls_doc *doc, uint32_t col);
  *   - If the target is already behind the frontier — or the row count is
  *     exact and the target is at/past EOF (clamp) — the jump completes
  *     BEFORE this call returns: ls_jump_poll immediately reports
- *     LS_JUMP_DONE with the (clamped) landed_row and no scan runs.
+ *     LS_JUMP_DONE with the (clamped) landed_row, no scan runs, and a
+ *     running search is NOT disturbed.
  *   - Otherwise an asynchronous scan advances the shared frontier toward
  *     the target (in both index modes), observable via ls_jump_poll, and
  *     completes when the frontier covers the target or EOF clamps it
- *     (reaching EOF makes the row count exact).
+ *     (reaching EOF makes the row count exact). Taking the scan slot
+ *     cancels a search in LS_SEARCH_SCANNING (it becomes
+ *     LS_SEARCH_CANCELLED; its counts, found results, and frontier gains
+ *     are kept — see SEARCH).
  * On a document with no data rows a jump completes immediately with
  * landed_row 0.
  */
@@ -471,6 +713,84 @@ void ls_jump_cancel(ls_doc *doc);
 
 /* Current jump status snapshot (see ls_jump_status). ZERO allocation. */
 ls_jump_status ls_jump_poll(const ls_doc *doc);
+
+/* ------------------------------------------------------------------------- */
+/* Search (asynchronous match-scans + navigation; shared scan slot;           */
+/* any thread — see the SEARCH section for the full job model)                */
+/* ------------------------------------------------------------------------- */
+
+/*
+ * Start the document's search for `request` (non-NULL; borrowed only for
+ * this call — the core copies what it keeps). Validates the request first:
+ *
+ *   returns false — request rejected, and NOTHING changes (no slot is
+ *   taken, a previous search and a running jump are untouched) — when:
+ *     - kind or op (PREDICATE) is outside its enum domain;
+ *     - TEXT: value_len == 0 (the empty query means "no search"), or
+ *       scope_ptr != NULL with scope_len == 0, or any scope index >=
+ *       ls_column_count;
+ *     - PREDICATE: column >= ls_column_count, or the operator is
+ *       LT/GT/LE/GE and the value does not parse under the pinned numeric
+ *       grammar (such a predicate could never match — the core refuses to
+ *       run a pointless scan).
+ *
+ *   returns true — the search REPLACES any previous search entirely (counts
+ *   reset; nav LS_SEARCH_NAV_NONE with found/position zeroed) and the
+ *   match-scan starts from row 0, taking the scan slot (a jump in
+ *   LS_JUMP_SCANNING is cancelled to LS_JUMP_IDLE; LS_JUMP_DONE persists).
+ *   Never blocks: the scan is asynchronous, observable via ls_search_poll
+ *   (state is LS_SEARCH_SCANNING, or already LS_SEARCH_DONE for a document
+ *   with nothing to scan). Note that starting a search performs NO
+ *   navigation: issue ls_search_nav(doc, 0, LS_SEARCH_FORWARD) for
+ *   "first match in the file".
+ *
+ * May allocate (count storage sized by the index checkpoints — O(index
+ * checkpoints) regardless of match density; see SEARCH).
+ */
+bool ls_search_start(ls_doc *doc, const ls_search_request *request);
+
+/*
+ * Request a navigation on the active search: find the nearest matching row
+ *   FORWARD  — the FIRST matching row with row >= anchor_row;
+ *   BACKWARD — the LAST matching row with row < anchor_row (STRICTLY).
+ * This asymmetry is deliberate: it makes every navigation expressible with
+ * plain uint64 anchors — first-in-file = (0, FORWARD); next-after-R =
+ * (R + 1, FORWARD); previous-before-R = (R, BACKWARD); last-in-file =
+ * (UINT64_MAX, BACKWARD), since no data row can have index UINT64_MAX.
+ * "Previous" from the first match is therefore a core-uniform EXHAUSTED
+ * (the frontend wraps).
+ *
+ * Replaces the pending navigation, if any (only one at a time). Never
+ * blocks beyond the sanctioned fast path:
+ *   - If the answer is already determined by the counted region — the
+ *     nearest match in `dir` lies within it, or the counted region already
+ *     proves exhaustion — the navigation completes BEFORE this call returns
+ *     (LS_SEARCH_NAV_FOUND / LS_SEARCH_NAV_EXHAUSTED; cost O(one block
+ *     re-lex), never O(file)). After LS_SEARCH_DONE every navigation takes
+ *     this path.
+ *   - Otherwise the match-scan serves it as it advances (resuming a
+ *     CANCELLED scan — see SEARCH), reporting LS_SEARCH_NAV_SEARCHING until
+ *     found/exhausted. A nav that must scan takes the scan slot (cancelling
+ *     a jump in LS_JUMP_SCANNING).
+ * No-op when no search is active (state LS_SEARCH_IDLE). May allocate.
+ */
+void ls_search_nav(ls_doc *doc, uint64_t anchor_row, ls_search_dir dir);
+
+/*
+ * Stop the active search's scanning, if any (no-op otherwise — including
+ * after LS_SEARCH_DONE, which persists). After this call returns,
+ * ls_search_poll reports LS_SEARCH_CANCELLED: counts, found results, and
+ * progress freeze at their last values (exact for the counted region); a
+ * pending LS_SEARCH_NAV_SEARCHING resolves to LS_SEARCH_NAV_NONE. All
+ * frontier gains are KEPT. The jump slot and the AUTO background indexer
+ * are unaffected. ZERO allocation.
+ */
+void ls_search_cancel(ls_doc *doc);
+
+/* Current search snapshot (see ls_search_status). Before the first
+ * ls_search_start on this handle: state LS_SEARCH_IDLE and every other
+ * field zero. ZERO allocation; never fails. */
+ls_search_status ls_search_poll(const ls_doc *doc);
 
 #ifdef __cplusplus
 }
