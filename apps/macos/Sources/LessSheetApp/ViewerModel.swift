@@ -510,10 +510,14 @@ final class DocumentModel {
         }
 
         // A new landing scrolls the viewport to it (same mechanics as a jump).
+        // The ONLY viewport movement is an exact FOUND landing: a .searching /
+        // .exhausted poll leaves `current` unchanged, so nothing scrolls.
+        var scrolledTo: UInt64?
         if let current = findSession.display.current, current != previous.current {
             landSearchOn(current.row)
+            scrolledTo = current.row
         }
-        if FindProbe.active { FindProbe.note(model: self) }
+        if FindProbe.active { FindProbe.note(model: self, snapshot: snapshot, scrolledTo: scrolledTo) }
     }
 
     /// Minimum time a wrap notice stays visible before the follow-up navigation

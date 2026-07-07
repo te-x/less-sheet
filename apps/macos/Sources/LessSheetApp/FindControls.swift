@@ -403,6 +403,10 @@ enum FindProbe {
     /// the wrap notice is held for the readable latch before it clears.
     static let wrapMode: Bool = env["LESSSHEET_FIND_WRAP"] != nil
 
+    /// Opt-in: drive submit + step-during-scan ×2 + step-after-done ×1, logging
+    /// every fold so each landing can be checked against the true match rows.
+    static let stepSeqMode: Bool = env["LESSSHEET_FIND_STEP_SEQ"] != nil
+
     private static var model: DocumentModel?
     private static var t0 = DispatchTime.now()
     private static var lastTick = DispatchTime.now()
@@ -416,6 +420,10 @@ enum FindProbe {
     private static var lastNotice = "none"
     private static var wrapTriggered = false
     private static var wrapNoticeSeen = false
+    private static var lastLandedRow: UInt64?
+    private static var landings = 0
+    private static var wantDoneStep = false
+    private static var doneStepIssued = false
 
     private static func noticeName(_ notice: FindNotice?) -> String {
         switch notice {
@@ -424,6 +432,23 @@ enum FindProbe {
         case .noMatches: "noMatches"
         case .stopped: "stopped"
         case nil: "none"
+        }
+    }
+
+    private static func phaseName(_ phase: SearchScanPhase) -> String {
+        switch phase {
+        case .scanning: "scanning"
+        case .done: "done"
+        case .cancelled: "cancelled"
+        }
+    }
+
+    private static func navName(_ nav: SearchNavStatus) -> String {
+        switch nav {
+        case .none: "none"
+        case .searching: "searching"
+        case .found: "found"
+        case .exhausted: "exhausted"
         }
     }
 
@@ -481,10 +506,25 @@ enum FindProbe {
     }
 
     /// Fold hook: called from the model after each search poll fold.
-    static func note(model: DocumentModel) {
+    static func note(model: DocumentModel, snapshot: SearchSnapshot?, scrolledTo: UInt64?) {
         guard active, !finished else { return }
         let display = model.findSession.display
-        // Notice transitions (with timestamps) trace the wrap latch's lifetime.
+
+        // Per-fold trace: the raw core snapshot (state, nav, its found row/pos),
+        // the resolved display (current landing / position / notice), and the
+        // frontend's landing decision (the ONLY viewport move). This is the
+        // decisive evidence — every scroll must be an exact FOUND landing.
+        var snapNav = "nil", snapState = "nil", snapFoundRow = "-", snapPos = "-"
+        if let snapshot {
+            snapState = phaseName(snapshot.phase)
+            snapNav = navName(snapshot.nav)
+            if case let .found(match, pos) = snapshot.nav { snapFoundRow = "\(match.row)"; snapPos = "\(pos)" }
+        }
+        log("lesssheet.find.fold state=\(snapState) nav=\(snapNav) snapFound=\(snapFoundRow) snapPos=\(snapPos)"
+            + " total=\(snapshot?.total ?? 0) final=\(snapshot?.totalIsFinal ?? false)"
+            + " dispCur=\(display.current.map { "\($0.row)" } ?? "-") dispPos=\(display.position.map(String.init) ?? "-")"
+            + " notice=\(noticeName(display.notice)) scrolledTo=\(scrolledTo.map(String.init) ?? "-") at_ms=\(elapsedMs())")
+
         let noticeNow = noticeName(display.notice)
         if noticeNow != lastNotice {
             lastNotice = noticeNow
@@ -506,7 +546,43 @@ enum FindProbe {
             finalLogged = true
             log("lesssheet.find.count_final total=\(display.total) at_ms=\(elapsedMs()) max_gap_ms=\(maxGapMs)")
         }
-        checkTerminal()
+
+        // A distinct new landing (the current match row changed).
+        if let row = display.current?.row, row != lastLandedRow {
+            lastLandedRow = row
+            landings += 1
+            log("lesssheet.find.landing n=\(landings) row_0based=\(row) pos=\(display.position ?? 0)"
+                + " total=\(display.total) final=\(display.totalIsFinal) at_ms=\(elapsedMs()) max_gap_ms=\(maxGapMs)")
+            if stepSeqMode { driveSequence(model) }
+        }
+
+        // The after-done step of the sequence (issued only once the scan is final).
+        if stepSeqMode, wantDoneStep, !doneStepIssued, display.totalIsFinal {
+            doneStepIssued = true
+            log("lesssheet.find.step seq=3 kind=after-done at_ms=\(elapsedMs())")
+            model.stepFind(.forward)
+        }
+
+        if !stepSeqMode { checkTerminal() }
+    }
+
+    /// Drive the submit + step-during-scan ×2 + step-after-done ×1 sequence off
+    /// the observed landings (each `stepFind` is exactly what ⌘G does).
+    private static func driveSequence(_ model: DocumentModel) {
+        switch landings {
+        case 1:  // first match (fromTop) landed; the scan is still counting.
+            log("lesssheet.find.step seq=1 kind=during-scan at_ms=\(elapsedMs())")
+            model.stepFind(.forward)
+        case 2:  // step #1's match landed; still scanning.
+            log("lesssheet.find.step seq=2 kind=during-scan at_ms=\(elapsedMs())")
+            model.stepFind(.forward)
+        case 3:  // step #2's match landed; hold until the scan completes.
+            wantDoneStep = true
+            log("lesssheet.find.await_done at_ms=\(elapsedMs())")
+        default: // step #3's (after-done) match landed -> done.
+            log("lesssheet.find.seq_complete landings=\(landings) at_ms=\(elapsedMs()) max_gap_ms=\(maxGapMs)")
+            finish()
+        }
     }
 
     /// The submit was rejected (ordering predicate, non-numeric value) or the
@@ -564,6 +640,99 @@ enum FindProbe {
         if env["LESSSHEET_DUMP_EXIT"] != nil {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { NSApp.terminate(nil) }
         }
+    }
+
+    private static func log(_ line: String) {
+        FileHandle.standardError.write(Data((line + "\n").utf8))
+    }
+}
+
+// MARK: - Landing-stall verification hook (LESSSHEET_LANDING_STALL)
+
+// Verification-only: drives 5 consecutive FAR landings alternating find/jump on
+// the loaded document and reports the worst MAIN-THREAD gap through a fast
+// (~16 ms) heartbeat — the < 100 ms no-stall proof for the bounded scroll
+// metric. INERT unless the env var is set. Seeds a Text search first so the
+// find-steps have matches to navigate; steps are spaced so each landing settles.
+@MainActor
+enum LandingStallProbe {
+    private static let env = ProcessInfo.processInfo.environment
+    static var active: Bool { env["LESSSHEET_LANDING_STALL"] != nil }
+    /// Comma-separated 1-based far rows for the jump landings; find-steps use the
+    /// seeded query's matches. Defaults suit the big verification fixture.
+    private static var jumpTargets: [String] {
+        (env["LESSSHEET_LANDING_STALL"] ?? "").split(separator: ",").map(String.init)
+            .filter { !$0.isEmpty }
+    }
+    private static var query: String { env["LESSSHEET_FIND"] ?? "ZQZmark" }
+
+    private static var model: DocumentModel?
+    private static var t0 = DispatchTime.now()
+    private static var lastTick = DispatchTime.now()
+    private static var heartbeat: Task<Void, Never>?
+    private static var maxGapMs = 0        // reset per landing (isolated block)
+    private static var worstGapMs = 0      // worst across all landings
+    private static var step = 0
+    private static var targets: [String] = []
+    private static let kinds = ["jump", "find", "jump", "find", "find"]
+
+    static func run(model: DocumentModel) {
+        guard active else { return }
+        self.model = model
+        let t = jumpTargets
+        targets = t.count >= 2 ? t : ["1500001", "2100001"]
+        t0 = DispatchTime.now(); lastTick = t0; maxGapMs = 0; worstGapMs = 0; step = 0
+        startHeartbeat()
+        log("lesssheet.landing.begin query=\(query) jumps=\(targets.joined(separator: ",")) at_ms=0")
+        model.submitFindQuery(query)                 // seed a search (lands match 1)
+        // Let the initial scan/index settle so each landing is measured in
+        // isolation (a clean single far ⌘G/Enter, not a rapid burst).
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { doStep() }
+    }
+
+    private static func startHeartbeat() {
+        heartbeat?.cancel()
+        heartbeat = Task { @MainActor in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(16))
+                if Task.isCancelled { return }
+                let now = DispatchTime.now()
+                let gap = Int((now.uptimeNanoseconds &- lastTick.uptimeNanoseconds) / 1_000_000)
+                lastTick = now
+                maxGapMs = max(maxGapMs, gap)
+            }
+        }
+    }
+
+    private static func doStep() {
+        guard let model else { return }
+        // Report the PREVIOUS landing's isolated max gap (measured across its
+        // settle window), then open a fresh window for this landing.
+        if step >= 1 {
+            worstGapMs = max(worstGapMs, maxGapMs)
+            log("lesssheet.landing.result step=\(step) kind=\(kinds[step - 1]) max_gap_ms=\(maxGapMs)"
+                + (maxGapMs > 100 ? " OVER" : " OK") + " at_ms=\(elapsedMs())")
+        }
+        guard step < kinds.count else {
+            log("lesssheet.landing.worst_max_gap_ms=\(worstGapMs) landings=\(kinds.count) at_ms=\(elapsedMs())"
+                + (worstGapMs > 100 ? " OVER_BUDGET" : " OK"))
+            heartbeat?.cancel(); heartbeat = nil
+            if env["LESSSHEET_DUMP_EXIT"] != nil {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { NSApp.terminate(nil) }
+            }
+            return
+        }
+        maxGapMs = 0; lastTick = DispatchTime.now()   // fresh isolated window
+        switch kinds[step] {
+        case "jump": _ = model.submitJump(targets[step == 0 ? 0 : 1])
+        default: model.stepFind(.forward)
+        }
+        step += 1
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { doStep() }
+    }
+
+    private static func elapsedMs() -> Int {
+        Int((DispatchTime.now().uptimeNanoseconds &- t0.uptimeNanoseconds) / 1_000_000)
     }
 
     private static func log(_ line: String) {
