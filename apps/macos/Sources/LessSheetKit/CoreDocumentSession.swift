@@ -128,27 +128,112 @@ public final class CoreDocumentSession: DocumentSession, @unchecked Sendable {
         }
     }
 
-    // MARK: - Search bridge (find-seek) — SEED STUBS ONLY.
-    // The contract lives in Sources/Contracts (frozen) over ls_search_* in
-    // api/lesssheet.h; these placeholders keep conformance compiling while
-    // the behavior suite is RED (rejecting start + nil snapshot — the
-    // terminal-placeholder pattern, so no frozen test can hang polling).
+    // MARK: - Search bridge (find-seek) — over ls_search_* in api/lesssheet.h.
+    // These sit on the poll/control lane (internally synchronized, safe from any
+    // thread except concurrently with ls_close — the app stops polling before
+    // close), so they need no window-lane lock, exactly like the jump bridge.
+    // The request struct + its value/scope buffers are borrowed only for the
+    // duration of ls_search_start (the core copies what it keeps), so the
+    // withUnsafeBufferPointer scopes cover the whole call.
 
     public func startSearch(_ request: SearchRequest) -> Bool {
-        _ = request
-        return false // NOT IMPLEMENTED (find-seek seed)
+        switch request {
+        case let .text(query, scope):
+            let value = Array(query.utf8)
+            return value.withUnsafeBufferPointer { valueBuffer in
+                func run(scopePtr: UnsafePointer<UInt32>?, scopeLen: Int) -> Bool {
+                    var req = ls_search_request(
+                        kind: LS_SEARCH_TEXT,
+                        op: LS_SEARCH_OP_EQ,          // ignored for TEXT
+                        column: 0,                    // ignored for TEXT
+                        value_ptr: valueBuffer.baseAddress,
+                        value_len: valueBuffer.count,
+                        scope_ptr: scopePtr,
+                        scope_len: scopeLen
+                    )
+                    // The local binding is for readability only — NOT
+                    // load-bearing (a direct `return ls_search_start(...)` is
+                    // equivalent). An earlier integration "rejection" here was a
+                    // STALE LINK, not a marshaling bug: SwiftPM does not track
+                    // liblesssheet.a as a build input (it is linked via -L /
+                    // linkedLibrary in Package.swift), so the test binary stayed
+                    // linked against the seed archive until a source edit forced
+                    // a relink against the rebuilt core.
+                    let started = ls_search_start(doc, &req)
+                    return started
+                }
+                if let scope {
+                    // nil scope means ALL columns; a concrete scope is fixed for
+                    // the search's lifetime (visibility changes re-scope next run).
+                    // A scope index outside UInt32 can never be a valid column —
+                    // reject gracefully rather than trap on the conversion.
+                    var columns = [UInt32]()
+                    columns.reserveCapacity(scope.count)
+                    for index in scope {
+                        guard let column = UInt32(exactly: index) else { return false }
+                        columns.append(column)
+                    }
+                    return columns.withUnsafeBufferPointer { run(scopePtr: $0.baseAddress, scopeLen: $0.count) }
+                }
+                return run(scopePtr: nil, scopeLen: 0)
+            }
+        case let .predicate(column, op, value):
+            // A column outside UInt32 can never be in-range — reject gracefully
+            // rather than trap converting it (the core rejects out-of-range too).
+            guard let abiColumn = UInt32(exactly: column) else { return false }
+            let value = Array(value.utf8)
+            return value.withUnsafeBufferPointer { valueBuffer in
+                var req = ls_search_request(
+                    kind: LS_SEARCH_PREDICATE,
+                    op: Self.abiOp(op),
+                    column: abiColumn,
+                    value_ptr: valueBuffer.baseAddress,
+                    value_len: valueBuffer.count,
+                    scope_ptr: nil,                   // ignored for PREDICATE
+                    scope_len: 0
+                )
+                // Local binding for readability only (see the TEXT case).
+                let started = ls_search_start(doc, &req)
+                return started
+            }
+        }
     }
 
     public func navigateSearch(_ nav: SearchNav) {
-        _ = nav // NOT IMPLEMENTED (find-seek seed)
+        ls_search_nav(doc, nav.anchor, Self.abiDir(nav.direction))
     }
 
     public func cancelSearch() {
-        // NOT IMPLEMENTED (find-seek seed)
+        ls_search_cancel(doc)
     }
 
     public func searchStatus() -> SearchSnapshot? {
-        nil // NOT IMPLEMENTED (find-seek seed)
+        let s = ls_search_poll(doc)
+        let phase: SearchScanPhase
+        switch s.state.rawValue {
+        case ls_search_state.RawValue(LS_SEARCH_SCANNING.rawValue):
+            phase = .scanning(progress: s.progress)
+        case ls_search_state.RawValue(LS_SEARCH_DONE.rawValue):
+            phase = .done
+        case ls_search_state.RawValue(LS_SEARCH_CANCELLED.rawValue):
+            phase = .cancelled(progress: s.progress)
+        default:
+            // LS_SEARCH_IDLE (no search started on this handle) -> nil snapshot;
+            // a fresh session, including a dialect re-open, reports this.
+            return nil
+        }
+        let nav: SearchNavStatus
+        switch s.nav.rawValue {
+        case ls_search_nav_state.RawValue(LS_SEARCH_NAV_SEARCHING.rawValue):
+            nav = .searching
+        case ls_search_nav_state.RawValue(LS_SEARCH_NAV_FOUND.rawValue):
+            nav = .found(SearchMatch(row: s.found_row, column: Int(s.found_col)), position: s.position)
+        case ls_search_nav_state.RawValue(LS_SEARCH_NAV_EXHAUSTED.rawValue):
+            nav = .exhausted
+        default:
+            nav = .none   // LS_SEARCH_NAV_NONE
+        }
+        return SearchSnapshot(phase: phase, nav: nav, total: s.total, totalIsFinal: s.total_exact)
     }
 
     public func close() {
@@ -181,6 +266,25 @@ public final class CoreDocumentSession: DocumentSession, @unchecked Sendable {
         case .sniff: Int32(LS_SNIFF)
         case .on: Int32(LS_HEADER_ON)
         case .off: Int32(LS_HEADER_OFF)
+        }
+    }
+
+    /// The predicate operator as its ABI enum (raw values pinned in the header).
+    private static func abiOp(_ op: SearchOperator) -> ls_search_op {
+        switch op {
+        case .equals: LS_SEARCH_OP_EQ
+        case .notEquals: LS_SEARCH_OP_NE
+        case .lessThan: LS_SEARCH_OP_LT
+        case .greaterThan: LS_SEARCH_OP_GT
+        case .lessOrEqual: LS_SEARCH_OP_LE
+        case .greaterOrEqual: LS_SEARCH_OP_GE
+        }
+    }
+
+    private static func abiDir(_ dir: SearchDirection) -> ls_search_dir {
+        switch dir {
+        case .forward: LS_SEARCH_FORWARD
+        case .backward: LS_SEARCH_BACKWARD
         }
     }
 

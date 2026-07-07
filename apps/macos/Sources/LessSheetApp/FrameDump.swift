@@ -69,6 +69,20 @@ enum FrameDump {
             // ImageRenderer cannot snapshot; render a plain-view mirror of the
             // same state for headless verification.
             render(DumpSettings(model: model), size: settingsSize, to: path)
+        case "find", "findtext":
+            render(findScene(model, findSession: FindScenes.textState, fieldActive: true), size: gridSize, to: path)
+        case "findwhere":
+            render(findScene(model, findSession: FindScenes.whereState, fieldActive: true), size: gridSize, to: path)
+        case "findcounts":
+            render(findScene(model, findSession: FindScenes.countsState, fieldActive: true), size: gridSize, to: path)
+        case "findnomatches":
+            render(findScene(model, findSession: FindScenes.noMatchesState, fieldActive: true), size: gridSize, to: path)
+        case "findwrapped":
+            render(findScene(model, findSession: FindScenes.wrappedState, fieldActive: true), size: gridSize, to: path)
+        case "highlights":
+            // Grid with subtle + strong highlights, popup closed so they read
+            // clearly (the Find button carries its active accent ring).
+            render(findScene(model, findSession: FindScenes.highlightsState, fieldActive: false), size: gridSize, to: path)
         default:
             render(DumpGrid(model: model), size: gridSize, to: path)
         }
@@ -163,6 +177,37 @@ enum FrameDump {
         .environment(\.overlayDumpChrome, true)
     }
 
+    /// A find scene (ARCH req. 9): the grid (with the search's viewport
+    /// highlights) plus the overlay's find popup in a chosen state, rendered
+    /// with the opaque dump chrome. The synthetic `findSession` drives both the
+    /// popup copy and the grid highlights (via the snapshot's CellMatcher).
+    @MainActor
+    private static func findScene(_ model: DocumentModel, findSession: FindSession, fieldActive: Bool) -> some View {
+        let snapshot = DocumentModel.dumpSnapshot(
+            from: model, revealed: true, expandedPill: nil, jumpFlow: .idle,
+            findSession: findSession, findFieldActive: fieldActive
+        )
+        return ZStack(alignment: .bottomTrailing) {
+            DumpGrid(model: snapshot)          // highlights read from snapshot.findSession
+            OverlayView(model: snapshot)
+        }
+        .environment(\.overlayDumpChrome, true)
+    }
+
+    /// The find verification hook's terminal dump: the LIVE model already holds
+    /// the resolved search (popup open, results + highlights), rendered with the
+    /// opaque dump chrome.
+    @MainActor
+    static func dumpFindResult(for model: DocumentModel) {
+        guard let path = dumpPath else { return }
+        let scene = ZStack(alignment: .bottomTrailing) {
+            DumpGrid(model: model)
+            OverlayView(model: model)
+        }
+        .environment(\.overlayDumpChrome, true)
+        render(scene, size: gridSize, to: path)
+    }
+
     /// The scrolled-to-end state (req. 8): the last data rows anchored so the
     /// final row sits above the floating controls, with the end-of-file
     /// overscroll strip of empty grid below it — proving the last row stays
@@ -248,7 +293,8 @@ struct DumpGrid: View {
                 SheetRow(
                     rowNumber: firstRow + i + 1, rowNumberWidth: gutterWidth, stickyRowNumber: false,
                     cells: model.visibleBodyCells(forRow: firstRow + i),
-                    widths: widths, fillerColumns: fillerCols, isHeader: false
+                    widths: widths, fillerColumns: fillerCols, isHeader: false,
+                    highlights: model.cellHighlights(forRow: firstRow + i)
                 )
             }
             ForEach(0..<fillerRows, id: \.self) { _ in
@@ -303,7 +349,8 @@ struct DumpEndGrid: View {
                 SheetRow(
                     rowNumber: firstRow + i + 1, rowNumberWidth: gutterWidth, stickyRowNumber: false,
                     cells: model.visibleBodyCells(forRow: firstRow + i),
-                    widths: widths, fillerColumns: fillerCols, isHeader: false
+                    widths: widths, fillerColumns: fillerCols, isHeader: false,
+                    highlights: model.cellHighlights(forRow: firstRow + i)
                 )
             }
             ForEach(0..<GridMetrics.overscrollRows, id: \.self) { _ in
@@ -406,4 +453,72 @@ struct DumpSettings: View {
             Text(value).foregroundStyle(.secondary)
         }
     }
+}
+
+/// Synthetic find sessions for the headless find dumps, keyed to the find.csv
+/// fixture (header name,qty,note; data rows 0..7 — "needle" folds to rows
+/// 0,1,2,3,6,7). Presentation-only fixtures: the counts state uses illustrative
+/// numbers to exhibit the growing "Match n of m…" + "Scanning… %" copy.
+enum FindScenes {
+    private static func draft(
+        mode: FindMode, text: String = "", column: Int = 0,
+        op: SearchOperator = .equals, value: String = ""
+    ) -> FindDraft {
+        FindDraft(mode: mode, text: text, column: column, op: op, value: value)
+    }
+
+    private static let empty = FindDisplay(
+        request: nil, current: nil, position: nil,
+        total: 0, totalIsFinal: false, progress: nil, notice: nil
+    )
+
+    /// Text popup, nothing run yet.
+    static let textState = FindSession(draft: draft(mode: .text, text: "needle"), display: empty)
+
+    /// Where popup, nothing run yet (qty ≤ 2).
+    static let whereState = FindSession(
+        draft: draft(mode: .predicate, column: 1, op: .lessOrEqual, value: "2"),
+        display: empty
+    )
+
+    /// Growing count while scanning ("Match 3 of 47…" + "Scanning… 34%"), strong
+    /// highlight on the current match + subtle on the rest.
+    static let countsState = FindSession(
+        draft: draft(mode: .text, text: "needle"),
+        display: FindDisplay(
+            request: .text(query: "needle", scope: nil),
+            current: SearchMatch(row: 2, column: 0),
+            position: 3, total: 47, totalIsFinal: false, progress: 0.34, notice: nil
+        )
+    )
+
+    /// No matches anywhere.
+    static let noMatchesState = FindSession(
+        draft: draft(mode: .text, text: "zzz"),
+        display: FindDisplay(
+            request: .text(query: "zzz", scope: nil),
+            current: nil, position: nil, total: 0, totalIsFinal: true, progress: nil, notice: .noMatches
+        )
+    )
+
+    /// Wrapped-to-start notice (Next past the last match).
+    static let wrappedState = FindSession(
+        draft: draft(mode: .text, text: "needle"),
+        display: FindDisplay(
+            request: .text(query: "needle", scope: nil),
+            current: SearchMatch(row: 0, column: 2),
+            position: 1, total: 6, totalIsFinal: true, progress: nil, notice: .wrappedToStart
+        )
+    )
+
+    /// Highlights only (popup closed): subtle on every "needle" cell, strong on
+    /// the current match (row 0, col 2 — "alpha needle").
+    static let highlightsState = FindSession(
+        draft: draft(mode: .text, text: "needle"),
+        display: FindDisplay(
+            request: .text(query: "needle", scope: nil),
+            current: SearchMatch(row: 0, column: 2),
+            position: 1, total: 6, totalIsFinal: true, progress: nil, notice: nil
+        )
+    )
 }

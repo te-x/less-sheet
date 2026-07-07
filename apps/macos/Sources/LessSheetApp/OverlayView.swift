@@ -51,9 +51,10 @@ enum OverlayMetrics {
 
 // The floating overlay — the one signature element over a data-first window.
 // A single horizontal Liquid Glass row in the BOTTOM-RIGHT (req. 3), left→right:
-// [Jump] [Header] [Separator] [Quote] [Settings]. Jump, Separator and Quote open
-// small popups that expand UPWARD from their button; Header toggles immediately;
-// Settings opens the Settings window. Revealed on pointer movement or keyboard
+// [Find] [Jump] [Header] [Separator] [Quote] [Settings]. Find, Jump, Separator
+// and Quote open small popups that expand UPWARD from their button; Header
+// toggles immediately; Settings opens the Settings window. Revealed on pointer
+// movement or keyboard
 // focus, faded after ~2 s idle (the window title + traffic lights ride the same
 // reveal). A click-away scrim dismisses any open popup. 8pt rhythm; one
 // orchestrated reveal (fade + slight rise); Reduce Motion honored; every control
@@ -76,6 +77,7 @@ struct OverlayView: View {
 
             GlassEffectContainer(spacing: 8) {
                 HStack(alignment: .bottom, spacing: 8) {
+                    FindControlView(model: model)
                     JumpControlView(model: model)
                     HeaderButton(model: model)
                     DialectPopupButton(kind: .separator, model: model)

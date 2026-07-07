@@ -4,6 +4,11 @@ LANG_NAME="Swift (SwiftPM)"
 FROZEN_PATHS=( "Sources/Contracts" "Tests" "Package.swift" )
 # The Kit links the Zig core statically (backend/zig-out/lib/liblesssheet.a),
 # so conformance builds the backend artifact first.
-CONFORMANCE_CMD='(cd ../../backend && zig build) && swift build'
+# STALE-LINK GUARD (find-seek round 2 lesson): SwiftPM does NOT track the .a as a
+# build input (linked via -L/linkedLibrary), so after rebuilding the backend we
+# delete the link products — otherwise the gate can certify binaries still linked
+# against an OLD core (proven both directions by experiment, REVIEW-6-frontend).
+# Object caches survive; only the final links are redone (seconds).
+CONFORMANCE_CMD='(cd ../../backend && zig build) && rm -rf .build/*/debug/LessSheet .build/*/debug/*.xctest .build/*/release/LessSheet .build/*/release/*.xctest && swift build'
 BEHAVIOR_CMD="swift test"
 CONTRACT_HOWTO="Data types: struct/enum (Codable where crossing the wire). Signatures: protocol in Sources/Contracts; implementations declare conformance so swiftc enforces the signature, and a frozen test pins it via 'let _: any Foo = FooImpl()'. Tests: XCTest/swift-testing under Tests/. Implementations in Sources/<Target>; keep SwiftUI views thin over the protocol layer. UI-app schemes may need 'xcodebuild -scheme <App> build/test' instead of swift build/test — adjust the commands."

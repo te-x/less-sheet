@@ -100,7 +100,8 @@ struct GridView: View {
                             cells: model.visibleBodyCells(forRow: row),
                             widths: widths,
                             fillerColumns: fillerColumns,
-                            isHeader: false
+                            isHeader: false,
+                            highlights: model.cellHighlights(forRow: row)
                         )
                         .frameLog("row1", if: row == 0)  // live overlap diagnosis (item 1)
                     }
@@ -216,6 +217,10 @@ struct SheetRow: View {
     let widths: [CGFloat]
     let fillerColumns: Int
     let isHeader: Bool
+    /// Find-highlight state per visible column (render order). Empty = none;
+    /// header / filler rows never pass highlights (header cells are never
+    /// matched).
+    var highlights: [SheetCellHighlight] = []
     @Environment(\.overlayDumpChrome) private var dumpChrome
 
     var body: some View {
@@ -226,6 +231,8 @@ struct SheetRow: View {
                 cellText(index < cells.count ? cells[index] : "")
                     .padding(.horizontal, GridMetrics.cellHPadding)
                     .frame(width: width, height: GridMetrics.rowHeight, alignment: .leading)
+                    .background { highlightFill(at: index) }
+                    .overlay { highlightBorder(at: index) }
                     .overlay(alignment: .trailing) { hairline.frame(width: 1) }
             }
             if fillerColumns > 0 {
@@ -274,6 +281,41 @@ struct SheetRow: View {
     }
 
     private var hairline: some View { Rectangle().fill(Color(nsColor: .gridColor)) }
+
+    private func highlight(at index: Int) -> SheetCellHighlight {
+        index < highlights.count ? highlights[index] : .none
+    }
+
+    /// Find highlight fill (semantic accent, legible in light/dark and over the
+    /// glass band): a subtle wash on every matching visible cell, a stronger one
+    /// on the current match.
+    @ViewBuilder
+    private func highlightFill(at index: Int) -> some View {
+        switch highlight(at: index) {
+        case .none: Color.clear
+        case .subtle: Color.accentColor.opacity(0.20)
+        case .strong: Color.accentColor.opacity(0.42)
+        }
+    }
+
+    /// The current match gets a distinct accent border so it reads apart from
+    /// the other (subtle) matches.
+    @ViewBuilder
+    private func highlightBorder(at index: Int) -> some View {
+        if highlight(at: index) == .strong {
+            Rectangle().strokeBorder(Color.accentColor, lineWidth: 1.5)
+        }
+    }
+}
+
+/// Per-cell find-highlight state (semantic, adaptive colors). Header cells are
+/// never highlighted (they are never matched).
+enum SheetCellHighlight: Equatable {
+    case none
+    /// A matching cell currently in the viewport.
+    case subtle
+    /// The current match (the strong, focused highlight).
+    case strong
 }
 
 /// Pins a view to the leading edge of its enclosing ScrollView by counter-

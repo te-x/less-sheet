@@ -239,6 +239,14 @@ struct LessSheetApp: App {
                     Button("Jump to Row…") { DocumentModel.shared.requestJumpFocus() }
                         .keyboardShortcut("j", modifiers: .command)
                 }
+                CommandMenu("Find") {
+                    Button("Find…") { DocumentModel.shared.requestFindFocus() }
+                        .keyboardShortcut("f", modifiers: .command)
+                    Button("Find Next") { DocumentModel.shared.stepFind(.forward) }
+                        .keyboardShortcut("g", modifiers: .command)
+                    Button("Find Previous") { DocumentModel.shared.stepFind(.backward) }
+                        .keyboardShortcut("g", modifiers: [.command, .shift])
+                }
             }
     }
 }
@@ -305,6 +313,10 @@ struct ContentView: View {
                 // arrival dumps + terminates itself, so skip the first-frame
                 // dump/terminate (which would quit before the jump completes).
                 JumpProbe.run(model: model)
+            } else if FindProbe.active {
+                // Verification: drive the real find path AFTER first paint (it
+                // dumps + terminates itself once the search resolves).
+                FindProbe.run(model: model)
             } else {
                 FrameDump.dumpIfRequested(for: model)
                 FrameDump.terminateIfRequested()

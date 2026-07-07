@@ -119,6 +119,52 @@ const Document = struct {
     jump_progress: f64,
     jump_landed: u64,
 
+    // Search job + navigation slot (mutex-protected). All fields zero ==
+    // LS_SEARCH_IDLE. See api/lesssheet.h SEARCH for the full model.
+    search_state: api.SearchState,
+    search_nav: api.SearchNavState,
+    search_progress: f64,
+    search_found_row: u64,
+    search_found_col: u32,
+    search_position: u64,
+    search_total: u64,
+    search_total_exact: bool,
+    // Match-scan cursor: rows [0, search_rows) are counted (contiguous from 0);
+    // search_offset is the content offset of the next data row to evaluate.
+    search_offset: u64,
+    search_rows: u64,
+    search_to_eof: bool, // scan goal: full sweep to EOF (vs nav-limited resume)
+    // Generation: bumped by every ls_search_start so an in-flight worker chunk
+    // of a replaced search is discarded on commit (no stale counts / no UAF of
+    // the request buffers the worker snapshots lock-free).
+    search_gen: u64,
+    // Pending navigation (mutex-protected).
+    nav_pending: bool,
+    nav_anchor: u64,
+    nav_dir: api.SearchDir,
+    // Active request (owned; set by ls_search_start).
+    search_kind: api.SearchKind,
+    search_op: api.SearchOp,
+    search_column: u32,
+    search_value: []u8, // owned query / comparison bytes
+    search_value_dec: Decimal, // pre-parsed value (ordering predicates)
+    search_fold: bool, // TEXT smart-case: fold ASCII case (all-lowercase query)
+    scope_mask: []bool, // owned; empty == all columns (NULL scope); else len == column_count
+    // Per-index-block match counters (owned): block b == rows
+    // [b*checkpoint_interval, (b+1)*checkpoint_interval); O(checkpoints) always.
+    block_counts: std.ArrayList(u64),
+    // Worker match-scan scratch + request snapshot (worker-only; lock-free
+    // during a chunk). Refreshed under the lock when search_gen changes.
+    search_scratch: std.ArrayList(u8),
+    search_refs: std.ArrayList(CellRef),
+    w_value: std.ArrayList(u8),
+    w_mask: std.ArrayList(bool),
+    w_ctx: MatchCtx,
+    w_gen: u64,
+    // Nav-resolution scratch (only touched while holding the mutex).
+    nav_scratch: std.ArrayList(u8),
+    nav_refs: std.ArrayList(CellRef),
+
     // Worker control.
     worker: ?std.Thread,
     stop: bool,
@@ -244,6 +290,37 @@ pub fn openWithAllocator(gpa: std.mem.Allocator, path: [*:0]const u8, options: ?
         .jump_start_rows = 0,
         .jump_progress = 0.0,
         .jump_landed = 0,
+        .search_state = .idle,
+        .search_nav = .none,
+        .search_progress = 0.0,
+        .search_found_row = 0,
+        .search_found_col = 0,
+        .search_position = 0,
+        .search_total = 0,
+        .search_total_exact = false,
+        .search_offset = 0,
+        .search_rows = 0,
+        .search_to_eof = true,
+        .search_gen = 0,
+        .nav_pending = false,
+        .nav_anchor = 0,
+        .nav_dir = .forward,
+        .search_kind = .text,
+        .search_op = .eq,
+        .search_column = 0,
+        .search_value = &.{},
+        .search_value_dec = .{},
+        .search_fold = false,
+        .scope_mask = &.{},
+        .block_counts = .empty,
+        .search_scratch = .empty,
+        .search_refs = .empty,
+        .w_value = .empty,
+        .w_mask = .empty,
+        .w_ctx = .{},
+        .w_gen = 0,
+        .nav_scratch = .empty,
+        .nav_refs = .empty,
         .worker = null,
         .stop = false,
         .stop_atomic = .init(false),
@@ -372,6 +449,15 @@ fn freeDoc(doc: *Document) void {
     doc.checkpoints.deinit(doc.gpa);
     doc.win_buf.deinit(doc.gpa);
     doc.win_refs.deinit(doc.gpa);
+    doc.block_counts.deinit(doc.gpa);
+    doc.search_scratch.deinit(doc.gpa);
+    doc.search_refs.deinit(doc.gpa);
+    doc.w_value.deinit(doc.gpa);
+    doc.w_mask.deinit(doc.gpa);
+    doc.nav_scratch.deinit(doc.gpa);
+    doc.nav_refs.deinit(doc.gpa);
+    if (doc.search_value.len > 0) doc.gpa.free(doc.search_value);
+    if (doc.scope_mask.len > 0) doc.gpa.free(doc.scope_mask);
     if (doc.header_buf.len > 0) doc.gpa.free(doc.header_buf);
     if (doc.header_refs.len > 0) doc.gpa.free(doc.header_refs);
     if (doc.mapping) |m| posix.munmap(m);
@@ -401,17 +487,67 @@ fn workerMain(doc: *Document) void {
     doc.lock();
     while (true) {
         if (doc.stop) break;
-        const need = !doc.complete and (doc.auto or doc.jump_state == .scanning);
-        if (!need) {
+        // Slot priority: a scanning jump owns the frontier; else a scanning
+        // search (which runs even after the index is complete — it must re-lex
+        // behind the frontier to COUNT); else the AUTO background indexer.
+        const do_jump = doc.jump_state == .scanning and !doc.complete;
+        const do_search = !do_jump and doc.search_state == .scanning;
+        const do_index = !do_jump and !do_search and doc.auto and !doc.complete;
+        if (!(do_jump or do_search or do_index)) {
             doc.waitWork();
             continue;
         }
+
+        if (do_search) {
+            // Refresh the worker's request snapshot on a new search generation.
+            if (doc.search_gen != doc.w_gen) {
+                if (!refreshWorkerCtx(doc)) {
+                    // OOM snapshotting the request: fail the search cleanly
+                    // rather than scan against a truncated query. Lock still
+                    // held; the loop top re-selects a job.
+                    failSearchLocked(doc);
+                    continue;
+                }
+                doc.w_gen = doc.search_gen;
+            }
+            const gen = doc.search_gen;
+            const start_off = doc.search_offset;
+            const start_row = doc.search_rows;
+            doc.unlock();
+
+            // Lex + match a chunk of rows lock-free (worker snapshot only).
+            const res = searchScanChunk(doc, start_off, start_row);
+
+            doc.lock();
+            // Commit only if this is still the same, still-scanning search;
+            // otherwise discard (a replace bumped the gen, or a jump/cancel took
+            // the slot — counts freeze at the last committed chunk).
+            if (doc.search_gen == gen and doc.search_state == .scanning) {
+                commitSearch(doc, res);
+                resolveNavLocked(doc);
+                if (doc.search_state == .scanning and !doc.search_to_eof and !doc.nav_pending) {
+                    // A nav-limited resume served its navigation before EOF.
+                    doc.search_state = .cancelled;
+                }
+            }
+            const advanced = doc.frontier_offset;
+            doc.unlock();
+
+            if (doc.mapping != null and advanced > released + madvise_release_chunk and advanced > madvise_keepback) {
+                const rel_end = advanced - madvise_keepback;
+                madviseDontNeed(doc, released, rel_end);
+                released = rel_end;
+            }
+            doc.lock();
+            continue;
+        }
+
+        // Jump or plain-index chunk: advance the frontier only (unchanged from
+        // the viewer-ui worker; the sole frontier writer, so lock-free).
         const start_off = doc.frontier_offset;
         const start_row = doc.frontier_rows;
         doc.unlock();
 
-        // Scan up to the next checkpoint boundary without holding the lock
-        // (the worker is the only frontier writer, so this is race-free).
         const res = scanChunk(doc, start_off, start_row);
 
         doc.lock();
@@ -655,6 +791,18 @@ pub export fn ls_jump_start(doc: *api.Doc, target_row: u64) callconv(.c) void {
         d.jump_progress = 1.0;
         return;
     }
+    // Taking the scan slot cancels a search in LS_SEARCH_SCANNING (its counts,
+    // found results, and frontier gains are kept; a pending nav resolves to
+    // NONE). Instant jumps (handled above) never reach here, so they never
+    // disturb a running search.
+    if (d.search_state == .scanning) {
+        d.search_state = .cancelled;
+        if (d.search_nav == .searching) {
+            d.search_nav = .none;
+            d.nav_pending = false;
+        }
+    }
+
     // Asynchronous scan toward the target (retargets any running jump).
     d.jump_state = .scanning;
     d.jump_target = target_row;
@@ -980,44 +1128,699 @@ pub fn isNumeric(raw: []const u8) bool {
     return i == s.len;
 }
 
+// ===========================================================================
+// Search (find-seek slice) — matcher, EXACT numeric comparison, streaming
+// match-scan with O(checkpoints) per-block counts, navigation, and the shared
+// scan-slot state machine. See api/lesssheet.h SEARCH for the pinned model.
+// ===========================================================================
+
+const Order = std.math.Order;
+
 // ---------------------------------------------------------------------------
-// Search (find-seek slice) — SEED STUBS ONLY.
-// The contract is frozen in api/lesssheet.h + contracts/api.zig; these
-// placeholders keep conformance green (signatures match) while the behavior
-// suite is RED. They follow the terminal-poll-placeholder pattern: rejecting
-// start + an IDLE snapshot, so no frozen test can hang on a poll loop.
+// EXACT decimal comparison (mathematical value; never through f64).
+// A number parses under the SAME pinned grammar as isNumeric, then compares by
+// sign, then order-of-magnitude of the most-significant significant digit, then
+// digit sequence — so "2.0"=="2", "1e2"=="100", 39-digit ids and 2^53±1 order
+// correctly, and "1e400">"1e399". Exponents beyond i64 saturate (documented).
 // ---------------------------------------------------------------------------
 
-/// See api/lesssheet.h `ls_search_start`. NOT IMPLEMENTED (find-seek seed).
-pub export fn ls_search_start(doc: *api.Doc, request: *const api.SearchRequest) callconv(.c) bool {
-    _ = doc;
-    _ = request;
+const Decimal = struct {
+    valid: bool = false,
+    negative: bool = false,
+    zero: bool = false,
+    /// Integer digits (may carry leading zeros) and fraction digits, borrowed
+    /// from the parsed input; logically concatenated as the digit sequence.
+    int_part: []const u8 = &.{},
+    frac_part: []const u8 = &.{},
+    /// Index (into int_part ++ frac_part) of the most-significant NONZERO digit.
+    first: usize = 0,
+    /// Count of significant digits (leading + trailing zeros stripped).
+    sig_len: usize = 0,
+    /// Base-10 exponent of the most-significant significant digit.
+    msd_pos: i64 = 0,
+
+    fn digitAt(self: Decimal, k: usize) u8 {
+        return if (k < self.int_part.len) self.int_part[k] else self.frac_part[k - self.int_part.len];
+    }
+    fn sigDigit(self: Decimal, i: usize) u8 {
+        return self.digitAt(self.first + i);
+    }
+};
+
+/// Parse `raw` under the pinned numeric grammar into an exact Decimal. Invalid
+/// (non-numeric) input yields `.valid == false`. Allocation-free.
+fn parseDecimal(raw: []const u8) Decimal {
+    var lo: usize = 0;
+    var hi: usize = raw.len;
+    while (lo < hi and isAsciiWs(raw[lo])) lo += 1;
+    while (hi > lo and isAsciiWs(raw[hi - 1])) hi -= 1;
+    const s = raw[lo..hi];
+    if (s.len == 0) return .{};
+
+    var i: usize = 0;
+    var negative = false;
+    if (s[0] == '+') {
+        i = 1;
+    } else if (s[0] == '-') {
+        negative = true;
+        i = 1;
+    }
+
+    const int_start = i;
+    while (i < s.len and isDigit(s[i])) i += 1;
+    const int_part = s[int_start..i];
+
+    var frac_part: []const u8 = s[0..0];
+    var has_sig = int_part.len > 0;
+    if (i < s.len and s[i] == '.') {
+        i += 1;
+        const frac_start = i;
+        while (i < s.len and isDigit(s[i])) i += 1;
+        frac_part = s[frac_start..i];
+        if (int_part.len == 0 and frac_part.len == 0) return .{}; // lone '.'
+        if (frac_part.len > 0) has_sig = true;
+    } else if (int_part.len == 0) {
+        return .{}; // needs the 'digits' form when there is no dot
+    }
+    if (!has_sig) return .{};
+
+    var exp: i64 = 0;
+    if (i < s.len and (s[i] == 'e' or s[i] == 'E')) {
+        i += 1;
+        var esign = false;
+        if (i < s.len and (s[i] == '+' or s[i] == '-')) {
+            esign = s[i] == '-';
+            i += 1;
+        }
+        const edig_start = i;
+        var e_acc: i64 = 0;
+        var saturated = false;
+        while (i < s.len and isDigit(s[i])) : (i += 1) {
+            if (!saturated) {
+                e_acc = (e_acc *| 10) +| @as(i64, s[i] - '0');
+                if (e_acc == std.math.maxInt(i64)) saturated = true;
+            }
+        }
+        if (i == edig_start) return .{}; // dangling exponent
+        exp = if (esign) -e_acc else e_acc;
+    }
+    if (i != s.len) return .{}; // trailing junk
+
+    // First & last significant (nonzero) digits across int_part ++ frac_part.
+    const total = int_part.len + frac_part.len;
+    var f: usize = 0;
+    var found_first = false;
+    var l: usize = 0;
+    var k: usize = 0;
+    while (k < total) : (k += 1) {
+        const d = if (k < int_part.len) int_part[k] else frac_part[k - int_part.len];
+        if (d != '0') {
+            if (!found_first) {
+                f = k;
+                found_first = true;
+            }
+            l = k;
+        }
+    }
+    if (!found_first) {
+        return .{ .valid = true, .negative = negative, .zero = true, .int_part = int_part, .frac_part = frac_part };
+    }
+    const msd_pos = exp +| @as(i64, @intCast(int_part.len)) -| 1 -| @as(i64, @intCast(f));
+    return .{
+        .valid = true,
+        .negative = negative,
+        .zero = false,
+        .int_part = int_part,
+        .frac_part = frac_part,
+        .first = f,
+        .sig_len = l - f + 1,
+        .msd_pos = msd_pos,
+    };
+}
+
+fn compareMagnitude(a: Decimal, b: Decimal) Order {
+    if (a.msd_pos != b.msd_pos) return if (a.msd_pos > b.msd_pos) .gt else .lt;
+    var i: usize = 0;
+    while (i < a.sig_len and i < b.sig_len) : (i += 1) {
+        const da = a.sigDigit(i);
+        const db = b.sigDigit(i);
+        if (da != db) return if (da > db) .gt else .lt;
+    }
+    if (a.sig_len == b.sig_len) return .eq;
+    return if (a.sig_len > b.sig_len) .gt else .lt;
+}
+
+/// Total order on two VALID Decimals by mathematical value.
+fn compareDecimal(a: Decimal, b: Decimal) Order {
+    if (a.zero and b.zero) return .eq;
+    if (a.zero) return if (b.negative) .gt else .lt;
+    if (b.zero) return if (a.negative) .lt else .gt;
+    if (a.negative != b.negative) return if (a.negative) .lt else .gt;
+    const mag = compareMagnitude(a, b);
+    return if (a.negative) mag.invert() else mag;
+}
+
+// ---------------------------------------------------------------------------
+// The matcher (allocation-free per row; runs inside the scan loop).
+// ---------------------------------------------------------------------------
+
+/// A resolved request, evaluated against a decoded record. Built from the
+/// document under the lock (nav) or from the worker's lock-free snapshot (scan).
+const MatchCtx = struct {
+    kind: api.SearchKind = .text,
+    op: api.SearchOp = .eq,
+    column: u32 = 0,
+    fold: bool = false, // TEXT: fold ASCII case (all-lowercase query)
+    value: []const u8 = &.{},
+    value_dec: Decimal = .{}, // pre-parsed value (ordering predicates)
+    scope_mask: []const bool = &.{}, // empty == all columns; else len == column_count
+    column_count: u32 = 0,
+};
+
+const Match = struct { row: u64, col: u32 };
+
+fn asciiLower(b: u8) u8 {
+    return if (b >= 'A' and b <= 'Z') b + 32 else b;
+}
+
+/// True iff the query has NO ASCII uppercase byte (then smart-case folds ASCII).
+fn queryFolds(q: []const u8) bool {
+    for (q) |b| if (b >= 'A' and b <= 'Z') return false;
+    return true;
+}
+
+/// Substring match with smart case: fold ASCII case iff `fold`, else byte-exact.
+/// Bytes >= 0x80 (all non-ASCII) always compare exactly.
+fn textMatch(cell: []const u8, query: []const u8, fold: bool) bool {
+    if (query.len == 0) return true;
+    if (query.len > cell.len) return false;
+    const last = cell.len - query.len;
+    var start: usize = 0;
+    while (start <= last) : (start += 1) {
+        var k: usize = 0;
+        while (k < query.len) : (k += 1) {
+            const a = cell[start + k];
+            const b = query[k];
+            const eq = if (fold) asciiLower(a) == asciiLower(b) else a == b;
+            if (!eq) break;
+        }
+        if (k == query.len) return true;
+    }
     return false;
 }
 
-/// See api/lesssheet.h `ls_search_nav`. NOT IMPLEMENTED (find-seek seed).
-pub export fn ls_search_nav(doc: *api.Doc, anchor_row: u64, dir: api.SearchDir) callconv(.c) void {
-    _ = doc;
-    _ = anchor_row;
-    _ = dir;
+/// Evaluate the matcher on a decoded record. Returns the matched column (lowest
+/// in-scope for TEXT; the predicate column for PREDICATE) or null. `refs` has
+/// exactly `column_count` entries (truncate/pad already applied, == ls_cell).
+fn matchRecord(ctx: MatchCtx, buf: []const u8, refs: []const CellRef) ?u32 {
+    switch (ctx.kind) {
+        .text => {
+            var col: u32 = 0;
+            while (col < ctx.column_count) : (col += 1) {
+                if (col >= refs.len) break;
+                if (ctx.scope_mask.len != 0 and !ctx.scope_mask[col]) continue;
+                const ref = refs[col];
+                if (textMatch(buf[ref.start .. ref.start + ref.len], ctx.value, ctx.fold)) return col;
+            }
+            return null;
+        },
+        .predicate => {
+            if (ctx.column >= refs.len) return null;
+            const ref = refs[ctx.column];
+            const cell = buf[ref.start .. ref.start + ref.len];
+            const matched = switch (ctx.op) {
+                .eq => std.mem.eql(u8, cell, ctx.value),
+                .ne => !std.mem.eql(u8, cell, ctx.value),
+                .lt, .gt, .le, .ge => blk: {
+                    const cd = parseDecimal(cell);
+                    if (!cd.valid) break :blk false; // non-numeric cell never matches ordering
+                    const ord = compareDecimal(cd, ctx.value_dec);
+                    break :blk switch (ctx.op) {
+                        .lt => ord == .lt,
+                        .gt => ord == .gt,
+                        .le => ord != .gt,
+                        .ge => ord != .lt,
+                        else => unreachable,
+                    };
+                },
+            };
+            return if (matched) ctx.column else null;
+        },
+    }
 }
 
-/// See api/lesssheet.h `ls_search_cancel`. NOT IMPLEMENTED (find-seek seed).
-pub export fn ls_search_cancel(doc: *api.Doc) callconv(.c) void {
-    _ = doc;
-}
+// ---------------------------------------------------------------------------
+// The streaming match-scan (worker; lock-free chunk, mutex-batched commit).
+// ---------------------------------------------------------------------------
 
-/// See api/lesssheet.h `ls_search_poll`. NOT IMPLEMENTED (find-seek seed).
-pub export fn ls_search_poll(doc: *const api.Doc) callconv(.c) api.SearchStatus {
-    _ = doc;
+const SearchChunk = struct {
+    end_offset: u64,
+    end_row: u64,
+    eof: bool,
+    checkpoint: ?Checkpoint,
+    matches: u64,
+};
+
+/// Build the matcher context from the document (caller holds the mutex).
+fn docCtx(doc: *Document) MatchCtx {
     return .{
-        .state = .idle,
-        .nav = .none,
-        .progress = 0.0,
-        .found_row = 0,
-        .found_col = 0,
-        .position = 0,
-        .total = 0,
-        .total_exact = false,
+        .kind = doc.search_kind,
+        .op = doc.search_op,
+        .column = doc.search_column,
+        .fold = doc.search_fold,
+        .value = doc.search_value,
+        .value_dec = doc.search_value_dec,
+        .scope_mask = doc.scope_mask,
+        .column_count = doc.column_count,
+    };
+}
+
+/// Snapshot the active request into worker-owned buffers (caller holds the
+/// mutex). The worker matches lock-free against this snapshot, so ls_search_start
+/// can replace/free the document's request buffers without a use-after-free.
+/// Returns false on OOM — a TRUNCATED query/scope copy must never be matched
+/// against (an empty query would match every cell); the caller fails the search.
+fn refreshWorkerCtx(doc: *Document) bool {
+    doc.w_value.clearRetainingCapacity();
+    doc.w_value.appendSlice(doc.gpa, doc.search_value) catch return false;
+    doc.w_mask.clearRetainingCapacity();
+    doc.w_mask.appendSlice(doc.gpa, doc.scope_mask) catch return false;
+    doc.w_ctx = .{
+        .kind = doc.search_kind,
+        .op = doc.search_op,
+        .column = doc.search_column,
+        .fold = doc.search_fold,
+        .value = doc.w_value.items,
+        .value_dec = parseDecimal(doc.w_value.items),
+        .scope_mask = doc.w_mask.items,
+        .column_count = doc.column_count,
+    };
+    return true;
+}
+
+fn searchProgress(doc: *Document, off: u64) f64 {
+    if (doc.content_len <= doc.data_start) return 1.0;
+    const span = doc.content_len - doc.data_start;
+    const covered = off - doc.data_start;
+    const p = @as(f64, @floatFromInt(covered)) / @as(f64, @floatFromInt(span));
+    return if (p > 1.0) 1.0 else p;
+}
+
+/// Lex + match one block of data rows (up to the next checkpoint boundary, EOF,
+/// or a stop request) from `start_off`/`start_row`, counting matches. Reads only
+/// immutable mmap bytes + the worker snapshot; reuses the scan scratch per row.
+fn searchScanChunk(doc: *Document, start_off: u64, start_row: u64) SearchChunk {
+    const content = doc.content;
+    var i: usize = @intCast(start_off);
+    var row = start_row;
+    var matches: u64 = 0;
+    const target = ((start_row / checkpoint_interval) + 1) * checkpoint_interval;
+    while (row < target) {
+        if (doc.stop_atomic.load(.monotonic)) return .{ .end_offset = i, .end_row = row, .eof = false, .checkpoint = null, .matches = matches };
+        if (i >= content.len) return .{ .end_offset = i, .end_row = row, .eof = true, .checkpoint = null, .matches = matches };
+        doc.search_scratch.clearRetainingCapacity();
+        doc.search_refs.clearRetainingCapacity();
+        const next = lexInto(content, i, doc.sep, doc.quote, doc.column_count, &doc.search_scratch, &doc.search_refs, doc.gpa) catch {
+            // Decode allocation failure: count no match and advance the boundary.
+            const nb = recordBounds(content, i, doc.sep, doc.quote, content.len);
+            i = nb.next;
+            row += 1;
+            if (nb.next >= content.len) return .{ .end_offset = i, .end_row = row, .eof = true, .checkpoint = null, .matches = matches };
+            continue;
+        };
+        if (matchRecord(doc.w_ctx, doc.search_scratch.items, doc.search_refs.items) != null) matches += 1;
+        i = next;
+        row += 1;
+        if (next >= content.len) return .{ .end_offset = i, .end_row = row, .eof = true, .checkpoint = null, .matches = matches };
+    }
+    return .{ .end_offset = i, .end_row = row, .eof = false, .checkpoint = .{ .row = row, .offset = i }, .matches = matches };
+}
+
+/// Terminate the active search cleanly at its last consistent state (caller
+/// holds the mutex): CANCELLED with counts/found/progress frozen and any
+/// pending navigation resolved to NONE. Used both by ls_search_cancel and as
+/// the fail-safe when a search allocation OOMs (a silently degraded search
+/// would corrupt block<->count alignment or match against a truncated query).
+fn failSearchLocked(doc: *Document) void {
+    doc.search_state = .cancelled;
+    if (doc.search_nav == .searching) {
+        doc.search_nav = .none;
+        doc.nav_pending = false;
+    }
+}
+
+/// Fold a completed match-scan chunk into the counted region (caller holds the
+/// mutex). One block per chunk (block b == block_counts.items[b]); advances the
+/// shared frontier where the scan broke new ground beyond it.
+fn commitSearch(doc: *Document, res: SearchChunk) void {
+    const advancing = res.end_offset > doc.frontier_offset;
+    const need_cp = advancing and res.checkpoint != null;
+    // Reserve counter (and any new nav checkpoint) storage BEFORE mutating the
+    // cursor: OOM here fails the search cleanly rather than dropping a block
+    // count (which would misalign block<->count and corrupt nav positions) or a
+    // checkpoint (which would misdirect a later nav re-lex). Nothing is mutated
+    // on failure, so the counted region stays exact at its last committed row.
+    doc.block_counts.ensureUnusedCapacity(doc.gpa, 1) catch {
+        failSearchLocked(doc);
+        return;
+    };
+    if (need_cp) doc.checkpoints.ensureUnusedCapacity(doc.gpa, 1) catch {
+        failSearchLocked(doc);
+        return;
+    };
+
+    doc.block_counts.appendAssumeCapacity(res.matches);
+    doc.search_rows = res.end_row;
+    doc.search_offset = res.end_offset;
+    doc.search_total +%= res.matches;
+    if (advancing) {
+        doc.frontier_offset = res.end_offset;
+        doc.frontier_rows = res.end_row;
+        if (res.checkpoint) |cp| doc.checkpoints.appendAssumeCapacity(cp);
+    }
+    if (res.eof) {
+        doc.complete = true;
+        doc.total_rows = doc.search_rows;
+        doc.search_state = .done;
+        doc.search_total_exact = true;
+        doc.search_progress = 1.0;
+        doc.search_to_eof = true;
+    } else {
+        doc.search_progress = searchProgress(doc, res.end_offset);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Navigation resolution over the counted region (caller holds the mutex).
+// Uses per-block counts to skip empty blocks, then re-lexes the target block(s)
+// via the nav scratch — O(one block re-lex), never O(file).
+// ---------------------------------------------------------------------------
+
+/// Re-lex block `b` and evaluate rows [lo, hi); return the first (FORWARD) or
+/// last (BACKWARD) matching row+col, or null. Caller holds the mutex.
+fn relexBlock(doc: *Document, b: u64, lo: u64, hi: u64, dir: api.SearchDir) ?Match {
+    if (b >= doc.checkpoints.items.len) return null;
+    const cp = doc.checkpoints.items[@intCast(b)];
+    const ctx = docCtx(doc);
+    var off: usize = @intCast(cp.offset);
+    var row = cp.row;
+    while (row < lo and off < doc.content.len) : (row += 1) {
+        off = recordBounds(doc.content, off, doc.sep, doc.quote, doc.content.len).next;
+    }
+    var result: ?Match = null;
+    while (row < hi and off < doc.content.len) : (row += 1) {
+        doc.nav_scratch.clearRetainingCapacity();
+        doc.nav_refs.clearRetainingCapacity();
+        const next = lexInto(doc.content, off, doc.sep, doc.quote, doc.column_count, &doc.nav_scratch, &doc.nav_refs, doc.gpa) catch break;
+        if (matchRecord(ctx, doc.nav_scratch.items, doc.nav_refs.items)) |col| {
+            result = .{ .row = row, .col = col };
+            if (dir == .forward) return result;
+        }
+        off = next;
+    }
+    return result;
+}
+
+/// First matching row in [anchor, hi) within the counted region, or null.
+fn findForwardMatch(doc: *Document, anchor: u64, hi: u64) ?Match {
+    const nblocks = doc.block_counts.items.len;
+    var b: u64 = anchor / checkpoint_interval;
+    while (b < nblocks) : (b += 1) {
+        const block_start = b * checkpoint_interval;
+        if (block_start >= hi) break;
+        if (doc.block_counts.items[@intCast(b)] == 0) continue; // skip empty block
+        const lo = @max(anchor, block_start);
+        const block_hi = @min(block_start + checkpoint_interval, hi);
+        if (relexBlock(doc, b, lo, block_hi, .forward)) |m| return m;
+    }
+    return null;
+}
+
+/// Last matching row in [0, upper) within the counted region, or null.
+fn findBackwardMatch(doc: *Document, upper: u64) ?Match {
+    if (upper == 0) return null;
+    const nblocks = doc.block_counts.items.len;
+    if (nblocks == 0) return null;
+    var b: u64 = (upper - 1) / checkpoint_interval;
+    if (b >= nblocks) b = nblocks - 1;
+    while (true) {
+        const block_start = b * checkpoint_interval;
+        if (doc.block_counts.items[@intCast(b)] != 0) {
+            const block_hi = @min(block_start + checkpoint_interval, upper);
+            if (relexBlock(doc, b, block_start, block_hi, .backward)) |m| return m;
+        }
+        if (b == 0) break;
+        b -= 1;
+    }
+    return null;
+}
+
+/// Count matches in block `b` for rows [b*interval, row]. Caller holds the mutex.
+fn countInBlockUpTo(doc: *Document, b: u64, row: u64) u64 {
+    if (b >= doc.checkpoints.items.len) return 0;
+    const cp = doc.checkpoints.items[@intCast(b)];
+    const ctx = docCtx(doc);
+    var off: usize = @intCast(cp.offset);
+    var r = cp.row;
+    var count: u64 = 0;
+    while (r <= row and off < doc.content.len) : (r += 1) {
+        doc.nav_scratch.clearRetainingCapacity();
+        doc.nav_refs.clearRetainingCapacity();
+        const next = lexInto(doc.content, off, doc.sep, doc.quote, doc.column_count, &doc.nav_scratch, &doc.nav_refs, doc.gpa) catch break;
+        if (matchRecord(ctx, doc.nav_scratch.items, doc.nav_refs.items)) |_| count += 1;
+        off = next;
+    }
+    return count;
+}
+
+/// 1-based position of `row` among all matching rows in file order (exact,
+/// since [0, row] is fully counted): sum of prior block counts + in-block count.
+fn positionOf(doc: *Document, row: u64) u64 {
+    const b = row / checkpoint_interval;
+    var sum: u64 = 0;
+    var i: usize = 0;
+    while (i < b and i < doc.block_counts.items.len) : (i += 1) sum += doc.block_counts.items[i];
+    return sum + countInBlockUpTo(doc, b, row);
+}
+
+fn setFound(doc: *Document, m: Match) void {
+    doc.search_found_row = m.row;
+    doc.search_found_col = m.col;
+    doc.search_position = positionOf(doc, m.row);
+    doc.search_nav = .found;
+    doc.nav_pending = false;
+}
+
+fn setExhausted(doc: *Document) void {
+    doc.search_nav = .exhausted;
+    doc.nav_pending = false;
+}
+
+/// Resolve the pending navigation from the counted region if the answer is
+/// determined; otherwise leave it pending (the scan will serve it). Caller holds
+/// the mutex. FORWARD = first match at-or-after anchor; BACKWARD = last match
+/// strictly before anchor; EXHAUSTED is core-uniform (the frontend wraps).
+fn resolveNavLocked(doc: *Document) void {
+    if (!doc.nav_pending) return;
+    const anchor = doc.nav_anchor;
+    const counted = doc.search_rows;
+    const done = doc.search_state == .done;
+    if (doc.nav_dir == .forward) {
+        if (anchor < counted) {
+            if (findForwardMatch(doc, anchor, counted)) |m| {
+                setFound(doc, m);
+                return;
+            }
+        }
+        if (done) setExhausted(doc); // no match at-or-after anchor anywhere
+    } else {
+        // Answerable once [0, anchor) is fully counted (or the scan is DONE).
+        if (counted >= anchor or done) {
+            const upper = @min(anchor, counted);
+            if (findBackwardMatch(doc, upper)) |m| setFound(doc, m) else setExhausted(doc);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Search C ABI.
+// ---------------------------------------------------------------------------
+
+/// See api/lesssheet.h `ls_search_start`.
+pub export fn ls_search_start(doc: *api.Doc, request: *const api.SearchRequest) callconv(.c) bool {
+    const d: *Document = @ptrCast(@alignCast(doc));
+    const req = request.*;
+
+    // Validate first — a rejected request changes NOTHING (no slot taken).
+    const kind_i = @intFromEnum(req.kind);
+    if (kind_i != 0 and kind_i != 1) return false;
+    if (req.value_ptr == null and req.value_len != 0) return false;
+    const value: []const u8 = if (req.value_ptr) |vp| vp[0..req.value_len] else &[_]u8{};
+    var fold = false;
+    if (kind_i == 0) { // TEXT
+        if (value.len == 0) return false; // empty query means "no search"
+        if (req.scope_ptr) |sp| {
+            if (req.scope_len == 0) return false; // non-NULL empty scope
+            var i: usize = 0;
+            while (i < req.scope_len) : (i += 1) if (sp[i] >= d.column_count) return false;
+        }
+        fold = queryFolds(value);
+    } else { // PREDICATE
+        if (req.column >= d.column_count) return false;
+        const op_i = @intFromEnum(req.op);
+        if (op_i < 0 or op_i > 5) return false;
+        if (op_i >= 2 and !parseDecimal(value).valid) return false; // ordering value must parse
+    }
+
+    // Allocate owned copies up front so an OOM rejects cleanly (no state change).
+    const value_copy = d.gpa.dupe(u8, value) catch return false;
+    var mask: []bool = &.{};
+    if (kind_i == 0 and req.scope_ptr != null) {
+        mask = d.gpa.alloc(bool, d.column_count) catch {
+            d.gpa.free(value_copy);
+            return false;
+        };
+        @memset(mask, false);
+        const sp = req.scope_ptr.?;
+        var i: usize = 0;
+        while (i < req.scope_len) : (i += 1) mask[sp[i]] = true;
+    }
+
+    d.lock();
+    // Replace any previous search ENTIRELY.
+    if (d.search_value.len > 0) d.gpa.free(d.search_value);
+    if (d.scope_mask.len > 0) d.gpa.free(d.scope_mask);
+    d.search_value = value_copy;
+    d.scope_mask = mask;
+    d.search_kind = req.kind;
+    d.search_op = req.op;
+    d.search_column = req.column;
+    d.search_fold = fold;
+    d.search_value_dec = if (kind_i == 1 and @intFromEnum(req.op) >= 2) parseDecimal(value_copy) else .{};
+    d.search_gen +%= 1;
+
+    // Take the scan slot: cancel a scanning jump (DONE persists; gains kept).
+    if (d.jump_state == .scanning) {
+        d.jump_state = .idle;
+        d.jump_progress = 0.0;
+    }
+
+    // Reset counts / navigation / cursor; the match-scan starts from row 0.
+    d.block_counts.clearRetainingCapacity();
+    d.search_total = 0;
+    d.search_total_exact = false;
+    d.search_rows = 0;
+    d.search_offset = d.data_start;
+    d.search_progress = 0.0;
+    d.search_found_row = 0;
+    d.search_found_col = 0;
+    d.search_position = 0;
+    d.search_nav = .none;
+    d.nav_pending = false;
+    d.search_to_eof = true;
+
+    if (d.data_start >= d.content_len or d.column_count == 0) {
+        // Nothing to scan: already DONE with total 0.
+        d.search_state = .done;
+        d.search_total_exact = true;
+        d.search_progress = 1.0;
+        d.unlock();
+        return true;
+    }
+    d.search_state = .scanning;
+    if (d.worker != null) {
+        d.wakeWorker();
+        d.unlock();
+        return true;
+    }
+    // Degraded (worker never spawned at open): scan to completion synchronously
+    // so the search always terminates. No other thread observes intermediate
+    // state (the caller is blocked here). A snapshot OOM fails to CANCELLED,
+    // which the loop guard below turns into an immediate, consistent terminal.
+    if (refreshWorkerCtx(d)) d.w_gen = d.search_gen else failSearchLocked(d);
+    while (d.search_state == .scanning) {
+        const res = searchScanChunk(d, d.search_offset, d.search_rows);
+        commitSearch(d, res);
+        resolveNavLocked(d);
+    }
+    d.unlock();
+    return true;
+}
+
+/// See api/lesssheet.h `ls_search_nav`.
+pub export fn ls_search_nav(doc: *api.Doc, anchor_row: u64, dir: api.SearchDir) callconv(.c) void {
+    const d: *Document = @ptrCast(@alignCast(doc));
+    d.lock();
+    defer d.unlock();
+    if (d.search_state == .idle) return; // no active search: no-op
+    const dir_i = @intFromEnum(dir);
+    if (dir_i != 0 and dir_i != 1) return; // out-of-domain direction: no-op
+
+    // Replace any pending navigation; clear the previous found result.
+    d.nav_pending = true;
+    d.nav_anchor = anchor_row;
+    d.nav_dir = dir;
+    d.search_nav = .searching;
+    d.search_found_row = 0;
+    d.search_found_col = 0;
+    d.search_position = 0;
+
+    // Instant fast path: answer from the counted region when already determined.
+    resolveNavLocked(d);
+    if (!d.nav_pending) return;
+
+    // Must scan to answer: ensure the match-scan runs and owns the slot.
+    if (d.search_state == .cancelled) {
+        d.search_state = .scanning;
+        d.search_to_eof = false; // resume only as far as the nav needs
+    }
+    if (d.search_state == .scanning) {
+        if (d.jump_state == .scanning) { // re-take the slot from a scanning jump
+            d.jump_state = .idle;
+            d.jump_progress = 0.0;
+        }
+        if (d.worker != null) {
+            d.wakeWorker();
+        } else {
+            // Degraded (no worker): scan synchronously until the nav resolves.
+            while (d.nav_pending and d.search_state == .scanning) {
+                const res = searchScanChunk(d, d.search_offset, d.search_rows);
+                commitSearch(d, res);
+                resolveNavLocked(d);
+                if (d.search_state == .scanning and !d.search_to_eof and !d.nav_pending) d.search_state = .cancelled;
+            }
+        }
+    }
+}
+
+/// See api/lesssheet.h `ls_search_cancel`. Zero allocation.
+pub export fn ls_search_cancel(doc: *api.Doc) callconv(.c) void {
+    const d: *Document = @ptrCast(@alignCast(doc));
+    d.lock();
+    defer d.unlock();
+    if (d.search_state == .scanning) {
+        d.search_state = .cancelled; // counts / found / progress freeze
+        if (d.search_nav == .searching) {
+            d.search_nav = .none; // a pending nav resolves to NONE
+            d.nav_pending = false;
+        }
+    }
+    // LS_SEARCH_DONE persists; the jump slot and the AUTO indexer are untouched.
+}
+
+/// See api/lesssheet.h `ls_search_poll`. Zero allocation; never fails.
+pub export fn ls_search_poll(doc: *const api.Doc) callconv(.c) api.SearchStatus {
+    const d = asDocMut(doc);
+    d.lock();
+    defer d.unlock();
+    return .{
+        .state = d.search_state,
+        .nav = d.search_nav,
+        .progress = d.search_progress,
+        .found_row = d.search_found_row,
+        .found_col = d.search_found_col,
+        .position = d.search_position,
+        .total = d.search_total,
+        .total_exact = d.search_total_exact,
     };
 }

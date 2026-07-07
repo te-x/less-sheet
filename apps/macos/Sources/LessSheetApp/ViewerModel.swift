@@ -77,6 +77,11 @@ final class DocumentModel {
     private(set) var visibility = ColumnVisibility(columnCount: 0, hiddenColumns: [])
     private(set) var jumpFlow: JumpFlow = .idle
 
+    // Find (search) session state: the editable draft + the active search's
+    // display (highlights render exactly while `display.request` is non-nil).
+    // The draft survives Esc / dialect re-open (query-retained semantics).
+    var findSession: FindSession = FindControl().initial()
+
     // A row the grid should bring into view (jump landing / cancel restore),
     // consumed and cleared by the grid once applied.
     var pendingScrollRow: UInt64?
@@ -85,6 +90,7 @@ final class DocumentModel {
     var overlayRevealed = false
     var expandedPill: PillKind?
     var jumpFieldActive = false
+    var findFieldActive = false
     var settingsOpen = false
     /// Bumped by the ⌘J command to ask the overlay to reveal + focus the jump
     /// field (the keyboard reveal path).
@@ -92,6 +98,12 @@ final class DocumentModel {
     /// Bumped whenever a jump is REJECTED (target past the last row, or invalid
     /// input): the jump field re-arms and the overlay blinks/shakes it (item 4).
     private(set) var jumpRejections = 0
+    /// Bumped by ⌘F to reveal the overlay + focus the find field.
+    private(set) var findFocusRequests = 0
+    /// Bumped whenever a find submit is REJECTED (ordering predicate with a
+    /// non-numeric value): the value field blinks red + shakes (Reduce Motion =
+    /// blink only), reusing the jump rejection components.
+    private(set) var findRejections = 0
 
     // MARK: Collaborators (pure view-model logic; pinned by frozen tests)
 
@@ -99,6 +111,11 @@ final class DocumentModel {
     private let visibilityManager = ColumnVisibilityManager()
     private let jumpControl = JumpControl()
     private let composer = DialectComposer()
+    private let findControl = FindControl()
+    private let cellMatcher = CellMatcher()
+    /// The direction of the outstanding search navigation (drives the wrap
+    /// notice's start/end choice when a poll reports exhaustion).
+    private var searchNavDirection: SearchDirection = .forward
 
     private var session: (any DocumentSession)?
     private var markedGeneration = -1
@@ -108,6 +125,7 @@ final class DocumentModel {
     private var desiredCount = 0
     private var pollTask: Task<Void, Never>?
     private var fadeTask: Task<Void, Never>?
+    private var wrapNavTask: Task<Void, Never>?
 
     init(opener: any DocumentSessionOpening = CoreSessionOpener()) {
         self.opener = opener
@@ -162,6 +180,12 @@ final class DocumentModel {
                 columnCount: session.columnCount
             )
             self.jumpFlow = .idle
+            // New document identity: the core's search state died with the old
+            // handle — clear results/highlights, retain the typed query so
+            // re-running is one Enter (ARCH req. 10; FindControlling.invalidated).
+            self.cancelWrapNav()
+            self.findSession = findControl.invalidated(self.findSession)
+            self.searchNavDirection = .forward
             self.pendingScrollRow = nil
             self.phase = .document
             startPolling()
@@ -390,42 +414,216 @@ final class DocumentModel {
         if JumpProbe.active { JumpProbe.arrived(model: self, landed: row) }
     }
 
+    // MARK: - Find (search)
+
+    /// Submit the current draft (Enter): compose + start the search, then
+    /// navigate to the first match in the FILE. A rejected compose (ordering
+    /// predicate with a non-numeric value, or an out-of-range column) blinks +
+    /// shakes the value field; the empty text query is silently ignored.
+    func submitFind() {
+        switch findControl.submit(findSession, visibleColumns: visibleColumns, columnCount: columnCount) {
+        case .ignored:
+            break
+        case .rejected:
+            findRejections += 1
+            if FindProbe.active { FindProbe.rejected(model: self) }
+        case let .run(request):
+            // Enter on the SAME active search advances to the next match (ARCH
+            // req. 7: "Enter runs the search … then Enter/⌘G = next"). A changed
+            // query/predicate starts a fresh search.
+            if findSession.display.request == request {
+                stepFind(.forward)
+                return
+            }
+            guard let session, session.startSearch(request) else {
+                // The composer already validated; the real core accepts. (The
+                // seed core rejects every start, so find stays inert until the
+                // core lands — surfaced as a rejection here.)
+                findRejections += 1
+                if FindProbe.active { FindProbe.rejected(model: self) }
+                return
+            }
+            cancelWrapNav()
+            findSession = findControl.began(findSession, running: request)
+            searchNavDirection = .forward
+            session.navigateSearch(.fromTop)          // "first match in the file"
+            foldSearch(session.searchStatus())        // fold the (possibly instant) result
+            startPolling()
+        }
+    }
+
+    /// Drive the real submit path from the verification hook (LESSSHEET_FIND):
+    /// open the field, set a Text-mode query, and submit — identical to typing
+    /// the query + Enter through the popup.
+    func submitFindQuery(_ query: String) {
+        openFindField()
+        findSession.draft.mode = .text
+        findSession.draft.text = query
+        submitFind()
+    }
+
+    /// ⌘G / ⇧⌘G: navigate to the next / previous match (relative to the current
+    /// landing, else the viewport). No-op when no search is active.
+    func stepFind(_ direction: SearchDirection) {
+        guard let session,
+              let nav = findControl.step(findSession, direction, viewportRow: UInt64(firstVisibleRow))
+        else { return }
+        cancelWrapNav()               // an explicit step supersedes a pending auto-wrap
+        searchNavDirection = direction
+        session.navigateSearch(nav)
+        foldSearch(session.searchStatus())
+        startPolling()
+    }
+
+    /// The scan-cancel affordance: stop the match-scan, keep what's known so
+    /// far, state "Stopped".
+    func cancelFind() {
+        cancelWrapNav()
+        session?.cancelSearch()
+        findSession = findControl.stopped(findSession)
+    }
+
+    /// Esc / close: clear results + highlights (request nil), retain the typed
+    /// query, and cancel the core search.
+    func closeFind() {
+        cancelWrapNav()
+        session?.cancelSearch()
+        findSession = findControl.closed(findSession)
+        findFieldActive = false
+        searchNavDirection = .forward
+    }
+
+    /// Fold one search poll into the display; when a wrap notice appears, hold
+    /// it on screen for a readable beat and THEN issue the follow-up navigation,
+    /// and bring a fresh landing into view like a jump landing.
+    private func foldSearch(_ snapshot: SearchSnapshot?) {
+        let previous = findSession.display
+        findSession = findControl.resolved(findSession, with: snapshot, navDirection: searchNavDirection)
+
+        // A wrap notice ("Wrapped to start/end") appeared. Issuing the follow-up
+        // navigation synchronously here would coalesce into this same @Observable
+        // turn, giving the notice a zero-frame lifetime; instead latch it for a
+        // readable beat, then navigate (see scheduleWrapNav). When the wrap
+        // lands, the next fold clears the notice — the pinned self-clear.
+        if findControl.wrapNav(findSession) != nil {
+            scheduleWrapNav()
+        }
+
+        // A new landing scrolls the viewport to it (same mechanics as a jump).
+        if let current = findSession.display.current, current != previous.current {
+            landSearchOn(current.row)
+        }
+        if FindProbe.active { FindProbe.note(model: self) }
+    }
+
+    /// Minimum time a wrap notice stays visible before the follow-up navigation
+    /// fires (the notice must be genuinely readable in both directions,
+    /// including the single-match case where the landing does not change).
+    private static let wrapNoticeLatch: Duration = .milliseconds(900)
+
+    /// Latch the current wrap notice, then issue its navigation on a LATER
+    /// main-actor turn (so the notice renders first) and resume polling. Armed
+    /// once per notice — polls during the latch keep re-deriving the same notice
+    /// but never stack another timer.
+    private func scheduleWrapNav() {
+        guard wrapNavTask == nil else { return }
+        wrapNavTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: DocumentModel.wrapNoticeLatch)
+            guard let self, !Task.isCancelled else { return }
+            self.wrapNavTask = nil
+            guard let session = self.session, let wrap = self.findControl.wrapNav(self.findSession) else { return }
+            self.searchNavDirection = wrap.direction
+            session.navigateSearch(wrap)
+            self.foldSearch(session.searchStatus())   // land the wrap on a fresh turn (clears the notice)
+            self.startPolling()
+        }
+    }
+
+    private func cancelWrapNav() {
+        wrapNavTask?.cancel()
+        wrapNavTask = nil
+    }
+
+    /// Page the window to a search landing and scroll it into view (mirrors the
+    /// jump landing, including the EOF overscroll allowance).
+    private func landSearchOn(_ row: UInt64) {
+        firstVisibleRow = Int(min(row, UInt64(Int.max)))
+        materialize(start: row, count: GridMetrics.scrollBufferRows * 2)
+        pendingScrollRow = row
+    }
+
+    /// Per-visible-column highlight state for a data row (O(viewport), zero core
+    /// calls — the frontend matcher is pinned byte-identical to the core's). The
+    /// current match is strong; every other matching visible cell is subtle;
+    /// header cells are never passed here (never matched).
+    func cellHighlights(forRow row: Int) -> [SheetCellHighlight] {
+        guard let request = findSession.display.request else {
+            return Array(repeating: .none, count: visibleColumns.count)
+        }
+        let cells = visibleBodyCells(forRow: row)
+        let current = findSession.display.current
+        return visibleColumns.enumerated().map { index, column in
+            let text = index < cells.count ? cells[index] : ""
+            if let current, current.row == UInt64(row), current.column == column {
+                return .strong
+            }
+            return cellMatcher.matches(cell: text, column: column, under: request) ? .subtle : .none
+        }
+    }
+
     // MARK: - Overlay reveal / fade
 
     /// Whether the overlay is currently pinned open (interaction in progress):
-    /// a dialect popup is expanded, the jump field is active, a scan is
+    /// a dialect popup is expanded, the jump or find field is active, a scan is
     /// running, or the Settings window is open.
     var overlayPinned: Bool {
-        if expandedPill != nil || jumpFieldActive || settingsOpen { return true }
+        if expandedPill != nil || jumpFieldActive || findFieldActive || settingsOpen { return true }
         if case .scanning = jumpFlow { return true }
         return false
     }
 
+    /// The find match-scan is running (progress % showing) — its popup stays
+    /// reachable (cancel affordance) independent of the click-away scrim.
+    var findScanning: Bool { findSession.display.progress != nil }
+
     // MARK: - Overlay popups (single active popup; Esc / click-away dismiss)
 
-    /// A dialect popup or the jump field is open — drives the click-away scrim
-    /// (a running scan keeps its popup up independently, so it is excluded).
-    var anyPopupOpen: Bool { expandedPill != nil || jumpFieldActive }
+    /// A dialect popup, the jump field, or the find field is open — drives the
+    /// click-away scrim. A running scan keeps its popup up independently, so a
+    /// scanning find field is excluded (like a running jump scan).
+    var anyPopupOpen: Bool {
+        expandedPill != nil || jumpFieldActive || (findFieldActive && !findScanning)
+    }
 
-    /// Dismiss the open dialect popup / jump field (Esc or click-away). A
-    /// running jump scan is left alone: its popup stays reachable (cancel)
-    /// until the scan ends or the user cancels it.
+    /// Dismiss the open dialect popup / jump field / find field (Esc or
+    /// click-away). Closing the find popup clears its highlights (retaining the
+    /// query). A running jump scan is left alone: its popup stays reachable.
     func dismissPopups() {
         expandedPill = nil
         jumpFieldActive = false
+        if findFieldActive { closeFind() }
     }
 
-    /// Open (or re-close) a dialect popup, closing the jump field so at most
-    /// one popup is ever open at a time.
+    /// Open (or re-close) a dialect popup, closing the other popups so at most
+    /// one is ever open at a time.
     func toggleExpandedPill(_ kind: PillKind) {
         expandedPill = (expandedPill == kind) ? nil : kind
         jumpFieldActive = false
+        if findFieldActive { closeFind() }
     }
 
-    /// Open the jump field, closing any dialect popup.
+    /// Open the jump field, closing any dialect popup / the find field.
     func openJumpField() {
         jumpFieldActive = true
         expandedPill = nil
+        if findFieldActive { closeFind() }
+    }
+
+    /// Open the find field, closing any dialect popup / the jump field.
+    func openFindField() {
+        findFieldActive = true
+        expandedPill = nil
+        jumpFieldActive = false
     }
 
     func revealOverlay() {
@@ -436,6 +634,12 @@ final class DocumentModel {
     /// Keyboard reveal (⌘J): reveal the overlay and ask the jump field to open.
     func requestJumpFocus() {
         jumpFocusRequests += 1
+        revealOverlay()
+    }
+
+    /// Keyboard reveal (⌘F): reveal the overlay and ask the find field to open.
+    func requestFindFocus() {
+        findFocusRequests += 1
         revealOverlay()
     }
 
@@ -473,7 +677,9 @@ final class DocumentModel {
         revealed: Bool,
         expandedPill: PillKind?,
         jumpFlow: JumpFlow,
-        jumpFieldActive: Bool = false
+        jumpFieldActive: Bool = false,
+        findSession: FindSession = FindControl().initial(),
+        findFieldActive: Bool = false
     ) -> DocumentModel {
         let snapshot = DocumentModel(opener: live.opener)
         snapshot.path = live.path
@@ -490,6 +696,8 @@ final class DocumentModel {
         snapshot.expandedPill = expandedPill
         snapshot.jumpFlow = jumpFlow
         snapshot.jumpFieldActive = jumpFieldActive
+        snapshot.findSession = findSession
+        snapshot.findFieldActive = findFieldActive
         return snapshot
     }
 
@@ -506,13 +714,19 @@ final class DocumentModel {
 
     private func startPolling() {
         guard let session else { return }
-        pollTask?.cancel()
+        // Hand the new task the old one and let it cancel + join before polling,
+        // so two poll loops never fold snapshots concurrently (the join happens
+        // off the main actor; the prior task exits within one poll interval).
+        let previous = pollTask
         pollTask = Task.detached(priority: .utility) { [weak self, session] in
+            previous?.cancel()
+            _ = await previous?.value
             while !Task.isCancelled {
                 let rc = session.rowCount()
                 let ip = session.indexProgress()
                 let js = session.jumpStatus()
-                let keepGoing = await self?.applyPoll(rowCount: rc, progress: ip, jump: js) ?? false
+                let ss = session.searchStatus()
+                let keepGoing = await self?.applyPoll(rowCount: rc, progress: ip, jump: js, search: ss) ?? false
                 if !keepGoing { break }
                 try? await Task.sleep(for: .milliseconds(100))
             }
@@ -520,12 +734,13 @@ final class DocumentModel {
     }
 
     /// Fold one poll snapshot into state; returns whether polling should
-    /// continue (stops once the index is complete and no scan is running, so
-    /// idle documents cost nothing).
-    private func applyPoll(rowCount: RowCountInfo, progress: ScanProgress, jump: JumpStatus) -> Bool {
+    /// continue (stops once the index is complete and neither a jump nor a
+    /// search is active, so idle documents cost nothing).
+    private func applyPoll(rowCount: RowCountInfo, progress: ScanProgress, jump: JumpStatus, search: SearchSnapshot?) -> Bool {
         rowCountInfo = rowCount
         indexProgress = progress
         foldJump(jump)
+        foldSearch(search)
 
         // If the current window came up short of what the viewport wants and
         // the frontier is still advancing, re-materialize to pick up new rows.
@@ -534,8 +749,17 @@ final class DocumentModel {
             materialize(start: desiredStart, count: desiredCount)
         }
 
-        let scanning: Bool = { if case .scanning = jumpFlow { return true } else { return false } }()
-        return !progress.isComplete || scanning
+        let jumpScanning: Bool = { if case .scanning = jumpFlow { return true } else { return false } }()
+        return !progress.isComplete || jumpScanning || Self.searchActive(search)
+    }
+
+    /// A search still needs polling while its match-scan runs or a navigation
+    /// is being served (counts grow / a landing is pending).
+    private static func searchActive(_ snapshot: SearchSnapshot?) -> Bool {
+        guard let snapshot else { return false }
+        if case .scanning = snapshot.phase { return true }
+        if case .searching = snapshot.nav { return true }
+        return false
     }
 
     private func stopPolling() async {

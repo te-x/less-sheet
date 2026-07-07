@@ -12,6 +12,9 @@ cd "$macos_dir"
 
 # 1) Build the statically-linked core (release), then the app (release).
 (cd ../../backend && zig build -Doptimize=ReleaseFast)
+# SwiftPM doesn't track liblesssheet.a as a build input (it's linked via -L), so a stale link product can keep the previous archive; drop only the link products (not object caches) to force a relink against the fresh core.
+rm -f .build/*/release/LessSheet
+rm -rf .build/*/release/*.xctest
 swift build -c release
 
 bin_dir="$(swift build -c release --show-bin-path)"
