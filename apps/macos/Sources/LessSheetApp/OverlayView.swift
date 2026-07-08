@@ -62,7 +62,6 @@ enum OverlayMetrics {
 
 struct OverlayView: View {
     @Bindable var model: DocumentModel
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         ZStack(alignment: .bottomTrailing) {
@@ -94,23 +93,10 @@ struct OverlayView: View {
             .padding(.trailing, 24)
             .padding(.bottom, 24)
         }
-        .opacity(model.overlayRevealed ? 1 : 0)
-        .offset(y: revealOffset)
-        .allowsHitTesting(model.overlayRevealed)
-        .animation(revealAnimation, value: model.overlayRevealed)
+        // Always visible (the author 2026-07-08: no fade — controls, traffic lights,
+        // and the title-bar filename all stay put).
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Viewer controls")
-    }
-
-    private var revealOffset: CGFloat {
-        guard !reduceMotion else { return 0 }
-        return model.overlayRevealed ? 0 : 6      // slight rise on reveal
-    }
-
-    private var revealAnimation: Animation? {
-        guard !reduceMotion else { return nil }
-        // ~180 ms orchestrated reveal; gentle, unhurried fade-out.
-        return model.overlayRevealed ? .easeOut(duration: 0.18) : .easeIn(duration: 0.5)
     }
 }
 

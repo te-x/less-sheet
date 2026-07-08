@@ -165,9 +165,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if !window.setFrameUsingName("LessSheetMain") {
             window.center()
         }
-        // Traffic lights hidden at rest; revealed with the overlay.
+        // Traffic lights always visible (no fade).
         for type in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
-            window.standardWindowButton(type)?.alphaValue = 0
+            window.standardWindowButton(type)?.alphaValue = 1
         }
         window.makeKeyAndOrderFront(nil)
         mainWindow = window
@@ -258,7 +258,7 @@ struct ContentView: View {
 
     var body: some View {
         content
-            .background(WindowConfigurator(revealed: model.overlayRevealed, title: windowTitle))
+            .background(WindowConfigurator(title: windowTitle))
     }
 
     @ViewBuilder
@@ -300,6 +300,16 @@ struct ContentView: View {
                     .allowsHitTesting(false)
             }
             OverlayView(model: model)
+            // Our own always-visible filename, drawn in the title-bar band
+            // (the native title stays hidden to preserve the under-titlebar
+            // frost + header alignment). Centered, clear of the traffic lights.
+            Text(windowTitle)
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .frame(height: GridMetrics.titleBarInset)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                .allowsHitTesting(false)
         }
         // Extend the grid UNDER the transparent title-bar region so content
         // scrolls beneath it and the scroll-edge effect frosts it (item 2). The
@@ -411,7 +421,6 @@ struct ErrorPanel: View {
 /// document title current. Static chrome (transparent title bar, hidden title)
 /// is set once by the delegate at window creation.
 struct WindowConfigurator: NSViewRepresentable {
-    let revealed: Bool
     let title: String
 
     func makeNSView(context: Context) -> NSView {
@@ -436,8 +445,11 @@ struct WindowConfigurator: NSViewRepresentable {
         // traffic lights fade in/out with the overlay reveal.
         window.title = title
         window.titleVisibility = .hidden
+        // Traffic lights always visible (no fade); the filename is drawn by our
+        // own always-on title label (keeping titleVisibility .hidden preserves
+        // the under-titlebar scroll + frost + header alignment).
         for type in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
-            window.standardWindowButton(type)?.animator().alphaValue = revealed ? 1 : 0
+            window.standardWindowButton(type)?.alphaValue = 1
         }
     }
 }
