@@ -149,7 +149,7 @@ struct FindControlView: View {
                 TextField("Find", text: $model.findSession.draft.text)
                     .textFieldStyle(.plain)
                     .focused($focus, equals: .query)
-                    .onSubmit { model.submitFind() }
+                    .onSubmit { model.submitFindField() }
             }
         }
         .font(.callout)
@@ -224,7 +224,7 @@ struct FindControlView: View {
                     .textFieldStyle(.plain)
                     .foregroundStyle(rejected ? Color.red : Color.primary)
                     .focused($focus, equals: .value)
-                    .onSubmit { model.submitFind() }
+                    .onSubmit { model.submitFindField() }
             }
         }
         .font(.callout)

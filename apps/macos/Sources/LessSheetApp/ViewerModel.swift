@@ -515,6 +515,13 @@ final class DocumentModel {
 
     // MARK: - Find (search)
 
+    /// Enter in the Find field: while a filter is active the field edits the
+    /// FILTER, so re-apply the (edited) predicate as the filter; otherwise run
+    /// a normal search.
+    func submitFindField() {
+        if isFiltered { applyFindAsFilter() } else { submitFind() }
+    }
+
     /// Submit the current draft (Enter): compose + start the search, then
     /// navigate to the first match in the FILE. A rejected compose (ordering
     /// predicate with a non-numeric value, or an out-of-range column) blinks +
