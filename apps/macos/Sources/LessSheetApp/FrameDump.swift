@@ -88,6 +88,74 @@ enum FrameDump {
         }
     }
 
+    /// The plain grid-CONTENT scene is captured from the LIVE grid (cacheDisplay
+    /// of the real NSTableView — ARCH bonus), self-triggered by the grid
+    /// controller once built (deterministic, unlike the first-paint .task which
+    /// races the representable's makeNSView). Returns the dump path when that
+    /// applies; overlay/find/settings/overscroll keep the SwiftUI mirror, and
+    /// probe runs (jump/find/landing) own their terminal dumps.
+    static var liveGridInitialDumpPath: String? {
+        guard let path = dumpPath else { return nil }
+        let env = ProcessInfo.processInfo.environment
+        let scene = env[sceneKey]
+        guard scene == nil || scene == "grid" else { return nil }
+        guard env["LESSSHEET_JUMP"] == nil, env["LESSSHEET_FIND"] == nil,
+              env["LESSSHEET_LANDING_STALL"] == nil else { return nil }
+        return path
+    }
+
+    /// Renders the LIVE grid container (real NSTableView rows, gutter, header,
+    /// hairlines, highlights, spreadsheet fill, EOF overscroll) into a PNG via
+    /// `NSView.cacheDisplay` — no screen capture, no TCC prompt. The glass band
+    /// composites in the live compositor only, so it reads as its backdrop here
+    /// (same limitation as ImageRenderer); everything the grid DRAWS is captured.
+    /// Returns false when there is no live grid to capture.
+    @MainActor
+    static func captureLiveGrid(to path: String) -> Bool {
+        // The representable's makeNSView (which registers the live grid) can lag
+        // the first-paint .task by a render tick; pump the main runloop briefly
+        // so the REAL grid exists and is sized before we capture it.
+        let deadline = Date().addingTimeInterval(0.6)
+        while (NativeGridController.live?.container.bounds.width ?? 0) < 1, Date() < deadline {
+            RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.02))
+        }
+        guard let controller = NativeGridController.live, controller.container.bounds.width > 0 else {
+            return false
+        }
+        let container = controller.container
+        // Appearance: honor the SYSTEM/inherited appearance by default (so a dark
+        // system captures dark, matching what the user sees and avoiding a
+        // forced-light flash), and let LESSSHEET_DUMP_APPEARANCE=dark|light pin
+        // either for the deterministic light+dark verification pair (ARCH
+        // criterion 5). Only set when forced — never override the live default.
+        switch ProcessInfo.processInfo.environment["LESSSHEET_DUMP_APPEARANCE"]?.lowercased() {
+        case "dark": container.appearance = NSAppearance(named: .darkAqua)
+        case "light": container.appearance = NSAppearance(named: .aqua)
+        default: break
+        }
+        // Flush any pending model-driven update (e.g. a jump/find landing scroll
+        // set just before this capture) and let it settle so the visible rows and
+        // gutter reflect the landed position, not the pre-landing top.
+        controller.apply()
+        let settle = Date().addingTimeInterval(0.2)
+        while Date() < settle { RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.02)) }
+        container.layoutSubtreeIfNeeded()
+        guard let rep = container.bitmapImageRepForCachingDisplay(in: container.bounds) else { return false }
+        controller.compositeCapture(into: rep)
+        guard let png = rep.representation(using: .png, properties: [:]) else {
+            log("lesssheet.frame_dump_failed=\(path)")
+            return false
+        }
+        do {
+            try png.write(to: URL(fileURLWithPath: path))
+            log("lesssheet.frame_dumped=\(path)")
+            return true
+        } catch {
+            log("lesssheet.frame_dump_failed=\(path)")
+            return false
+        }
+    }
+
     @MainActor
     static func dumpError(error: DocumentOpenError, path filePath: String) {
         guard let path = dumpPath else { return }
@@ -101,7 +169,12 @@ enum FrameDump {
     @MainActor
     static func dumpArrival(for model: DocumentModel) {
         guard let path = dumpPath else { return }
-        render(DumpGrid(model: model), size: gridSize, to: path)
+        // The live grid has already landed the target row (jump path); capture
+        // the REAL table so the arrival frame — including EOF overscroll on a
+        // jump-to-end — is the shipping render, not the mirror.
+        if !captureLiveGrid(to: path) {
+            render(DumpGrid(model: model), size: gridSize, to: path)
+        }
     }
 
     /// Renders the jump field in its REJECTED (red) state over the grid — the
@@ -206,6 +279,9 @@ enum FrameDump {
         }
         .environment(\.overlayDumpChrome, true)
         render(scene, size: gridSize, to: path)
+        // Also capture the LIVE grid (its SheetRowView highlights) alongside the
+        // popup mirror, so the shipping highlight render is verifiable too.
+        _ = captureLiveGrid(to: (path as NSString).deletingPathExtension + ".live.png")
     }
 
     /// The scrolled-to-end state (req. 8): the last data rows anchored so the

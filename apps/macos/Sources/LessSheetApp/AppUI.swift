@@ -321,7 +321,10 @@ struct ContentView: View {
                 // Verification: drive the real find path AFTER first paint (it
                 // dumps + terminates itself once the search resolves).
                 FindProbe.run(model: model)
-            } else {
+            } else if FrameDump.liveGridInitialDumpPath == nil {
+                // Overlay / find / settings / overscroll etc. render off a SwiftUI
+                // mirror here; the plain grid-content scene instead self-captures
+                // the LIVE table from the grid controller (see NativeGrid).
                 FrameDump.dumpIfRequested(for: model)
                 FrameDump.terminateIfRequested()
             }
