@@ -500,6 +500,14 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
         header.needsDisplay = true
         gutter.needsDisplay = true
 
+        // Reconfigure the visible rows from the CURRENT window on every scroll,
+        // not only when the window identity changes. During a fast fling a row
+        // view is configured empty while the window lags; when the fling settles
+        // inside a window that already covers those rows, no window-change refresh
+        // fires — so without this they stay blank until recycled by another
+        // scroll (the reported gaps). configure is O(viewport); cheap per tick.
+        refreshVisibleRows()
+
         ScrollProbe.note(clip.bounds.origin)        // inert unless LESSSHEET_LOG_OFFSET
         emitLayoutFramesIfEnabled()
     }
