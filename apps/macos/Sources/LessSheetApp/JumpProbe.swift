@@ -189,3 +189,90 @@ enum ScrollProbe {
         )
     }
 }
+
+// Verification-only: prove the header toggle PRESERVES the viewport position
+// (keeps the same physical/file record at the data-area top across the on/off
+// re-derivation, NOT scrolling to row 0 and NOT drifting by the ±1 header
+// shift). INERT unless the env var is set — starts only after first paint, so it
+// never touches the cold-start measurement.
+//
+//   LESSSHEET_HEADER_TOGGLE=<row_1based>  Park the viewport at that row (a real
+//     jump — genuine scroll), then toggle the header exactly as clicking the H
+//     button does, and log the top DATA row + the file record it maps to, both
+//     BEFORE and AFTER. Under LESSSHEET_DUMP_EXIT the headless instance quits
+//     once the toggle re-anchors.
+@MainActor
+enum HeaderToggleProbe {
+    private static let env = ProcessInfo.processInfo.environment
+    /// 1-based row to park the viewport at before toggling.
+    static let park: Int? = env["LESSSHEET_HEADER_TOGGLE"].flatMap(Int.init)
+    static var active: Bool { park != nil }
+
+    private static var started = false
+    private static var model: DocumentModel?
+
+    /// Called from the first data-bearing frame's task (after the cold-start
+    /// marker). Idempotent: the toggle re-opens (bumping the open generation, which
+    /// re-fires that task), so re-entry must be a no-op.
+    static func run(model: DocumentModel) {
+        guard active, !started, let park, park >= 1 else { return }
+        started = true
+        self.model = model
+        // 1) Park the viewport at `park` via the real jump path (a genuine scroll).
+        _ = model.submitJump(String(park))
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+            guard let model = self.model else { return }
+            // Headless windows get no implicit updateNSView, so drive the grid the
+            // way the jump verification does (FrameDump.captureLiveGrid) — flush the
+            // landing so the clip is really parked at `park`.
+            NativeGridController.live?.apply()
+            log("lesssheet.header_toggle.parked target_1based=\(park) has_header=\(model.dialect.hasHeader)")
+            // 2) Toggle the header exactly as clicking the H button does.
+            let generation = model.openGeneration
+            _ = model.applyDialectChange(.header(!model.dialect.hasHeader))
+            // 3) Once the async re-open bumps the generation, drive the grid's
+            //    re-anchor (its openGeneration branch reads the still-parked clip and
+            //    re-lands on the same file record, logging before/after via toggled()).
+            driveReanchor(afterGeneration: generation, triesLeft: 80)
+        }
+    }
+
+    /// Poll for the header-toggle re-open to complete, then invoke the live grid's
+    /// update so its openGeneration branch runs (headless has no implicit one).
+    private static func driveReanchor(afterGeneration generation: Int, triesLeft: Int) {
+        guard let model else { return }
+        if model.openGeneration != generation {
+            NativeGridController.live?.apply()
+            return
+        }
+        guard triesLeft > 0 else {
+            log("lesssheet.header_toggle.error reopen_not_observed")
+            if env["LESSSHEET_DUMP_EXIT"] != nil { NSApp.terminate(nil) }
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+            driveReanchor(afterGeneration: generation, triesLeft: triesLeft - 1)
+        }
+    }
+
+    /// Logged by the grid once it re-anchors the viewport after the toggle re-open:
+    /// the exact top DATA row before/after and the file record each maps to
+    /// (file_record = data-row index + 1 when a header is present, else the index).
+    /// `same_record=true` + `landed_at_zero=false` is the proof.
+    static func toggled(oldTop: Int, newTop: Int, newHasHeader: Bool, shift: Int) {
+        guard active else { return }
+        let oldHasHeader = shift == 0 ? newHasHeader : (shift > 0)  // +1 = turned OFF; −1 = turned ON
+        let recordBefore = oldTop + (oldHasHeader ? 1 : 0)
+        let recordAfter = newTop + (newHasHeader ? 1 : 0)
+        log("lesssheet.header_toggle.before top_data_0based=\(oldTop) file_record=\(recordBefore) has_header=\(oldHasHeader)")
+        log("lesssheet.header_toggle.after top_data_0based=\(newTop) file_record=\(recordAfter) has_header=\(newHasHeader)"
+            + " same_record=\(recordAfter == recordBefore) data_index_delta=\(newTop - oldTop) landed_at_zero=\(newTop == 0)")
+        if env["LESSSHEET_DUMP_EXIT"] != nil {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { NSApp.terminate(nil) }
+        }
+    }
+
+    private static func log(_ line: String) {
+        FileHandle.standardError.write(Data((line + "\n").utf8))
+    }
+}

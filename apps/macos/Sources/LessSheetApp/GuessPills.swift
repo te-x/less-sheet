@@ -43,19 +43,26 @@ struct HeaderButton: View {
     }
 }
 
-/// "H", or "H" struck through with a diagonal slash when the header is off.
+/// A solid "H" when the file has a header; in the NO-HEADER state the H fades
+/// back and a full-strength diagonal slash crosses it, so the control reads as
+/// "H negated" — the slash, not the H, carries the meaning. Semantic colors, so
+/// the slash is full white in dark mode / full black in light mode either way.
 struct HeaderGlyph: View {
     let on: Bool
 
     var body: some View {
         Text("H")
             .font(.callout.weight(.semibold))
-            .foregroundStyle(.primary)
+            // Header ON: solid label color. Header OFF: faint (~0.3 of label
+            // color) so the crossing slash dominates.
+            .foregroundStyle(on ? AnyShapeStyle(.primary) : AnyShapeStyle(.primary.opacity(0.3)))
             .overlay {
                 if !on {
+                    // Full-strength (labelColor) and thicker than the H's stroke,
+                    // so the negation is unmistakable in both appearances.
                     Capsule()
                         .fill(.primary)
-                        .frame(width: 2, height: 24)
+                        .frame(width: 3, height: 24)
                         .rotationEffect(.degrees(45))
                 }
             }

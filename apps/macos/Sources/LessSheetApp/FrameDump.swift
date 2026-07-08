@@ -307,16 +307,45 @@ enum FrameDump {
 
     @MainActor
     private static func render(_ content: some View, size: CGSize, to path: String) {
-        let renderer = ImageRenderer(content:
-            content
-                .frame(width: size.width, height: size.height, alignment: .topLeading)
-                .background(Color(nsColor: .windowBackgroundColor))
-                .clipped()
-        )
+        let framed = content
+            .frame(width: size.width, height: size.height, alignment: .topLeading)
+            .background(Color(nsColor: .windowBackgroundColor))
+            .clipped()
+
+        // Verification-only: pin the appearance so the light+dark dump pair
+        // actually differs (LESSSHEET_DUMP_APPEARANCE=dark|light) — mirrors the
+        // live-grid capture. Inject the SwiftUI colorScheme (for semantic
+        // ShapeStyles like .primary/.secondary) AND resolve dynamic catalog
+        // NSColors under the matching NSAppearance while ImageRenderer rasterizes.
+        // Absent env var => the ambient default (unchanged behavior).
+        let appearance: NSAppearance?
+        let rendered: AnyView
+        switch ProcessInfo.processInfo.environment["LESSSHEET_DUMP_APPEARANCE"]?.lowercased() {
+        case "dark":
+            appearance = NSAppearance(named: .darkAqua)
+            rendered = AnyView(framed.environment(\.colorScheme, .dark))
+        case "light":
+            appearance = NSAppearance(named: .aqua)
+            rendered = AnyView(framed.environment(\.colorScheme, .light))
+        default:
+            appearance = nil
+            rendered = AnyView(framed)
+        }
+
+        let renderer = ImageRenderer(content: rendered)
         renderer.scale = 2
 
+        let cgImage: CGImage?
+        if let appearance {
+            var image: CGImage?
+            appearance.performAsCurrentDrawingAppearance { image = renderer.cgImage }
+            cgImage = image
+        } else {
+            cgImage = renderer.cgImage
+        }
+
         guard
-            let cgImage = renderer.cgImage,
+            let cgImage,
             let png = NSBitmapImageRep(cgImage: cgImage).representation(using: .png, properties: [:])
         else {
             log("lesssheet.frame_dump_failed=\(path)")

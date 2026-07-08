@@ -120,6 +120,13 @@ final class DocumentModel {
     private var session: (any DocumentSession)?
     private var markedGeneration = -1
     private var firstVisibleRow = 0
+    /// Set on a header on/off re-open (consumed by the grid): how a data-row
+    /// index shifts across the re-derivation so the viewport can re-anchor to the
+    /// SAME file record. +1 when the header turns OFF (the former header record
+    /// becomes data row 0, pushing every data row down one), −1 when it turns ON
+    /// (the first data row is absorbed as the header), 0 for a no-op. `nil` for a
+    /// fresh open or a separator/quote change (those rest at the top as before).
+    private var pendingHeaderShift: Int?
     private var lastVisibleCount = 1
     private var desiredStart: UInt64 = 0
     private var desiredCount = 0
@@ -157,6 +164,7 @@ final class DocumentModel {
                 self.visibility = visibilityManager.carriedOver(previous, toColumnCount: session.columnCount)
             } else {
                 self.visibility = visibilityManager.allVisible(columnCount: session.columnCount)
+                self.pendingHeaderShift = nil   // a fresh open never re-anchors to a prior toggle
             }
 
             // Verification-only: pre-hide columns (comma-separated indices) so a
@@ -205,8 +213,25 @@ final class DocumentModel {
         }
         let path = self.path
         let carried = self.visibility
+        // A header toggle preserves the viewport: record how the data-row index
+        // shifts so the grid can re-anchor to the same file record across the
+        // re-open (it captures its own exact top row from the live scroll, so we
+        // only pass the ±1 shift). A separator/quote change resets to the top.
+        if case let .header(newValue) = change {
+            pendingHeaderShift = (newValue == dialect.hasHeader) ? 0 : (newValue ? -1 : +1)
+        } else {
+            pendingHeaderShift = nil
+        }
         Task { await self.open(path: path, forcing: override, carrying: carried) }
         return true
+    }
+
+    /// The grid reads (and clears) the pending header-toggle shift when it handles
+    /// a re-open, to decide whether to re-anchor the viewport (header toggle) or
+    /// rest at the top-left (every other open). Returns nil when there is none.
+    func consumePendingHeaderShift() -> Int? {
+        defer { pendingHeaderShift = nil }
+        return pendingHeaderShift
     }
 
     func closeDocument() {

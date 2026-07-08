@@ -277,6 +277,14 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
 
         // Re-open / dialect re-open: columns + widths reset; reload from the top.
         if model.openGeneration != lastOpenGeneration {
+            // A header on/off toggle keeps its place instead of flashing to row 0:
+            // capture the EXACT top data row from the current (pre-reload) scroll
+            // BEFORE anything resets it, then re-land on the SAME file record after
+            // the ±1 data-row shift (O(viewport) — the anchor row is at/near the
+            // already-scanned frontier, so there is no scan and no stall).
+            let headerShift = model.consumePendingHeaderShift()
+            let preToggleTop = headerShift != nil ? currentTopDataRow() : 0
+
             lastOpenGeneration = model.openGeneration
             refreshLayoutMetrics()
             lastVisibleColumns = model.visibleColumns
@@ -284,7 +292,18 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
             layoutContainer()
             table.reloadData()
             lastRowCount = numberOfRows(in: table)
-            scrollToTopLeft()
+            if let shift = headerShift {
+                // At the very top, stay at the top of data; otherwise carry the top
+                // row across the shift. Clamp to the (possibly ±1) new data range.
+                let target = preToggleTop == 0 ? 0 : max(0, preToggleTop + shift)
+                let landed = min(target, max(0, dataRowCount - 1))
+                scrollToTopLeft()        // reset the horizontal offset + baseline
+                landOn(row: landed)      // re-anchor vertically to the same record
+                HeaderToggleProbe.toggled(oldTop: preToggleTop, newTop: landed,
+                                          newHasHeader: model.dialect.hasHeader, shift: shift)
+            } else {
+                scrollToTopLeft()
+            }
             refreshVisibleRows()
             return
         }
@@ -353,6 +372,18 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
         let clip = scroll.contentView
         clip.scroll(to: NSPoint(x: 0, y: -NativeGrid.contentInsetTop))
         scroll.reflectScrolledClipView(clip)
+    }
+
+    /// The data row currently at the TOP of the unobscured data area (just below
+    /// the glass band), recovered exactly from the clip origin: a landing sets
+    /// clip.y = row*rowHeight − contentInsetTop, so this inverts it. Used to
+    /// re-anchor the viewport across a header toggle (no band-offset drift, unlike
+    /// the model's paging `firstVisibleRow`, which counts rows hidden under the
+    /// band). Clamped to a valid data row.
+    private func currentTopDataRow() -> Int {
+        let y = scroll.contentView.bounds.origin.y
+        let row = ((y + NativeGrid.contentInsetTop) / NativeGrid.rowHeight).rounded()
+        return min(max(0, Int(row)), max(0, dataRowCount - 1))
     }
 
     /// Composite the LIVE grid into `rep` for a headless `cacheDisplay` capture

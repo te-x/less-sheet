@@ -321,6 +321,10 @@ struct ContentView: View {
                 // Verification: drive the real find path AFTER first paint (it
                 // dumps + terminates itself once the search resolves).
                 FindProbe.run(model: model)
+            } else if HeaderToggleProbe.active {
+                // Verification: park the viewport, toggle the header, and prove the
+                // same file record stays in view (it logs + terminates itself).
+                HeaderToggleProbe.run(model: model)
             } else if FrameDump.liveGridInitialDumpPath == nil {
                 // Overlay / find / settings / overscroll etc. render off a SwiftUI
                 // mirror here; the plain grid-content scene instead self-captures
