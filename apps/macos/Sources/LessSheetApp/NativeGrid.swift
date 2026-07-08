@@ -311,13 +311,20 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
             return
         }
 
-        // Hidden-column reflow / width change: recompute strip + reload.
+        // Hidden-column reflow / width change: recompute strip + reload. Preserve
+        // the scroll clip origin across it — layoutContainer resets scroll.frame
+        // and reloadData can clamp the clip, which would desync the visual scroll
+        // (gutter) from the model window (cells) mid-scroll, e.g. when columns
+        // grow to fit content while paging. (Same guard the estimate branch uses.)
         if model.visibleColumns != lastVisibleColumns || model.columnWidths != lastColumnWidths {
             lastVisibleColumns = model.visibleColumns
             lastColumnWidths = model.columnWidths
+            let origin = scroll.contentView.bounds.origin
             refreshLayoutMetrics()
             layoutContainer()
             table.reloadData()
+            scroll.contentView.scroll(to: origin)
+            scroll.reflectScrolledClipView(scroll.contentView)
             lastRowCount = numberOfRows(in: table)
         }
 

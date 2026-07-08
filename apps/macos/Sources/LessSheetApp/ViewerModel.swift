@@ -295,12 +295,21 @@ final class DocumentModel {
     /// (triggering a reflow) when a width actually grows.
     private func growColumnWidthsToFitWindow() {
         guard columnCount > 0, !window.rows.isEmpty, columnWidths.count == columnCount else { return }
+        // Measure only the VISIBLE slice (~a viewport), not the whole buffered
+        // window — keeps this off the landing hot path (<100 ms budget); growth
+        // keeps up incrementally as further scrolls re-materialize.
+        let start = Int(window.firstRow)
+        let lo = max(start, firstVisibleRow)
+        let hi = min(start + window.rows.count, firstVisibleRow + max(lastVisibleCount, 1))
+        guard lo < hi else { return }
         let bodyFont = NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
         var widths = columnWidths
         var grew = false
         for c in visibleColumns where c < widths.count && widths[c] < GridMetrics.maxColumnWidth {
             var w = widths[c]
-            for row in window.rows where c < row.count {
+            for r in lo..<hi {
+                let row = window.rows[r - start]
+                guard c < row.count else { continue }
                 let cellW = Self.textWidth(row[c], bodyFont) + GridMetrics.cellHPadding * 2
                 if cellW > w {
                     w = cellW
