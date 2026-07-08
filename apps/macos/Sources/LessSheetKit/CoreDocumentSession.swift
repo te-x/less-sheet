@@ -242,6 +242,31 @@ public final class CoreDocumentSession: DocumentSession, @unchecked Sendable {
         return SearchSnapshot(phase: phase, nav: nav, total: s.total, totalIsFinal: s.total_exact)
     }
 
+    // MARK: - Filter bridge (filtered-views) — SEED STUBS ONLY.
+    // The contract lives in Sources/Contracts (frozen) over ls_filter_* /
+    // ls_source_row in api/lesssheet.h; these placeholders keep conformance
+    // compiling while the behavior suite is RED (rejecting setFilter + nil
+    // snapshots — the terminal-placeholder pattern, so no frozen test hangs
+    // polling). Implementation lands via the aidev build loop.
+
+    public func setFilter(_ request: SearchRequest) -> Bool {
+        _ = request
+        return false // NOT IMPLEMENTED (filtered-views seed)
+    }
+
+    public func clearFilter() {
+        // NOT IMPLEMENTED (filtered-views seed)
+    }
+
+    public func filterStatus() -> FilterSnapshot? {
+        nil // NOT IMPLEMENTED (filtered-views seed)
+    }
+
+    public func sourceRow(_ viewRow: UInt64) -> UInt64? {
+        _ = viewRow
+        return nil // NOT IMPLEMENTED (filtered-views seed)
+    }
+
     public func close() {
         lock.lock()
         defer { lock.unlock() }

@@ -2346,3 +2346,43 @@ pub export fn ls_search_poll(doc: *const api.Doc) callconv(.c) api.SearchStatus 
         .total_exact = d.search_total_exact,
     };
 }
+
+// ---------------------------------------------------------------------------
+// Filtered views (filtered-views slice) — SEED STUBS ONLY.
+// The contract is frozen in api/lesssheet.h + contracts/api.zig; these
+// placeholders keep conformance green (signatures match) while the behavior
+// suite is RED. They follow the terminal-poll-placeholder pattern: ls_filter_set
+// rejects (no filter ever activates) and ls_filter_poll reports IDLE, so no
+// frozen test can hang on a poll loop; ls_source_row returns the LS_NO_ROW
+// sentinel. Implementation lands via the aidev build loop.
+// ---------------------------------------------------------------------------
+
+/// See api/lesssheet.h `ls_filter_set`. NOT IMPLEMENTED (filtered-views seed).
+pub export fn ls_filter_set(doc: *api.Doc, request: *const api.SearchRequest) callconv(.c) bool {
+    _ = doc;
+    _ = request;
+    return false;
+}
+
+/// See api/lesssheet.h `ls_filter_clear`. NOT IMPLEMENTED (filtered-views seed).
+pub export fn ls_filter_clear(doc: *api.Doc) callconv(.c) void {
+    _ = doc;
+}
+
+/// See api/lesssheet.h `ls_filter_poll`. NOT IMPLEMENTED (filtered-views seed).
+pub export fn ls_filter_poll(doc: *const api.Doc) callconv(.c) api.FilterStatus {
+    _ = doc;
+    return .{
+        .state = .idle,
+        .progress = 0.0,
+        .total = 0,
+        .total_exact = false,
+    };
+}
+
+/// See api/lesssheet.h `ls_source_row`. NOT IMPLEMENTED (filtered-views seed).
+pub export fn ls_source_row(doc: *const api.Doc, row: u64) callconv(.c) u64 {
+    _ = doc;
+    _ = row;
+    return api.no_row;
+}

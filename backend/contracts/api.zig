@@ -1,5 +1,5 @@
 //! Frozen Zig-side contract for the less-sheet core (viewer-ui + find-seek +
-//! csv-hardening slices).
+//! csv-hardening + filtered-views slices).
 //!
 //! This file is planner-owned. It mirrors the workspace-frozen C header
 //! `api/lesssheet.h` EXACTLY — names, types, values, and semantics; the two
@@ -39,6 +39,13 @@
 //!   - Search jobs and jump jobs share the document's single background-scan
 //!     slot; the pinned interaction (mutual cancellation, kept gains,
 //!     terminal states, nav resume) is in api/lesssheet.h SEARCH.
+//!   - A FILTER (ls_filter_set/clear/poll, ls_source_row) is a view mode over
+//!     the same machinery: per-block match counters (O(index checkpoints),
+//!     never a match-row list) make the row accessors, jump, and search all
+//!     operate in filtered coordinates. Its filter-scan shares the single
+//!     scan slot; the full model (slot contention, reset, source-row mapping,
+//!     the filtered-coordinate reinterpretation) is in api/lesssheet.h
+//!     FILTERED VIEWS.
 //!   - The core may own background threads (std.Thread); tests pin
 //!     observable behavior, never scheduling.
 
@@ -65,6 +72,9 @@ pub const open_ready_min_rows: u32 = 512;
 pub const open_head_max_bytes: u64 = 4 * 1024 * 1024;
 /// Mirrors LS_WINDOW_MAX_ROWS.
 pub const window_max_rows: u32 = 4096;
+/// Mirrors LS_NO_ROW: the ls_source_row sentinel for a view row that is not
+/// currently servable (outside the materialized window / view range).
+pub const no_row: u64 = std.math.maxInt(u64);
 
 /// Mirror LS_ENCODING_*. `encoding_auto` (options only, detect sentinel — in
 /// the LS_SNIFF / LS_QUOTE_NONE negative-sentinel style) is NEVER reported in
@@ -251,6 +261,29 @@ pub const SearchStatus = extern struct {
     total_exact: bool,
 };
 
+/// Mirrors `ls_filter_state`: the (single) filter's scan-slot occupancy.
+/// idle == no filter active (the identity view); scanning/done/cancelled all
+/// mean a filter IS active (the view is filtered). See FILTERED VIEWS.
+pub const FilterState = enum(c_int) {
+    idle = 0,
+    scanning = 1,
+    done = 2,
+    cancelled = 3,
+};
+
+/// Mirrors `ls_filter_status`: like SearchStatus without the navigation slot.
+/// idle means "no filter active" (every other field zero). progress is in
+/// [0,1], monotone within one filter, exactly 1.0 at done, frozen when
+/// cancelled. total is matching rows counted so far (m; exact for the counted
+/// region, monotone) and equals ls_row_count_get().count while filtered;
+/// total_exact iff the filter-scan completed (done).
+pub const FilterStatus = extern struct {
+    state: FilterState,
+    progress: f64,
+    total: u64,
+    total_exact: bool,
+};
+
 // ---------------------------------------------------------------------------
 // Public surface (re-exported from the implementation; tests use only these).
 // ---------------------------------------------------------------------------
@@ -274,6 +307,10 @@ pub const ls_search_start = core.ls_search_start;
 pub const ls_search_nav = core.ls_search_nav;
 pub const ls_search_cancel = core.ls_search_cancel;
 pub const ls_search_poll = core.ls_search_poll;
+pub const ls_filter_set = core.ls_filter_set;
+pub const ls_filter_clear = core.ls_filter_clear;
+pub const ls_filter_poll = core.ls_filter_poll;
+pub const ls_source_row = core.ls_source_row;
 
 /// Zig-level seam for tests: identical to `ls_open` but with an explicit
 /// allocator. `ls_open` == `openWithAllocator(default allocator, ...)`.
@@ -326,4 +363,12 @@ comptime {
         @compileError("signature drift: ls_search_poll");
     if (@TypeOf(core.openWithAllocator) != fn (std.mem.Allocator, [*:0]const u8, ?*const OpenOptions, *?*Doc) Status)
         @compileError("signature drift: openWithAllocator");
+    if (@TypeOf(core.ls_filter_set) != fn (*Doc, *const SearchRequest) callconv(.c) bool)
+        @compileError("signature drift: ls_filter_set");
+    if (@TypeOf(core.ls_filter_clear) != fn (*Doc) callconv(.c) void)
+        @compileError("signature drift: ls_filter_clear");
+    if (@TypeOf(core.ls_filter_poll) != fn (*const Doc) callconv(.c) FilterStatus)
+        @compileError("signature drift: ls_filter_poll");
+    if (@TypeOf(core.ls_source_row) != fn (*const Doc, u64) callconv(.c) u64)
+        @compileError("signature drift: ls_source_row");
 }

@@ -2522,3 +2522,469 @@ test "abi: csv-hardening constants are pinned and truncation symbols link" {
     try std.testing.expectEqual(false, c_linked_csv.ls_cell_truncated(od.doc, 0, 0));
     try std.testing.expectEqual(false, c_linked_csv.ls_header_cell_truncated(od.doc, 0));
 }
+
+// ===========================================================================
+// filtered-views slice (ARCH-filtered-views core criteria 1-15; app criteria
+// 16-18 live in apps/macos). Frozen; planner-owned. Naming: fv<criterion>.
+// Semantics are pinned in api/lesssheet.h FILTERED VIEWS (the filter view mode,
+// the counters-not-lists memory bound, the shared scan slot, filtered
+// coordinates for the row accessors / jump / find, source-row mapping, reset)
+// and mirrored in contracts/api.zig. Tests exercise the PUBLIC C ABI through
+// @import("api") only, reusing the helpers above (openBytes/openWith, expectCell,
+// expectDims, winAll, startSearch/navAndWait/expectFound, genNeedleRows,
+// ascending, BytesAllocator, ...). Determinism: the addressing fixture is far
+// below the head budget (fully indexed at open, filter counts exact fast);
+// scale tests use MANUAL mode where only scans drive the frontier, and the
+// filter-scan runs to EOF on the core worker exactly like a match-scan.
+// ===========================================================================
+
+/// A fixture with matches interleaved among non-matches, header ON, 3 columns.
+/// Data rows 0..7 (source row numbers in comments):
+const fv_fixture =
+    "name,qty,note\n" ++
+    "Widget,2,alpha needle\n" ++ //   0: note has "needle";      qty 2
+    "NEEDLE,10,beta\n" ++ //          1: name "NEEDLE";           qty 10
+    "needle,2.0,gamma\n" ++ //        2: name "needle";           qty 2.0
+    "gadget,-3,Needle point\n" ++ //  3: note "Needle";           qty -3
+    "Gizmo,1e2,delta\n" ++ //         4: no "needle";             qty 1e2=100
+    "café,0.5,CAFÉ\n" ++ //           5: no "needle";             qty 0.5
+    ",5.,needleneedle\n" ++ //        6: note "needleneedle";     qty 5.
+    "plain,abc,end needle\n"; //      7: note "end needle";       qty non-numeric
+
+/// TEXT "needle" (smart-case fold) matches source rows 0,1,2,3,6,7 (m = 6).
+/// WHERE qty(col 1) >= 2 matches source rows 0,1,2,4,6 (m = 5).
+
+fn setFilter(doc: *api.Doc, req: api.SearchRequest) !void {
+    try std.testing.expectEqual(true, api.ls_filter_set(doc, &req));
+}
+
+fn expectFilterRejected(doc: *api.Doc, req: api.SearchRequest) !void {
+    try std.testing.expectEqual(false, api.ls_filter_set(doc, &req));
+}
+
+/// Poll the filter until DONE (<= 15 s); returns the snapshot. Errors on IDLE
+/// (a set filter never polls IDLE), so an unimplemented seed fails at the
+/// ls_filter_set assertion instead of hanging here.
+fn waitFilterDone(doc: *api.Doc) !api.FilterStatus {
+    const io = std.testing.io;
+    const t0: std.Io.Clock.Timestamp = .now(io, .awake);
+    while (true) {
+        const s = api.ls_filter_poll(doc);
+        if (s.state == .done) return s;
+        if (s.state == .idle) return error.FilterNotSet;
+        if (elapsedMs(t0) > 15_000) return error.FilterTimeout;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+}
+
+/// Materialize the full filtered view and assert filtered row i maps to
+/// `sources[i]` (its gutter value), with the row one past the last not servable.
+fn expectSourceRows(doc: *api.Doc, sources: []const u64) !void {
+    _ = api.ls_window_set(doc, 0, api.window_max_rows);
+    for (sources, 0..) |src, i| {
+        try std.testing.expectEqual(src, api.ls_source_row(doc, @intCast(i)));
+    }
+    try std.testing.expectEqual(api.no_row, api.ls_source_row(doc, sources.len));
+}
+
+// --- fv1..fv6 — the filter view & addressing --------------------------------
+
+test "fv1: with no filter the identity view is unchanged; filter poll IDLE; source_row is identity" {
+    var od = try openBytes(fv_fixture);
+    defer od.deinit();
+    // A fresh handle: no filter -> LS_FILTER_IDLE, all-zero snapshot.
+    const f = api.ls_filter_poll(od.doc);
+    try std.testing.expectEqual(api.FilterState.idle, f.state);
+    try std.testing.expectEqual(@as(f64, 0.0), f.progress);
+    try std.testing.expectEqual(@as(u64, 0), f.total);
+    try std.testing.expectEqual(false, f.total_exact);
+    // Identity accessors behave exactly as today (regression guard).
+    try expectDims(od.doc, 8, 3);
+    try std.testing.expectEqual(true, api.ls_dialect_get(od.doc).header);
+    winAll(od.doc);
+    try expectCell(od.doc, 0, 0, "Widget");
+    try expectCell(od.doc, 3, 2, "Needle point");
+    try expectHeaderCell(od.doc, 1, "qty");
+    // ls_source_row is the identity on servable rows; sentinel past the range.
+    try std.testing.expectEqual(@as(u64, 0), api.ls_source_row(od.doc, 0));
+    try std.testing.expectEqual(@as(u64, 7), api.ls_source_row(od.doc, 7));
+    try std.testing.expectEqual(api.no_row, api.ls_source_row(od.doc, 8));
+}
+
+test "fv2: a WHERE filter reports the matching count and serves the matching rows' cells in file order" {
+    var od = try openBytes(fv_fixture);
+    defer od.deinit();
+    try setFilter(od.doc, predReq(1, .ge, "2")); // qty >= 2 -> sources 0,1,2,4,6
+    const f = try waitFilterDone(od.doc);
+    try std.testing.expectEqual(@as(u64, 5), f.total);
+    try std.testing.expectEqual(true, f.total_exact);
+    try std.testing.expectEqual(@as(f64, 1.0), f.progress);
+    // Row count reports m, exact.
+    const rc = api.ls_row_count_get(od.doc);
+    try std.testing.expectEqual(@as(u64, 5), rc.count);
+    try std.testing.expectEqual(true, rc.exact);
+    // A window over [0, m) serves the matching rows' cells in file order.
+    const r = api.ls_window_set(od.doc, 0, api.window_max_rows);
+    try std.testing.expectEqual(@as(u64, 5), r.row_count);
+    try expectCell(od.doc, 0, 0, "Widget"); //       source 0
+    try expectCell(od.doc, 1, 0, "NEEDLE"); //       source 1
+    try expectCell(od.doc, 2, 1, "2.0"); //          source 2
+    try expectCell(od.doc, 3, 0, "Gizmo"); //        source 4
+    try expectCell(od.doc, 4, 2, "needleneedle"); // source 6
+    // The header record is unaffected by the filter.
+    try expectHeaderCell(od.doc, 0, "name");
+    try expectSourceRows(od.doc, &.{ 0, 1, 2, 4, 6 });
+}
+
+test "fv3: a TEXT filter yields the substring-matching rows with Find's smart-case rule" {
+    var od = try openBytes(fv_fixture);
+    defer od.deinit();
+    // Lowercase query folds ASCII case: sources 0,1,2,3,6,7.
+    try setFilter(od.doc, textReq("needle"));
+    var f = try waitFilterDone(od.doc);
+    try std.testing.expectEqual(@as(u64, 6), f.total);
+    try expectSourceRows(od.doc, &.{ 0, 1, 2, 3, 6, 7 });
+    // One ASCII uppercase byte -> byte-exact: only "NEEDLE" (source 1).
+    try setFilter(od.doc, textReq("NEEDLE"));
+    f = try waitFilterDone(od.doc);
+    try std.testing.expectEqual(@as(u64, 1), f.total);
+    try expectSourceRows(od.doc, &.{1});
+    // Column scope excludes columns exactly: "needle" (fold) in the NAME column
+    // (col 0) is sources 1 (NEEDLE) and 2 (needle); notes are ignored.
+    try setFilter(od.doc, textReqScoped("needle", &.{0}));
+    f = try waitFilterDone(od.doc);
+    try std.testing.expectEqual(@as(u64, 2), f.total);
+    try expectSourceRows(od.doc, &.{ 1, 2 });
+}
+
+test "fv4: clearing the filter restores the identity view" {
+    var od = try openBytes(fv_fixture);
+    defer od.deinit();
+    try setFilter(od.doc, textReq("needle"));
+    _ = try waitFilterDone(od.doc);
+    try std.testing.expectEqual(@as(u64, 6), api.ls_row_count_get(od.doc).count);
+    // Clear -> identity view: full count, poll IDLE, row i == physical data row i.
+    api.ls_filter_clear(od.doc);
+    try std.testing.expectEqual(api.FilterState.idle, api.ls_filter_poll(od.doc).state);
+    const rc = api.ls_row_count_get(od.doc);
+    try std.testing.expectEqual(@as(u64, 8), rc.count);
+    try std.testing.expectEqual(true, rc.exact);
+    winAll(od.doc);
+    try expectCell(od.doc, 3, 0, "gadget"); // physical data row 3 again
+    try expectCell(od.doc, 4, 2, "delta");
+    try std.testing.expectEqual(@as(u64, 4), api.ls_source_row(od.doc, 4)); // identity
+}
+
+test "fv5: an invalid filter request is rejected and leaves the current view unchanged" {
+    var od = try openBytes(fv_fixture);
+    defer od.deinit();
+    // Establish a filtered view (qty >= 2 -> 5 rows).
+    try setFilter(od.doc, predReq(1, .ge, "2"));
+    _ = try waitFilterDone(od.doc);
+    try std.testing.expectEqual(@as(u64, 5), api.ls_row_count_get(od.doc).count);
+    // Each invalid request is rejected (exactly as ls_search_start rejects it).
+    try expectFilterRejected(od.doc, textReq("")); //               empty TEXT query
+    try expectFilterRejected(od.doc, textReqScoped("x", &.{})); //  non-NULL empty scope
+    try expectFilterRejected(od.doc, textReqScoped("x", &.{3})); // scope column out of range
+    try expectFilterRejected(od.doc, predReq(9, .eq, "x")); //      column out of range
+    try expectFilterRejected(od.doc, predReq(1, .lt, "abc")); //    non-numeric ordering value
+    // The 5-row filtered view is unchanged after every rejection.
+    try std.testing.expect(api.ls_filter_poll(od.doc).state != .idle);
+    try std.testing.expectEqual(@as(u64, 5), api.ls_row_count_get(od.doc).count);
+    try expectSourceRows(od.doc, &.{ 0, 1, 2, 4, 6 });
+}
+
+test "fv6: a filter that matches nothing yields a filtered view of exactly 0 rows" {
+    var od = try openBytes(fv_fixture);
+    defer od.deinit();
+    try setFilter(od.doc, textReq("zzz-no-such-substring"));
+    const f = try waitFilterDone(od.doc);
+    try std.testing.expectEqual(@as(u64, 0), f.total);
+    try std.testing.expectEqual(true, f.total_exact);
+    const rc = api.ls_row_count_get(od.doc);
+    try std.testing.expectEqual(@as(u64, 0), rc.count);
+    try std.testing.expectEqual(true, rc.exact);
+    // No rows servable; ls_source_row(0) is the sentinel.
+    const r = api.ls_window_set(od.doc, 0, api.window_max_rows);
+    try std.testing.expectEqual(@as(u64, 0), r.row_count);
+    try std.testing.expectEqual(api.no_row, api.ls_source_row(od.doc, 0));
+}
+
+// --- fv7..fv10 — scan, progress, memory, the shared slot --------------------
+
+test "fv7: the filter-scan is scanning with monotone progress until done, then an exact total" {
+    const gpa = std.testing.allocator;
+    // Row 290,000 is well beyond any MANUAL open frontier: the filter-scan must
+    // advance the shared frontier to count it.
+    const fixture = try genNeedleRows(gpa, 300_000, &.{ 100, 150_000, 290_000 });
+    defer gpa.free(fixture);
+    var od = try openWith(fixture, manualNoHeader);
+    defer od.deinit();
+    try setFilter(od.doc, textReq("needle"));
+    const io = std.testing.io;
+    const t0: std.Io.Clock.Timestamp = .now(io, .awake);
+    var last_progress: f64 = 0.0;
+    var last_total: u64 = 0;
+    while (true) {
+        const s = api.ls_filter_poll(od.doc);
+        try std.testing.expect(s.state != .idle); // a set filter is never IDLE
+        try std.testing.expect(s.progress >= 0.0 and s.progress <= 1.0);
+        try std.testing.expect(s.progress >= last_progress); // monotone
+        try std.testing.expect(s.total >= last_total); // monotone
+        try std.testing.expect(api.ls_row_count_get(od.doc).count >= s.total);
+        last_progress = s.progress;
+        last_total = s.total;
+        if (s.state == .done) {
+            try std.testing.expectEqual(@as(f64, 1.0), s.progress);
+            try std.testing.expectEqual(@as(u64, 3), s.total);
+            try std.testing.expectEqual(true, s.total_exact);
+            const rc = api.ls_row_count_get(od.doc);
+            try std.testing.expectEqual(@as(u64, 3), rc.count);
+            try std.testing.expectEqual(true, rc.exact);
+            break;
+        }
+        if (elapsedMs(t0) > 15_000) return error.FilterTimeout;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    // All three matches are servable, in filtered coordinates.
+    try expectSourceRows(od.doc, &.{ 100, 150_000, 290_000 });
+}
+
+test "fv8: filter counter storage is O(checkpoints) — independent of the match count" {
+    const gpa = std.testing.allocator;
+    const n: u64 = 200_000; // 3.6 MB: fully indexed at open, so the deltas below
+    // measure FILTER allocations only.
+    const sparse_rows = try ascending(gpa, n, 20_000); // 10 matches
+    defer gpa.free(sparse_rows);
+    const dense_rows = try ascending(gpa, n, 1); // every row matches
+    defer gpa.free(dense_rows);
+    const sets = [2][]const u64{ sparse_rows, dense_rows };
+    const expected = [2]u64{ 10, n };
+    var deltas: [2]u64 = undefined;
+    for (sets, 0..) |match_set, idx| {
+        const fixture = try genNeedleRows(gpa, n, match_set);
+        defer gpa.free(fixture);
+        var fx = try makeFixture(fixture, 0o644);
+        defer fx.deinit();
+        var tracking: BytesAllocator = .{ .parent = std.testing.allocator };
+        var doc_opt: ?*api.Doc = null;
+        try std.testing.expectEqual(api.Status.ok, api.openWithAllocator(tracking.allocator(), fx.path.ptr, &manualNoHeader, &doc_opt));
+        const doc = doc_opt.?;
+        defer api.ls_close(doc);
+        const before = tracking.bytes.load(.monotonic);
+        try setFilter(doc, textReq("needle"));
+        const s = try waitFilterDone(doc);
+        try std.testing.expectEqual(expected[idx], s.total);
+        deltas[idx] = tracking.bytes.load(.monotonic) - before;
+    }
+    // A materialized match-row list would grow the dense filter by ~200k
+    // entries (>= 1.6 MB); per-block counters are identical for both layouts.
+    try std.testing.expect(deltas[1] <= deltas[0] + 64 * 1024);
+}
+
+test "fv9: the filter-scan feeds the base row index — after it completes the index is complete" {
+    const gpa = std.testing.allocator;
+    const fixture = try genNeedleRows(gpa, 300_000, &.{ 5, 290_000 });
+    defer gpa.free(fixture);
+    var od = try openWith(fixture, manualNoHeader); // MANUAL: only scans advance the frontier
+    defer od.deinit();
+    try std.testing.expectEqual(false, api.ls_index_poll(od.doc).complete); // head only, so far
+    try setFilter(od.doc, textReq("needle"));
+    _ = try waitFilterDone(od.doc);
+    // Bytes scanned for the filter also indexed the document (paid once).
+    const p = api.ls_index_poll(od.doc);
+    try std.testing.expectEqual(true, p.complete);
+    try std.testing.expectEqual(p.bytes_total, p.bytes_scanned);
+    // The base (unfiltered) row count is exact once the filter is cleared.
+    api.ls_filter_clear(od.doc);
+    const rc = api.ls_row_count_get(od.doc);
+    try std.testing.expectEqual(@as(u64, 300_000), rc.count);
+    try std.testing.expectEqual(true, rc.exact);
+}
+
+test "fv10: filter and jump share the scan slot — a jump takes it, gains kept, the mode persists" {
+    const gpa = std.testing.allocator;
+    const fixture = try genNeedleRows(gpa, 2_000_000, &.{ 5, 1_000_000, 1_999_990 });
+    defer gpa.free(fixture);
+    var od = try openWith(fixture, manualNoHeader);
+    defer od.deinit();
+    try setFilter(od.doc, textReq("needle"));
+    // Let the filter-scan count at least the first match.
+    const io = std.testing.io;
+    const t0: std.Io.Clock.Timestamp = .now(io, .awake);
+    while (api.ls_filter_poll(od.doc).total < 1) {
+        if (elapsedMs(t0) > 15_000) return error.FilterTimeout;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    const mid = api.ls_filter_poll(od.doc);
+    // A jump that must scan (far target) engages the slot.
+    api.ls_jump_start(od.doc, 1_900_000);
+    const after = api.ls_filter_poll(od.doc);
+    // The filter MODE persists (never IDLE); the match frontier never regresses.
+    try std.testing.expect(after.state != .idle);
+    try std.testing.expect(after.total >= mid.total);
+    try std.testing.expect(after.progress >= mid.progress);
+    // Rows already counted behind the filter frontier stay servable.
+    const r = api.ls_window_set(od.doc, 0, 1);
+    try std.testing.expectEqual(@as(u64, 1), r.row_count);
+    try std.testing.expectEqual(@as(u64, 5), api.ls_source_row(od.doc, 0)); // first match's source
+    _ = try waitJumpDone(od.doc);
+    // The filter mode survived the whole exchange (fv12 pins the filtered landing).
+    try std.testing.expect(api.ls_filter_poll(od.doc).state != .idle);
+}
+
+// --- fv11..fv13 — source rows, jump, clear re-anchor ------------------------
+
+test "fv11: each served filtered row reports its correct original data-row number" {
+    var od = try openBytes(fv_fixture);
+    defer od.deinit();
+    try setFilter(od.doc, textReq("needle")); // sources 0,1,2,3,6,7
+    _ = try waitFilterDone(od.doc);
+    _ = api.ls_window_set(od.doc, 0, api.window_max_rows);
+    const expected = [_]u64{ 0, 1, 2, 3, 6, 7 };
+    for (expected, 0..) |src, i| {
+        try std.testing.expectEqual(src, api.ls_source_row(od.doc, @intCast(i)));
+    }
+    try std.testing.expectEqual(api.no_row, api.ls_source_row(od.doc, expected.len)); // past range
+    // Same window/borrow domain as ls_cell: a narrower window makes rows outside
+    // it unservable (LS_NO_ROW), and the in-window rows still map correctly.
+    const r = api.ls_window_set(od.doc, 2, 2); // filtered rows 2,3 -> sources 2,3
+    try std.testing.expectEqual(@as(u64, 2), r.row_count);
+    try std.testing.expectEqual(@as(u64, 2), api.ls_source_row(od.doc, 2));
+    try std.testing.expectEqual(@as(u64, 3), api.ls_source_row(od.doc, 3));
+    try std.testing.expectEqual(api.no_row, api.ls_source_row(od.doc, 0)); // now out of window
+}
+
+test "fv12: jump under a filter takes an original row number and lands on the nearest match at-or-after it" {
+    var od = try openBytes(fv_fixture);
+    defer od.deinit();
+    try setFilter(od.doc, textReq("needle")); // sources 0,1,2,3,6,7 -> filtered 0..5
+    _ = try waitFilterDone(od.doc);
+    // go to original row 4 -> nearest match >= 4 is source 6 = filtered index 4.
+    api.ls_jump_start(od.doc, 4);
+    var jd = try waitJumpDone(od.doc);
+    try std.testing.expectEqual(@as(u64, 4), jd.landed_row); // FILTERED index
+    _ = api.ls_window_set(od.doc, jd.landed_row, 1);
+    try std.testing.expectEqual(@as(u64, 6), api.ls_source_row(od.doc, jd.landed_row)); // gutter >= 4
+    // go to original row 3 -> exact match at source 3 = filtered index 3.
+    api.ls_jump_start(od.doc, 3);
+    jd = try waitJumpDone(od.doc);
+    try std.testing.expectEqual(@as(u64, 3), jd.landed_row);
+    // go past EOF -> clamp to the last match: source 7 = filtered index 5.
+    api.ls_jump_start(od.doc, 1_000_000);
+    jd = try waitJumpDone(od.doc);
+    try std.testing.expectEqual(@as(u64, 5), jd.landed_row);
+    _ = api.ls_window_set(od.doc, jd.landed_row, 1);
+    try std.testing.expectEqual(@as(u64, 7), api.ls_source_row(od.doc, jd.landed_row));
+}
+
+test "fv13: clearing re-anchors via the source row of the top visible filtered row" {
+    var od = try openBytes(fv_fixture);
+    defer od.deinit();
+    try setFilter(od.doc, textReq("needle"));
+    _ = try waitFilterDone(od.doc);
+    // Viewport top at filtered row 4 (source row 6): capture its source row.
+    _ = api.ls_window_set(od.doc, 4, 2);
+    const anchor = api.ls_source_row(od.doc, 4);
+    try std.testing.expectEqual(@as(u64, 6), anchor);
+    // Clear, then the captured source row is directly addressable in identity.
+    api.ls_filter_clear(od.doc);
+    const r = api.ls_window_set(od.doc, anchor, 1);
+    try std.testing.expectEqual(@as(u64, 1), r.row_count);
+    try expectCell(od.doc, anchor, 2, "needleneedle"); // physical data row 6, note col
+    try std.testing.expectEqual(anchor, api.ls_source_row(od.doc, anchor)); // identity again
+}
+
+// --- fv14..fv15 — find within a filter; reset semantics ---------------------
+
+test "fv14: find within a filter matches only filtered rows; counts/positions/nav are filtered" {
+    var od = try openBytes(fv_fixture);
+    defer od.deinit();
+    // Filter: qty >= 2 -> source rows 0,1,2,4,6 (filtered 0..4).
+    try setFilter(od.doc, predReq(1, .ge, "2"));
+    _ = try waitFilterDone(od.doc);
+    // Find "needle" WITHIN the filter: filtered rows whose cells contain it are
+    // filtered 0 (src 0), 1 (src 1), 2 (src 2), 4 (src 6); filtered 3 (src 4,
+    // "Gizmo") does not -> total within the filter = 4.
+    try startSearch(od.doc, textReq("needle"));
+    const done = try waitSearchDone(od.doc);
+    try std.testing.expectEqual(@as(u64, 4), done.total);
+    try std.testing.expectEqual(true, done.total_exact);
+    // found_row is a FILTERED index; navigation stays within the filtered view;
+    // the position (n of m) counts rows satisfying BOTH predicates.
+    var s = try navAndWait(od.doc, 0, .forward);
+    try expectFound(s, 0, 2, 1); // filtered 0 (src 0), "alpha needle" col 2
+    s = try navAndWait(od.doc, 1, .forward);
+    try expectFound(s, 1, 0, 2); // filtered 1 (src 1), "NEEDLE" col 0
+    s = try navAndWait(od.doc, 2, .forward);
+    try expectFound(s, 2, 0, 3); // filtered 2 (src 2), "needle" col 0
+    s = try navAndWait(od.doc, 3, .forward);
+    try expectFound(s, 4, 2, 4); // skips filtered 3 (no match); filtered 4 (src 6) col 2
+    s = try navAndWait(od.doc, 5, .forward);
+    try std.testing.expectEqual(api.SearchNavState.exhausted, s.nav);
+    // The found filtered row maps back to its source row for the gutter.
+    _ = api.ls_window_set(od.doc, 4, 1);
+    try std.testing.expectEqual(@as(u64, 6), api.ls_source_row(od.doc, 4));
+}
+
+test "fv15: setting/clearing a filter resets an active find; a re-open clears the filter" {
+    var fx = try makeFixture(fv_fixture, 0o644);
+    defer fx.deinit();
+    var doc_opt: ?*api.Doc = null;
+    try std.testing.expectEqual(api.Status.ok, api.ls_open(fx.path.ptr, &manual, &doc_opt));
+    var doc = doc_opt.?;
+    // A find in the identity view...
+    try startSearch(doc, textReq("needle"));
+    _ = try waitSearchDone(doc);
+    try std.testing.expect(api.ls_search_poll(doc).state != .idle);
+    // ...is RESET when a filter is set (the coordinate space changed).
+    try setFilter(doc, predReq(1, .ge, "2"));
+    try std.testing.expectEqual(api.SearchState.idle, api.ls_search_poll(doc).state);
+    // A find within the filter, then CLEARING the filter, resets it again.
+    try startSearch(doc, textReq("needle"));
+    _ = try waitSearchDone(doc);
+    api.ls_filter_clear(doc);
+    try std.testing.expectEqual(api.SearchState.idle, api.ls_search_poll(doc).state);
+    // Set a filter, then a dialect re-open clears BOTH the filter and the search.
+    try setFilter(doc, predReq(1, .ge, "2"));
+    _ = try waitFilterDone(doc);
+    api.ls_close(doc);
+    const opts: api.OpenOptions = .{ .header = api.header_off, .index_mode = api.index_manual };
+    doc_opt = null;
+    try std.testing.expectEqual(api.Status.ok, api.ls_open(fx.path.ptr, &opts, &doc_opt));
+    doc = doc_opt.?;
+    defer api.ls_close(doc);
+    try std.testing.expectEqual(api.FilterState.idle, api.ls_filter_poll(doc).state);
+    try std.testing.expectEqual(api.SearchState.idle, api.ls_search_poll(doc).state);
+}
+
+// ---------------------------------------------------------------------------
+// Public C ABI: the filter symbols are callable through extern linkage, and the
+// enum values / sentinel are pinned to the header (regression guard; the seed
+// links and reports IDLE, so this stays green from the seed).
+// ---------------------------------------------------------------------------
+
+const c_linked_filter = struct {
+    extern fn ls_filter_set(doc: *api.Doc, request: *const api.SearchRequest) bool;
+    extern fn ls_filter_clear(doc: *api.Doc) void;
+    extern fn ls_filter_poll(doc: *const api.Doc) api.FilterStatus;
+    extern fn ls_source_row(doc: *const api.Doc, row: u64) u64;
+};
+
+test "abi: the filter C symbols are callable through extern linkage; enum values pinned" {
+    try std.testing.expectEqual(@as(c_int, 0), @intFromEnum(api.FilterState.idle));
+    try std.testing.expectEqual(@as(c_int, 1), @intFromEnum(api.FilterState.scanning));
+    try std.testing.expectEqual(@as(c_int, 2), @intFromEnum(api.FilterState.done));
+    try std.testing.expectEqual(@as(c_int, 3), @intFromEnum(api.FilterState.cancelled));
+    try std.testing.expectEqual(std.math.maxInt(u64), api.no_row);
+
+    var od = try openBytes(fv_fixture);
+    defer od.deinit();
+    const req = textReq("needle");
+    _ = c_linked_filter.ls_filter_set(od.doc, &req);
+    _ = c_linked_filter.ls_filter_poll(od.doc);
+    winAll(od.doc);
+    _ = c_linked_filter.ls_source_row(od.doc, 0);
+    c_linked_filter.ls_filter_clear(od.doc);
+    try std.testing.expectEqual(api.FilterState.idle, c_linked_filter.ls_filter_poll(od.doc).state);
+}

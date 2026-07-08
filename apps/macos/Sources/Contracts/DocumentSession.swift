@@ -3,7 +3,10 @@
 /// copy-and-close head snapshot). A session wraps one open core handle
 /// (`ls_doc`) for its whole lifetime; rows are paged through `setWindow` as
 /// the user scrolls, and background indexing / jump scans / match-scans are
-/// observed by polling.
+/// observed by polling. A FILTER (setFilter / clearFilter / filterStatus /
+/// sourceRow) is an in-place VIEW MODE: while active, the same accessors serve
+/// only the matching rows in filtered coordinates, with each row's original
+/// number retrievable — see api/lesssheet.h FILTERED VIEWS.
 ///
 /// Contract (mirrors api/lesssheet.h; see it for full semantics):
 /// - All strings returned by a session OWN their storage: implementations
@@ -149,6 +152,36 @@ public protocol DocumentSession: AnyObject, Sendable {
     /// session — a fresh session, including a dialect RE-OPEN, is nil (all
     /// search state dies with the old handle). Poll; never blocks.
     func searchStatus() -> SearchSnapshot?
+
+    /// Set (or replace) the active FILTER from `request` (mirrors
+    /// `ls_filter_set`), entering FILTERED MODE: every row accessor, jump, and
+    /// search then operates in filtered coordinates (row i = the i-th matching
+    /// row in file order). REPLACES any previous filter, takes the core's
+    /// single scan slot (cancelling a scanning jump), and RESETS any active
+    /// search (the coordinate space changed — `searchStatus()` returns nil
+    /// afterwards). Returns false iff the core REJECTS the request (same rules
+    /// as `startSearch`: empty text query, invalid scope, out-of-range column,
+    /// an ordering operator with a non-numeric value); NOTHING changes then.
+    /// Never blocks (the filter-scan is asynchronous — poll `filterStatus`).
+    func setFilter(_ request: SearchRequest) -> Bool
+    /// Clear the active filter, restoring the IDENTITY view (mirrors
+    /// `ls_filter_clear`; no-op when no filter is active). Resets any active
+    /// search. Re-anchoring the viewport near the row you were viewing is the
+    /// caller's affair (capture `sourceRow` of the top visible row BEFORE
+    /// clearing — ARCH criterion 13). Never blocks.
+    func clearFilter()
+    /// Current filter snapshot (mirrors `ls_filter_poll`), or nil when no
+    /// filter is active — a fresh session or a dialect RE-OPEN is nil (the
+    /// filter dies with the old handle). Poll; never blocks.
+    func filterStatus() -> FilterSnapshot?
+    /// The ORIGINAL (unfiltered) 0-based data-row number of view row `viewRow`
+    /// — the gutter value (mirrors `ls_source_row`). `viewRow` is a
+    /// view-relative index (a FILTERED index while a filter is active; a
+    /// physical data row otherwise). Returns nil (the core's LS_NO_ROW
+    /// sentinel) for a row outside the currently materialized window or the
+    /// view's range — identical window/borrow domain to a cell read. Without a
+    /// filter it is the identity on servable rows. Never blocks; never scans.
+    func sourceRow(_ viewRow: UInt64) -> UInt64?
 
     /// Release the core handle. Idempotent; nothing else may be called
     /// afterwards.

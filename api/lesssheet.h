@@ -7,7 +7,8 @@
  * library. It is frozen by the workspace-root planner: implementers on either
  * side may not change it (two-key change-request process only).
  *
- * Scope (viewer-ui + find-seek + csv-hardening slices): open a document with
+ * Scope (viewer-ui + find-seek + csv-hardening + filtered-views slices):
+ * open a document with
  * an optionally forced parse profile (separator / quote / header / ENCODING),
  * read the effective dialect report (now including the resolved encoding),
  * access any contiguous row window over a file of any size (64-bit row
@@ -16,8 +17,12 @@
  * estimated), run cancellable jump-scans with progress, and run streaming
  * content SEARCHES: text and column-predicate match-scans with bounded
  * per-block match counts, match navigation (next/previous), and pollable
- * progress — sharing the single scan slot with jumps. The walking-skeleton
- * head-window surface is superseded.
+ * progress — sharing the single scan slot with jumps. filtered-views adds a
+ * derived FILTER view over the same machinery: set a filter from an
+ * ls_search_request and the row accessors, jumps, and searches then operate
+ * in FILTERED coordinates (row i = the i-th matching data row), with each
+ * match's original row number retrievable — see FILTERED VIEWS. The
+ * walking-skeleton head-window surface is superseded.
  *
  * csv-hardening adds two things to the delimited-text path without changing
  * any existing signature: (1) ENCODING — the core detects (or is forced to)
@@ -34,9 +39,11 @@
  *     profile (the only format this slice ships). Future formats (XLSX,
  *     Parquet) ignore the dialect options and are specified at their slices.
  *   - Row addressing is view-relative (see ls_cell): a row index addresses
- *     the document's current row set (today: the identity view — all data
- *     rows in file order), never a physical file line. Filtered views can be
- *     added later without breaking the addressing model. The search-job
+ *     the document's current row set (the identity view — all data rows in
+ *     file order — by default, or a FILTER view while one is active), never
+ *     a physical file line. A filter is a second view kind over the same
+ *     document (see FILTERED VIEWS); it does not change the addressing model.
+ *     The search-job
  *     handle is deliberately opaque state on the document so a later slice
  *     can promote a search into a view definition.
  *
@@ -47,26 +54,32 @@
  *     valid until the NEXT ls_window_set() call on that document or until
  *     ls_close(), whichever comes first. ls_window_set may evict; nothing
  *     else invalidates borrows — in particular the core's own background
- *     scanning (indexing, jump-scans, AND match-scans) NEVER invalidates a
+ *     scanning (indexing, jump-scans, match-scans, AND filter-scans) NEVER
+ *     invalidates a
  *     borrow. Callers copy at their own boundary; they never free anything
  *     obtained from the core.
- *   - Allocation discipline: ls_open, ls_window_set, ls_search_start, and
- *     ls_search_nav are the only CALLS that may allocate (running background
+ *   - Allocation discipline: ls_open, ls_window_set, ls_search_start,
+ *     ls_search_nav, and ls_filter_set are the only CALLS that may allocate
+ *     (running background
  *     scans may also allocate internally for index/count storage). Every
  *     accessor and poll (ls_dialect_get, ls_column_count, ls_row_count_get,
  *     ls_index_poll, ls_cell, ls_cell_truncated, ls_header_cell,
- *     ls_header_cell_truncated, ls_jump_poll, ls_search_poll) and
- *     ls_jump_cancel / ls_search_cancel performs ZERO heap allocation and
+ *     ls_header_cell_truncated, ls_jump_poll, ls_search_poll, ls_filter_poll,
+ *     ls_source_row) and ls_jump_cancel / ls_search_cancel / ls_filter_clear
+ *     performs ZERO heap allocation and
  *     never fails; out-of-range access returns the empty string / a
  *     well-defined value. Additionally, once every scan has reported a
  *     terminal state (index complete or idle, jump slot not LS_JUMP_SCANNING,
- *     search not LS_SEARCH_SCANNING), the core performs no further internal
- *     allocation on that document until the next mutating call
- *     (ls_window_set, ls_jump_start, ls_search_start, ls_search_nav).
+ *     search not LS_SEARCH_SCANNING, filter not LS_FILTER_SCANNING), the core
+ *     performs no further internal allocation on that document until the next
+ *     mutating call (ls_window_set, ls_jump_start, ls_search_start,
+ *     ls_search_nav, ls_filter_set).
  *   - Source files are read-only to the core: never modified, locked, or
  *     copied. Steady-state memory is O(materialized window + index
  *     checkpoints), never O(file) and never O(rows). A search adds
- *     O(index checkpoints) count storage + O(1) job state — see SEARCH.
+ *     O(index checkpoints) count storage + O(1) job state — see SEARCH. A
+ *     filter adds the same O(index checkpoints) counter storage + O(1) mode
+ *     state (never a match-row list) — see FILTERED VIEWS.
  *
  * OPEN COST (the cold-start contract)
  *   - ls_open performs O(head) work regardless of file size: it consumes at
@@ -78,7 +91,8 @@
  *     giant first record or first cell cannot make open O(file) either (see
  *     the column-count / record-1 rule and LS_CELL_MAX_BYTES). The search
  *     machinery is lazy: it costs nothing (no storage, no threads, no scan
- *     work) until the first ls_search_start on the document.
+ *     work) until the first ls_search_start on the document. The filter
+ *     machinery is likewise lazy: nothing until the first ls_filter_set.
  *   - After a successful open the scan frontier covers at least
  *     min(total rows, LS_OPEN_READY_MIN_ROWS) rows, provided those rows fit
  *     within LS_OPEN_HEAD_MAX_BYTES — so a window at the top of the document
@@ -179,19 +193,128 @@
  *     re-open (ls_close + ls_open) and therefore invalidates ALL search
  *     state: a fresh handle polls LS_SEARCH_IDLE with an all-zero snapshot.
  *
+ * FILTERED VIEWS (filtered-views slice — a derived row view, counters not lists)
+ *   - A document has at most ONE active FILTER: a VIEW MODE set from an
+ *     ls_search_request (the SAME request type, grammar, and validation as
+ *     ls_search_start) by ls_filter_set, and removed by ls_filter_clear. A
+ *     filter is a view mode, not a transient job: once set it PERSISTS until
+ *     cleared or the document is re-opened, regardless of scan-slot contention.
+ *   - THE FILTERED VIEW. While a filter is active the document PRESENTS ONLY
+ *     the data rows that satisfy the filter predicate, indexed 0..m-1 in file
+ *     order (row i = the i-th matching data row). ALL row-addressing accessors
+ *     reinterpret their row arguments AND results in these FILTERED
+ *     coordinates:
+ *       * ls_row_count_get — reports m (matching rows); see COUNT below.
+ *       * ls_window_set / ls_cell / ls_cell_truncated — address and serve the
+ *         matching rows and their cells (every cell rule unchanged: quoting,
+ *         the truncate/pad rule, the LS_CELL_MAX_BYTES display cap and flag).
+ *       * ls_jump_* — target is an ORIGINAL data-row number; see JUMP below.
+ *       * ls_search_* — the find predicate is evaluated only over rows that
+ *         satisfy the filter; see FIND below.
+ *     The effective HEADER record is NOT a data row and is UNAFFECTED:
+ *     ls_header_cell / ls_header_cell_truncated are unchanged by a filter.
+ *     With NO filter (LS_FILTER_IDLE) every accessor behaves exactly as
+ *     specified elsewhere in this header — the identity view is the "m == all
+ *     data rows" case, and ls_source_row(doc, i) == i for a servable row.
+ *   - COUNTERS, NOT LISTS (memory). The matching rows are tracked with
+ *     per-block match COUNTERS aligned to the sparse row-index checkpoints (the
+ *     SEARCH mechanism), NEVER a materialized list of matching row numbers.
+ *     Filter memory is O(index checkpoints) + O(1) mode state, INDEPENDENT of
+ *     the match count — a filter over a 10 GB file with millions of matches
+ *     uses the same bounded memory as the base index. Mapping a filtered index
+ *     to/from its source row, and materializing a filtered window, are served
+ *     by counting into blocks (O(checkpoints)) plus a bounded in-block re-lex
+ *     (O(window)); NEVER O(m).
+ *   - THE FILTER-SCAN & FRONTIER. ls_filter_set starts a streaming FILTER-SCAN
+ *     that sweeps data rows from row 0 toward EOF, tallying the per-block match
+ *     counts and advancing the SHARED scan frontier exactly like a match-scan
+ *     (every byte it scans also feeds the base row index — paid once). It does
+ *     NOT scan the whole file before returning: the first screen of matching
+ *     rows is servable as soon as they are found behind the frontier
+ *     (O(viewport)), and the scan continues in the background with pollable
+ *     progress. The filter's COUNTED REGION is contiguous from row 0; its
+ *     discovered-match frontier is MONOTONE (only advances, never regresses)
+ *     and survives slot contention.
+ *   - THE SINGLE SCAN SLOT (now three contenders: jump, find, filter). The
+ *     filter-scan shares the document's one background-scan slot with
+ *     jump-scans and match-scans:
+ *       * ls_filter_set takes the slot for the filter-scan: a jump in
+ *         LS_JUMP_SCANNING is cancelled (LS_JUMP_IDLE, frontier gains kept) and
+ *         any active search is RESET (see RESET below).
+ *       * An ls_jump_start that must scan, or an ls_search_start / ls_search_nav
+ *         that must scan, TAKES the slot from a running filter-scan: the filter
+ *         goes LS_FILTER_CANCELLED (counts, progress, and frontier gains kept,
+ *         frozen at their last values) but the filter MODE PERSISTS — the view
+ *         stays filtered and already-counted rows stay servable.
+ *       * Under LS_INDEX_AUTO the filter-scan is a background view-completion
+ *         job: it converges to LS_FILTER_DONE (m exact, progress 1.0) WITHOUT
+ *         further caller input, whatever jumps/finds intervene (mirroring the
+ *         AUTO indexer's drive to completion). Under LS_INDEX_MANUAL it advances
+ *         only while it owns the slot: after slot contention it stays
+ *         LS_FILTER_CANCELLED until re-driven (ls_filter_set again, or a
+ *         filtered jump/find that re-engages the slot and advances the
+ *         frontier).
+ *   - COUNT (ls_row_count_get and ls_filter_status.total). While a filter is
+ *     active BOTH report the SAME value: the number of matching rows COUNTED SO
+ *     FAR (m) — exact for the counted region, MONOTONE non-decreasing within one
+ *     filter, and FINAL exactly when the filter-scan completes (LS_FILTER_DONE:
+ *     total_exact and ls_row_count.exact both true). It is 0 while scanning has
+ *     found no match yet, and exactly 0 (exact) for a completed filter that
+ *     matches nothing. This mirrors the base row count during indexing (a
+ *     converging lower bound that becomes exact), so a frontend renders "N of M
+ *     rows" with N growing alongside the scan %.
+ *   - SOURCE ROWS (ls_source_row). For any view row currently SERVABLE (inside
+ *     the materialized window), ls_source_row returns its ORIGINAL (unfiltered)
+ *     0-based data-row number — the gutter value. Total, zero-alloc; identical
+ *     window/borrow domain to ls_cell; returns LS_NO_ROW for a row outside the
+ *     materialized window or the view's row range. Without a filter it is the
+ *     identity on servable rows (ls_source_row(doc, i) == i).
+ *   - JUMP under a filter. ls_jump_start's target_row is interpreted as an
+ *     ORIGINAL data-row number: the jump advances the filter-scan (with
+ *     progress) to the FIRST matching row whose original index >= target_row and
+ *     reports THAT row's FILTERED index as ls_jump_status.landed_row (clamped to
+ *     the last match when target_row is at/after EOF; 0 when the filtered view
+ *     has no rows). Behind the filter frontier it completes before the call
+ *     returns (no scan), as jumps do today.
+ *   - FIND under a filter. ls_search_* operates entirely in FILTERED
+ *     coordinates: ls_search_nav anchors and found_row are FILTERED indices, and
+ *     the find predicate is evaluated ONLY over rows that satisfy the filter.
+ *     total and position count rows satisfying BOTH the filter and the find
+ *     predicate; navigation (first/next/previous, wrap) moves within the
+ *     filtered view. Counts are exact for the scanned region and converge with
+ *     progress, exactly as Find does without a filter. Filter and find share the
+ *     single slot (above).
+ *   - RESET. Setting a filter, clearing a filter, and a dialect/encoding re-open
+ *     each RESET any active search (the coordinate space changed):
+ *     ls_search_poll returns LS_SEARCH_IDLE with an all-zero snapshot. A re-open
+ *     (ls_close + ls_open — a new document identity) ADDITIONALLY clears the
+ *     filter: a fresh handle polls LS_FILTER_IDLE. Setting or clearing a filter
+ *     also returns the jump slot to LS_JUMP_IDLE (a scanning jump is cancelled
+ *     with its frontier gains kept; a completed jump's landing does not persist
+ *     across the coordinate change).
+ *   - LAZINESS & COST. The filter machinery costs nothing until the first
+ *     ls_filter_set (no storage, no scan). Setting a filter is O(viewport) to
+ *     the first matching rows plus a background scan; it never reads the whole
+ *     file before returning and never blocks the caller. Re-deriving a filtered
+ *     window behind the frontier is O(window) re-lex + O(checkpoints) counting —
+ *     safe on the caller/UI thread (ls_window_set never scans, in either view).
+ *
  * THREADING
  *   - ls_open / ls_close: exclusive. Do not call anything on a document
  *     concurrently with its open or close. ls_close may be called while
- *     scans are running (jump-scans AND match-scans): it cancels and joins
+ *     scans are running (jump-scans, match-scans, AND filter-scans): it
+ *     cancels and joins
  *     all core-owned threads for that document before releasing storage.
- *   - Window lane — ls_window_set, ls_cell, ls_header_cell: one caller
+ *   - Window lane — ls_window_set, ls_cell, ls_source_row, ls_header_cell:
+ *     one caller
  *     thread at a time (callers serialize these among themselves). They are
  *     safe to call concurrently with the poll/control lane and with the
  *     core's own background scanning.
  *   - Poll/control lane — ls_dialect_get, ls_column_count, ls_row_count_get,
  *     ls_index_poll, ls_jump_start, ls_jump_cancel, ls_jump_poll,
- *     ls_search_start, ls_search_nav, ls_search_cancel, ls_search_poll: safe
- *     from any thread at any time (internally synchronized), except
+ *     ls_search_start, ls_search_nav, ls_search_cancel, ls_search_poll,
+ *     ls_filter_set, ls_filter_clear, ls_filter_poll: safe from any thread
+ *     at any time (internally synchronized), except
  *     concurrently with ls_open/ls_close on the same document.
  *   - Distinct documents are fully independent.
  *
@@ -356,6 +479,13 @@ extern "C" {
 
 /* ls_window_set row_count is clamped to this (bounds window memory). */
 #define LS_WINDOW_MAX_ROWS (4096)
+
+/*
+ * ls_source_row sentinel: the given view row is not currently servable
+ * (outside the materialized window, or beyond the view's row range). No data
+ * row can have this index. See FILTERED VIEWS.
+ */
+#define LS_NO_ROW (UINT64_MAX)
 
 /*
  * Text encoding of the source file (ls_open_options.encoding and, resolved,
@@ -682,6 +812,48 @@ typedef struct ls_search_status {
 } ls_search_status;
 
 /* ------------------------------------------------------------------------- */
+/* Filter types (see the FILTERED VIEWS section above for the view model)      */
+/* ------------------------------------------------------------------------- */
+
+/* State of the document's (single) filter — its scan-slot occupancy. */
+typedef enum ls_filter_state {
+    /* No filter active: the IDENTITY view. The whole snapshot is zero. */
+    LS_FILTER_IDLE = 0,
+    /* A filter is active and its filter-scan is advancing. */
+    LS_FILTER_SCANNING = 1,
+    /* A filter is active and its filter-scan covered every data row: `total`
+     * is final (total_exact true), progress is exactly 1.0. */
+    LS_FILTER_DONE = 2,
+    /* A filter is active but its filter-scan stopped before EOF (a jump-scan
+     * or match-scan took the slot). Counts, progress, and frontier gains are
+     * kept, frozen at their last values; the filter MODE persists (the view is
+     * still filtered). See FILTERED VIEWS for when it resumes. */
+    LS_FILTER_CANCELLED = 3,
+} ls_filter_state;
+
+/*
+ * Filter snapshot (see the FILTERED VIEWS section for the full model). Like
+ * ls_search_status without the navigation slot.
+ *   state       — filter/scan state; LS_FILTER_IDLE means "no filter active"
+ *                 (the identity view, every other field zero). SCANNING / DONE
+ *                 / CANCELLED all mean a filter IS active (the view is
+ *                 filtered).
+ *   progress    — filter-scan work fraction in [0.0, 1.0]; monotone within one
+ *                 filter; exactly 1.0 at LS_FILTER_DONE; frozen when CANCELLED.
+ *   total       — matching rows counted so far (m); exact for the counted
+ *                 region; monotone within one filter. While a filter is active
+ *                 this equals ls_row_count_get().count.
+ *   total_exact — true iff the filter-scan completed (LS_FILTER_DONE): `total`
+ *                 is the final match count and stops growing.
+ */
+typedef struct ls_filter_status {
+    ls_filter_state state;
+    double progress;
+    uint64_t total;
+    bool total_exact;
+} ls_filter_status;
+
+/* ------------------------------------------------------------------------- */
 /* Lifecycle                                                                  */
 /* ------------------------------------------------------------------------- */
 
@@ -700,15 +872,15 @@ typedef struct ls_search_status {
  *
  * A dialect change is a re-open: close the document and open the same path
  * with the new forced options (the index restarts — that is the documented
- * cost of changing the parse profile — and all search state is gone: the
- * new handle polls LS_SEARCH_IDLE).
+ * cost of changing the parse profile — all search state is gone AND any
+ * filter is cleared: the new handle polls LS_SEARCH_IDLE and LS_FILTER_IDLE).
  */
 ls_status ls_open(const char *path, const ls_open_options *options, ls_doc **out_doc);
 
 /*
  * Release the document and all storage owned by it, first cancelling and
- * joining any core-owned scan threads (background index, jump-scans, and
- * match-scans — calling ls_close during any of them is safe). Every ls_str
+ * joining any core-owned scan threads (background index, jump-scans,
+ * match-scans, and filter-scans — calling ls_close during any is safe). Every ls_str
  * borrowed from this document becomes invalid. `doc` must be a handle
  * returned by a successful ls_open, closed exactly once.
  */
@@ -729,7 +901,9 @@ uint32_t ls_column_count(const ls_doc *doc);
 /* Row-count knowledge and index progress (zero-alloc; any thread)            */
 /* ------------------------------------------------------------------------- */
 
-/* Current row-count knowledge (see ls_row_count). */
+/* Current row-count knowledge (see ls_row_count). While a filter is active
+ * this is the matching-row count m, in filtered coordinates — see FILTERED
+ * VIEWS. */
 ls_row_count ls_row_count_get(const ls_doc *doc);
 
 /* Current index/scan progress (see ls_scan_progress). */
@@ -757,6 +931,10 @@ ls_scan_progress ls_index_poll(const ls_doc *doc);
  * — it never fails. Invalidates all previously borrowed ls_str of this
  * document.
  *
+ * While a filter is active, first_row/row_count are in FILTERED coordinates
+ * and the window serves matching rows (O(window) re-lex + O(checkpoints)
+ * counting — still no scan) — see FILTERED VIEWS.
+ *
  * Eviction guarantee: a row evicted and later re-materialized serves
  * byte-identical cell text (re-lexed from the same file bytes).
  */
@@ -768,7 +946,8 @@ ls_row_range ls_window_set(ls_doc *doc, uint64_t first_row, uint32_t row_count);
  * LS_CELL_MAX_BYTES of UTF-8 (cut at a code-point boundary; see TEXT AND
  * ENCODING). ls_cell_truncated reports whether that cap cut this cell.
  *   row — 0-based, 64-bit view-relative data-row index (the effective header
- *         record is not a data row). Only rows inside the currently
+ *         record is not a data row; a FILTERED index while a filter is
+ *         active — see FILTERED VIEWS). Only rows inside the currently
  *         materialized window are served.
  *   col — 0-based column index, < ls_column_count().
  * Total function: any (row, col) outside the materialized window / column
@@ -827,6 +1006,10 @@ bool ls_header_cell_truncated(const ls_doc *doc, uint32_t col);
  *     are kept — see SEARCH).
  * On a document with no data rows a jump completes immediately with
  * landed_row 0.
+ *
+ * While a filter is active, target_row is an ORIGINAL data-row number and
+ * landed_row is the FILTERED index of the nearest matching row at/after it
+ * — see FILTERED VIEWS.
  */
 void ls_jump_start(ls_doc *doc, uint64_t target_row);
 
@@ -920,6 +1103,68 @@ void ls_search_cancel(ls_doc *doc);
  * ls_search_start on this handle: state LS_SEARCH_IDLE and every other
  * field zero. ZERO allocation; never fails. */
 ls_search_status ls_search_poll(const ls_doc *doc);
+
+/* ------------------------------------------------------------------------- */
+/* Filtered views (set/clear a filter; poll it; map a view row to its source; */
+/* the row accessors + jump + search operate in filtered coordinates while a  */
+/* filter is active — see the FILTERED VIEWS section for the full model)       */
+/* ------------------------------------------------------------------------- */
+
+/*
+ * Set (or replace) the document's active FILTER from `request` (non-NULL;
+ * borrowed only for this call — the core copies what it keeps). The request is
+ * validated EXACTLY as ls_search_start validates it (same TEXT / PREDICATE
+ * grammar and rejection rules; see ls_search_request and ls_search_start).
+ *
+ *   returns false — request rejected, and NOTHING changes: the current view
+ *   (filtered or identity), any active search, and a running jump are all
+ *   untouched. Same rejection conditions as ls_search_start (empty TEXT query;
+ *   non-NULL scope with scope_len 0; out-of-range scope/column; an ordering
+ *   operator whose value is non-numeric; out-of-domain kind/op).
+ *
+ *   returns true — the document enters (or re-enters) FILTERED MODE with this
+ *   request, REPLACING any previous filter entirely (its counted region and
+ *   match counts reset; the filter-scan restarts from row 0). Takes the scan
+ *   slot for the filter-scan (a jump in LS_JUMP_SCANNING is cancelled to
+ *   LS_JUMP_IDLE, gains kept) and RESETS any active search to LS_SEARCH_IDLE
+ *   (the coordinate space changed). Never blocks: the filter-scan is
+ *   asynchronous, observable via ls_filter_poll (state LS_FILTER_SCANNING, or
+ *   already LS_FILTER_DONE for a document with nothing to scan). See FILTERED
+ *   VIEWS.
+ *
+ * May allocate (per-block counter storage sized by the index checkpoints —
+ * O(index checkpoints) regardless of match count).
+ */
+bool ls_filter_set(ls_doc *doc, const ls_search_request *request);
+
+/*
+ * Clear the active filter, restoring the IDENTITY view (no-op when no filter
+ * is active). After this call ls_filter_poll reports LS_FILTER_IDLE and every
+ * accessor addresses physical data rows again. Clearing RESETS any active
+ * search to LS_SEARCH_IDLE and returns the jump slot to LS_JUMP_IDLE (a
+ * scanning filter-scan or jump-scan is stopped; all frontier gains are KEPT).
+ * Re-anchoring the viewport near the row you were viewing is the caller's
+ * affair (capture ls_source_row of the top visible row BEFORE clearing). ZERO
+ * allocation.
+ */
+void ls_filter_clear(ls_doc *doc);
+
+/* Current filter snapshot (see ls_filter_status and FILTERED VIEWS). Before
+ * any ls_filter_set on this handle, and after ls_filter_clear: LS_FILTER_IDLE
+ * with every other field zero. ZERO allocation; never fails. */
+ls_filter_status ls_filter_poll(const ls_doc *doc);
+
+/*
+ * The ORIGINAL (unfiltered) 0-based data-row number of view row `row` — the
+ * gutter value. `row` is a view-relative index (a FILTERED index while a filter
+ * is active; a physical data row otherwise). Defined ONLY for rows inside the
+ * currently materialized window (identical window/borrow domain to ls_cell):
+ * returns LS_NO_ROW for any `row` outside the materialized window or the view's
+ * row range. Without a filter this is the identity on servable rows
+ * (ls_source_row(doc, i) == i). Total function; ZERO allocation; never fails;
+ * never scans.
+ */
+uint64_t ls_source_row(const ls_doc *doc, uint64_t row);
 
 #ifdef __cplusplus
 }
