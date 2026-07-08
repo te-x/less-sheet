@@ -691,6 +691,16 @@ final class DocumentModel {
     /// (identity) `rowCountInfo` unchanged.
     var jumpRowCountInfo: RowCountInfo { isFiltered ? (filterDocumentRows ?? rowCountInfo) : rowCountInfo }
 
+    /// Whether the current find draft composes into something filterable — the
+    /// filter toggle is enabled to turn ON only when this is true (an empty
+    /// draft yields `.ignored`). Pure check; same compose the apply path uses.
+    var canApplyFilter: Bool {
+        if case .ignored = findControl.submit(findSession, visibleColumns: visibleColumns, columnCount: columnCount) {
+            return false
+        }
+        return true
+    }
+
     /// "Apply as filter" (ARCH req. 10): validate the CURRENT find draft
     /// exactly as Find does (`FindControlling.submit` — identical grammar, no
     /// new predicate UI), then route a successful compose to `setFilter`

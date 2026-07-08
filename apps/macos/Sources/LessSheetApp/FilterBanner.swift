@@ -25,6 +25,10 @@ struct FilterBannerView: View {
                     } else {
                         ProgressView(value: fraction).progressViewStyle(.linear).frame(width: 40)
                     }
+                    Text("\(Int((fraction * 100).rounded()))%")
+                        .font(.caption2)
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
                 }
                 Text(FilterCopy.summary(banner))
                     .font(.caption)

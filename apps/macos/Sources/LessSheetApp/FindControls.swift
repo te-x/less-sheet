@@ -111,26 +111,28 @@ struct FindControlView: View {
         .accessibilityLabel("Find")
     }
 
-    // "Apply as filter" (ARCH-filtered-views req. 10): composes the SAME draft
-    // as Find (`FindControlling.submit` — identical grammar, no new predicate
-    // UI) and routes it to `setFilter` instead of `startSearch`. "Clear
-    // filter" mirrors the banner's ✕ (req. 11 — "Clearing is also available
-    // from the Find popup").
+    // "Filter to matches" (ARCH-filtered-views req. 10): a TOGGLE reflecting the
+    // standing filter state — On applies the SAME draft as Find
+    // (`FindControlling.submit` — identical grammar, no new predicate UI) via
+    // `setFilter`; Off clears it (req. 11 — "Clearing is also available from the
+    // Find popup"). Disabled while Off and the draft composes nothing, so it
+    // never reads as dead text.
     private var filterRow: some View {
         HStack(spacing: 8) {
-            Button("Apply as filter") { model.applyFindAsFilter() }
-                .buttonStyle(.plain)
-                .font(.caption.weight(.medium))
-                .foregroundStyle(Color.accentColor)
+            Toggle("Filter to matches", isOn: filterBinding)
+                .toggleStyle(.switch)
+                .controlSize(.mini)
+                .font(.caption)
+                .disabled(!model.isFiltered && !model.canApplyFilter)
             Spacer(minLength: 8)
-            if model.isFiltered {
-                Button("Clear filter") { model.clearFilter() }
-                    .buttonStyle(.plain)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
         }
         .accessibilityElement(children: .contain)
+    }
+
+    /// On = apply the current find draft as the active filter; Off = clear it.
+    private var filterBinding: Binding<Bool> {
+        Binding(get: { model.isFiltered },
+                set: { on in on ? model.applyFindAsFilter() : model.clearFilter() })
     }
 
     // Text mode: one query field with smart case (ARCH req. 7).

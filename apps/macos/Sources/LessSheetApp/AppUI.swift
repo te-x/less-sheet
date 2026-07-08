@@ -291,6 +291,14 @@ struct ContentView: View {
     private var documentContent: some View {
         ZStack(alignment: .bottomTrailing) {
             GridView(model: model)
+            // A filter that matched nothing (scan complete): a centered message
+            // over the empty grid, mirroring the empty-file EmptyStateView
+            // (ARCH criterion 18). The banner also says so, top-leading.
+            if model.filterBanner?.isEmptyResult == true {
+                EmptyStateView(line: "No rows match the filter.")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .allowsHitTesting(false)
+            }
             OverlayView(model: model)
             // The filtered banner (ARCH req. 11) is independent of the
             // floating overlay's hover reveal/fade — it stays up the whole
