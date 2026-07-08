@@ -6,13 +6,17 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleName</key>
-    <string>LessSheet</string>
+    <string>less-sheet</string>
     <key>CFBundleDisplayName</key>
-    <string>LessSheet</string>
+    <string>less-sheet</string>
     <key>CFBundleIdentifier</key>
     <string>com.lesssheet.app</string>
     <key>CFBundleExecutable</key>
     <string>LessSheet</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>CFBundleIconName</key>
+    <string>AppIcon</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleVersion</key>

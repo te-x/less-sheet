@@ -7,3 +7,6 @@ DerivedData/
 xcuserdata/
 *.o
 *.a
+
+# Generated icon artifacts (source of truth: branding/icon.svg)
+branding/generated/
