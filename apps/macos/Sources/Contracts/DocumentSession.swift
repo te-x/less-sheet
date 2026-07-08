@@ -8,7 +8,11 @@
 /// Contract (mirrors api/lesssheet.h; see it for full semantics):
 /// - All strings returned by a session OWN their storage: implementations
 ///   copy the core's borrowed bytes before returning (respecting the
-///   eviction-safe borrow rule) and replace invalid UTF-8 with U+FFFD.
+///   eviction-safe borrow rule). The core serves UTF-8 (transcoded from the
+///   resolved encoding; the UTF-8 path is pass-through), and per-cell display
+///   is byte-capped by the core — `RowWindow.truncated` flags a cut cell
+///   (search still sees the FULL cell — the cap is display-only). Any invalid
+///   UTF-8 on the pass-through path is rendered as U+FFFD at the display.
 /// - `Sendable`: every member is safe to call from any actor/thread;
 ///   implementations internally serialize the window lane per the C
 ///   threading rules. Poll methods never block; `setWindow` is the
@@ -63,10 +67,18 @@ public struct ScanProgress: Equatable, Sendable {
 public struct RowWindow: Equatable, Sendable {
     public let firstRow: UInt64
     public let rows: [[String]]
+    /// Per-cell display-truncation flags, PARALLEL to `rows`: `truncated[i][j]`
+    /// is true iff cell (i, j) was cut by the core's per-cell display cap
+    /// (`ls_cell_truncated`). Same shape as `rows` (each row's flags count ==
+    /// that row's cell count); empty only when `rows` is empty. The cut is
+    /// DISPLAY-ONLY — the full cell is still searchable (grids render a
+    /// truncation indicator from this flag, ARCH req. 13/20).
+    public let truncated: [[Bool]]
 
-    public init(firstRow: UInt64, rows: [[String]]) {
+    public init(firstRow: UInt64, rows: [[String]], truncated: [[Bool]] = []) {
         self.firstRow = firstRow
         self.rows = rows
+        self.truncated = truncated
     }
 }
 

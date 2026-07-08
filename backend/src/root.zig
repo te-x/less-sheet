@@ -356,9 +356,14 @@ pub fn openWithAllocator(gpa: std.mem.Allocator, path: [*:0]const u8, options: ?
         .quote = doc.quote orelse api.default_quote,
         .has_quote = doc.quote != null,
         .header = doc.has_header,
+        // csv-hardening RED SEED: encoding detection/transcode not implemented
+        // yet — report a placeholder so this compiles; the encoding behavior
+        // tests stay RED until the implementer resolves the real encoding.
+        .encoding = api.encoding_utf8,
         .separator_forced = opt.separator != api.sniff,
         .quote_forced = opt.quote != api.sniff,
         .header_forced = opt.header != api.sniff,
+        .encoding_forced = false,
     };
 
     // One worker for the document's lifetime: advances the frontier (AUTO) or
@@ -755,6 +760,25 @@ pub export fn ls_header_cell(doc: *const api.Doc, col: u32) callconv(.c) api.Str
     const ref = d.header_refs[col];
     if (ref.len == 0) return empty_str;
     return .{ .ptr = d.header_buf.ptr + ref.start, .len = ref.len };
+}
+
+/// See api/lesssheet.h `ls_cell_truncated`. csv-hardening RED SEED: the
+/// LS_CELL_MAX_BYTES display cap is not implemented yet, so this always
+/// reports "not truncated" (and ls_cell serves the full cell) — the huge-cell
+/// behavior tests stay RED. Zero allocation; total function; never fails.
+pub export fn ls_cell_truncated(doc: *const api.Doc, row: u64, col: u32) callconv(.c) bool {
+    _ = doc;
+    _ = row;
+    _ = col;
+    return false;
+}
+
+/// See api/lesssheet.h `ls_header_cell_truncated`. csv-hardening RED SEED (see
+/// ls_cell_truncated). Zero allocation; total function; never fails.
+pub export fn ls_header_cell_truncated(doc: *const api.Doc, col: u32) callconv(.c) bool {
+    _ = doc;
+    _ = col;
+    return false;
 }
 
 // ---------------------------------------------------------------------------

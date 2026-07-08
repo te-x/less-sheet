@@ -56,7 +56,8 @@ public final class CoreDocumentSession: DocumentSession, @unchecked Sendable {
             separator: Self.abiSeparator(override.separator),
             quote: Self.abiQuote(override.quote),
             header: Self.abiHeader(override.header),
-            index_mode: Int32(LS_INDEX_AUTO)
+            index_mode: Int32(LS_INDEX_AUTO),
+            encoding: Self.abiEncodingOption(override.encoding)
         )
         var handle: OpaquePointer?
         let status = path.withCString { ls_open($0, &options, &handle) }
@@ -74,7 +75,9 @@ public final class CoreDocumentSession: DocumentSession, @unchecked Sendable {
             hasHeader: d.header,
             separatorForced: d.separator_forced,
             quoteForced: d.quote_forced,
-            headerForced: d.header_forced
+            headerForced: d.header_forced,
+            encoding: Self.abiEncoding(d.encoding),
+            encodingForced: d.encoding_forced
         )
         if d.header {
             headerCells = (0..<columnCount).map { Self.copyCell(ls_header_cell(doc, UInt32($0))) }
@@ -101,11 +104,14 @@ public final class CoreDocumentSession: DocumentSession, @unchecked Sendable {
         let clamped = UInt32(clamping: max(rowCount, 0))
         let range = ls_window_set(doc, firstRow, clamped)
         var rows = [[String]]()
+        var truncated = [[Bool]]()
         rows.reserveCapacity(Int(range.row_count))
+        truncated.reserveCapacity(Int(range.row_count))
         for row in range.first_row..<(range.first_row + range.row_count) {
             rows.append((0..<columnCount).map { Self.copyCell(ls_cell(doc, row, UInt32($0))) })
+            truncated.append((0..<columnCount).map { ls_cell_truncated(doc, row, UInt32($0)) })
         }
-        return RowWindow(firstRow: range.first_row, rows: rows)
+        return RowWindow(firstRow: range.first_row, rows: rows, truncated: truncated)
     }
 
     public func startJump(to targetRow: UInt64) {
@@ -267,6 +273,24 @@ public final class CoreDocumentSession: DocumentSession, @unchecked Sendable {
         case .on: Int32(LS_HEADER_ON)
         case .off: Int32(LS_HEADER_OFF)
         }
+    }
+
+    /// The encoding override as its ABI value (LS_ENCODING_AUTO + concretes).
+    private static func abiEncodingOption(_ e: EncodingOverride) -> Int32 {
+        switch e {
+        case .automatic: Int32(LS_ENCODING_AUTO)
+        case .utf8: Int32(LS_ENCODING_UTF8)
+        case .utf16LE: Int32(LS_ENCODING_UTF16LE)
+        case .utf16BE: Int32(LS_ENCODING_UTF16BE)
+        case .latin1: Int32(LS_ENCODING_LATIN1)
+        case .windows1252: Int32(LS_ENCODING_WINDOWS1252)
+        }
+    }
+
+    /// The reported resolved encoding (ls_dialect.encoding: a concrete uint8
+    /// enum value, never LS_ENCODING_AUTO) as its Swift `TextEncoding`.
+    private static func abiEncoding(_ raw: UInt8) -> TextEncoding {
+        TextEncoding(rawValue: raw) ?? .utf8
     }
 
     /// The predicate operator as its ABI enum (raw values pinned in the header).

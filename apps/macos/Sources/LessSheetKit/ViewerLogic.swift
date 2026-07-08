@@ -131,6 +131,14 @@ public struct DialectComposer: DialectComposing {
         case let .header(isOn):
             // Header changes are always valid.
             return DialectOverride(separator: carriedSeparator, quote: carriedQuote, header: isOn ? .on : .off)
+
+        case .encoding:
+            // csv-hardening RED SEED: encoding carry-forward + selection are not
+            // wired yet — this drops the chosen encoding and does not carry the
+            // report's forced encoding, so the composer encoding tests stay RED.
+            // (The other cases likewise omit `encoding:`, defaulting it to
+            // `.automatic` instead of carrying `current`'s forced encoding.)
+            return DialectOverride(separator: carriedSeparator, quote: carriedQuote, header: carriedHeader)
         }
     }
 

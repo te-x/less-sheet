@@ -7,15 +7,25 @@
  * library. It is frozen by the workspace-root planner: implementers on either
  * side may not change it (two-key change-request process only).
  *
- * Scope (viewer-ui + find-seek slices): open a document with an optionally
- * forced parse profile (separator / quote / header), read the effective
- * dialect report, access any contiguous row window over a file of any size
- * (64-bit row addressing), observe background indexing and row-count
- * knowledge (count + exact/estimated), run cancellable jump-scans with
- * progress, and run streaming content SEARCHES: text and column-predicate
- * match-scans with bounded per-block match counts, match navigation
- * (next/previous), and pollable progress — sharing the single scan slot with
- * jumps. The walking-skeleton head-window surface is superseded.
+ * Scope (viewer-ui + find-seek + csv-hardening slices): open a document with
+ * an optionally forced parse profile (separator / quote / header / ENCODING),
+ * read the effective dialect report (now including the resolved encoding),
+ * access any contiguous row window over a file of any size (64-bit row
+ * addressing) with per-cell text served UTF-8 and capped to a display size,
+ * observe background indexing and row-count knowledge (count + exact/
+ * estimated), run cancellable jump-scans with progress, and run streaming
+ * content SEARCHES: text and column-predicate match-scans with bounded
+ * per-block match counts, match navigation (next/previous), and pollable
+ * progress — sharing the single scan slot with jumps. The walking-skeleton
+ * head-window surface is superseded.
+ *
+ * csv-hardening adds two things to the delimited-text path without changing
+ * any existing signature: (1) ENCODING — the core detects (or is forced to)
+ * one of UTF-8, UTF-16 LE/BE, ISO-8859-1 (Latin-1), or Windows-1252 and
+ * transcodes to UTF-8 internally so the ABI stays byte-clean (see TEXT AND
+ * ENCODING); (2) a per-cell DISPLAY CAP of LS_CELL_MAX_BYTES so a pathological
+ * giant cell or first record can never make open O(file) or blow window
+ * memory (see the cap and ls_cell_truncated / ls_header_cell_truncated).
  *
  * FORMAT NEUTRALITY
  *   - Nothing here promises that a document is a text file. The document /
@@ -44,8 +54,9 @@
  *     ls_search_nav are the only CALLS that may allocate (running background
  *     scans may also allocate internally for index/count storage). Every
  *     accessor and poll (ls_dialect_get, ls_column_count, ls_row_count_get,
- *     ls_index_poll, ls_cell, ls_header_cell, ls_jump_poll, ls_search_poll)
- *     and ls_jump_cancel / ls_search_cancel performs ZERO heap allocation and
+ *     ls_index_poll, ls_cell, ls_cell_truncated, ls_header_cell,
+ *     ls_header_cell_truncated, ls_jump_poll, ls_search_poll) and
+ *     ls_jump_cancel / ls_search_cancel performs ZERO heap allocation and
  *     never fails; out-of-range access returns the empty string / a
  *     well-defined value. Additionally, once every scan has reported a
  *     terminal state (index complete or idle, jump slot not LS_JUMP_SCANNING,
@@ -59,21 +70,25 @@
  *
  * OPEN COST (the cold-start contract)
  *   - ls_open performs O(head) work regardless of file size: it consumes at
- *     most LS_OPEN_HEAD_MAX_BYTES of the file (sniffing, column count,
- *     header decision, and the initial index frontier all come from this
- *     head region) and never blocks on file length. A 10 GB document opens
- *     as fast as a 10 KB one. The search machinery is lazy: it costs nothing
- *     (no storage, no threads, no scan work) until the first
- *     ls_search_start on the document.
+ *     most LS_OPEN_HEAD_MAX_BYTES of the file (encoding detection, transcode,
+ *     sniffing, column count, header decision, and the initial index frontier
+ *     all come from this head region) and never blocks on file length. A 10 GB
+ *     document opens as fast as a 10 KB one, in every encoding: the O(head)
+ *     bound is measured in SOURCE bytes (bytes faulted from the file), so a
+ *     giant first record or first cell cannot make open O(file) either (see
+ *     the column-count / record-1 rule and LS_CELL_MAX_BYTES). The search
+ *     machinery is lazy: it costs nothing (no storage, no threads, no scan
+ *     work) until the first ls_search_start on the document.
  *   - After a successful open the scan frontier covers at least
  *     min(total rows, LS_OPEN_READY_MIN_ROWS) rows, provided those rows fit
  *     within LS_OPEN_HEAD_MAX_BYTES — so a window at the top of the document
  *     is always served immediately.
- *   - Determinism pin: a file whose size is <= LS_OPEN_HEAD_MAX_BYTES is
- *     fully indexed by open itself — its index reports complete and its row
- *     count exact from the moment open returns (in both index modes). For
- *     larger files open stops within the byte budget (at a record boundary);
- *     where exactly is implementation detail.
+ *   - Determinism pin: a file whose SIZE (source bytes) is <=
+ *     LS_OPEN_HEAD_MAX_BYTES is fully indexed by open itself — its index
+ *     reports complete and its row count exact from the moment open returns
+ *     (in both index modes), whatever its encoding. For larger files open
+ *     stops within the byte budget (at a record boundary), measured in source
+ *     bytes; where exactly is implementation detail.
  *
  * THE SCAN FRONTIER, INDEX, AND JUMPS
  *   - The core maintains a sparse row index (row -> byte offset at safe
@@ -98,9 +113,14 @@
  *     the previous one ENTIRELY: counts reset, the navigation slot resets to
  *     LS_SEARCH_NAV_NONE with found/position fields zeroed, and the match-
  *     scan restarts from row 0. A failed (rejected) start changes NOTHING.
- *   - Matching is defined PER CELL on raw cell text — exactly the bytes
- *     ls_cell serves (quoting removed, truncate/pad applied: a missing cell
- *     of a ragged record is the empty string). Only DATA rows are evaluated;
+ *   - Matching is defined PER CELL on the cell's FULL transcoded UTF-8 text
+ *     (quoting removed, the column-count truncate/pad rule applied: a missing
+ *     cell of a ragged record is the empty string). It scans the WHOLE cell,
+ *     NOT the LS_CELL_MAX_BYTES-capped bytes ls_cell serves — the display cap
+ *     is presentation-only (see TEXT AND ENCODING). A match, and its reported
+ *     column/position, can therefore lie past the bytes a frontend can display
+ *     (the ls_cell_truncated flag signals more exists; frontends clamp any
+ *     in-cell highlight to the served bytes). Only DATA rows are evaluated;
  *     the effective header record is never searched. A row matches when any
  *     in-scope cell matches (TEXT) or the target column's cell matches
  *     (PREDICATE). The match column reported for a row is the lowest-indexed
@@ -175,14 +195,56 @@
  *     concurrently with ls_open/ls_close on the same document.
  *   - Distinct documents are fully independent.
  *
- * TEXT AND ENCODING
- *   - Cell bytes are the raw file bytes with quoting removed per the
- *     effective dialect. They are assumed UTF-8 but NOT validated by the
- *     core; consumers replace invalid sequences (U+FFFD) at the display
- *     boundary. Search matches over these same raw bytes (see
- *     ls_search_request for the pinned byte-level semantics).
- *   - A leading UTF-8 BOM (EF BB BF) at the start of the file is stripped
- *     before parsing and never appears in cell text.
+ * TEXT AND ENCODING (source encoding detection + internal transcode to UTF-8)
+ *   - Every cell / header byte crossing this ABI is UTF-8. The core resolves
+ *     ONE source encoding at open (constant for the document's lifetime; a new
+ *     choice is a re-open) from a fixed set, and transcodes on demand:
+ *       * UTF-8 (detected or forced): PASS-THROUGH. Bytes are handed through
+ *         unchanged and are NOT validated by the core; consumers replace
+ *         invalid sequences with U+FFFD at the display boundary. An invalid
+ *         UTF-8 byte therefore survives in the served cell (Option A: the
+ *         UTF-8 path never rewrites bytes). Search matches over these same
+ *         pass-through bytes (see ls_search_request for the byte-level rule).
+ *       * UTF-16 LE, UTF-16 BE, ISO-8859-1 (Latin-1), Windows-1252: TRANSCODED
+ *         to guaranteed-VALID UTF-8. Latin-1 maps all 256 byte values (never
+ *         U+FFFD from decoding); Windows-1252's five undefined bytes
+ *         (0x81 0x8D 0x8F 0x90 0x9D) and any ill-formed / lone-surrogate
+ *         UTF-16 code unit map to U+FFFD.
+ *   - DETECTION (encoding == LS_ENCODING_AUTO, the default), on the raw head
+ *     bytes, before dialect sniffing, in this order:
+ *       1. BOM: EF BB BF -> UTF-8; FF FE -> UTF-16LE; FE FF -> UTF-16BE.
+ *       2. NUL-ratio heuristic (BOM-less): a head sample dominated by NUL
+ *          bytes in one alternating parity of positions resolves UTF-16 — LE
+ *          when the NULs fall on odd offsets (48 00 65 00 ...), BE on even
+ *          (00 48 00 65 ...). The exact threshold is implementation detail.
+ *       3. UTF-8 validation of the head sample -> UTF-8 (a multibyte sequence
+ *          cut by the head boundary does not fail detection).
+ *       4. Otherwise ISO-8859-1 (Latin-1) — the never-lose-a-byte 8-bit
+ *          default. (No statistical charset guessing; head-only detection can
+ *          miss an 8-bit file whose first non-ASCII byte is past the head —
+ *          the caller then forces the encoding, which re-opens correctly.)
+ *   - FORCING (encoding == one of LS_ENCODING_UTF8..LS_ENCODING_WINDOWS1252)
+ *     bypasses detection entirely: the head and every window are decoded as
+ *     the forced encoding. A forced UTF-16 LE/BE is honored with or without a
+ *     BOM. A leading BOM that MATCHES the resolved encoding (forced or
+ *     detected) is consumed before parsing and never appears in a cell — the
+ *     UTF-8 BOM strip generalizes to the resolved encoding's BOM (UTF-8
+ *     EF BB BF, UTF-16LE FF FE, UTF-16BE FE FF).
+ *   - Transcoding is streaming and windowed: index checkpoints are byte
+ *     offsets in the SOURCE file; a window transcodes only its source byte
+ *     range on demand; jump / search / index scans read source bytes. Nothing
+ *     transcodes the whole file; cell memory scales with the window + sparse
+ *     index, never the file (UTF-8 is zero-copy pass-through). The O(head)
+ *     open bound is on source bytes (see OPEN COST); transcoded output may be
+ *     larger (Latin-1 high bytes double, UTF-16 ASCII halves) but reads no
+ *     more file.
+ *   - DISPLAY CAP: ls_cell and ls_header_cell serve at most LS_CELL_MAX_BYTES
+ *     of a cell's transcoded UTF-8, cut at a UTF-8 code-point boundary (never
+ *     a split code point). ls_cell_truncated / ls_header_cell_truncated report
+ *     whether a served cell was cut. This cap is DISPLAY-ONLY: it never alters
+ *     the source file, and SEARCH scans the full cell, not the capped bytes
+ *     (see SEARCH and ls_search_request). Normal cells (<= the cap) are served
+ *     whole with the flag false.
  *
  * DELIMITED-TEXT DIALECT (parameterized; RFC-4180 generalized)
  *   - Effective separator: one byte. Effective quote: one byte, or NONE
@@ -202,6 +264,15 @@
  *     fields are truncated to the column count; records with fewer read as
  *     empty cells at the missing positions. A separator that never occurs
  *     yields a single-column document — that is NOT an error.
+ *   - BOUNDED RECORD 1: if record 1 does not terminate within the O(head)
+ *     source-byte budget (a multi-hundred-MB first line, or a giant
+ *     unterminated quoted cell), the document still opens — it does NOT error.
+ *     The column count is the number of fields decoded within the budget
+ *     (always >= 1), the final in-progress field is display-truncated (its
+ *     ls_cell_truncated / ls_header_cell_truncated flag set), and the header
+ *     decision runs on those (capped) record-1 cells. This extends the capped-
+ *     record mechanism (which defers a record spilling past the budget beyond
+ *     record 1) to make record 1 itself safe and keep open O(head).
  *   - An empty (0-byte, or BOM-only) file opens successfully as an empty
  *     document: 0 columns, 0 data rows (exact), no header, index complete.
  *
@@ -286,6 +357,28 @@ extern "C" {
 /* ls_window_set row_count is clamped to this (bounds window memory). */
 #define LS_WINDOW_MAX_ROWS (4096)
 
+/*
+ * Text encoding of the source file (ls_open_options.encoding and, resolved,
+ * ls_dialect.encoding — see TEXT AND ENCODING). LS_ENCODING_AUTO is the detect
+ * sentinel (options only; negative, in the LS_SNIFF / LS_QUOTE_NONE style) and
+ * is NEVER reported in ls_dialect.encoding, which always names a concrete
+ * resolved encoding. The concrete values are stable uint8 enum values.
+ */
+#define LS_ENCODING_AUTO (-1)        /* options only: detect from the head. */
+#define LS_ENCODING_UTF8 (0)
+#define LS_ENCODING_UTF16LE (1)
+#define LS_ENCODING_UTF16BE (2)
+#define LS_ENCODING_LATIN1 (3)       /* ISO-8859-1 (maps all 256 byte values). */
+#define LS_ENCODING_WINDOWS1252 (4)
+
+/*
+ * Maximum UTF-8 bytes ls_cell / ls_header_cell serve for a single cell (the
+ * per-cell DISPLAY CAP). A larger cell is served truncated at a UTF-8 code-
+ * point boundary (<= this many bytes) and flagged by ls_cell_truncated /
+ * ls_header_cell_truncated. Display-only: SEARCH still scans the full cell.
+ */
+#define LS_CELL_MAX_BYTES (4096)
+
 /* ------------------------------------------------------------------------- */
 /* Types                                                                      */
 /* ------------------------------------------------------------------------- */
@@ -329,25 +422,32 @@ typedef struct ls_str {
  *                [0x01, 0x7F] that is neither LF nor CR.
  *   header     — LS_SNIFF, LS_HEADER_OFF, or LS_HEADER_ON.
  *   index_mode — LS_INDEX_AUTO or LS_INDEX_MANUAL.
+ *   encoding   — LS_ENCODING_AUTO (detect), or one of LS_ENCODING_UTF8,
+ *                LS_ENCODING_UTF16LE, LS_ENCODING_UTF16BE, LS_ENCODING_LATIN1,
+ *                LS_ENCODING_WINDOWS1252 (force). See TEXT AND ENCODING.
  * A forced separator equal to a forced quote byte is invalid. Any field
  * outside its domain (or the collision) fails with
  * LS_ERROR_INVALID_ARGUMENT. Forcing a parameter equal to a SNIFF-resolved
  * value of the other is legal: sniffing simply excludes the forced byte from
- * its candidates. The struct is copied by ls_open; the caller keeps
- * ownership.
+ * its candidates. Encoding is orthogonal to the dialect parameters (forcing/
+ * detecting it bypasses none of them). The struct is copied by ls_open; the
+ * caller keeps ownership.
  */
 typedef struct ls_open_options {
     int32_t separator;
     int32_t quote;
     int32_t header;
     int32_t index_mode;
+    int32_t encoding;
 } ls_open_options;
 
 /*
- * The effective dialect report: what was sniffed and/or forced at open —
- * exactly what dialect UI (guess-pills) renders. Constant for the document's
- * lifetime. For an empty document: separator/quote report the forced values
- * or the sniff defaults (',' and '"'), header is false.
+ * The effective dialect report: what was sniffed/detected and/or forced at
+ * open — exactly what dialect UI (guess-pills, the encoding picker) renders.
+ * Constant for the document's lifetime. For an empty document: separator/quote
+ * report the forced values or the sniff defaults (',' and '"'), header is
+ * false, and encoding is the forced value, or UTF-8 (or the BOM's encoding for
+ * a UTF-16 BOM-only file).
  */
 typedef struct ls_dialect {
     /* The effective separator byte. */
@@ -358,10 +458,17 @@ typedef struct ls_dialect {
     bool has_quote;
     /* True when record 1 is the header (forced or per the pinned grammar). */
     bool header;
-    /* Which parameters the caller forced (vs. sniffed/grammar-derived). */
+    /* The effective (resolved) source encoding: one concrete LS_ENCODING_*
+     * value (UTF8 / UTF16LE / UTF16BE / LATIN1 / WINDOWS1252) — NEVER
+     * LS_ENCODING_AUTO. In AUTO mode this is what detection chose; when forced
+     * it echoes the forced value. */
+    uint8_t encoding;
+    /* Which parameters the caller forced (vs. sniffed/detected/grammar-
+     * derived). encoding_forced mirrors the others for the encoding picker. */
     bool separator_forced;
     bool quote_forced;
     bool header_forced;
+    bool encoding_forced;
 } ls_dialect;
 
 /*
@@ -656,7 +763,10 @@ ls_scan_progress ls_index_poll(const ls_doc *doc);
 ls_row_range ls_window_set(ls_doc *doc, uint64_t first_row, uint32_t row_count);
 
 /*
- * Borrowed text of the data cell at (row, col), truncate/pad rule applied.
+ * Borrowed text of the data cell at (row, col): quoting removed, the
+ * column-count truncate/pad rule applied, then DISPLAY-CAPPED to at most
+ * LS_CELL_MAX_BYTES of UTF-8 (cut at a code-point boundary; see TEXT AND
+ * ENCODING). ls_cell_truncated reports whether that cap cut this cell.
  *   row — 0-based, 64-bit view-relative data-row index (the effective header
  *         record is not a data row). Only rows inside the currently
  *         materialized window are served.
@@ -668,13 +778,32 @@ ls_row_range ls_window_set(ls_doc *doc, uint64_t first_row, uint32_t row_count);
 ls_str ls_cell(const ls_doc *doc, uint64_t row, uint32_t col);
 
 /*
- * Borrowed text of the effective header record's cell at `col` (truncate/pad
- * rule applied). Returns the empty string for every col when the effective
- * header is off, and for out-of-range col. Header cells are materialized at
- * open (they are not subject to window eviction, but the borrow-validity
- * rule is the same). ZERO allocation; never fails.
+ * Whether the cell ls_cell(doc, row, col) serves was cut by the
+ * LS_CELL_MAX_BYTES display cap (its full transcoded content is longer than
+ * the served bytes). Same (row, col) domain and window/borrow rules as
+ * ls_cell; returns false for any cell ls_cell serves whole and for every
+ * out-of-range / unmaterialized (row, col). The cut is display-only — SEARCH
+ * still matches the full cell. ZERO allocation; never fails; never scans.
+ */
+bool ls_cell_truncated(const ls_doc *doc, uint64_t row, uint32_t col);
+
+/*
+ * Borrowed text of the effective header record's cell at `col`: column-count
+ * truncate/pad rule applied, then DISPLAY-CAPPED exactly like ls_cell.
+ * Returns the empty string for every col when the effective header is off,
+ * and for out-of-range col. Header cells are materialized at open (they are
+ * not subject to window eviction, but the borrow-validity rule is the same).
+ * ZERO allocation; never fails.
  */
 ls_str ls_header_cell(const ls_doc *doc, uint32_t col);
+
+/*
+ * Whether the header cell ls_header_cell(doc, col) serves was cut by the
+ * LS_CELL_MAX_BYTES display cap. Returns false when the effective header is
+ * off, for out-of-range col, and for any header cell served whole. Same
+ * display-only semantics as ls_cell_truncated. ZERO allocation; never fails.
+ */
+bool ls_header_cell_truncated(const ls_doc *doc, uint32_t col);
 
 /* ------------------------------------------------------------------------- */
 /* Jump-scans (asynchronous; shared frontier; any thread)                     */

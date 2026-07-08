@@ -2007,3 +2007,518 @@ test "abi: the search C symbols are callable through extern linkage; enum values
     c_linked_search.ls_search_cancel(od.doc); // no-op after DONE
     try std.testing.expectEqual(api.SearchState.done, c_linked_search.ls_search_poll(od.doc).state);
 }
+
+// ===========================================================================
+// csv-hardening slice (ARCH-csv-hardening core criteria 1-17; app criteria
+// 18-20 live in apps/macos). Frozen; planner-owned. Naming: h<criterion>.
+// Semantics are pinned in api/lesssheet.h (TEXT AND ENCODING: detection
+// pipeline, transcode-to-UTF-8 guarantee vs UTF-8 pass-through, the
+// LS_CELL_MAX_BYTES display cap, search-over-the-full-cell; DELIMITED-TEXT:
+// bounded record 1) and mirrored in contracts/api.zig. Tests exercise the
+// PUBLIC C ABI through @import("api") only, reusing the helpers above
+// (openBytes/openWith, expectCell, expectDims, scanToEnd, searchTotal, ...).
+// Determinism: fixtures no larger than the head budget are fully indexed at
+// open (row counts exact immediately); large-file probes use MANUAL mode +
+// sparse fixtures and assert the O(head) SOURCE-byte bound.
+// ===========================================================================
+
+/// UTF-16 code units of UTF-8 `s` (BMP direct; astral as surrogate pairs).
+fn utf16Units(gpa: std.mem.Allocator, s: []const u8) ![]u16 {
+    var units: std.ArrayList(u16) = .empty;
+    errdefer units.deinit(gpa);
+    var it = (std.unicode.Utf8View.init(s) catch unreachable).iterator();
+    while (it.nextCodepoint()) |cp| {
+        if (cp <= 0xFFFF) {
+            try units.append(gpa, @intCast(cp));
+        } else {
+            const v = cp - 0x10000;
+            try units.append(gpa, @intCast(0xD800 + (v >> 10)));
+            try units.append(gpa, @intCast(0xDC00 + (v & 0x3FF)));
+        }
+    }
+    return units.toOwnedSlice(gpa);
+}
+
+/// UTF-16 bytes of `s`, `little` endian, with an optional matching leading BOM.
+fn toUtf16(gpa: std.mem.Allocator, s: []const u8, little: bool, bom: bool) ![]u8 {
+    const units = try utf16Units(gpa, s);
+    defer gpa.free(units);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    if (bom) try out.appendSlice(gpa, if (little) &[_]u8{ 0xFF, 0xFE } else &[_]u8{ 0xFE, 0xFF });
+    for (units) |u| {
+        const hi: u8 = @intCast(u >> 8);
+        const lo: u8 = @intCast(u & 0xFF);
+        try out.appendSlice(gpa, if (little) &[_]u8{ lo, hi } else &[_]u8{ hi, lo });
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+fn expectEncoding(doc: *const api.Doc, encoding: u8, forced: bool) !void {
+    const d = api.ls_dialect_get(doc);
+    try std.testing.expectEqual(encoding, d.encoding);
+    try std.testing.expectEqual(forced, d.encoding_forced);
+}
+
+// ---------------------------------------------------------------------------
+// h1..h12 — encoding detection, transcoding, forcing, reporting, bounds.
+// ---------------------------------------------------------------------------
+
+test "h1: UTF-16LE with BOM decodes to UTF-8; BOM absent; report UTF-16 LE" {
+    const gpa = std.testing.allocator;
+    const src = try toUtf16(gpa, "name,city\nJosé,42\n", true, true);
+    defer gpa.free(src);
+    var od = try openBytes(src); // automatic detection
+    defer od.deinit();
+    const d = api.ls_dialect_get(od.doc);
+    try expectEncoding(od.doc, api.encoding_utf16le, false);
+    try std.testing.expectEqual(@as(u8, ','), d.separator); // sniffed on transcoded UTF-8
+    try std.testing.expectEqual(true, d.header);
+    try expectDims(od.doc, 1, 2);
+    winAll(od.doc);
+    try expectHeaderCell(od.doc, 0, "name");
+    try expectCell(od.doc, 0, 0, "José"); // UTF-8: 4A 6F 73 C3 A9
+    try expectCell(od.doc, 0, 1, "42");
+}
+
+test "h2: UTF-16BE with BOM decodes to UTF-8; report UTF-16 BE" {
+    const gpa = std.testing.allocator;
+    const src = try toUtf16(gpa, "name,city\nJosé,42\n", false, true);
+    defer gpa.free(src);
+    var od = try openBytes(src);
+    defer od.deinit();
+    try expectEncoding(od.doc, api.encoding_utf16be, false);
+    try expectDims(od.doc, 1, 2);
+    winAll(od.doc);
+    try expectHeaderCell(od.doc, 1, "city");
+    try expectCell(od.doc, 0, 0, "José");
+}
+
+test "h3: BOM-less UTF-16 is caught by the NUL-ratio heuristic (LE and BE)" {
+    const gpa = std.testing.allocator;
+    const le = try toUtf16(gpa, "id,name\n1,Ada\n2,Bo\n", true, false);
+    defer gpa.free(le);
+    var od = try openBytes(le);
+    defer od.deinit();
+    try expectEncoding(od.doc, api.encoding_utf16le, false);
+    try expectDims(od.doc, 2, 2);
+    winAll(od.doc);
+    try expectHeaderCell(od.doc, 1, "name");
+    try expectCell(od.doc, 1, 1, "Bo");
+
+    const be = try toUtf16(gpa, "id,name\n1,Ada\n2,Bo\n", false, false);
+    defer gpa.free(be);
+    var od2 = try openBytes(be);
+    defer od2.deinit();
+    try expectEncoding(od2.doc, api.encoding_utf16be, false);
+    winAll(od2.doc);
+    try expectCell(od2.doc, 0, 1, "Ada");
+}
+
+test "h4: a Latin-1 file auto-detects as ISO-8859-1 and transcodes to UTF-8" {
+    var od = try openBytes("name,note\nAda,caf\xE9\n");
+    defer od.deinit();
+    try expectEncoding(od.doc, api.encoding_latin1, false);
+    try std.testing.expectEqual(true, api.ls_dialect_get(od.doc).header);
+    winAll(od.doc);
+    try expectCell(od.doc, 0, 0, "Ada");
+    try expectCell(od.doc, 0, 1, "caf\xC3\xA9"); // é as UTF-8 C3 A9
+}
+
+test "h5: head-only detection misses a late 8-bit byte; forcing ISO-8859-1 recovers" {
+    const gpa = std.testing.allocator;
+    // Header + fixed-width ASCII rows filling > head budget, then one final row
+    // whose second cell holds a lone Latin-1 byte (0xE9) only AFTER the head.
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    try buf.appendSlice(gpa, "id,note\n");
+    while (buf.items.len < api.open_head_max_bytes + 64 * 1024) {
+        try buf.appendSlice(gpa, "aaaaaaa,bbbbbbb\n"); // 16 bytes each
+    }
+    try buf.appendSlice(gpa, "z,caf\xE9\n"); // the late 8-bit row
+
+    // Automatic: the head is pure ASCII -> detected UTF-8 (documented limit).
+    var od = try openBytes(buf.items);
+    defer od.deinit();
+    try expectEncoding(od.doc, api.encoding_utf8, false);
+
+    // Forcing ISO-8859-1 re-reads the whole file correctly.
+    var od2 = try openWith(buf.items, .{ .encoding = api.encoding_latin1, .index_mode = api.index_manual });
+    defer od2.deinit();
+    try expectEncoding(od2.doc, api.encoding_latin1, true);
+    try scanToEnd(od2.doc);
+    const rc = api.ls_row_count_get(od2.doc);
+    try std.testing.expectEqual(true, rc.exact);
+    const last = rc.count - 1;
+    _ = api.ls_window_set(od2.doc, last, 1);
+    try expectCell(od2.doc, last, 1, "caf\xC3\xA9");
+}
+
+test "h6: Windows-1252 smart quotes + undefined bytes; the same bytes as Latin-1" {
+    const bytes = "a,b\n\x93q\x94,\x81\n";
+    var od = try openWith(bytes, .{ .encoding = api.encoding_windows1252, .index_mode = api.index_manual });
+    defer od.deinit();
+    try expectEncoding(od.doc, api.encoding_windows1252, true);
+    winAll(od.doc);
+    try expectCell(od.doc, 0, 0, "\xE2\x80\x9Cq\xE2\x80\x9D"); // 0x93/0x94 -> “ ” (U+201C/201D)
+    try expectCell(od.doc, 0, 1, "\xEF\xBF\xBD"); // 0x81 undefined -> U+FFFD
+
+    // The same bytes decoded as Latin-1: 0x93 -> U+0093, 0x94 -> U+0094,
+    // 0x81 -> U+0081 (C1 controls; UTF-8 two-byte C2 xx).
+    var od2 = try openWith(bytes, .{ .encoding = api.encoding_latin1, .index_mode = api.index_manual });
+    defer od2.deinit();
+    winAll(od2.doc);
+    try expectCell(od2.doc, 0, 0, "\xC2\x93q\xC2\x94");
+    try expectCell(od2.doc, 0, 1, "\xC2\x81");
+}
+
+test "h7: UTF-8 is pass-through — BOM stripped, invalid bytes survive unchanged" {
+    // Valid UTF-8 with a BOM: byte-identical to today, BOM absent, report UTF-8.
+    var od = try openBytes("\xEF\xBB\xBFname,city\nJosé,42\n");
+    defer od.deinit();
+    try expectEncoding(od.doc, api.encoding_utf8, false);
+    winAll(od.doc);
+    try expectHeaderCell(od.doc, 0, "name");
+    try expectCell(od.doc, 0, 0, "José");
+
+    // An invalid UTF-8 byte on the UTF-8 path is served UNCHANGED (Option A —
+    // the core never rewrites it to U+FFFD). Forced UTF-8 so it stays UTF-8.
+    var od2 = try openWith("h\naa\xFFbb\n", .{ .encoding = api.encoding_utf8, .index_mode = api.index_manual });
+    defer od2.deinit();
+    try expectEncoding(od2.doc, api.encoding_utf8, true);
+    winAll(od2.doc);
+    try expectCell(od2.doc, 0, 0, "aa\xFFbb"); // raw 0xFF survives
+}
+
+test "h8: an out-of-domain encoding is a distinct usage error (file untouched)" {
+    var fx = try makeFixture("a,b\n1,2\n", 0o644);
+    defer fx.deinit();
+    const bad = [_]i32{ -2, -3, 5, 6, 100, -100 };
+    for (bad) |enc| {
+        var doc: ?*api.Doc = null;
+        const opts: api.OpenOptions = .{ .encoding = enc };
+        try std.testing.expectEqual(api.Status.invalid_argument, api.ls_open(fx.path.ptr, &opts, &doc));
+        try std.testing.expectEqual(@as(?*api.Doc, null), doc);
+    }
+    // ...and every value in the domain opens.
+    const good = [_]i32{
+        api.encoding_auto,      api.encoding_utf8,    api.encoding_utf16le,
+        api.encoding_utf16be,   api.encoding_latin1,  api.encoding_windows1252,
+    };
+    for (good) |enc| {
+        var doc: ?*api.Doc = null;
+        const opts: api.OpenOptions = .{ .encoding = enc, .index_mode = api.index_manual };
+        try std.testing.expectEqual(api.Status.ok, api.ls_open(fx.path.ptr, &opts, &doc));
+        api.ls_close(doc.?);
+    }
+}
+
+test "h9: detection + transcode read <= head budget (SOURCE bytes) per encoding" {
+    const gpa = std.testing.allocator;
+    const total: u64 = 1024 * 1024 * 1024; // 1 GiB sparse
+
+    // Large Latin-1 file: opens fast, reports ISO-8859-1, reads <= head budget.
+    {
+        var head: std.ArrayList(u8) = .empty;
+        defer head.deinit(gpa);
+        try head.appendSlice(gpa, "id,note\n");
+        var i: usize = 0;
+        while (i < 4000) : (i += 1) try head.appendSlice(gpa, "1,caf\xE9\n");
+        var fx = try makeSparseFixture(head.items, total);
+        defer fx.deinit();
+        const t0: std.Io.Clock.Timestamp = .now(std.testing.io, .awake);
+        var doc: ?*api.Doc = null;
+        try std.testing.expectEqual(api.Status.ok, api.ls_open(fx.path.ptr, &manual, &doc));
+        defer api.ls_close(doc.?);
+        try std.testing.expect(elapsedMs(t0) < 500); // never O(file)
+        try expectEncoding(doc.?, api.encoding_latin1, false);
+        const p = api.ls_index_poll(doc.?);
+        try std.testing.expectEqual(total, p.bytes_total);
+        try std.testing.expect(p.bytes_scanned <= api.open_head_max_bytes);
+    }
+    // Large UTF-16LE file (BOM): same source-byte bound.
+    {
+        const u16head = try toUtf16(gpa, "id,name\n1,Ada\n2,Bob\n", true, true);
+        defer gpa.free(u16head);
+        var fx = try makeSparseFixture(u16head, total);
+        defer fx.deinit();
+        const t0: std.Io.Clock.Timestamp = .now(std.testing.io, .awake);
+        var doc: ?*api.Doc = null;
+        try std.testing.expectEqual(api.Status.ok, api.ls_open(fx.path.ptr, &manual, &doc));
+        defer api.ls_close(doc.?);
+        try std.testing.expect(elapsedMs(t0) < 500);
+        try expectEncoding(doc.?, api.encoding_utf16le, false);
+        try std.testing.expect(api.ls_index_poll(doc.?).bytes_scanned <= api.open_head_max_bytes);
+    }
+}
+
+test "h10: forced UTF-16 without a BOM decodes; a matching leading BOM is stripped" {
+    const gpa = std.testing.allocator;
+    // No BOM, forced LE.
+    const le = try toUtf16(gpa, "a,b\nJosé,x\n", true, false);
+    defer gpa.free(le);
+    var od = try openWith(le, .{ .encoding = api.encoding_utf16le, .index_mode = api.index_manual });
+    defer od.deinit();
+    try expectEncoding(od.doc, api.encoding_utf16le, true);
+    try expectDims(od.doc, 1, 2);
+    winAll(od.doc);
+    try expectCell(od.doc, 0, 0, "José");
+
+    // A BOM matching the forced encoding is consumed (not a leading cell char).
+    const le_bom = try toUtf16(gpa, "a,b\nx,y\n", true, true);
+    defer gpa.free(le_bom);
+    var od2 = try openWith(le_bom, .{ .encoding = api.encoding_utf16le, .index_mode = api.index_manual });
+    defer od2.deinit();
+    winAll(od2.doc);
+    try expectHeaderCell(od2.doc, 0, "a"); // not "\u{FEFF}a"
+}
+
+test "h11: empty and BOM-only files open empty with a sensible reported encoding" {
+    // Empty, automatic -> UTF-8.
+    var od = try openBytes("");
+    defer od.deinit();
+    try expectDims(od.doc, 0, 0);
+    try expectEncoding(od.doc, api.encoding_utf8, false);
+    // Empty, forced Latin-1 -> the forced value is reported.
+    var od2 = try openWith("", .{ .encoding = api.encoding_latin1, .index_mode = api.index_manual });
+    defer od2.deinit();
+    try expectDims(od2.doc, 0, 0);
+    try expectEncoding(od2.doc, api.encoding_latin1, true);
+    // UTF-16LE BOM-only -> empty document, encoding UTF-16 LE.
+    var od3 = try openBytes("\xFF\xFE");
+    defer od3.deinit();
+    try expectDims(od3.doc, 0, 0);
+    try expectEncoding(od3.doc, api.encoding_utf16le, false);
+    // UTF-8 BOM-only -> empty document, UTF-8.
+    var od4 = try openBytes("\xEF\xBB\xBF");
+    defer od4.deinit();
+    try expectDims(od4.doc, 0, 0);
+    try expectEncoding(od4.doc, api.encoding_utf8, false);
+}
+
+test "h12: dialect/header/column outcomes are identical across encodings" {
+    const gpa = std.testing.allocator;
+    const logical = "name;age\nJosé;42\nBo;7\n"; // ';' delimited, header, accented
+
+    var u8doc = try openBytes(logical);
+    defer u8doc.deinit();
+    const du8 = api.ls_dialect_get(u8doc.doc);
+    try std.testing.expectEqual(@as(u8, ';'), du8.separator);
+    try std.testing.expectEqual(true, du8.header);
+
+    const le = try toUtf16(gpa, logical, true, true);
+    defer gpa.free(le);
+    var ledoc = try openBytes(le);
+    defer ledoc.deinit();
+
+    const latin = "name;age\nJos\xE9;42\nBo;7\n"; // é -> 0xE9
+    var latindoc = try openWith(latin, .{ .encoding = api.encoding_latin1, .index_mode = api.index_manual });
+    defer latindoc.deinit();
+
+    inline for (.{ ledoc, latindoc }) |od| {
+        const d = api.ls_dialect_get(od.doc);
+        try std.testing.expectEqual(du8.separator, d.separator);
+        try std.testing.expectEqual(du8.header, d.header);
+        try std.testing.expectEqual(api.ls_column_count(u8doc.doc), api.ls_column_count(od.doc));
+    }
+    // The transcoded cells match the UTF-8 baseline exactly.
+    winAll(u8doc.doc);
+    winAll(ledoc.doc);
+    winAll(latindoc.doc);
+    try expectCell(u8doc.doc, 0, 0, "José");
+    try expectCell(ledoc.doc, 0, 0, "José");
+    try expectCell(latindoc.doc, 0, 0, "José");
+}
+
+// ---------------------------------------------------------------------------
+// h13..h17 — the per-cell display cap, bounded record 1, search-over-full-cell.
+// ---------------------------------------------------------------------------
+
+test "h13: a cell over the display cap is served truncated at a code-point boundary" {
+    const gpa = std.testing.allocator;
+    // Data row 0, one column: 4095 'a', then a 2-byte 'é' straddling byte 4096,
+    // then filler — the cap must cut BEFORE 'é' (largest boundary <= 4096 = 4095).
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    try buf.appendSlice(gpa, "h\n");
+    var k: usize = 0;
+    while (k < 4095) : (k += 1) try buf.append(gpa, 'a');
+    try buf.appendSlice(gpa, "é"); // bytes at offsets 4095, 4096
+    k = 0;
+    while (k < 1000) : (k += 1) try buf.append(gpa, 'b');
+    try buf.append(gpa, '\n');
+    try buf.appendSlice(gpa, "small\n");
+
+    var od = try openBytes(buf.items);
+    defer od.deinit();
+    try expectDims(od.doc, 2, 1);
+    winAll(od.doc);
+
+    const served = api.ls_cell(od.doc, 0, 0).slice();
+    try std.testing.expect(served.len <= api.cell_max_bytes);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(served)); // never a split code point
+    try std.testing.expectEqual(@as(usize, 4095), served.len); // cut before the 'é'
+    for (served) |ch| try std.testing.expectEqual(@as(u8, 'a'), ch);
+    try std.testing.expectEqual(true, api.ls_cell_truncated(od.doc, 0, 0));
+
+    // A cell within the cap is served whole with the flag false.
+    try expectCell(od.doc, 1, 0, "small");
+    try std.testing.expectEqual(false, api.ls_cell_truncated(od.doc, 1, 0));
+    // Out-of-window / out-of-range: false.
+    try std.testing.expectEqual(false, api.ls_cell_truncated(od.doc, 99, 0));
+    try std.testing.expectEqual(false, api.ls_cell_truncated(od.doc, 0, 9));
+}
+
+test "h13b: an oversized HEADER cell is capped and flagged too" {
+    const gpa = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    var k: usize = 0;
+    while (k < 6000) : (k += 1) try buf.append(gpa, 'H'); // header cell > cap
+    try buf.appendSlice(gpa, "\nx\n"); // one data row keeps the header a header
+    var od = try openWith(buf.items, .{ .header = api.header_on, .index_mode = api.index_manual });
+    defer od.deinit();
+    winAll(od.doc);
+    try std.testing.expect(api.ls_header_cell(od.doc, 0).slice().len <= api.cell_max_bytes);
+    try std.testing.expectEqual(true, api.ls_header_cell_truncated(od.doc, 0));
+    try std.testing.expectEqual(false, api.ls_header_cell_truncated(od.doc, 9)); // out of range
+}
+
+test "h14: an unterminated giant record 1 opens bounded, last field truncated+flagged" {
+    const gpa = std.testing.allocator;
+    // Record 1: field "a", then an unclosed quoted cell (no closing quote, no
+    // newline) swallowing the rest for > head budget of source bytes. A 256 MiB
+    // sparse tail makes an O(file) decode measurably slow — open must stay O(head).
+    var head: std.ArrayList(u8) = .empty;
+    defer head.deinit(gpa);
+    try head.appendSlice(gpa, "a,\"");
+    while (head.items.len < api.open_head_max_bytes + 256 * 1024) {
+        try head.appendSlice(gpa, "bbbbbbbb");
+    }
+    const total: u64 = 256 * 1024 * 1024;
+    var fx = try makeSparseFixture(head.items, total);
+    defer fx.deinit();
+
+    const t0: std.Io.Clock.Timestamp = .now(std.testing.io, .awake);
+    var doc: ?*api.Doc = null;
+    const opts: api.OpenOptions = .{ .separator = ',', .quote = '"', .header = api.header_off, .index_mode = api.index_manual };
+    try std.testing.expectEqual(api.Status.ok, api.ls_open(fx.path.ptr, &opts, &doc));
+    defer api.ls_close(doc.?);
+    try std.testing.expect(elapsedMs(t0) < 500); // O(head), not O(file)
+    // Column count = the fields decoded within budget (the quote swallows all
+    // separators, so exactly two: "a" and the giant unterminated field).
+    try std.testing.expectEqual(@as(u32, 2), api.ls_column_count(doc.?));
+    try std.testing.expect(api.ls_index_poll(doc.?).bytes_scanned <= api.open_head_max_bytes);
+
+    _ = api.ls_window_set(doc.?, 0, 1);
+    try expectCell(doc.?, 0, 0, "a");
+    try std.testing.expectEqual(false, api.ls_cell_truncated(doc.?, 0, 0));
+    // The in-progress final field is display-truncated and flagged.
+    try std.testing.expect(api.ls_cell(doc.?, 0, 1).slice().len <= api.cell_max_bytes);
+    try std.testing.expectEqual(true, api.ls_cell_truncated(doc.?, 0, 1));
+}
+
+test "h15: text search matches the FULL cell, past the display cap" {
+    const gpa = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    try buf.appendSlice(gpa, "h\n"); // header record
+    var k: usize = 0;
+    while (k < 5000) : (k += 1) try buf.append(gpa, 'a'); // > cap of filler
+    try buf.appendSlice(gpa, "NEEDLE\n"); // the only match, past the 4 KiB cap
+
+    var od = try openBytes(buf.items);
+    defer od.deinit();
+    // The match is found even though it lives past the served display bytes.
+    try std.testing.expectEqual(@as(u64, 1), try searchTotal(od.doc, textReq("NEEDLE")));
+    const s = try navAndWait(od.doc, 0, .forward);
+    try expectFound(s, 0, 0, 1);
+    // ...and that same served cell is capped + flagged (display-only).
+    _ = api.ls_window_set(od.doc, 0, 1);
+    try std.testing.expect(api.ls_cell(od.doc, 0, 0).slice().len <= api.cell_max_bytes);
+    try std.testing.expectEqual(true, api.ls_cell_truncated(od.doc, 0, 0));
+}
+
+test "h16: predicate = compares the FULL cell, past the display cap" {
+    const gpa = std.testing.allocator;
+    var big: std.ArrayList(u8) = .empty;
+    defer big.deinit(gpa);
+    var k: usize = 0;
+    while (k < 5000) : (k += 1) try big.append(gpa, 'z'); // > cap
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    try buf.appendSlice(gpa, big.items); // data row 0 (header off)
+    try buf.append(gpa, '\n');
+    try buf.appendSlice(gpa, "small\n"); // data row 1
+
+    var od = try openWith(buf.items, .{ .header = api.header_off, .index_mode = api.index_manual });
+    defer od.deinit();
+    // = big matches ONLY the full-content row 0 (byte-exact over the WHOLE cell).
+    try std.testing.expectEqual(@as(u64, 1), try searchTotal(od.doc, predReq(0, .eq, big.items)));
+    const s = try navAndWait(od.doc, 0, .forward);
+    try expectFound(s, 0, 0, 1);
+    // A value equal only to the capped prefix must NOT match the full cell.
+    try std.testing.expectEqual(@as(u64, 0), try searchTotal(od.doc, predReq(0, .eq, big.items[0..api.cell_max_bytes])));
+    _ = api.ls_window_set(od.doc, 0, 1);
+    try std.testing.expectEqual(true, api.ls_cell_truncated(od.doc, 0, 0));
+}
+
+test "h17: a window of oversized cells is per-cell bounded and window_set stays fast" {
+    const gpa = std.testing.allocator;
+    const cell = try gpa.alloc(u8, 8192); // 8 KiB per cell (2x the cap)
+    defer gpa.free(cell);
+    @memset(cell, 'a');
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    var r: usize = 0;
+    while (r < 200) : (r += 1) {
+        try buf.appendSlice(gpa, cell);
+        try buf.append(gpa, ',');
+        try buf.appendSlice(gpa, cell);
+        try buf.append(gpa, '\n');
+    }
+    var od = try openWith(buf.items, .{ .header = api.header_off, .separator = ',', .index_mode = api.index_manual });
+    defer od.deinit();
+    try scanToEnd(od.doc);
+
+    const before = api.ls_index_poll(od.doc).bytes_scanned;
+    const t0: std.Io.Clock.Timestamp = .now(std.testing.io, .awake);
+    const range = api.ls_window_set(od.doc, 0, 200);
+    try std.testing.expect(elapsedMs(t0) < 100); // synchronous-fast: no scan, no full-file read
+    try std.testing.expectEqual(@as(u64, 200), range.row_count);
+    try std.testing.expectEqual(before, api.ls_index_poll(od.doc).bytes_scanned); // frontier untouched
+    // Per-cell cap == the window memory bound (window <= rows*cols*cap).
+    var i: u64 = 0;
+    while (i < 200) : (i += 1) {
+        try std.testing.expect(api.ls_cell(od.doc, i, 0).slice().len <= api.cell_max_bytes);
+        try std.testing.expect(api.ls_cell(od.doc, i, 1).slice().len <= api.cell_max_bytes);
+        try std.testing.expectEqual(true, api.ls_cell_truncated(od.doc, i, 0));
+        try std.testing.expectEqual(true, api.ls_cell_truncated(od.doc, i, 1));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Public C ABI: csv-hardening constants + truncation symbols pinned to the
+// header, callable through extern linkage (regression guard; green from seed).
+// ---------------------------------------------------------------------------
+
+const c_linked_csv = struct {
+    extern fn ls_cell_truncated(doc: *const api.Doc, row: u64, col: u32) bool;
+    extern fn ls_header_cell_truncated(doc: *const api.Doc, col: u32) bool;
+};
+
+test "abi: csv-hardening constants are pinned and truncation symbols link" {
+    try std.testing.expectEqual(@as(i32, -1), api.encoding_auto);
+    try std.testing.expectEqual(@as(u8, 0), api.encoding_utf8);
+    try std.testing.expectEqual(@as(u8, 1), api.encoding_utf16le);
+    try std.testing.expectEqual(@as(u8, 2), api.encoding_utf16be);
+    try std.testing.expectEqual(@as(u8, 3), api.encoding_latin1);
+    try std.testing.expectEqual(@as(u8, 4), api.encoding_windows1252);
+    try std.testing.expectEqual(@as(usize, 4096), api.cell_max_bytes);
+
+    var od = try openBytes("h\nsmall\n");
+    defer od.deinit();
+    winAll(od.doc);
+    try std.testing.expectEqual(false, c_linked_csv.ls_cell_truncated(od.doc, 0, 0));
+    try std.testing.expectEqual(false, c_linked_csv.ls_header_cell_truncated(od.doc, 0));
+}

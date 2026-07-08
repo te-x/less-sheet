@@ -1,5 +1,5 @@
-//! Frozen Zig-side contract for the less-sheet core (viewer-ui + find-seek
-//! slices).
+//! Frozen Zig-side contract for the less-sheet core (viewer-ui + find-seek +
+//! csv-hardening slices).
 //!
 //! This file is planner-owned. It mirrors the workspace-frozen C header
 //! `api/lesssheet.h` EXACTLY — names, types, values, and semantics; the two
@@ -66,6 +66,23 @@ pub const open_head_max_bytes: u64 = 4 * 1024 * 1024;
 /// Mirrors LS_WINDOW_MAX_ROWS.
 pub const window_max_rows: u32 = 4096;
 
+/// Mirror LS_ENCODING_*. `encoding_auto` (options only, detect sentinel — in
+/// the LS_SNIFF / LS_QUOTE_NONE negative-sentinel style) is NEVER reported in
+/// Dialect.encoding, which always names one concrete resolved encoding. See
+/// the header's TEXT AND ENCODING section.
+pub const encoding_auto: i32 = -1;
+pub const encoding_utf8: u8 = 0;
+pub const encoding_utf16le: u8 = 1;
+pub const encoding_utf16be: u8 = 2;
+pub const encoding_latin1: u8 = 3; // ISO-8859-1
+pub const encoding_windows1252: u8 = 4;
+
+/// Mirrors LS_CELL_MAX_BYTES: the per-cell UTF-8 DISPLAY CAP ls_cell /
+/// ls_header_cell serve (cut at a code-point boundary; display-only — search
+/// scans the full cell). Reported per cell by ls_cell_truncated /
+/// ls_header_cell_truncated.
+pub const cell_max_bytes: usize = 4096;
+
 /// Sniffer candidates in pinned tie-break preference order (see the header's
 /// DIALECT SNIFFING section).
 pub const separator_candidates: []const u8 = ",;\t|";
@@ -111,17 +128,23 @@ pub const OpenOptions = extern struct {
     quote: i32 = sniff,
     header: i32 = sniff,
     index_mode: i32 = index_auto,
+    encoding: i32 = encoding_auto,
 };
 
-/// Mirrors `ls_dialect`: the effective dialect report.
+/// Mirrors `ls_dialect`: the effective dialect report. Field order matches the
+/// C struct exactly (encoding after header; encoding_forced after
+/// header_forced). encoding is a concrete resolved LS_ENCODING_* value, never
+/// encoding_auto.
 pub const Dialect = extern struct {
     separator: u8,
     quote: u8,
     has_quote: bool,
     header: bool,
+    encoding: u8,
     separator_forced: bool,
     quote_forced: bool,
     header_forced: bool,
+    encoding_forced: bool,
 };
 
 /// Mirrors `ls_row_count`: row-count knowledge (count + exact/estimated).
@@ -241,7 +264,9 @@ pub const ls_row_count_get = core.ls_row_count_get;
 pub const ls_index_poll = core.ls_index_poll;
 pub const ls_window_set = core.ls_window_set;
 pub const ls_cell = core.ls_cell;
+pub const ls_cell_truncated = core.ls_cell_truncated;
 pub const ls_header_cell = core.ls_header_cell;
+pub const ls_header_cell_truncated = core.ls_header_cell_truncated;
 pub const ls_jump_start = core.ls_jump_start;
 pub const ls_jump_cancel = core.ls_jump_cancel;
 pub const ls_jump_poll = core.ls_jump_poll;
@@ -279,8 +304,12 @@ comptime {
         @compileError("signature drift: ls_window_set");
     if (@TypeOf(core.ls_cell) != fn (*const Doc, u64, u32) callconv(.c) Str)
         @compileError("signature drift: ls_cell");
+    if (@TypeOf(core.ls_cell_truncated) != fn (*const Doc, u64, u32) callconv(.c) bool)
+        @compileError("signature drift: ls_cell_truncated");
     if (@TypeOf(core.ls_header_cell) != fn (*const Doc, u32) callconv(.c) Str)
         @compileError("signature drift: ls_header_cell");
+    if (@TypeOf(core.ls_header_cell_truncated) != fn (*const Doc, u32) callconv(.c) bool)
+        @compileError("signature drift: ls_header_cell_truncated");
     if (@TypeOf(core.ls_jump_start) != fn (*Doc, u64) callconv(.c) void)
         @compileError("signature drift: ls_jump_start");
     if (@TypeOf(core.ls_jump_cancel) != fn (*Doc) callconv(.c) void)
