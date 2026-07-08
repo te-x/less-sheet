@@ -81,7 +81,7 @@ struct FindControlView: View {
     /// (an overestimate only widens the gap; it never overlaps).
     private var popupHeight: CGFloat {
         let base: CGFloat = model.findSession.draft.mode == .text ? 116 : 156
-        return base + (searching ? 34 : 0)
+        return base + (searching ? 34 : 0) + 28   // + the apply-as-filter row
     }
 
     // MARK: - Popup
@@ -99,6 +99,7 @@ struct FindControlView: View {
             case .predicate: whereFields
             }
 
+            filterRow
             statusRow
             if let progress = display.progress { scanningRow(progress) }
         }
@@ -108,6 +109,28 @@ struct FindControlView: View {
         .onExitCommand { model.closeFind() }              // Esc closes + clears
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Find")
+    }
+
+    // "Apply as filter" (ARCH-filtered-views req. 10): composes the SAME draft
+    // as Find (`FindControlling.submit` — identical grammar, no new predicate
+    // UI) and routes it to `setFilter` instead of `startSearch`. "Clear
+    // filter" mirrors the banner's ✕ (req. 11 — "Clearing is also available
+    // from the Find popup").
+    private var filterRow: some View {
+        HStack(spacing: 8) {
+            Button("Apply as filter") { model.applyFindAsFilter() }
+                .buttonStyle(.plain)
+                .font(.caption.weight(.medium))
+                .foregroundStyle(Color.accentColor)
+            Spacer(minLength: 8)
+            if model.isFiltered {
+                Button("Clear filter") { model.clearFilter() }
+                    .buttonStyle(.plain)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .accessibilityElement(children: .contain)
     }
 
     // Text mode: one query field with smart case (ARCH req. 7).

@@ -233,7 +233,10 @@ struct JumpControlView: View {
                 }
             }
             .font(.callout.monospacedDigit())
-            Text(RowCountText.summary(model.rowCountInfo))
+            // While filtered, the field takes ORIGINAL row numbers (ARCH
+            // criterion 12/17), so the hint is scaled to the whole document
+            // (`jumpRowCountInfo`), not the filtered row count.
+            Text(RowCountText.summary(model.jumpRowCountInfo))
                 .font(.caption)
                 .foregroundStyle(rejected ? Color.red : Color.secondary)
                 .lineLimit(1)
@@ -243,8 +246,8 @@ struct JumpControlView: View {
         // Red blink on rejection (item 4): a red ring over the capsule.
         .overlay { if rejected { Capsule().strokeBorder(Color.red, lineWidth: 2) } }
         .onExitCommand { model.dismissPopups() }      // Esc closes the field
-        .accessibilityLabel("Jump to row, \(RowCountText.summary(model.rowCountInfo))")
-        .accessibilityValue(rejected ? "No such row. Enter a row from 1 to \(model.rowCountInfo.count)." : "")
+        .accessibilityLabel("Jump to row, \(RowCountText.summary(model.jumpRowCountInfo))")
+        .accessibilityValue(rejected ? "No such row. Enter a row from 1 to \(model.jumpRowCountInfo.count)." : "")
     }
 
     @ViewBuilder

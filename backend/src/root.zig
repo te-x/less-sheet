@@ -189,14 +189,55 @@ const Document = struct {
     nav_scratch: std.ArrayList(u8),
     nav_refs: std.ArrayList(CellRef),
 
+    // Filter (filtered-views slice) — a persistent VIEW MODE, not a transient
+    // job: it PERSISTS (scanning/done/cancelled) until cleared or re-opened,
+    // regardless of scan-slot contention (see api/lesssheet.h FILTERED VIEWS).
+    // Mirrors the search job's per-block counting machinery with its OWN
+    // predicate, cursor, and counters — never a materialized match-row list.
+    filter_state: api.FilterState,
+    filter_progress: f64,
+    filter_total: u64,
+    filter_total_exact: bool,
+    // Filter-scan cursor: rows [0, filter_rows) are counted (contiguous from
+    // row 0); filter_offset is the content offset of the next row to evaluate.
+    filter_offset: u64,
+    filter_rows: u64,
+    // Generation: bumped by every ls_filter_set so a stale in-flight worker
+    // chunk of a replaced filter is discarded on commit.
+    filter_gen: u64,
+    // Active filter request (owned; same shape as the search request fields).
+    filter_kind: api.SearchKind,
+    filter_op: api.SearchOp,
+    filter_column: u32,
+    filter_value: []u8,
+    filter_value_dec: Decimal,
+    filter_fold: bool,
+    filter_scope_mask: []bool,
+    // Per-index-block filter-match counters (owned): O(checkpoints) always,
+    // aligned 1:1 with `checkpoints`, exactly like the search job's block_counts.
+    filter_block_counts: std.ArrayList(u64),
+    // Worker match-scan scratch + request snapshot (worker-only; lock-free
+    // during a chunk; refreshed under the lock when filter_gen changes). Also
+    // the lock-free snapshot a concurrent SEARCH chunk composes against while
+    // filtered (see searchRowMatch).
+    filter_scratch: std.ArrayList(u8),
+    filter_refs: std.ArrayList(CellRef),
+    wf_value: std.ArrayList(u8),
+    wf_mask: std.ArrayList(bool),
+    wf_ctx: MatchCtx,
+    wf_gen: u64,
+
     // Worker control.
     worker: ?std.Thread,
     stop: bool,
     stop_atomic: std.atomic.Value(bool),
 
-    // Materialized window (window lane only; no lock).
+    // Materialized window (window lane only; no lock). win_source[i] is the
+    // ORIGINAL data-row number of materialized row win_first+i (identity when
+    // no filter is active; see ls_source_row / FILTERED VIEWS).
     win_buf: std.ArrayList(u8),
     win_refs: std.ArrayList(CellRef),
+    win_source: std.ArrayList(u64),
     win_first: u64,
     win_rows: u64,
 
@@ -453,11 +494,33 @@ pub fn openWithAllocator(gpa: std.mem.Allocator, path: [*:0]const u8, options: ?
         .w_gen = 0,
         .nav_scratch = .empty,
         .nav_refs = .empty,
+        .filter_state = .idle,
+        .filter_progress = 0.0,
+        .filter_total = 0,
+        .filter_total_exact = false,
+        .filter_offset = 0,
+        .filter_rows = 0,
+        .filter_gen = 0,
+        .filter_kind = .text,
+        .filter_op = .eq,
+        .filter_column = 0,
+        .filter_value = &.{},
+        .filter_value_dec = .{},
+        .filter_fold = false,
+        .filter_scope_mask = &.{},
+        .filter_block_counts = .empty,
+        .filter_scratch = .empty,
+        .filter_refs = .empty,
+        .wf_value = .empty,
+        .wf_mask = .empty,
+        .wf_ctx = .{},
+        .wf_gen = 0,
         .worker = null,
         .stop = false,
         .stop_atomic = .init(false),
         .win_buf = .empty,
         .win_refs = .empty,
+        .win_source = .empty,
         .win_first = 0,
         .win_rows = 0,
     };
@@ -634,6 +697,7 @@ fn freeDoc(doc: *Document) void {
     doc.checkpoints.deinit(doc.gpa);
     doc.win_buf.deinit(doc.gpa);
     doc.win_refs.deinit(doc.gpa);
+    doc.win_source.deinit(doc.gpa);
     doc.block_counts.deinit(doc.gpa);
     doc.search_scratch.deinit(doc.gpa);
     doc.search_refs.deinit(doc.gpa);
@@ -641,8 +705,15 @@ fn freeDoc(doc: *Document) void {
     doc.w_mask.deinit(doc.gpa);
     doc.nav_scratch.deinit(doc.gpa);
     doc.nav_refs.deinit(doc.gpa);
+    doc.filter_block_counts.deinit(doc.gpa);
+    doc.filter_scratch.deinit(doc.gpa);
+    doc.filter_refs.deinit(doc.gpa);
+    doc.wf_value.deinit(doc.gpa);
+    doc.wf_mask.deinit(doc.gpa);
     if (doc.search_value.len > 0) doc.gpa.free(doc.search_value);
     if (doc.scope_mask.len > 0) doc.gpa.free(doc.scope_mask);
+    if (doc.filter_value.len > 0) doc.gpa.free(doc.filter_value);
+    if (doc.filter_scope_mask.len > 0) doc.gpa.free(doc.filter_scope_mask);
     if (doc.header_buf.len > 0) doc.gpa.free(doc.header_buf);
     if (doc.header_refs.len > 0) doc.gpa.free(doc.header_refs);
     if (doc.row0_pinned_buf.len > 0) doc.gpa.free(doc.row0_pinned_buf);
@@ -675,13 +746,87 @@ fn workerMain(doc: *Document) void {
     while (true) {
         if (doc.stop) break;
         // Slot priority: a scanning jump owns the frontier; else a scanning
-        // search (which runs even after the index is complete — it must re-lex
-        // behind the frontier to COUNT); else the AUTO background indexer.
-        const do_jump = doc.jump_state == .scanning and !doc.complete;
+        // search (find — which runs even after the index is complete; it must
+        // re-lex behind the frontier to COUNT); else a scanning (or, under
+        // AUTO, cancelled-but-resumable) filter-scan; else the AUTO background
+        // indexer. See api/lesssheet.h FILTERED VIEWS "the single scan slot".
+        const do_jump = doc.jump_state == .scanning and (doc.filter_state != .idle or !doc.complete);
         const do_search = !do_jump and doc.search_state == .scanning;
-        const do_index = !do_jump and !do_search and doc.auto and !doc.complete;
-        if (!(do_jump or do_search or do_index)) {
+        const do_filter = !do_jump and !do_search and
+            (doc.filter_state == .scanning or (doc.filter_state == .cancelled and doc.auto));
+        const do_index = !do_jump and !do_search and !do_filter and doc.auto and !doc.complete;
+        if (!(do_jump or do_search or do_filter or do_index)) {
             doc.waitWork();
+            continue;
+        }
+
+        if (do_jump and doc.filter_state != .idle) {
+            // FILTERED jump: target is an ORIGINAL row; drive the SAME
+            // filter-scan machinery toward it (see FILTERED VIEWS JUMP).
+            // Taking the slot cancels a scanning filter-scan (mode persists).
+            if (doc.filter_state == .scanning) doc.filter_state = .cancelled;
+            if (doc.filter_gen != doc.wf_gen) {
+                if (!refreshFilterWorkerCtx(doc)) {
+                    failFilterLocked(doc);
+                    continue;
+                }
+                doc.wf_gen = doc.filter_gen;
+            }
+            const gen = doc.filter_gen;
+            const start_off = doc.filter_offset;
+            const start_row = doc.filter_rows;
+            doc.unlock();
+
+            const res = filterScanChunk(doc, start_off, start_row);
+
+            doc.lock();
+            if (doc.filter_gen == gen and doc.jump_state == .scanning) {
+                commitFilter(doc, res);
+                resolveFilterJumpLocked(doc);
+            }
+            const advanced = doc.frontier_offset;
+            doc.unlock();
+
+            if (doc.mapping != null and advanced > released + madvise_release_chunk and advanced > madvise_keepback) {
+                const rel_end = advanced - madvise_keepback;
+                madviseDontNeed(doc, released, rel_end);
+                released = rel_end;
+            }
+            doc.lock();
+            continue;
+        }
+
+        if (do_filter) {
+            // The filter's OWN job (not driven by a jump): a background
+            // view-completion scan toward EOF (see FILTERED VIEWS).
+            doc.filter_state = .scanning;
+            if (doc.filter_gen != doc.wf_gen) {
+                if (!refreshFilterWorkerCtx(doc)) {
+                    failFilterLocked(doc);
+                    continue;
+                }
+                doc.wf_gen = doc.filter_gen;
+            }
+            const gen = doc.filter_gen;
+            const start_off = doc.filter_offset;
+            const start_row = doc.filter_rows;
+            doc.unlock();
+
+            const res = filterScanChunk(doc, start_off, start_row);
+
+            doc.lock();
+            if (doc.filter_gen == gen and doc.filter_state == .scanning) {
+                commitFilter(doc, res);
+            }
+            const advanced = doc.frontier_offset;
+            doc.unlock();
+
+            if (doc.mapping != null and advanced > released + madvise_release_chunk and advanced > madvise_keepback) {
+                const rel_end = advanced - madvise_keepback;
+                madviseDontNeed(doc, released, rel_end);
+                released = rel_end;
+            }
+            doc.lock();
             continue;
         }
 
@@ -697,20 +842,31 @@ fn workerMain(doc: *Document) void {
                 }
                 doc.w_gen = doc.search_gen;
             }
+            // While filtered, find composes the filter predicate too (see
+            // FILTERED VIEWS FIND) — refresh the worker's lock-free filter
+            // snapshot alongside the find one.
+            const filtered = doc.filter_state != .idle;
+            if (filtered and doc.filter_gen != doc.wf_gen) {
+                if (!refreshFilterWorkerCtx(doc)) {
+                    failSearchLocked(doc);
+                    continue;
+                }
+                doc.wf_gen = doc.filter_gen;
+            }
             const gen = doc.search_gen;
             const start_off = doc.search_offset;
             const start_row = doc.search_rows;
             doc.unlock();
 
             // Lex + match a chunk of rows lock-free (worker snapshot only).
-            const res = searchScanChunk(doc, start_off, start_row);
+            const res = searchScanChunk(doc, start_off, start_row, filtered);
 
             doc.lock();
             // Commit only if this is still the same, still-scanning search;
             // otherwise discard (a replace bumped the gen, or a jump/cancel took
             // the slot — counts freeze at the last committed chunk).
             if (doc.search_gen == gen and doc.search_state == .scanning) {
-                commitSearch(doc, res);
+                commitSearch(doc, res, filtered);
                 resolveNavLocked(doc);
                 if (doc.search_state == .scanning and !doc.search_to_eof and !doc.nav_pending) {
                     // A nav-limited resume served its navigation before EOF.
@@ -836,6 +992,10 @@ pub export fn ls_row_count_get(doc: *const api.Doc) callconv(.c) api.RowCount {
     const d = asDocMut(doc);
     d.lock();
     defer d.unlock();
+    // While filtered, report the FILTERED match count (see FILTERED VIEWS):
+    // identical semantics to the unfiltered count during indexing (a
+    // converging lower bound that becomes exact at LS_FILTER_DONE).
+    if (d.filter_state != .idle) return .{ .count = d.filter_total, .exact = d.filter_total_exact };
     if (d.complete) return .{ .count = d.total_rows, .exact = true };
     // Estimate = total data bytes / mean indexed row bytes.
     const scanned_data = d.frontier_offset - d.data_start;
@@ -876,12 +1036,19 @@ pub export fn ls_window_set(doc: *api.Doc, first_row: u64, row_count: u32) callc
     // Evict the previous window regardless of the outcome.
     d.win_buf.clearRetainingCapacity();
     d.win_refs.clearRetainingCapacity();
+    d.win_source.clearRetainingCapacity();
     d.win_first = first_row;
     d.win_rows = 0;
 
     if (d.column_count == 0) return .{ .first_row = first_row, .row_count = 0 };
     const clamped: u64 = @min(@as(u64, row_count), @as(u64, api.window_max_rows));
     if (clamped == 0) return .{ .first_row = first_row, .row_count = 0 };
+
+    // While filtered, first_row/row_count are FILTERED coordinates and rows
+    // are served by counting into the filter's per-block counters + a bounded
+    // in-block re-lex — see FILTERED VIEWS. The BOUNDED RECORD 1 pinned-row-0
+    // special case below is an identity-view-only edge case.
+    if (d.filter_state != .idle) return windowSetFiltered(d, first_row, clamped);
 
     // BOUNDED RECORD 1 (requirement 9): when record 1 is ALSO data row 0
     // (header off) and never terminated within the O(head) budget, its
@@ -896,6 +1063,7 @@ pub export fn ls_window_set(doc: *api.Doc, first_row: u64, row_count: u32) callc
             d.win_buf.appendSlice(d.gpa, d.row0_pinned_buf[ref.start .. ref.start + ref.len]) catch break;
             d.win_refs.append(d.gpa, .{ .start = start, .len = ref.len, .truncated = ref.truncated }) catch break;
         }
+        d.win_source.append(d.gpa, 0) catch {}; // identity: row 0's source is row 0
         pinned_rows = 1;
         d.win_rows = 1;
     }
@@ -925,10 +1093,50 @@ pub export fn ls_window_set(doc: *api.Doc, first_row: u64, row_count: u32) callc
     var produced: u64 = 0;
     while (produced < materialize) : (produced += 1) {
         const res = lexInto(d.content, off, d.sep, d.quote, d.column_count, api.cell_max_bytes, d.content.len, d.encoding, &d.win_buf, &d.win_refs, d.gpa) catch break;
+        d.win_source.append(d.gpa, next_row + produced) catch {}; // identity: source == physical row
         off = res.next;
     }
     d.win_rows = pinned_rows + produced;
     return .{ .first_row = first_row, .row_count = pinned_rows + produced };
+}
+
+/// ls_window_set while a filter is active: `first_row`/`clamped` are FILTERED
+/// coordinates (row i = the i-th matching data row). Locates the source
+/// row/offset of filtered index `first_row` via the filter's per-block
+/// counters (O(checkpoints) + a bounded in-block re-lex — never O(matches)),
+/// then walks forward re-lexing candidate rows, skipping non-matches, to
+/// serve up to `clamped` consecutive filtered rows. Holds the mutex for the
+/// whole call (bounded: O(checkpoints) + O(window) re-lex) — simpler and
+/// still safe on the caller/UI thread; see api/lesssheet.h FILTERED VIEWS.
+fn windowSetFiltered(d: *Document, first_row: u64, clamped: u64) api.RowRange {
+    d.lock();
+    defer d.unlock();
+    if (first_row >= d.filter_total) return .{ .first_row = first_row, .row_count = 0 };
+    const materialize = @min(clamped, d.filter_total - first_row);
+    const fctx = filterCtx(d);
+    const start = nthMatchLocation(d, d.filter_block_counts.items, fctx, d.filter_rows, first_row) orelse
+        return .{ .first_row = first_row, .row_count = 0 };
+
+    var produced: u64 = 0;
+    var off: usize = @intCast(start.offset);
+    var row = start.row;
+    while (produced < materialize and row < d.filter_rows and off < d.content.len) {
+        // Test the FULL cell (cap = null), same rule as SEARCH, using the nav
+        // scratch (mutex already held throughout this call).
+        d.nav_scratch.clearRetainingCapacity();
+        d.nav_refs.clearRetainingCapacity();
+        const test_res = lexInto(d.content, off, d.sep, d.quote, d.column_count, null, d.content.len, d.encoding, &d.nav_scratch, &d.nav_refs, d.gpa) catch break;
+        if (matchRecord(fctx, d.nav_scratch.items, d.nav_refs.items) != null) {
+            // Re-lex the same row WITH the display cap directly into the window.
+            _ = lexInto(d.content, off, d.sep, d.quote, d.column_count, api.cell_max_bytes, d.content.len, d.encoding, &d.win_buf, &d.win_refs, d.gpa) catch break;
+            d.win_source.append(d.gpa, row) catch break;
+            produced += 1;
+        }
+        off = test_res.next;
+        row += 1;
+    }
+    d.win_rows = produced;
+    return .{ .first_row = first_row, .row_count = produced };
 }
 
 /// Largest checkpoint with `.row <= row` (checkpoints[0].row == 0 always).
@@ -1000,6 +1208,10 @@ pub export fn ls_jump_start(doc: *api.Doc, target_row: u64) callconv(.c) void {
     const d: *Document = @ptrCast(@alignCast(doc));
     d.lock();
     defer d.unlock();
+    if (d.filter_state != .idle) {
+        jumpStartFiltered(d, target_row);
+        return;
+    }
     if (target_row < d.frontier_rows) {
         // Behind the frontier: complete before this call returns.
         d.jump_state = .done;
@@ -1041,6 +1253,54 @@ pub export fn ls_jump_start(doc: *api.Doc, target_row: u64) callconv(.c) void {
     d.jump_state = .scanning;
     d.jump_target = target_row;
     d.jump_start_rows = d.frontier_rows;
+    d.jump_progress = 0.0;
+    d.wakeWorker();
+}
+
+/// ls_jump_start while a filter is active: `target_row` is an ORIGINAL
+/// data-row number; the jump lands on the FILTERED index of the first
+/// matching row with original index >= target (clamped to the last match at/
+/// after EOF; 0 when the filtered view has no rows) — see api/lesssheet.h
+/// FILTERED VIEWS JUMP. Caller holds the mutex.
+fn jumpStartFiltered(d: *Document, target_row: u64) void {
+    const fctx = filterCtx(d);
+    // Instant path 1: already answerable from the filter's counted region.
+    if (target_row < d.filter_rows) {
+        if (findForwardMatch(d, d.filter_block_counts.items, null, fctx, target_row, d.filter_rows)) |m| {
+            d.jump_state = .done;
+            d.jump_landed = positionOf(d, d.filter_block_counts.items, null, fctx, m.row) - 1;
+            d.jump_progress = 1.0;
+            return;
+        }
+    }
+    // Instant path 2: the filter is exact and there is no match at/after
+    // target anywhere -> clamp to the last match (0 for an empty view).
+    if (d.filter_total_exact) {
+        d.jump_state = .done;
+        d.jump_landed = if (d.filter_total > 0) d.filter_total - 1 else 0;
+        d.jump_progress = 1.0;
+        return;
+    }
+    if (d.worker == null) {
+        // Degraded mode: no scan can advance the filter-scan either.
+        d.jump_state = .done;
+        d.jump_landed = if (d.filter_total > 0) d.filter_total - 1 else 0;
+        d.jump_progress = 1.0;
+        return;
+    }
+    // Must scan: take the slot (cancel a scanning search; a scanning
+    // filter-scan goes CANCELLED — its mode persists, now driven by this jump).
+    if (d.search_state == .scanning) {
+        d.search_state = .cancelled;
+        if (d.search_nav == .searching) {
+            d.search_nav = .none;
+            d.nav_pending = false;
+        }
+    }
+    if (d.filter_state == .scanning) d.filter_state = .cancelled;
+    d.jump_state = .scanning;
+    d.jump_target = target_row;
+    d.jump_start_rows = d.filter_rows;
     d.jump_progress = 0.0;
     d.wakeWorker();
 }
@@ -1897,7 +2157,8 @@ const SearchChunk = struct {
     end_row: u64,
     eof: bool,
     checkpoint: ?Checkpoint,
-    matches: u64,
+    matches: u64, // rows satisfying find (AND the filter, when one is active)
+    filter_matches: u64, // rows satisfying the filter alone; meaningful only when filtered
 };
 
 /// Build the matcher context from the document (caller holds the mutex).
@@ -1937,6 +2198,28 @@ fn refreshWorkerCtx(doc: *Document) bool {
     return true;
 }
 
+/// Snapshot the active FILTER request into worker-owned buffers (caller holds
+/// the mutex) — mirrors refreshWorkerCtx for `doc.wf_ctx`, the lock-free
+/// filter predicate both the filter-scan and a concurrent (filtered) search
+/// chunk compose against.
+fn refreshFilterWorkerCtx(doc: *Document) bool {
+    doc.wf_value.clearRetainingCapacity();
+    doc.wf_value.appendSlice(doc.gpa, doc.filter_value) catch return false;
+    doc.wf_mask.clearRetainingCapacity();
+    doc.wf_mask.appendSlice(doc.gpa, doc.filter_scope_mask) catch return false;
+    doc.wf_ctx = .{
+        .kind = doc.filter_kind,
+        .op = doc.filter_op,
+        .column = doc.filter_column,
+        .fold = doc.filter_fold,
+        .value = doc.wf_value.items,
+        .value_dec = parseDecimal(doc.wf_value.items),
+        .scope_mask = doc.wf_mask.items,
+        .column_count = doc.column_count,
+    };
+    return true;
+}
+
 fn searchProgress(doc: *Document, off: u64) f64 {
     if (doc.content_len <= doc.data_start) return 1.0;
     const span = doc.content_len - doc.data_start;
@@ -1948,15 +2231,22 @@ fn searchProgress(doc: *Document, off: u64) f64 {
 /// Lex + match one block of data rows (up to the next checkpoint boundary, EOF,
 /// or a stop request) from `start_off`/`start_row`, counting matches. Reads only
 /// immutable mmap bytes + the worker snapshot; reuses the scan scratch per row.
-fn searchScanChunk(doc: *Document, start_off: u64, start_row: u64) SearchChunk {
+/// `filtered` composes `doc.wf_ctx` (the worker's lock-free filter snapshot,
+/// refreshed alongside `doc.w_ctx` — see refreshFilterWorkerCtx) with the find
+/// predicate: a row counts toward `matches` only if it ALSO satisfies the
+/// filter (see api/lesssheet.h FILTERED VIEWS FIND); `filter_matches` tallies
+/// the filter alone, letting the caller re-drive the filter's own counted
+/// region as a side effect (maybeAdvanceFilterFromSearch).
+fn searchScanChunk(doc: *Document, start_off: u64, start_row: u64, filtered: bool) SearchChunk {
     const content = doc.content;
     var i: usize = @intCast(start_off);
     var row = start_row;
     var matches: u64 = 0;
+    var filter_matches: u64 = 0;
     const target = ((start_row / checkpoint_interval) + 1) * checkpoint_interval;
     while (row < target) {
-        if (doc.stop_atomic.load(.monotonic)) return .{ .end_offset = i, .end_row = row, .eof = false, .checkpoint = null, .matches = matches };
-        if (i >= content.len) return .{ .end_offset = i, .end_row = row, .eof = true, .checkpoint = null, .matches = matches };
+        if (doc.stop_atomic.load(.monotonic)) return .{ .end_offset = i, .end_row = row, .eof = false, .checkpoint = null, .matches = matches, .filter_matches = filter_matches };
+        if (i >= content.len) return .{ .end_offset = i, .end_row = row, .eof = true, .checkpoint = null, .matches = matches, .filter_matches = filter_matches };
         doc.search_scratch.clearRetainingCapacity();
         doc.search_refs.clearRetainingCapacity();
         // SEARCH matches the FULL cell, not the display-capped bytes (cap =
@@ -1966,15 +2256,20 @@ fn searchScanChunk(doc: *Document, start_off: u64, start_row: u64) SearchChunk {
             const nb = recordBounds(content, i, doc.sep, doc.quote, content.len, doc.encoding);
             i = nb.next;
             row += 1;
-            if (nb.next >= content.len) return .{ .end_offset = i, .end_row = row, .eof = true, .checkpoint = null, .matches = matches };
+            if (nb.next >= content.len) return .{ .end_offset = i, .end_row = row, .eof = true, .checkpoint = null, .matches = matches, .filter_matches = filter_matches };
             continue;
         };
-        if (matchRecord(doc.w_ctx, doc.search_scratch.items, doc.search_refs.items) != null) matches += 1;
+        var filt_ok = true;
+        if (filtered) {
+            filt_ok = matchRecord(doc.wf_ctx, doc.search_scratch.items, doc.search_refs.items) != null;
+            if (filt_ok) filter_matches += 1;
+        }
+        if (filt_ok and matchRecord(doc.w_ctx, doc.search_scratch.items, doc.search_refs.items) != null) matches += 1;
         i = res.next;
         row += 1;
-        if (res.next >= content.len) return .{ .end_offset = i, .end_row = row, .eof = true, .checkpoint = null, .matches = matches };
+        if (res.next >= content.len) return .{ .end_offset = i, .end_row = row, .eof = true, .checkpoint = null, .matches = matches, .filter_matches = filter_matches };
     }
-    return .{ .end_offset = i, .end_row = row, .eof = false, .checkpoint = .{ .row = row, .offset = i }, .matches = matches };
+    return .{ .end_offset = i, .end_row = row, .eof = false, .checkpoint = .{ .row = row, .offset = i }, .matches = matches, .filter_matches = filter_matches };
 }
 
 /// Terminate the active search cleanly at its last consistent state (caller
@@ -1992,8 +2287,12 @@ fn failSearchLocked(doc: *Document) void {
 
 /// Fold a completed match-scan chunk into the counted region (caller holds the
 /// mutex). One block per chunk (block b == block_counts.items[b]); advances the
-/// shared frontier where the scan broke new ground beyond it.
-fn commitSearch(doc: *Document, res: SearchChunk) void {
+/// shared frontier where the scan broke new ground beyond it. When `filtered`,
+/// also re-drives the filter's OWN counted region with this chunk's
+/// filter-only tally (maybeAdvanceFilterFromSearch) — a filtered find's own
+/// scan "advances the frontier" for the filter too (see FILTERED VIEWS).
+fn commitSearch(doc: *Document, res: SearchChunk, filtered: bool) void {
+    const block = doc.search_rows / checkpoint_interval;
     const advancing = res.end_offset > doc.frontier_offset;
     const need_cp = advancing and res.checkpoint != null;
     // Reserve counter (and any new nav checkpoint) storage BEFORE mutating the
@@ -2029,6 +2328,157 @@ fn commitSearch(doc: *Document, res: SearchChunk) void {
     } else {
         doc.search_progress = searchProgress(doc, res.end_offset);
     }
+    if (filtered) maybeAdvanceFilterFromSearch(doc, block, res);
+}
+
+/// When SEARCH runs while a filter is active, its scan visits the SAME rows
+/// the filter-scan would. Fold this chunk's filter-only tally into the
+/// filter's OWN counted region too, IFF this is exactly the next unrecorded
+/// filter block (both cursors always advance block-by-block from row 0, so
+/// they can only be ahead of or exactly meet each other — never leave a gap).
+/// A block the filter already knows independently is left untouched. Caller
+/// holds the mutex. Best-effort: an allocation failure just skips extending
+/// this time (the filter's own counted region simply lags a little longer).
+fn maybeAdvanceFilterFromSearch(doc: *Document, block: u64, res: SearchChunk) void {
+    if (block != doc.filter_block_counts.items.len) return;
+    doc.filter_block_counts.ensureUnusedCapacity(doc.gpa, 1) catch return;
+    doc.filter_block_counts.appendAssumeCapacity(res.filter_matches);
+    doc.filter_rows = res.end_row;
+    doc.filter_offset = res.end_offset;
+    doc.filter_total +%= res.filter_matches;
+    if (res.eof) {
+        doc.filter_total_exact = true;
+        doc.filter_progress = 1.0;
+        if (doc.filter_state == .cancelled) doc.filter_state = .done;
+    } else {
+        doc.filter_progress = searchProgress(doc, res.end_offset);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The filter-scan itself (worker; lock-free chunk, mutex-batched commit) —
+// mirrors the search match-scan above but tests ONLY the filter predicate.
+// Drives BOTH the standalone filter-scan job (do_filter) and a filtered
+// jump's own scan (jump-under-filter reuses this exact machinery — see
+// api/lesssheet.h FILTERED VIEWS JUMP).
+// ---------------------------------------------------------------------------
+
+const FilterChunk = struct {
+    end_offset: u64,
+    end_row: u64,
+    eof: bool,
+    checkpoint: ?Checkpoint,
+    matches: u64,
+};
+
+/// Lex + test the filter predicate for one block of data rows. Reads only
+/// immutable mmap bytes + the worker's lock-free filter snapshot (doc.wf_ctx,
+/// refreshed by refreshFilterWorkerCtx). Matches the FULL cell (cap = null),
+/// same rule as SEARCH.
+fn filterScanChunk(doc: *Document, start_off: u64, start_row: u64) FilterChunk {
+    const content = doc.content;
+    var i: usize = @intCast(start_off);
+    var row = start_row;
+    var matches: u64 = 0;
+    const target = ((start_row / checkpoint_interval) + 1) * checkpoint_interval;
+    while (row < target) {
+        if (doc.stop_atomic.load(.monotonic)) return .{ .end_offset = i, .end_row = row, .eof = false, .checkpoint = null, .matches = matches };
+        if (i >= content.len) return .{ .end_offset = i, .end_row = row, .eof = true, .checkpoint = null, .matches = matches };
+        doc.filter_scratch.clearRetainingCapacity();
+        doc.filter_refs.clearRetainingCapacity();
+        const res = lexInto(content, i, doc.sep, doc.quote, doc.column_count, null, content.len, doc.encoding, &doc.filter_scratch, &doc.filter_refs, doc.gpa) catch {
+            const nb = recordBounds(content, i, doc.sep, doc.quote, content.len, doc.encoding);
+            i = nb.next;
+            row += 1;
+            if (nb.next >= content.len) return .{ .end_offset = i, .end_row = row, .eof = true, .checkpoint = null, .matches = matches };
+            continue;
+        };
+        if (matchRecord(doc.wf_ctx, doc.filter_scratch.items, doc.filter_refs.items) != null) matches += 1;
+        i = res.next;
+        row += 1;
+        if (res.next >= content.len) return .{ .end_offset = i, .end_row = row, .eof = true, .checkpoint = null, .matches = matches };
+    }
+    return .{ .end_offset = i, .end_row = row, .eof = false, .checkpoint = .{ .row = row, .offset = i }, .matches = matches };
+}
+
+/// Terminate the active filter-scan cleanly at its last consistent state
+/// (caller holds the mutex): mirrors failSearchLocked. The filter MODE
+/// persists (CANCELLED, not idle) — only an OOM-degraded fail-safe.
+fn failFilterLocked(doc: *Document) void {
+    doc.filter_state = .cancelled;
+}
+
+/// Fold a completed filter-scan chunk into the filter's counted region
+/// (caller holds the mutex): mirrors commitSearch, advancing the shared
+/// frontier where the scan broke new ground beyond it (paid once — fv9).
+/// Does NOT itself decide SCANNING vs CANCELLED (the caller — the plain
+/// filter job or a filtered jump — owns that per the shared-slot rules); only
+/// EOF unconditionally resolves to LS_FILTER_DONE (the total is final however
+/// it got there).
+fn commitFilter(doc: *Document, res: FilterChunk) void {
+    const advancing = res.end_offset > doc.frontier_offset;
+    const need_cp = advancing and res.checkpoint != null;
+    doc.filter_block_counts.ensureUnusedCapacity(doc.gpa, 1) catch {
+        failFilterLocked(doc);
+        return;
+    };
+    if (need_cp) doc.checkpoints.ensureUnusedCapacity(doc.gpa, 1) catch {
+        failFilterLocked(doc);
+        return;
+    };
+    doc.filter_block_counts.appendAssumeCapacity(res.matches);
+    doc.filter_rows = res.end_row;
+    doc.filter_offset = res.end_offset;
+    doc.filter_total +%= res.matches;
+    if (advancing) {
+        doc.frontier_offset = res.end_offset;
+        doc.frontier_rows = res.end_row;
+        if (res.checkpoint) |cp| doc.checkpoints.appendAssumeCapacity(cp);
+    }
+    if (res.eof) {
+        doc.complete = true;
+        doc.total_rows = doc.filter_rows;
+        doc.filter_state = .done;
+        doc.filter_total_exact = true;
+        doc.filter_progress = 1.0;
+    } else {
+        doc.filter_progress = searchProgress(doc, res.end_offset);
+    }
+}
+
+/// Resolve a pending FILTERED jump from the filter's counted region if
+/// determined, mirroring updateJump's role for the plain (unfiltered) jump.
+/// `jump_target` is an ORIGINAL row number; once resolved, `jump_landed` is
+/// the FILTERED index of the first matching row with original index >=
+/// target (clamped to the last match once the filter-scan is exact; 0 when
+/// the filtered view has no rows). Caller holds the mutex; called only while
+/// doc.jump_state == .scanning and a filter is active — see api/lesssheet.h
+/// FILTERED VIEWS JUMP.
+fn resolveFilterJumpLocked(doc: *Document) void {
+    const target = doc.jump_target;
+    const counted = doc.filter_rows;
+    const fctx = filterCtx(doc);
+    if (target < counted) {
+        if (findForwardMatch(doc, doc.filter_block_counts.items, null, fctx, target, counted)) |m| {
+            doc.jump_state = .done;
+            doc.jump_landed = positionOf(doc, doc.filter_block_counts.items, null, fctx, m.row) - 1;
+            doc.jump_progress = 1.0;
+            return;
+        }
+    }
+    if (doc.filter_total_exact) {
+        // EOF: no match at/after target anywhere -> clamp to the last match
+        // (0 for an empty filtered view).
+        doc.jump_state = .done;
+        doc.jump_landed = if (doc.filter_total > 0) doc.filter_total - 1 else 0;
+        doc.jump_progress = 1.0;
+        return;
+    }
+    if (target > doc.jump_start_rows) {
+        const span = target - doc.jump_start_rows;
+        const p = @as(f64, @floatFromInt(counted - doc.jump_start_rows)) / @as(f64, @floatFromInt(span));
+        if (p > doc.jump_progress) doc.jump_progress = p;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2037,12 +2487,23 @@ fn commitSearch(doc: *Document, res: SearchChunk) void {
 // via the nav scratch — O(one block re-lex), never O(file).
 // ---------------------------------------------------------------------------
 
+/// True iff `filter_ctx` is absent or satisfied — the composed per-row test
+/// shared by search-nav (unfiltered: filter_ctx null) and search-nav-under-a-
+/// filter (filter_ctx = the active filter, so find evaluates only rows that
+/// satisfy it too — see api/lesssheet.h FILTERED VIEWS FIND) and by the
+/// filter-scan's own counting (primary_ctx = the filter, filter_ctx = null).
+fn rowMatch(filter_ctx: ?MatchCtx, primary_ctx: MatchCtx, buf: []const u8, refs: []const CellRef) ?u32 {
+    if (filter_ctx) |fc| {
+        if (matchRecord(fc, buf, refs) == null) return null;
+    }
+    return matchRecord(primary_ctx, buf, refs);
+}
+
 /// Re-lex block `b` and evaluate rows [lo, hi); return the first (FORWARD) or
 /// last (BACKWARD) matching row+col, or null. Caller holds the mutex.
-fn relexBlock(doc: *Document, b: u64, lo: u64, hi: u64, dir: api.SearchDir) ?Match {
+fn relexBlock(doc: *Document, filter_ctx: ?MatchCtx, primary_ctx: MatchCtx, b: u64, lo: u64, hi: u64, dir: api.SearchDir) ?Match {
     if (b >= doc.checkpoints.items.len) return null;
     const cp = doc.checkpoints.items[@intCast(b)];
-    const ctx = docCtx(doc);
     var off: usize = @intCast(cp.offset);
     var row = cp.row;
     while (row < lo and off < doc.content.len) : (row += 1) {
@@ -2054,7 +2515,7 @@ fn relexBlock(doc: *Document, b: u64, lo: u64, hi: u64, dir: api.SearchDir) ?Mat
         doc.nav_refs.clearRetainingCapacity();
         // NAVIGATION also matches the FULL cell (cap = null), same as the scan.
         const res = lexInto(doc.content, off, doc.sep, doc.quote, doc.column_count, null, doc.content.len, doc.encoding, &doc.nav_scratch, &doc.nav_refs, doc.gpa) catch break;
-        if (matchRecord(ctx, doc.nav_scratch.items, doc.nav_refs.items)) |col| {
+        if (rowMatch(filter_ctx, primary_ctx, doc.nav_scratch.items, doc.nav_refs.items)) |col| {
             result = .{ .row = row, .col = col };
             if (dir == .forward) return result;
         }
@@ -2063,33 +2524,35 @@ fn relexBlock(doc: *Document, b: u64, lo: u64, hi: u64, dir: api.SearchDir) ?Mat
     return result;
 }
 
-/// First matching row in [anchor, hi) within the counted region, or null.
-fn findForwardMatch(doc: *Document, anchor: u64, hi: u64) ?Match {
-    const nblocks = doc.block_counts.items.len;
+/// First matching row in [anchor, hi) within the counted region described by
+/// `block_counts`, or null.
+fn findForwardMatch(doc: *Document, block_counts: []const u64, filter_ctx: ?MatchCtx, primary_ctx: MatchCtx, anchor: u64, hi: u64) ?Match {
+    const nblocks = block_counts.len;
     var b: u64 = anchor / checkpoint_interval;
     while (b < nblocks) : (b += 1) {
         const block_start = b * checkpoint_interval;
         if (block_start >= hi) break;
-        if (doc.block_counts.items[@intCast(b)] == 0) continue; // skip empty block
+        if (block_counts[@intCast(b)] == 0) continue; // skip empty block
         const lo = @max(anchor, block_start);
         const block_hi = @min(block_start + checkpoint_interval, hi);
-        if (relexBlock(doc, b, lo, block_hi, .forward)) |m| return m;
+        if (relexBlock(doc, filter_ctx, primary_ctx, b, lo, block_hi, .forward)) |m| return m;
     }
     return null;
 }
 
-/// Last matching row in [0, upper) within the counted region, or null.
-fn findBackwardMatch(doc: *Document, upper: u64) ?Match {
+/// Last matching row in [0, upper) within the counted region described by
+/// `block_counts`, or null.
+fn findBackwardMatch(doc: *Document, block_counts: []const u64, filter_ctx: ?MatchCtx, primary_ctx: MatchCtx, upper: u64) ?Match {
     if (upper == 0) return null;
-    const nblocks = doc.block_counts.items.len;
+    const nblocks = block_counts.len;
     if (nblocks == 0) return null;
     var b: u64 = (upper - 1) / checkpoint_interval;
     if (b >= nblocks) b = nblocks - 1;
     while (true) {
         const block_start = b * checkpoint_interval;
-        if (doc.block_counts.items[@intCast(b)] != 0) {
+        if (block_counts[@intCast(b)] != 0) {
             const block_hi = @min(block_start + checkpoint_interval, upper);
-            if (relexBlock(doc, b, block_start, block_hi, .backward)) |m| return m;
+            if (relexBlock(doc, filter_ctx, primary_ctx, b, block_start, block_hi, .backward)) |m| return m;
         }
         if (b == 0) break;
         b -= 1;
@@ -2098,10 +2561,9 @@ fn findBackwardMatch(doc: *Document, upper: u64) ?Match {
 }
 
 /// Count matches in block `b` for rows [b*interval, row]. Caller holds the mutex.
-fn countInBlockUpTo(doc: *Document, b: u64, row: u64) u64 {
+fn countInBlockUpTo(doc: *Document, filter_ctx: ?MatchCtx, primary_ctx: MatchCtx, b: u64, row: u64) u64 {
     if (b >= doc.checkpoints.items.len) return 0;
     const cp = doc.checkpoints.items[@intCast(b)];
-    const ctx = docCtx(doc);
     var off: usize = @intCast(cp.offset);
     var r = cp.row;
     var count: u64 = 0;
@@ -2109,7 +2571,7 @@ fn countInBlockUpTo(doc: *Document, b: u64, row: u64) u64 {
         doc.nav_scratch.clearRetainingCapacity();
         doc.nav_refs.clearRetainingCapacity();
         const res = lexInto(doc.content, off, doc.sep, doc.quote, doc.column_count, null, doc.content.len, doc.encoding, &doc.nav_scratch, &doc.nav_refs, doc.gpa) catch break;
-        if (matchRecord(ctx, doc.nav_scratch.items, doc.nav_refs.items)) |_| count += 1;
+        if (rowMatch(filter_ctx, primary_ctx, doc.nav_scratch.items, doc.nav_refs.items)) |_| count += 1;
         off = res.next;
     }
     return count;
@@ -2117,18 +2579,89 @@ fn countInBlockUpTo(doc: *Document, b: u64, row: u64) u64 {
 
 /// 1-based position of `row` among all matching rows in file order (exact,
 /// since [0, row] is fully counted): sum of prior block counts + in-block count.
-fn positionOf(doc: *Document, row: u64) u64 {
+fn positionOf(doc: *Document, block_counts: []const u64, filter_ctx: ?MatchCtx, primary_ctx: MatchCtx, row: u64) u64 {
     const b = row / checkpoint_interval;
     var sum: u64 = 0;
     var i: usize = 0;
-    while (i < b and i < doc.block_counts.items.len) : (i += 1) sum += doc.block_counts.items[i];
-    return sum + countInBlockUpTo(doc, b, row);
+    while (i < b and i < block_counts.len) : (i += 1) sum += block_counts[i];
+    return sum + countInBlockUpTo(doc, filter_ctx, primary_ctx, b, row);
 }
 
+/// The active filter's matcher (caller holds the mutex; see docCtx). Only
+/// meaningful when `doc.filter_state != .idle`.
+fn filterCtx(doc: *Document) MatchCtx {
+    return .{
+        .kind = doc.filter_kind,
+        .op = doc.filter_op,
+        .column = doc.filter_column,
+        .fold = doc.filter_fold,
+        .value = doc.filter_value,
+        .value_dec = doc.filter_value_dec,
+        .scope_mask = doc.filter_scope_mask,
+        .column_count = doc.column_count,
+    };
+}
+
+/// The filter_ctx argument for the generalized nav/count helpers above: the
+/// active filter while one is set (find-under-a-filter composes both
+/// predicates), else null (plain find). Caller holds the mutex.
+fn activeFilterCtxOrNull(doc: *Document) ?MatchCtx {
+    return if (doc.filter_state != .idle) filterCtx(doc) else null;
+}
+
+const SourceLoc = struct { row: u64, offset: u64 };
+
+/// Locate the ORIGINAL row/offset of the `need`-th (0-based) row satisfying
+/// `ctx` within block `b` (rows [b*interval, min((b+1)*interval, hi_bound))),
+/// re-lexing from its checkpoint. Caller holds the mutex.
+fn nthMatchInBlock(doc: *Document, ctx: MatchCtx, b: u64, hi_bound: u64, need: u64) ?SourceLoc {
+    if (b >= doc.checkpoints.items.len) return null;
+    const cp = doc.checkpoints.items[@intCast(b)];
+    const block_hi = @min((b + 1) * checkpoint_interval, hi_bound);
+    var off: usize = @intCast(cp.offset);
+    var row = cp.row;
+    var seen: u64 = 0;
+    while (row < block_hi and off < doc.content.len) : (row += 1) {
+        doc.nav_scratch.clearRetainingCapacity();
+        doc.nav_refs.clearRetainingCapacity();
+        const res = lexInto(doc.content, off, doc.sep, doc.quote, doc.column_count, null, doc.content.len, doc.encoding, &doc.nav_scratch, &doc.nav_refs, doc.gpa) catch return null;
+        if (matchRecord(ctx, doc.nav_scratch.items, doc.nav_refs.items) != null) {
+            if (seen == need) return .{ .row = row, .offset = off };
+            seen += 1;
+        }
+        off = res.next;
+    }
+    return null;
+}
+
+/// Locate the ORIGINAL row/offset of the `idx`-th (0-based) row satisfying
+/// `ctx` within the counted region described by `block_counts` (bounded by
+/// `hi_bound`, its row cursor). O(checkpoints) to find the block + a bounded
+/// in-block re-lex — never O(idx)/O(matches) (see FILTERED VIEWS). Null when
+/// `idx` is beyond the counted region's match count. Caller holds the mutex.
+fn nthMatchLocation(doc: *Document, block_counts: []const u64, ctx: MatchCtx, hi_bound: u64, idx: u64) ?SourceLoc {
+    var cum: u64 = 0;
+    var b: u64 = 0;
+    while (b < block_counts.len) : (b += 1) {
+        const cnt = block_counts[b];
+        if (cum + cnt > idx) return nthMatchInBlock(doc, ctx, b, hi_bound, idx - cum);
+        cum += cnt;
+    }
+    return null;
+}
+
+/// `m.row` is an ORIGINAL data-row number. Unfiltered, that IS the reported
+/// found_row; while filtered, found_row must be `m.row`'s FILTERED index (see
+/// api/lesssheet.h FILTERED VIEWS FIND) — the count of filter matches
+/// strictly before it (m.row itself satisfies the filter: rowMatch checked
+/// it to find it at all), via the filter's OWN counted region.
 fn setFound(doc: *Document, m: Match) void {
-    doc.search_found_row = m.row;
     doc.search_found_col = m.col;
-    doc.search_position = positionOf(doc, m.row);
+    doc.search_position = positionOf(doc, doc.block_counts.items, activeFilterCtxOrNull(doc), docCtx(doc), m.row);
+    doc.search_found_row = if (doc.filter_state != .idle)
+        positionOf(doc, doc.filter_block_counts.items, null, filterCtx(doc), m.row) - 1
+    else
+        m.row;
     doc.search_nav = .found;
     doc.nav_pending = false;
 }
@@ -2142,14 +2675,21 @@ fn setExhausted(doc: *Document) void {
 /// determined; otherwise leave it pending (the scan will serve it). Caller holds
 /// the mutex. FORWARD = first match at-or-after anchor; BACKWARD = last match
 /// strictly before anchor; EXHAUSTED is core-uniform (the frontend wraps).
+/// While filtered, dispatches to the FILTERED-INDEX variant below (see
+/// api/lesssheet.h FILTERED VIEWS FIND: "ls_search_nav anchors and found_row
+/// are FILTERED indices").
 fn resolveNavLocked(doc: *Document) void {
     if (!doc.nav_pending) return;
+    if (doc.filter_state != .idle) {
+        resolveNavLockedFiltered(doc);
+        return;
+    }
     const anchor = doc.nav_anchor;
     const counted = doc.search_rows;
     const done = doc.search_state == .done;
     if (doc.nav_dir == .forward) {
         if (anchor < counted) {
-            if (findForwardMatch(doc, anchor, counted)) |m| {
+            if (findForwardMatch(doc, doc.block_counts.items, null, docCtx(doc), anchor, counted)) |m| {
                 setFound(doc, m);
                 return;
             }
@@ -2159,7 +2699,58 @@ fn resolveNavLocked(doc: *Document) void {
         // Answerable once [0, anchor) is fully counted (or the scan is DONE).
         if (counted >= anchor or done) {
             const upper = @min(anchor, counted);
-            if (findBackwardMatch(doc, upper)) |m| setFound(doc, m) else setExhausted(doc);
+            if (findBackwardMatch(doc, doc.block_counts.items, null, docCtx(doc), upper)) |m| setFound(doc, m) else setExhausted(doc);
+        }
+    }
+}
+
+/// resolveNavLocked's filtered-coordinate variant: `doc.nav_anchor` is a
+/// FILTERED index (not an original row). Converts it to the original row of
+/// that filtered position via the filter's OWN counted region
+/// (nthMatchLocation), then searches the combined (filter AND find) counted
+/// region — `doc.block_counts` — from there, exactly like the unfiltered
+/// path. Caller holds the mutex; see api/lesssheet.h FILTERED VIEWS FIND.
+fn resolveNavLockedFiltered(doc: *Document) void {
+    const anchor = doc.nav_anchor;
+    const counted = doc.search_rows; // combined-match counted region (original rows)
+    const search_done = doc.search_state == .done;
+    const fctx = filterCtx(doc);
+    const pctx = docCtx(doc);
+    if (doc.nav_dir == .forward) {
+        if (anchor >= doc.filter_total) {
+            // No row exists at/after this filtered index YET; only exhausted
+            // once the filter is known to be exact (it never will).
+            if (doc.filter_total_exact) setExhausted(doc);
+            return;
+        }
+        const loc = nthMatchLocation(doc, doc.filter_block_counts.items, fctx, doc.filter_rows, anchor) orelse return;
+        if (loc.row < counted) {
+            if (findForwardMatch(doc, doc.block_counts.items, fctx, pctx, loc.row, counted)) |m| {
+                setFound(doc, m);
+                return;
+            }
+        }
+        if (search_done) setExhausted(doc);
+    } else {
+        if (anchor == 0) {
+            setExhausted(doc); // nothing is strictly before filtered index 0
+            return;
+        }
+        var r0: u64 = 0;
+        var have_bound = false;
+        if (anchor - 1 < doc.filter_total) {
+            if (nthMatchLocation(doc, doc.filter_block_counts.items, fctx, doc.filter_rows, anchor - 1)) |loc| {
+                r0 = loc.row + 1; // include that row itself: "< anchor" is inclusive of anchor-1
+                have_bound = true;
+            }
+        } else if (doc.filter_total_exact) {
+            r0 = doc.filter_rows; // anchor is at/past the (now fully known) filtered view's end
+            have_bound = true;
+        }
+        if (!have_bound) return; // more filter matches could still land before `anchor`
+        if (counted >= r0 or search_done) {
+            const upper = @min(r0, counted);
+            if (findBackwardMatch(doc, doc.block_counts.items, fctx, pctx, upper)) |m| setFound(doc, m) else setExhausted(doc);
         }
     }
 }
@@ -2260,9 +2851,13 @@ pub export fn ls_search_start(doc: *api.Doc, request: *const api.SearchRequest) 
     // state (the caller is blocked here). A snapshot OOM fails to CANCELLED,
     // which the loop guard below turns into an immediate, consistent terminal.
     if (refreshWorkerCtx(d)) d.w_gen = d.search_gen else failSearchLocked(d);
+    const filtered = d.filter_state != .idle;
+    if (filtered) {
+        if (refreshFilterWorkerCtx(d)) d.wf_gen = d.filter_gen else failSearchLocked(d);
+    }
     while (d.search_state == .scanning) {
-        const res = searchScanChunk(d, d.search_offset, d.search_rows);
-        commitSearch(d, res);
+        const res = searchScanChunk(d, d.search_offset, d.search_rows, filtered);
+        commitSearch(d, res, filtered);
         resolveNavLocked(d);
     }
     d.unlock();
@@ -2305,9 +2900,16 @@ pub export fn ls_search_nav(doc: *api.Doc, anchor_row: u64, dir: api.SearchDir) 
             d.wakeWorker();
         } else {
             // Degraded (no worker): scan synchronously until the nav resolves.
+            if (d.search_gen != d.w_gen) {
+                if (refreshWorkerCtx(d)) d.w_gen = d.search_gen else failSearchLocked(d);
+            }
+            const filtered = d.filter_state != .idle;
+            if (filtered and d.filter_gen != d.wf_gen) {
+                if (refreshFilterWorkerCtx(d)) d.wf_gen = d.filter_gen else failSearchLocked(d);
+            }
             while (d.nav_pending and d.search_state == .scanning) {
-                const res = searchScanChunk(d, d.search_offset, d.search_rows);
-                commitSearch(d, res);
+                const res = searchScanChunk(d, d.search_offset, d.search_rows, filtered);
+                commitSearch(d, res, filtered);
                 resolveNavLocked(d);
                 if (d.search_state == .scanning and !d.search_to_eof and !d.nav_pending) d.search_state = .cancelled;
             }
@@ -2348,41 +2950,169 @@ pub export fn ls_search_poll(doc: *const api.Doc) callconv(.c) api.SearchStatus 
 }
 
 // ---------------------------------------------------------------------------
-// Filtered views (filtered-views slice) — SEED STUBS ONLY.
-// The contract is frozen in api/lesssheet.h + contracts/api.zig; these
-// placeholders keep conformance green (signatures match) while the behavior
-// suite is RED. They follow the terminal-poll-placeholder pattern: ls_filter_set
-// rejects (no filter ever activates) and ls_filter_poll reports IDLE, so no
-// frozen test can hang on a poll loop; ls_source_row returns the LS_NO_ROW
-// sentinel. Implementation lands via the aidev build loop.
+// Filtered views (filtered-views slice) — see api/lesssheet.h FILTERED VIEWS
+// for the full model. ls_filter_set validates EXACTLY like ls_search_start
+// (duplicated rather than shared, so neither call site risks drifting the
+// other's already-frozen-green behavior).
 // ---------------------------------------------------------------------------
 
-/// See api/lesssheet.h `ls_filter_set`. NOT IMPLEMENTED (filtered-views seed).
+/// See api/lesssheet.h `ls_filter_set`.
 pub export fn ls_filter_set(doc: *api.Doc, request: *const api.SearchRequest) callconv(.c) bool {
-    _ = doc;
-    _ = request;
-    return false;
+    const d: *Document = @ptrCast(@alignCast(doc));
+    const req = request.*;
+
+    // Validate first — a rejected request changes NOTHING (same rules as
+    // ls_search_start; see api/lesssheet.h ls_search_request).
+    const kind_i = @intFromEnum(req.kind);
+    if (kind_i != 0 and kind_i != 1) return false;
+    if (req.value_ptr == null and req.value_len != 0) return false;
+    const value: []const u8 = if (req.value_ptr) |vp| vp[0..req.value_len] else &[_]u8{};
+    var fold = false;
+    if (kind_i == 0) { // TEXT
+        if (value.len == 0) return false; // empty query means "no filter"
+        if (req.scope_ptr) |sp| {
+            if (req.scope_len == 0) return false; // non-NULL empty scope
+            var i: usize = 0;
+            while (i < req.scope_len) : (i += 1) if (sp[i] >= d.column_count) return false;
+        }
+        fold = queryFolds(value);
+    } else { // PREDICATE
+        if (req.column >= d.column_count) return false;
+        const op_i = @intFromEnum(req.op);
+        if (op_i < 0 or op_i > 5) return false;
+        if (op_i >= 2 and !parseDecimal(value).valid) return false; // ordering value must parse
+    }
+
+    // Allocate owned copies up front so an OOM rejects cleanly (no state change).
+    const value_copy = d.gpa.dupe(u8, value) catch return false;
+    var mask: []bool = &.{};
+    if (kind_i == 0 and req.scope_ptr != null) {
+        mask = d.gpa.alloc(bool, d.column_count) catch {
+            d.gpa.free(value_copy);
+            return false;
+        };
+        @memset(mask, false);
+        const sp = req.scope_ptr.?;
+        var i: usize = 0;
+        while (i < req.scope_len) : (i += 1) mask[sp[i]] = true;
+    }
+
+    d.lock();
+    // Replace any previous filter ENTIRELY.
+    if (d.filter_value.len > 0) d.gpa.free(d.filter_value);
+    if (d.filter_scope_mask.len > 0) d.gpa.free(d.filter_scope_mask);
+    d.filter_value = value_copy;
+    d.filter_scope_mask = mask;
+    d.filter_kind = req.kind;
+    d.filter_op = req.op;
+    d.filter_column = req.column;
+    d.filter_fold = fold;
+    d.filter_value_dec = if (kind_i == 1 and @intFromEnum(req.op) >= 2) parseDecimal(value_copy) else .{};
+    d.filter_gen +%= 1;
+
+    // Takes the scan slot: a scanning jump is cancelled (LS_JUMP_IDLE, gains
+    // kept); RESETS any active search to IDLE (the coordinate space changed).
+    // Setting a filter ALSO forces the jump slot to IDLE even if it was DONE
+    // (a completed jump's landing does not persist across a coordinate
+    // change) — see api/lesssheet.h FILTERED VIEWS RESET.
+    d.jump_state = .idle;
+    d.jump_progress = 0.0;
+    d.jump_landed = 0;
+    d.search_state = .idle;
+    d.search_nav = .none;
+    d.search_progress = 0.0;
+    d.search_found_row = 0;
+    d.search_found_col = 0;
+    d.search_position = 0;
+    d.search_total = 0;
+    d.search_total_exact = false;
+    d.nav_pending = false;
+
+    // Reset the counted region / counters; the filter-scan restarts from row 0.
+    d.filter_block_counts.clearRetainingCapacity();
+    d.filter_total = 0;
+    d.filter_total_exact = false;
+    d.filter_rows = 0;
+    d.filter_offset = d.data_start;
+    d.filter_progress = 0.0;
+
+    if (d.data_start >= d.content_len or d.column_count == 0) {
+        // Nothing to scan: already DONE with total 0.
+        d.filter_state = .done;
+        d.filter_total_exact = true;
+        d.filter_progress = 1.0;
+        d.unlock();
+        return true;
+    }
+    d.filter_state = .scanning;
+    if (d.worker != null) {
+        d.wakeWorker();
+        d.unlock();
+        return true;
+    }
+    // Degraded (no worker): scan to completion synchronously, mirroring
+    // ls_search_start's degraded fallback — the caller is blocked here so no
+    // other thread observes intermediate state.
+    if (refreshFilterWorkerCtx(d)) d.wf_gen = d.filter_gen else failFilterLocked(d);
+    while (d.filter_state == .scanning) {
+        const res = filterScanChunk(d, d.filter_offset, d.filter_rows);
+        commitFilter(d, res);
+    }
+    d.unlock();
+    return true;
 }
 
-/// See api/lesssheet.h `ls_filter_clear`. NOT IMPLEMENTED (filtered-views seed).
+/// See api/lesssheet.h `ls_filter_clear`. ZERO allocation.
 pub export fn ls_filter_clear(doc: *api.Doc) callconv(.c) void {
-    _ = doc;
+    const d: *Document = @ptrCast(@alignCast(doc));
+    d.lock();
+    defer d.unlock();
+    if (d.filter_state == .idle) return; // no-op
+
+    d.filter_state = .idle;
+    d.filter_progress = 0.0;
+    d.filter_total = 0;
+    d.filter_total_exact = false;
+    d.filter_rows = 0;
+    d.filter_offset = 0;
+    d.filter_gen +%= 1; // discard any in-flight filter/jump-driven chunk
+
+    // RESETS any active search to IDLE and returns the jump slot to IDLE
+    // (frontier gains — the base index — are KEPT; see FILTERED VIEWS RESET).
+    d.jump_state = .idle;
+    d.jump_progress = 0.0;
+    d.jump_landed = 0;
+    d.search_state = .idle;
+    d.search_nav = .none;
+    d.search_progress = 0.0;
+    d.search_found_row = 0;
+    d.search_found_col = 0;
+    d.search_position = 0;
+    d.search_total = 0;
+    d.search_total_exact = false;
+    d.nav_pending = false;
 }
 
-/// See api/lesssheet.h `ls_filter_poll`. NOT IMPLEMENTED (filtered-views seed).
+/// See api/lesssheet.h `ls_filter_poll`. ZERO allocation; never fails.
 pub export fn ls_filter_poll(doc: *const api.Doc) callconv(.c) api.FilterStatus {
-    _ = doc;
+    const d = asDocMut(doc);
+    d.lock();
+    defer d.unlock();
     return .{
-        .state = .idle,
-        .progress = 0.0,
-        .total = 0,
-        .total_exact = false,
+        .state = d.filter_state,
+        .progress = d.filter_progress,
+        .total = d.filter_total,
+        .total_exact = d.filter_total_exact,
     };
 }
 
-/// See api/lesssheet.h `ls_source_row`. NOT IMPLEMENTED (filtered-views seed).
+/// See api/lesssheet.h `ls_source_row`. Same window/borrow domain as ls_cell
+/// (win_source[i] is populated by ls_window_set alongside win_refs). Total
+/// function; ZERO allocation; never fails; never scans.
 pub export fn ls_source_row(doc: *const api.Doc, row: u64) callconv(.c) u64 {
-    _ = doc;
-    _ = row;
-    return api.no_row;
+    const d = asDoc(doc);
+    if (row < d.win_first or row >= d.win_first + d.win_rows) return api.no_row;
+    const idx: usize = @intCast(row - d.win_first);
+    if (idx >= d.win_source.items.len) return api.no_row;
+    return d.win_source.items[idx];
 }

@@ -134,15 +134,29 @@ public final class CoreDocumentSession: DocumentSession, @unchecked Sendable {
         }
     }
 
-    // MARK: - Search bridge (find-seek) — over ls_search_* in api/lesssheet.h.
-    // These sit on the poll/control lane (internally synchronized, safe from any
+    // MARK: - Search + filter request marshaling (shared) — ls_search_start
+    // (Find) and ls_filter_set (filtered-views) both take a freshly built
+    // ls_search_request, validated identically by the core (api/lesssheet.h).
+    // Both sit on the poll/control lane (internally synchronized, safe from any
     // thread except concurrently with ls_close — the app stops polling before
-    // close), so they need no window-lane lock, exactly like the jump bridge.
-    // The request struct + its value/scope buffers are borrowed only for the
-    // duration of ls_search_start (the core copies what it keeps), so the
-    // withUnsafeBufferPointer scopes cover the whole call.
+    // close), so neither needs the window-lane lock, exactly like the jump
+    // bridge. The request struct + its value/scope buffers are borrowed only
+    // for the duration of the one call (the core copies what it keeps), so the
+    // withUnsafeBufferPointer scopes cover exactly that call.
+    //
+    // NOTE: an earlier integration "rejection" on this path was mistaken for a
+    // marshaling bug — it was actually a STALE LINK. SwiftPM does not track
+    // liblesssheet.a as a build input (it is linked via -L / linkedLibrary in
+    // Package.swift), so the test binary stayed linked against the seed
+    // archive until a source edit forced a relink against the rebuilt core
+    // (see the STALE-LINK GUARD in .aidev/profile.sh).
 
-    public func startSearch(_ request: SearchRequest) -> Bool {
+    /// Builds the `ls_search_request` for `request` and hands it to `body`
+    /// (either `ls_search_start` or `ls_filter_set`) with its buffers alive
+    /// for the call. A scope/column index outside UInt32 can never be a valid
+    /// column — reject gracefully (false) rather than trap converting it; the
+    /// core rejects genuinely out-of-range indices itself.
+    private func withSearchRequest(_ request: SearchRequest, _ body: (inout ls_search_request) -> Bool) -> Bool {
         switch request {
         case let .text(query, scope):
             let value = Array(query.utf8)
@@ -157,22 +171,11 @@ public final class CoreDocumentSession: DocumentSession, @unchecked Sendable {
                         scope_ptr: scopePtr,
                         scope_len: scopeLen
                     )
-                    // The local binding is for readability only — NOT
-                    // load-bearing (a direct `return ls_search_start(...)` is
-                    // equivalent). An earlier integration "rejection" here was a
-                    // STALE LINK, not a marshaling bug: SwiftPM does not track
-                    // liblesssheet.a as a build input (it is linked via -L /
-                    // linkedLibrary in Package.swift), so the test binary stayed
-                    // linked against the seed archive until a source edit forced
-                    // a relink against the rebuilt core.
-                    let started = ls_search_start(doc, &req)
-                    return started
+                    return body(&req)
                 }
                 if let scope {
                     // nil scope means ALL columns; a concrete scope is fixed for
                     // the search's lifetime (visibility changes re-scope next run).
-                    // A scope index outside UInt32 can never be a valid column —
-                    // reject gracefully rather than trap on the conversion.
                     var columns = [UInt32]()
                     columns.reserveCapacity(scope.count)
                     for index in scope {
@@ -184,8 +187,6 @@ public final class CoreDocumentSession: DocumentSession, @unchecked Sendable {
                 return run(scopePtr: nil, scopeLen: 0)
             }
         case let .predicate(column, op, value):
-            // A column outside UInt32 can never be in-range — reject gracefully
-            // rather than trap converting it (the core rejects out-of-range too).
             guard let abiColumn = UInt32(exactly: column) else { return false }
             let value = Array(value.utf8)
             return value.withUnsafeBufferPointer { valueBuffer in
@@ -198,11 +199,13 @@ public final class CoreDocumentSession: DocumentSession, @unchecked Sendable {
                     scope_ptr: nil,                   // ignored for PREDICATE
                     scope_len: 0
                 )
-                // Local binding for readability only (see the TEXT case).
-                let started = ls_search_start(doc, &req)
-                return started
+                return body(&req)
             }
         }
+    }
+
+    public func startSearch(_ request: SearchRequest) -> Bool {
+        withSearchRequest(request) { req in ls_search_start(doc, &req) }
     }
 
     public func navigateSearch(_ nav: SearchNav) {
@@ -242,29 +245,44 @@ public final class CoreDocumentSession: DocumentSession, @unchecked Sendable {
         return SearchSnapshot(phase: phase, nav: nav, total: s.total, totalIsFinal: s.total_exact)
     }
 
-    // MARK: - Filter bridge (filtered-views) — SEED STUBS ONLY.
-    // The contract lives in Sources/Contracts (frozen) over ls_filter_* /
-    // ls_source_row in api/lesssheet.h; these placeholders keep conformance
-    // compiling while the behavior suite is RED (rejecting setFilter + nil
-    // snapshots — the terminal-placeholder pattern, so no frozen test hangs
-    // polling). Implementation lands via the aidev build loop.
+    // MARK: - Filter bridge (filtered-views) — over ls_filter_* / ls_source_row
+    // in api/lesssheet.h. ls_filter_set / ls_filter_clear / ls_filter_poll sit
+    // on the poll/control lane, exactly like the search bridge above (no
+    // window-lane lock). ls_source_row, though, is grouped with ls_window_set /
+    // ls_cell / ls_header_cell in the THREADING section — the WINDOW lane — so
+    // it takes the same `lock` as `setWindow`.
 
     public func setFilter(_ request: SearchRequest) -> Bool {
-        _ = request
-        return false // NOT IMPLEMENTED (filtered-views seed)
+        withSearchRequest(request) { req in ls_filter_set(doc, &req) }
     }
 
     public func clearFilter() {
-        // NOT IMPLEMENTED (filtered-views seed)
+        ls_filter_clear(doc)
     }
 
     public func filterStatus() -> FilterSnapshot? {
-        nil // NOT IMPLEMENTED (filtered-views seed)
+        let s = ls_filter_poll(doc)
+        let phase: FilterScanPhase
+        switch s.state.rawValue {
+        case ls_filter_state.RawValue(LS_FILTER_SCANNING.rawValue):
+            phase = .scanning(progress: s.progress)
+        case ls_filter_state.RawValue(LS_FILTER_DONE.rawValue):
+            phase = .done
+        case ls_filter_state.RawValue(LS_FILTER_CANCELLED.rawValue):
+            phase = .cancelled(progress: s.progress)
+        default:
+            // LS_FILTER_IDLE -> nil snapshot; no filter active (identity view),
+            // exactly like a fresh/re-opened handle's search state.
+            return nil
+        }
+        return FilterSnapshot(phase: phase, total: s.total, totalIsFinal: s.total_exact)
     }
 
     public func sourceRow(_ viewRow: UInt64) -> UInt64? {
-        _ = viewRow
-        return nil // NOT IMPLEMENTED (filtered-views seed)
+        lock.lock()
+        defer { lock.unlock() }
+        let row = ls_source_row(doc, viewRow)
+        return row == UInt64(LS_NO_ROW) ? nil : row
     }
 
     public func close() {

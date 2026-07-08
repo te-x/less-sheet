@@ -58,6 +58,7 @@ struct GridView: View {
         _ = model.findSession.display.request != nil
         _ = model.findSession.display.current?.row
         _ = model.findSession.display.current?.column
+        _ = model.isFiltered
         _ = model.visibleColumns
         _ = model.columnWidths
         return NativeGridRepresentable(model: model)
@@ -118,6 +119,7 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
     private var lastRowCount = -1
     private var lastVisibleColumns: [Int] = []
     private var lastColumnWidths: [CGFloat] = []
+    private var lastIsFiltered = false
     private var built = false
 
     init(model: DocumentModel) {
@@ -191,6 +193,7 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
         lastOpenGeneration = model.openGeneration
         lastVisibleColumns = model.visibleColumns
         lastColumnWidths = model.columnWidths
+        lastIsFiltered = model.isFiltered
         layoutContainer()
         table.reloadData()
         lastRowCount = numberOfRows(in: table)
@@ -316,6 +319,16 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
             layoutContainer()
             table.reloadData()
             lastRowCount = numberOfRows(in: table)
+        }
+
+        // Filter mode toggled (entered/cleared): the gutter switches between
+        // identity and original row numbers and may need to widen/narrow for
+        // the captured document row count (ARCH criterion 13) — refresh its
+        // metrics right away rather than waiting for the next scroll.
+        if model.isFiltered != lastIsFiltered {
+            lastIsFiltered = model.isFiltered
+            refreshLayoutMetrics()
+            layoutContainer()
         }
 
         // Row-count estimate refined (grows/shrinks toward exact as the index
@@ -736,10 +749,17 @@ final class GridGutterView: NSView {
 
         if visible.length > 0 {
             for row in visible.location..<(visible.location + visible.length) where row < c.dataRowCount {
+                // The gutter's ORIGINAL (unfiltered) row number while a filter
+                // is active (ARCH criterion 13/17), forwarded verbatim from
+                // the core's `sourceRow` — never recomputed; the identity
+                // `row` otherwise. A row not yet servable under a filter
+                // (outside the materialized window) is left blank, same as
+                // its cells.
+                guard let source = c.model.gutterRow(forRow: row) else { continue }
                 let inWindow = table.convert(table.rect(ofRow: row), to: nil)
                 let local = convert(inWindow, from: nil)
                 let cell = NSRect(x: 0, y: local.minY, width: w - GridMetrics.rowNumberHPadding, height: local.height)
-                SheetRowView.drawText(String(row + 1), in: cell, font: GridGutterView.font,
+                SheetRowView.drawText(String(source + 1), in: cell, font: GridGutterView.font,
                                       color: .secondaryLabelColor, alignment: .right)
             }
         }

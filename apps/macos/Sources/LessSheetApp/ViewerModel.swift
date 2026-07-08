@@ -82,6 +82,15 @@ final class DocumentModel {
     // The draft survives Esc / dialect re-open (query-retained semantics).
     var findSession: FindSession = FindControl().initial()
 
+    // Filter (filtered-views) state: the active filter's poll snapshot, or nil
+    // for the identity view (ARCH-filtered-views reqs. 10-18).
+    // `filterDocumentRows` captures M — the base (unfiltered) row-count
+    // knowledge from the identity view at the moment filtering began — held
+    // fixed while filtered, since the session's own `rowCount()` reports the
+    // filtered m from then on.
+    private(set) var filterSnapshot: FilterSnapshot?
+    private(set) var filterDocumentRows: RowCountInfo?
+
     // A row the grid should bring into view (jump landing / cancel restore),
     // consumed and cleared by the grid once applied.
     var pendingScrollRow: UInt64?
@@ -112,6 +121,7 @@ final class DocumentModel {
     private let jumpControl = JumpControl()
     private let composer = DialectComposer()
     private let findControl = FindControl()
+    private let filterControl = FilterControl()
     private let cellMatcher = CellMatcher()
     /// The direction of the outstanding search navigation (drives the wrap
     /// notice's start/end choice when a poll reports exhaustion).
@@ -188,12 +198,16 @@ final class DocumentModel {
                 columnCount: session.columnCount
             )
             self.jumpFlow = .idle
-            // New document identity: the core's search state died with the old
-            // handle — clear results/highlights, retain the typed query so
-            // re-running is one Enter (ARCH req. 10; FindControlling.invalidated).
+            // New document identity: the core's search AND filter state died
+            // with the old handle — clear results/highlights, retain the typed
+            // query so re-running is one Enter (ARCH req. 10;
+            // FindControlling.invalidated); a fresh/re-opened session has no
+            // filter either (ARCH-filtered-views req. 9).
             self.cancelWrapNav()
             self.findSession = findControl.invalidated(self.findSession)
             self.searchNavDirection = .forward
+            self.filterSnapshot = nil
+            self.filterDocumentRows = nil
             self.pendingScrollRow = nil
             self.phase = .document
             startPolling()
@@ -304,10 +318,33 @@ final class DocumentModel {
     /// crosses a power-of-ten — and never below a 2-digit floor. Uses tabular
     /// digits so the width is exact.
     func rowNumberColumnWidth() -> CGFloat {
-        // Clamp to the last data row so scrolling into the overscroll strip
-        // (whose filler rows carry no number) never inflates the gutter.
-        let maxVisible = min(firstVisibleRow + max(lastVisibleCount, 1), max(displayRowCount, 1))
+        let maxVisible: Int
+        if isFiltered {
+            // Original row numbers are non-contiguous under a filter (ARCH
+            // criterion 13): size for the largest POSSIBLE original number —
+            // the captured document row count — so the gutter width stays
+            // stable across a scroll instead of re-deriving it from each
+            // visible row's source mapping.
+            let documentRows = filterDocumentRows?.count ?? rowCountInfo.count
+            maxVisible = Int(min(documentRows, UInt64(Int.max)))
+        } else {
+            // Clamp to the last data row so scrolling into the overscroll strip
+            // (whose filler rows carry no number) never inflates the gutter.
+            maxVisible = min(firstVisibleRow + max(lastVisibleCount, 1), max(displayRowCount, 1))
+        }
         return Self.rowNumberWidth(digits: Self.rowNumberDigits(forMaxNumber: maxVisible))
+    }
+
+    /// The row-number gutter's value for row `row` (ARCH criteria 13/17): the
+    /// row's ORIGINAL (unfiltered) data-row number while a filter is active —
+    /// forwarded verbatim from the core's `sourceRow`, never recomputed — else
+    /// the row's own identity index. `nil` while filtered and the row is not
+    /// currently servable (outside the materialized window) — the gutter
+    /// leaves such a row blank until a re-window catches up, exactly like its
+    /// cells.
+    func gutterRow(forRow row: Int) -> UInt64? {
+        guard isFiltered else { return UInt64(row) }
+        return session?.sourceRow(UInt64(row))
     }
 
     static func rowNumberDigits(forMaxNumber n: Int) -> Int {
@@ -385,8 +422,12 @@ final class DocumentModel {
             return false
         }
         // (a) Total exact: valid 0-based rows are 0..<count; anything at/beyond
-        // count is rejected immediately, no scan.
-        if rowCountInfo.isExact && target >= rowCountInfo.count {
+        // count is rejected immediately, no scan. IDENTITY VIEW ONLY: under a
+        // filter `target` is an ORIGINAL row number (ARCH-filtered-views req.
+        // 7/12) while `rowCountInfo` reports the filtered m — not the same
+        // domain — and the filtered jump never rejects (it clamps to the last
+        // match instead), so this upfront check does not apply while filtered.
+        if !isFiltered, rowCountInfo.isExact, target >= rowCountInfo.count {
             rejectJump(restoreTo: nil, scanned: false)
             return false
         }
@@ -435,8 +476,12 @@ final class DocumentModel {
             // row — reject and restore the pre-jump viewport, rather than land on
             // the clamped last row (ARCH error case, amended 2026-07-06). The
             // frozen JumpControl.resolve() is unchanged — it still says .landed;
-            // the reject decision lives here, above it.
-            if case let .scanning(target, preJumpFirstRow, _) = previous, row < target {
+            // the reject decision lives here, above it. IDENTITY VIEW ONLY:
+            // under a filter `row` is a FILTERED index and `target` an
+            // ORIGINAL row number (not comparable), and the filtered jump
+            // never rejects — it clamps to the last match instead
+            // (ARCH-filtered-views criterion 12).
+            if !isFiltered, case let .scanning(target, preJumpFirstRow, _) = previous, row < target {
                 rejectJump(restoreTo: preJumpFirstRow, scanned: true)   // sets jumpFlow = .idle
                 return
             }
@@ -453,10 +498,19 @@ final class DocumentModel {
     /// arrival dump shows the target row immediately. Then ask the grid to
     /// scroll the landed row into view.
     private func landOn(_ row: UInt64) {
+        landViewport(on: row)
+        if JumpProbe.active { JumpProbe.arrived(model: self, landed: row) }
+    }
+
+    /// Page the window to `row` and hand the grid the row to scroll into view
+    /// — the shared landing mechanics behind a jump landing, a search landing,
+    /// and a filter apply/clear (ARCH-filtered-views criterion 13): materialize
+    /// a fresh window centered on `row`, then set `pendingScrollRow` (consumed
+    /// once by the grid).
+    private func landViewport(on row: UInt64) {
         firstVisibleRow = Int(min(row, UInt64(Int.max)))
         materialize(start: row, count: GridMetrics.scrollBufferRows * 2)
         pendingScrollRow = row
-        if JumpProbe.active { JumpProbe.arrived(model: self, landed: row) }
     }
 
     // MARK: - Find (search)
@@ -596,9 +650,7 @@ final class DocumentModel {
     /// Page the window to a search landing and scroll it into view (mirrors the
     /// jump landing, including the EOF overscroll allowance).
     private func landSearchOn(_ row: UInt64) {
-        firstVisibleRow = Int(min(row, UInt64(Int.max)))
-        materialize(start: row, count: GridMetrics.scrollBufferRows * 2)
-        pendingScrollRow = row
+        landViewport(on: row)
     }
 
     /// Per-visible-column highlight state for a data row (O(viewport), zero core
@@ -618,6 +670,90 @@ final class DocumentModel {
             }
             return cellMatcher.matches(cell: text, column: column, under: request) ? .subtle : .none
         }
+    }
+
+    // MARK: - Filter (filtered-views)
+
+    /// Whether a filter is the active view (ARCH-filtered-views FILTERED
+    /// VIEWS) — a nil poll snapshot means the identity view.
+    var isFiltered: Bool { filterSnapshot != nil }
+
+    /// The "Filtered — N of M rows" banner, or nil for the identity view (ARCH
+    /// req. 11, criterion 16).
+    var filterBanner: FilterBanner? {
+        filterControl.banner(filterSnapshot, documentRows: filterDocumentRows ?? rowCountInfo)
+    }
+
+    /// The row-count knowledge the JUMP popup hints with: the captured base
+    /// document count while filtered — the jump box interprets ORIGINAL row
+    /// numbers (ARCH-filtered-views req. 7/12, criterion 17), so its hint must
+    /// be scaled to the whole document, not the filtered view — else the
+    /// (identity) `rowCountInfo` unchanged.
+    var jumpRowCountInfo: RowCountInfo { isFiltered ? (filterDocumentRows ?? rowCountInfo) : rowCountInfo }
+
+    /// "Apply as filter" (ARCH req. 10): validate the CURRENT find draft
+    /// exactly as Find does (`FindControlling.submit` — identical grammar, no
+    /// new predicate UI), then route a successful compose to `setFilter`
+    /// instead of `startSearch`. Entering (or re-entering) filtered mode
+    /// resets any active find app-side (the core resets it too — the
+    /// coordinate space changed) and lands the grid on the top of the
+    /// filtered view.
+    func applyFindAsFilter() {
+        switch findControl.submit(findSession, visibleColumns: visibleColumns, columnCount: columnCount) {
+        case .ignored:
+            break
+        case .rejected:
+            findRejections += 1
+            if FindProbe.active { FindProbe.rejected(model: self) }
+        case let .run(request):
+            guard let session else { return }
+            // M is captured from the IDENTITY view once, the moment filtering
+            // begins; while already filtered (re-running / replacing the
+            // active filter) the base document count is no longer knowable
+            // through the session, so the earlier capture is kept.
+            let capturedDocumentRows = isFiltered ? filterDocumentRows : rowCountInfo
+            guard session.setFilter(request) else {
+                // The composer already validated; a real rejection here would
+                // mean the core disagrees (shouldn't happen — same rules as
+                // Find). Surface it exactly like a Find rejection.
+                findRejections += 1
+                if FindProbe.active { FindProbe.rejected(model: self) }
+                return
+            }
+            filterDocumentRows = capturedDocumentRows
+            cancelWrapNav()
+            findSession = findControl.invalidated(findSession)
+            searchNavDirection = .forward
+            jumpFlow = .idle
+            filterSnapshot = session.filterStatus()
+            rowCountInfo = session.rowCount()
+            landViewport(on: 0)
+            startPolling()
+        }
+    }
+
+    /// Clear the active filter (the banner's ✕, or the Find popup's "Clear
+    /// filter"), restoring the identity view. Re-anchors on the source row of
+    /// the top visible filtered row (ARCH criterion 13) via the same
+    /// materialize-then-scroll landing mechanics as a jump/find/header-toggle
+    /// re-anchor. No-op when no filter is active.
+    func clearFilter() {
+        guard let session, isFiltered else { return }
+        // Capture the re-anchor row BEFORE clearing (the coordinate space is
+        // about to change): make sure the top visible row is servable, then
+        // read its original row number.
+        _ = session.setWindow(firstRow: UInt64(firstVisibleRow), rowCount: 1)
+        let anchor = session.sourceRow(UInt64(firstVisibleRow)) ?? 0
+        session.clearFilter()
+        filterSnapshot = nil
+        filterDocumentRows = nil
+        rowCountInfo = session.rowCount()
+        cancelWrapNav()
+        findSession = findControl.invalidated(findSession)
+        searchNavDirection = .forward
+        jumpFlow = .idle
+        landViewport(on: anchor)
+        startPolling()
     }
 
     // MARK: - Overlay reveal / fade
@@ -775,7 +911,8 @@ final class DocumentModel {
                 let ip = session.indexProgress()
                 let js = session.jumpStatus()
                 let ss = session.searchStatus()
-                let keepGoing = await self?.applyPoll(rowCount: rc, progress: ip, jump: js, search: ss) ?? false
+                let fs = session.filterStatus()
+                let keepGoing = await self?.applyPoll(rowCount: rc, progress: ip, jump: js, search: ss, filter: fs) ?? false
                 if !keepGoing { break }
                 try? await Task.sleep(for: .milliseconds(100))
             }
@@ -783,23 +920,33 @@ final class DocumentModel {
     }
 
     /// Fold one poll snapshot into state; returns whether polling should
-    /// continue (stops once the index is complete and neither a jump nor a
-    /// search is active, so idle documents cost nothing).
-    private func applyPoll(rowCount: RowCountInfo, progress: ScanProgress, jump: JumpStatus, search: SearchSnapshot?) -> Bool {
+    /// continue (stops once the index is complete and neither a jump, a
+    /// search, nor an unfinished filter-scan is active, so idle documents
+    /// cost nothing).
+    private func applyPoll(
+        rowCount: RowCountInfo, progress: ScanProgress, jump: JumpStatus, search: SearchSnapshot?, filter: FilterSnapshot?
+    ) -> Bool {
         rowCountInfo = rowCount
         indexProgress = progress
+        filterSnapshot = filter
         foldJump(jump)
         foldSearch(search)
 
-        // If the current window came up short of what the viewport wants and
-        // the frontier is still advancing, re-materialize to pick up new rows.
-        if !progress.isComplete, window.rows.count < desiredCount,
+        // Under a filter, rows beyond its discovered-match frontier become
+        // servable as the filter-scan (or a jump/find sharing its slot)
+        // advances (ARCH-filtered-views req. 5) — re-materialize on the same
+        // short-window signal already used for the base index. A CANCELLED
+        // filter-scan still counts as "ongoing": under LS_INDEX_AUTO it
+        // resumes to completion on its own (api/lesssheet.h FILTERED VIEWS),
+        // so polling must keep watching it rather than going silent.
+        let filterOngoing = filter.map { !$0.totalIsFinal } ?? false
+        if (!progress.isComplete || filterOngoing), window.rows.count < desiredCount,
            Int(window.firstRow) + window.rows.count < displayRowCount {
             materialize(start: desiredStart, count: desiredCount)
         }
 
         let jumpScanning: Bool = { if case .scanning = jumpFlow { return true } else { return false } }()
-        return !progress.isComplete || jumpScanning || Self.searchActive(search)
+        return !progress.isComplete || jumpScanning || Self.searchActive(search) || filterOngoing
     }
 
     /// A search still needs polling while its match-scan runs or a navigation

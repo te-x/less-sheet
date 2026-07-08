@@ -292,6 +292,14 @@ struct ContentView: View {
         ZStack(alignment: .bottomTrailing) {
             GridView(model: model)
             OverlayView(model: model)
+            // The filtered banner (ARCH req. 11) is independent of the
+            // floating overlay's hover reveal/fade — it stays up the whole
+            // time a filter is active, top-leading past the row gutter.
+            FilterBannerView(model: model)
+                .padding(.top, GridMetrics.titleBarInset + 8)
+                .padding(.leading, 16)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                .allowsHitTesting(model.filterBanner != nil)
         }
         // Extend the grid UNDER the transparent title-bar region so content
         // scrolls beneath it and the scroll-edge effect frosts it (item 2). The
