@@ -17,23 +17,53 @@ import SwiftUI
 struct SettingsView: View {
     @Bindable var model: DocumentModel
 
+    // Custom separator/quote entry (parity with the overlay pills, which offer a
+    // "Custom…" single-ASCII-character field). The fixed pickers can only PICK a
+    // preset or echo an already-forced custom byte; selecting "Custom…" reveals
+    // an inline one-character field routed through the SAME `applyDialectChange`
+    // funnel, so the frozen `DialectComposer` still owns validation (ASCII
+    // 0x01–0x7F, not CR/LF, separator ≠ quote — an invalid byte is a no-op).
+    @State private var showSeparatorCustom = false
+    @State private var showQuoteCustom = false
+    @State private var separatorCustomText = ""
+    @State private var quoteCustomText = ""
+    @FocusState private var customFocus: CustomField?
+
+    private enum CustomField { case separator, quote }
+    private enum SeparatorChoice: Hashable { case byte(UInt8); case custom }
+    private enum QuoteChoice: Hashable { case byte(UInt8); case none; case custom }
+
     var body: some View {
         Form {
             Section("Parsing") {
                 Toggle("First row is header", isOn: headerBinding)
 
-                Picker("Separator", selection: separatorBinding) {
+                Picker("Separator", selection: separatorChoiceBinding) {
                     ForEach(separatorOptions, id: \.self) { byte in
-                        Text(DialectGlyph.separatorName(byte)).tag(byte)
+                        Text(DialectGlyph.separatorName(byte)).tag(SeparatorChoice.byte(byte))
+                    }
+                    Text("Custom…").tag(SeparatorChoice.custom)
+                }
+                if showSeparatorCustom {
+                    customCharField(text: $separatorCustomText, field: .separator) { byte in
+                        if model.applyDialectChange(.separator(byte)) { showSeparatorCustom = false }
+                        separatorCustomText = ""
                     }
                 }
 
-                Picker("Quote character", selection: quoteBinding) {
-                    Text("Double quote  \"").tag(UInt8?.some(0x22))
-                    Text("Single quote  '").tag(UInt8?.some(0x27))
-                    Text("None").tag(UInt8?.none)
+                Picker("Quote character", selection: quoteChoiceBinding) {
+                    Text("Double quote  \"").tag(QuoteChoice.byte(0x22))
+                    Text("Single quote  '").tag(QuoteChoice.byte(0x27))
+                    Text("None").tag(QuoteChoice.none)
                     if let custom = customQuote {
-                        Text(DialectGlyph.quoteName(custom)).tag(UInt8?.some(custom))
+                        Text(DialectGlyph.quoteName(custom)).tag(QuoteChoice.byte(custom))
+                    }
+                    Text("Custom…").tag(QuoteChoice.custom)
+                }
+                if showQuoteCustom {
+                    customCharField(text: $quoteCustomText, field: .quote) { byte in
+                        if model.applyDialectChange(.quote(byte)) { showQuoteCustom = false }
+                        quoteCustomText = ""
                     }
                 }
 
@@ -68,14 +98,76 @@ struct SettingsView: View {
                 set: { model.applyDialectChange(.header($0)) })
     }
 
-    private var separatorBinding: Binding<UInt8> {
-        Binding(get: { model.dialect.separator },
-                set: { model.applyDialectChange(.separator($0)) })
+    /// Separator picker selection. While the "Custom…" field is open the picker
+    /// reads as `.custom` (so it stays highlighted); otherwise it reflects the
+    /// effective byte. Picking a preset closes any open custom field and
+    /// re-opens; picking "Custom…" reveals the inline field and focuses it.
+    private var separatorChoiceBinding: Binding<SeparatorChoice> {
+        Binding(
+            get: { showSeparatorCustom ? .custom : .byte(model.dialect.separator) },
+            set: { choice in
+                switch choice {
+                case .byte(let b):
+                    showSeparatorCustom = false
+                    model.applyDialectChange(.separator(b))
+                case .custom:
+                    showSeparatorCustom = true
+                    customFocus = .separator
+                }
+            }
+        )
     }
 
-    private var quoteBinding: Binding<UInt8?> {
-        Binding(get: { model.dialect.quote },
-                set: { model.applyDialectChange(.quote($0)) })
+    private var quoteChoiceBinding: Binding<QuoteChoice> {
+        Binding(
+            get: {
+                if showQuoteCustom { return .custom }
+                guard let q = model.dialect.quote else { return .none }
+                return .byte(q)
+            },
+            set: { choice in
+                switch choice {
+                case .byte(let b):
+                    showQuoteCustom = false
+                    model.applyDialectChange(.quote(b))
+                case .none:
+                    showQuoteCustom = false
+                    model.applyDialectChange(.quote(nil))
+                case .custom:
+                    showQuoteCustom = true
+                    customFocus = .quote
+                }
+            }
+        )
+    }
+
+    /// One-character ASCII entry, mirroring the overlay pills' custom field:
+    /// keep only the last ASCII character typed; commit on Enter. Validation
+    /// (byte range, CR/LF, separator≠quote) is the composer's job — a rejected
+    /// byte simply doesn't re-open.
+    private func customCharField(
+        text: Binding<String>,
+        field: CustomField,
+        onCommit: @escaping (UInt8) -> Void
+    ) -> some View {
+        LabeledContent("Custom character") {
+            TextField("", text: text)
+                .frame(width: 90)
+                .multilineTextAlignment(.center)
+                .focused($customFocus, equals: field)
+                .onChange(of: text.wrappedValue) { _, value in
+                    if let last = value.unicodeScalars.last, last.isASCII {
+                        text.wrappedValue = String(last)
+                    } else {
+                        text.wrappedValue = ""
+                    }
+                }
+                .onSubmit {
+                    if let scalar = text.wrappedValue.unicodeScalars.first, scalar.isASCII {
+                        onCommit(UInt8(scalar.value))
+                    }
+                }
+        }
     }
 
     /// The report's resolved encoding (ARCH req. 11's "detected: …" subtitle),
