@@ -507,11 +507,15 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
     // MARK: Row refresh (data / highlights)
 
     private func refreshVisibleRows() {
-        let visible = table.rows(in: table.visibleRect)
-        guard visible.length > 0 else { gutter.needsDisplay = true; return }
-        for row in visible.location..<(visible.location + visible.length) {
-            if let rv = table.rowView(atRow: row, makeIfNecessary: false) as? SheetRowView {
-                configure(rv, row: row)
+        // Reconfigure EVERY live row view, not just those in the current
+        // visibleRect: after a fast fling a row view can be created empty (the
+        // viewport outran the window), then sit just off the visible rect when
+        // the window catches up — so a visibleRect-only refresh leaves stale
+        // gaps that only fill when the row is recycled by another scroll.
+        // enumerateAvailableRowViews covers the whole live pool.
+        table.enumerateAvailableRowViews { rowView, row in
+            if let rv = rowView as? SheetRowView {
+                self.configure(rv, row: row)
                 rv.needsDisplay = true
             }
         }
