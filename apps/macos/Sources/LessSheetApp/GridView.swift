@@ -29,6 +29,10 @@ struct SheetRow: View {
     /// header / filler rows never pass highlights (header cells are never
     /// matched).
     var highlights: [SheetCellHighlight] = []
+    /// Per-cell display-truncation flags (ARCH req. 13/20), PARALLEL to
+    /// `cells`; mirrors `RowWindow.truncated`. Empty = none (header/filler rows
+    /// never carry a truncation flag, like `headerCells` in the contract).
+    var truncated: [Bool] = []
     @Environment(\.overlayDumpChrome) private var dumpChrome
 
     var body: some View {
@@ -41,6 +45,7 @@ struct SheetRow: View {
                     .frame(width: width, height: GridMetrics.rowHeight, alignment: .leading)
                     .background { highlightFill(at: index) }
                     .overlay { highlightBorder(at: index) }
+                    .overlay(alignment: .trailing) { truncationMarker(at: index) }
                     .overlay(alignment: .trailing) { hairline.frame(width: 1) }
             }
             if fillerColumns > 0 {
@@ -112,6 +117,22 @@ struct SheetRow: View {
     private func highlightBorder(at index: Int) -> some View {
         if highlight(at: index) == .strong {
             Rectangle().strokeBorder(Color.accentColor, lineWidth: 1.5)
+        }
+    }
+
+    /// A truncated cell's indicator (ARCH req. 13/20): a subtle dot inset from
+    /// the column's trailing hairline, in addition to the tail-truncating "…"
+    /// `cellText` already applies when the (possibly 4 KiB-capped) text
+    /// overflows the column. Mirrors the live grid's `drawTruncationMarker` so
+    /// the same cue is headlessly verifiable through `FrameDump`. Purely
+    /// presentational: rendered exactly as the flag says, no re-measuring.
+    @ViewBuilder
+    private func truncationMarker(at index: Int) -> some View {
+        if index < truncated.count, truncated[index] {
+            Circle()
+                .fill(Color.secondary.opacity(0.6))
+                .frame(width: 5, height: 5)
+                .padding(.trailing, 3)
         }
     }
 }

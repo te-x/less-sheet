@@ -503,10 +503,12 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
         if row < dataRowCount {
             rv.isFiller = false
             rv.cells = model.visibleBodyCells(forRow: row)
+            rv.truncated = model.visibleBodyTruncated(forRow: row)
             rv.highlights = model.cellHighlights(forRow: row)
         } else {
             rv.isFiller = true
             rv.cells = []
+            rv.truncated = []
             rv.highlights = []
         }
     }
@@ -574,6 +576,10 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
 final class SheetRowView: NSTableRowView {
     weak var controller: NativeGridController?
     var cells: [String] = []
+    /// Per-cell display-truncation flags, PARALLEL to `cells` (ARCH req. 13/20;
+    /// mirrors `RowWindow.truncated`). Drives `drawTruncationMarker` only — the
+    /// core's flag is rendered as-is, never re-derived from measured text.
+    var truncated: [Bool] = []
     var highlights: [SheetCellHighlight] = []
     var isFiller = false
 
@@ -604,6 +610,9 @@ final class SheetRowView: NSTableRowView {
                 SheetRowView.drawText(cells[i], in: cell.insetBy(dx: GridMetrics.cellHPadding, dy: 0),
                                       font: SheetRowView.font, color: .labelColor, alignment: .left)
             }
+            if i < truncated.count, truncated[i] {
+                SheetRowView.drawTruncationMarker(in: cell)
+            }
             if hl == .strong {
                 accent.setStroke()
                 let p = NSBezierPath(rect: cell.insetBy(dx: 0.75, dy: 0.75))
@@ -621,6 +630,22 @@ final class SheetRowView: NSTableRowView {
         }
         // Full-width bottom hairline (data -> filler seam is continuous).
         NSRect(x: 0, y: h - NativeGrid.hairline, width: bounds.width, height: NativeGrid.hairline).fill()
+    }
+
+    /// A truncated cell's indicator (ARCH req. 13/20): a subtle dot inset from
+    /// the column's trailing hairline. AppKit's own `.byTruncatingTail` already
+    /// ends an overflowing cell in "…" when it is wider than the column — this
+    /// marker is the ADDITIONAL cue that the CORE cut the underlying data at the
+    /// 4 KiB display cap (`RowWindow.truncated`), distinct from ordinary
+    /// column-width overflow (which can happen to any cell, truncated or not).
+    /// Purely presentational: driven by the flag as given, never a re-measure.
+    static func drawTruncationMarker(in cell: NSRect) {
+        let diameter: CGFloat = 5
+        let margin: CGFloat = 3   // clearance from the column's trailing hairline
+        let dot = NSRect(x: cell.maxX - margin - diameter, y: (cell.height - diameter) / 2,
+                         width: diameter, height: diameter)
+        NSColor.secondaryLabelColor.withAlphaComponent(0.6).setFill()
+        NSBezierPath(ovalIn: dot).fill()
     }
 
     /// Single-line, tail-truncated text drawn vertically centered in `rect`.

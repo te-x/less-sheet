@@ -24,7 +24,7 @@ enum FrameDump {
     private static let pathKey = "LESSSHEET_DUMP_FRAME"
     private static let sceneKey = "LESSSHEET_DUMP_SCENE"
     private static let gridSize = CGSize(width: 900, height: 600)
-    private static let settingsSize = CGSize(width: 420, height: 460)
+    private static let settingsSize = CGSize(width: 420, height: 500)
 
     @MainActor
     static func dumpIfRequested(for model: DocumentModel) {
@@ -399,7 +399,8 @@ struct DumpGrid: View {
                     rowNumber: firstRow + i + 1, rowNumberWidth: gutterWidth, stickyRowNumber: false,
                     cells: model.visibleBodyCells(forRow: firstRow + i),
                     widths: widths, fillerColumns: fillerCols, isHeader: false,
-                    highlights: model.cellHighlights(forRow: firstRow + i)
+                    highlights: model.cellHighlights(forRow: firstRow + i),
+                    truncated: model.visibleBodyTruncated(forRow: firstRow + i)
                 )
             }
             ForEach(0..<fillerRows, id: \.self) { _ in
@@ -455,7 +456,8 @@ struct DumpEndGrid: View {
                     rowNumber: firstRow + i + 1, rowNumberWidth: gutterWidth, stickyRowNumber: false,
                     cells: model.visibleBodyCells(forRow: firstRow + i),
                     widths: widths, fillerColumns: fillerCols, isHeader: false,
-                    highlights: model.cellHighlights(forRow: firstRow + i)
+                    highlights: model.cellHighlights(forRow: firstRow + i),
+                    truncated: model.visibleBodyTruncated(forRow: firstRow + i)
                 )
             }
             ForEach(0..<GridMetrics.overscrollRows, id: \.self) { _ in
@@ -526,6 +528,7 @@ struct DumpSettings: View {
             labeled("First row is header", model.dialect.hasHeader ? "On" : "Off")
             labeled("Separator", DialectGlyph.separatorName(model.dialect.separator))
             labeled("Quote character", model.dialect.quote.map(DialectGlyph.quoteName) ?? "None")
+            labeled("Text encoding", DialectGlyph.encodingValueLabel(model.dialect))
 
             Divider().padding(.vertical, 4)
 
@@ -547,7 +550,7 @@ struct DumpSettings: View {
             Spacer()
         }
         .padding(20)
-        .frame(width: 420, height: 460, alignment: .topLeading)
+        .frame(width: 420, height: 500, alignment: .topLeading)
         .background(Color(nsColor: .windowBackgroundColor))
     }
 

@@ -111,34 +111,37 @@ public struct DialectComposer: DialectComposing {
         }()
         let carriedHeader: HeaderOverride =
             current.headerForced ? (current.hasHeader ? .on : .off) : .sniff
+        // Encoding carries the same way as the other parameters: forced ->
+        // pinned as the forced value; otherwise `.automatic` (re-detected on
+        // the re-open).
+        let carriedEncoding: EncodingOverride =
+            current.encodingForced ? EncodingOverride(current.encoding) : .automatic
 
         switch change {
         case let .separator(byte):
             guard Self.isValidDialectByte(byte) else { return nil }
             // Collision only against a byte the caller is CARRYING as forced.
             if case let .forced(q) = carriedQuote, q == byte { return nil }
-            return DialectOverride(separator: .forced(byte), quote: carriedQuote, header: carriedHeader)
+            return DialectOverride(separator: .forced(byte), quote: carriedQuote, header: carriedHeader, encoding: carriedEncoding)
 
         case let .quote(maybeByte):
             guard let byte = maybeByte else {
                 // NONE disables quoting; it can never collide with a separator.
-                return DialectOverride(separator: carriedSeparator, quote: .none, header: carriedHeader)
+                return DialectOverride(separator: carriedSeparator, quote: .none, header: carriedHeader, encoding: carriedEncoding)
             }
             guard Self.isValidDialectByte(byte) else { return nil }
             if case let .forced(s) = carriedSeparator, s == byte { return nil }
-            return DialectOverride(separator: carriedSeparator, quote: .forced(byte), header: carriedHeader)
+            return DialectOverride(separator: carriedSeparator, quote: .forced(byte), header: carriedHeader, encoding: carriedEncoding)
 
         case let .header(isOn):
             // Header changes are always valid.
-            return DialectOverride(separator: carriedSeparator, quote: carriedQuote, header: isOn ? .on : .off)
+            return DialectOverride(separator: carriedSeparator, quote: carriedQuote, header: isOn ? .on : .off, encoding: carriedEncoding)
 
-        case .encoding:
-            // csv-hardening RED SEED: encoding carry-forward + selection are not
-            // wired yet — this drops the chosen encoding and does not carry the
-            // report's forced encoding, so the composer encoding tests stay RED.
-            // (The other cases likewise omit `encoding:`, defaulting it to
-            // `.automatic` instead of carrying `current`'s forced encoding.)
-            return DialectOverride(separator: carriedSeparator, quote: carriedQuote, header: carriedHeader)
+        case let .encoding(chosen):
+            // An encoding change never fails and never touches the dialect
+            // bytes — it only sets `encoding` to the chosen override
+            // (`.automatic` included, which re-detects on the re-open).
+            return DialectOverride(separator: carriedSeparator, quote: carriedQuote, header: carriedHeader, encoding: chosen)
         }
     }
 

@@ -294,4 +294,46 @@ enum DialectGlyph {
         case .quote: return dialect.quote.map(quoteName) ?? "None"
         }
     }
+
+    /// Plain name of a resolved encoding (ARCH req. 11 vocabulary).
+    static func textEncodingName(_ encoding: TextEncoding) -> String {
+        switch encoding {
+        case .utf8: return "UTF-8"
+        case .utf16LE: return "UTF-16 LE"
+        case .utf16BE: return "UTF-16 BE"
+        case .latin1: return "ISO-8859-1 (Latin-1)"
+        case .windows1252: return "Windows-1252"
+        }
+    }
+
+    /// Plain name of one "Text encoding" picker option, not accounting for the
+    /// Automatic subtitle (see `encodingOptionLabel`).
+    static func encodingOverrideName(_ option: EncodingOverride) -> String {
+        switch option {
+        case .automatic: return "Automatic"
+        case .utf8: return textEncodingName(.utf8)
+        case .utf16LE: return textEncodingName(.utf16LE)
+        case .utf16BE: return textEncodingName(.utf16BE)
+        case .latin1: return textEncodingName(.latin1)
+        case .windows1252: return textEncodingName(.windows1252)
+        }
+    }
+
+    /// The "Text encoding" picker row label for one `EncodingPicker.options`
+    /// entry (ARCH req. 11): Automatic always surfaces the report's resolved
+    /// encoding ("Automatic — detected: Latin-1"), mirroring how the
+    /// separator/quote pills always show their current effective value; the
+    /// five concrete options are their plain name.
+    static func encodingOptionLabel(_ option: EncodingOverride, detected: TextEncoding) -> String {
+        guard option == .automatic else { return encodingOverrideName(option) }
+        return "Automatic — detected: \(textEncodingName(detected))"
+    }
+
+    /// The current-selection label for the WHOLE "Text encoding" control (a
+    /// collapsed Picker, or the headless Settings dump's read-out): the same
+    /// rule as `encodingOptionLabel`, applied to the report's actual selection
+    /// (`EncodingPicker.selection`/`.detected`).
+    static func encodingValueLabel(_ dialect: DialectReport) -> String {
+        encodingOptionLabel(EncodingPicker.selection(for: dialect), detected: EncodingPicker.detected(in: dialect))
+    }
 }

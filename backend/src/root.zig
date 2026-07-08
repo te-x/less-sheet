@@ -49,10 +49,18 @@ const madvise_keepback: u64 = 2 * 1024 * 1024;
 
 const head_budget: u64 = api.open_head_max_bytes;
 
+/// Sample size (SOURCE bytes) for encoding detection (BOM / NUL-ratio / UTF-8
+/// validation): a small, fixed prefix of the head is plenty for the pinned
+/// heuristics and keeps detection itself trivially cheap. Well within
+/// `head_budget`, so it never affects the O(head) bound.
+const encoding_sample_bytes: usize = 256 * 1024;
+
 // --- Small value types ------------------------------------------------------
 
 /// A decoded cell: byte range into an owning buffer (window or header).
-const CellRef = struct { start: usize, len: usize };
+/// `truncated` is set when LS_CELL_MAX_BYTES cut the cell's stored bytes, or
+/// when a bounded record-1 decode stopped mid-field (see `lexInto`).
+const CellRef = struct { start: usize, len: usize, truncated: bool = false };
 
 /// A sparse row-index entry: data row `row` begins at content offset `offset`.
 const Checkpoint = struct { row: u64, offset: u64 };
@@ -87,10 +95,15 @@ const Document = struct {
 
     // File mapping (immutable after open). `mapping` is null for an empty file.
     mapping: ?[]align(std.heap.page_size_min) const u8,
-    content: []const u8, // mapping[bom_len..] (post-BOM working bytes)
+    content: []const u8, // mapping[bom_len..] (post-BOM SOURCE bytes; NOT UTF-8
+    // unless `encoding` is UTF-8 -- every scan decodes it through `decodeUnit`)
     content_len: u64,
     file_size: u64,
     bom_len: u64,
+    // The resolved source encoding (see TEXT AND ENCODING). Constant for the
+    // document's lifetime; drives every `decodeUnit` call site (head scan,
+    // background index, jump/search scans, window materialization).
+    encoding: u8,
 
     // Dialect + shape (immutable after open).
     sep: u8,
@@ -104,6 +117,17 @@ const Document = struct {
     has_header: bool,
     header_buf: []const u8,
     header_refs: []const CellRef,
+
+    // BOUNDED RECORD 1 (see api/lesssheet.h DELIMITED-TEXT / requirement 9):
+    // true iff record 1 did not terminate within the O(head) budget.
+    // `row0_pinned_*` holds record 1's bounded decode when it is ALSO data
+    // row 0 (header off): served by ls_cell/ls_window_set directly, bypassing
+    // the frontier (which never claims a row whose true extent past the
+    // budget is unknown) -- so row 0 stays instantly servable without ever
+    // re-scanning the pathological record. Empty/unused otherwise.
+    record1_capped: bool,
+    row0_pinned_buf: []const u8,
+    row0_pinned_refs: []const CellRef,
 
     // Frontier + index + jump slot (mutex-protected).
     mutex: c.pthread_mutex_t,
@@ -215,14 +239,113 @@ fn validByte(v: i32) bool {
     return v >= 0x01 and v <= 0x7F and v != 0x0A and v != 0x0D;
 }
 
+fn validEncodingOption(v: i32) bool {
+    return v == api.encoding_auto or (v >= 0 and v <= @as(i32, api.encoding_windows1252));
+}
+
 fn validateOptions(opt: api.OpenOptions) bool {
     if (opt.separator != api.sniff and !validByte(opt.separator)) return false;
     if (opt.quote != api.sniff and opt.quote != api.quote_none and !validByte(opt.quote)) return false;
     if (opt.header != api.sniff and opt.header != api.header_off and opt.header != api.header_on) return false;
     if (opt.index_mode != api.index_auto and opt.index_mode != api.index_manual) return false;
+    if (!validEncodingOption(opt.encoding)) return false;
     // Forced separator == forced quote byte is a collision.
     if (opt.separator != api.sniff and opt.separator == opt.quote) return false;
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// Encoding resolution (see api/lesssheet.h TEXT AND ENCODING). Runs on the
+// RAW head bytes (pre-BOM-strip), before dialect sniffing. A forced encoding
+// bypasses detection but a leading BOM matching it is still stripped.
+// ---------------------------------------------------------------------------
+
+const EncodingResolution = struct { encoding: u8, forced: bool, bom_len: u64 };
+
+/// The BOM length for `enc` if `raw` actually starts with it, else 0.
+/// Latin-1 / Windows-1252 have no BOM.
+fn matchingBomLen(raw: []const u8, enc: u8) u64 {
+    return switch (enc) {
+        api.encoding_utf8 => if (raw.len >= 3 and raw[0] == 0xEF and raw[1] == 0xBB and raw[2] == 0xBF) 3 else 0,
+        api.encoding_utf16le => if (raw.len >= 2 and raw[0] == 0xFF and raw[1] == 0xFE) 2 else 0,
+        api.encoding_utf16be => if (raw.len >= 2 and raw[0] == 0xFE and raw[1] == 0xFF) 2 else 0,
+        else => 0,
+    };
+}
+
+/// UTF-8 validation step of detection: like `std.unicode.utf8ValidateSlice`,
+/// except a multibyte sequence that is simply CUT by the sample boundary
+/// (not enough bytes left to tell, but every available byte of it is a
+/// plausible continuation byte) does not fail detection -- requirement 3. A
+/// genuinely invalid byte (bad lead byte, bad continuation, overlong,
+/// surrogate) anywhere, including in a trailing "short" sequence that has
+/// more sample bytes after it that AREN'T valid continuations, still fails.
+fn looksLikeUtf8(sample: []const u8) bool {
+    var i: usize = 0;
+    while (i < sample.len) {
+        const b0 = sample[i];
+        const n = std.unicode.utf8ByteSequenceLength(b0) catch return false;
+        if (i + n > sample.len) {
+            var k: usize = 1;
+            while (i + k < sample.len) : (k += 1) {
+                if (sample[i + k] & 0xC0 != 0x80) return false;
+            }
+            return true; // cut by the boundary; every available byte checks out
+        }
+        if (n > 1) _ = std.unicode.utf8Decode(sample[i .. i + n]) catch return false;
+        i += n;
+    }
+    return true;
+}
+
+/// NUL-ratio heuristic for BOM-less UTF-16: true (LE, NULs on odd offsets),
+/// false (BE, NULs on even offsets), or null (neither parity is UTF-16
+/// shaped). Thresholds are an implementation detail (pinned outcomes only).
+fn detectUtf16NulRatio(sample: []const u8) ?bool {
+    if (sample.len < 8) return null;
+    var even_total: usize = 0;
+    var even_nul: usize = 0;
+    var odd_total: usize = 0;
+    var odd_nul: usize = 0;
+    for (sample, 0..) |b, i| {
+        if (i % 2 == 0) {
+            even_total += 1;
+            if (b == 0) even_nul += 1;
+        } else {
+            odd_total += 1;
+            if (b == 0) odd_nul += 1;
+        }
+    }
+    if (even_total == 0 or odd_total == 0) return null;
+    const even_ratio = @as(f64, @floatFromInt(even_nul)) / @as(f64, @floatFromInt(even_total));
+    const odd_ratio = @as(f64, @floatFromInt(odd_nul)) / @as(f64, @floatFromInt(odd_total));
+    const dominant = 0.70;
+    const sparse = 0.10;
+    if (odd_ratio >= dominant and even_ratio <= sparse) return true; // LE
+    if (even_ratio >= dominant and odd_ratio <= sparse) return false; // BE
+    return null;
+}
+
+/// Resolve the effective encoding per the pinned detection pipeline (BOM ->
+/// NUL-ratio -> UTF-8 validation -> Latin-1) or honor a forced one (stripping
+/// a matching BOM either way). `raw` is a bounded prefix of the raw file
+/// bytes (pre-BOM-strip); empty for a 0-byte file.
+fn resolveEncoding(raw: []const u8, forced_opt: i32) EncodingResolution {
+    if (forced_opt != api.encoding_auto) {
+        const enc: u8 = @intCast(forced_opt);
+        return .{ .encoding = enc, .forced = true, .bom_len = matchingBomLen(raw, enc) };
+    }
+    if (raw.len >= 3 and raw[0] == 0xEF and raw[1] == 0xBB and raw[2] == 0xBF)
+        return .{ .encoding = api.encoding_utf8, .forced = false, .bom_len = 3 };
+    if (raw.len >= 2 and raw[0] == 0xFF and raw[1] == 0xFE)
+        return .{ .encoding = api.encoding_utf16le, .forced = false, .bom_len = 2 };
+    if (raw.len >= 2 and raw[0] == 0xFE and raw[1] == 0xFF)
+        return .{ .encoding = api.encoding_utf16be, .forced = false, .bom_len = 2 };
+    if (detectUtf16NulRatio(raw)) |le|
+        return .{ .encoding = if (le) api.encoding_utf16le else api.encoding_utf16be, .forced = false, .bom_len = 0 };
+    if (looksLikeUtf8(raw))
+        return .{ .encoding = api.encoding_utf8, .forced = false, .bom_len = 0 };
+    return .{ .encoding = api.encoding_latin1, .forced = false, .bom_len = 0 };
 }
 
 /// See contracts/api.zig `openWithAllocator`. Every heap allocation for the
@@ -249,14 +372,19 @@ pub fn openWithAllocator(gpa: std.mem.Allocator, path: [*:0]const u8, options: ?
     // Map the file head-to-tail (sparse tails cost nothing; pages fault lazily
     // and the indexer madvises them away). Empty files are not mapped.
     var mapping: ?[]align(std.heap.page_size_min) const u8 = null;
-    var content: []const u8 = &.{};
-    var bom_len: u64 = 0;
     if (file_size > 0) {
         const m = posix.mmap(null, file_size, .{ .READ = true }, .{ .TYPE = .PRIVATE }, fd, 0) catch return .io;
         mapping = m;
-        if (file_size >= 3 and m[0] == 0xEF and m[1] == 0xBB and m[2] == 0xBF) bom_len = 3;
-        content = m[bom_len..file_size];
     }
+
+    // Resolve the source encoding from the raw head bytes (BEFORE dialect
+    // sniffing -- see TEXT AND ENCODING): BOM, else the NUL-ratio heuristic,
+    // else UTF-8 validation, else Latin-1; a forced encoding bypasses
+    // detection but still strips a matching BOM. The sample is a small,
+    // fixed prefix -- well within the O(head) budget regardless of file size.
+    const sample: []const u8 = if (mapping) |m| m[0..@min(m.len, encoding_sample_bytes)] else &.{};
+    const enc_res = resolveEncoding(sample, opt.encoding);
+    const content: []const u8 = if (mapping) |m| m[enc_res.bom_len..file_size] else &.{};
 
     const doc = gpa.create(Document) catch {
         if (mapping) |m| posix.munmap(m);
@@ -268,7 +396,8 @@ pub fn openWithAllocator(gpa: std.mem.Allocator, path: [*:0]const u8, options: ?
         .content = content,
         .content_len = content.len,
         .file_size = file_size,
-        .bom_len = bom_len,
+        .bom_len = enc_res.bom_len,
+        .encoding = enc_res.encoding,
         .sep = api.default_separator,
         .quote = api.default_quote,
         .dialect = undefined,
@@ -278,6 +407,9 @@ pub fn openWithAllocator(gpa: std.mem.Allocator, path: [*:0]const u8, options: ?
         .has_header = false,
         .header_buf = &.{},
         .header_refs = &.{},
+        .record1_capped = false,
+        .row0_pinned_buf = &.{},
+        .row0_pinned_refs = &.{},
         .mutex = .{},
         .cond = .{},
         .checkpoints = .empty,
@@ -330,8 +462,12 @@ pub fn openWithAllocator(gpa: std.mem.Allocator, path: [*:0]const u8, options: ?
         .win_rows = 0,
     };
 
-    // Resolve the effective dialect (sniff the non-forced parameters).
-    const rd = sniffDialect(content, opt);
+    // Resolve the effective dialect (sniff the non-forced parameters) on the
+    // TRANSCODED structure of the head: sniffing/header/column-count logic is
+    // unchanged, but every byte comparison now flows through `decodeUnit` so
+    // it is correct for whichever encoding produced this UTF-8 (see
+    // api/lesssheet.h "Pipeline order at open").
+    const rd = sniffDialect(content, opt, doc.encoding);
     doc.sep = rd.sep;
     doc.quote = rd.quote;
 
@@ -347,8 +483,20 @@ pub fn openWithAllocator(gpa: std.mem.Allocator, path: [*:0]const u8, options: ?
             return .io;
         };
         doc.frontier_offset = doc.data_start;
-        doc.complete = false;
-        headScan(doc);
+        if (doc.has_header and doc.record1_capped) {
+            // The header record itself never terminated within the head
+            // budget (requirement 9): its true end -- and therefore where
+            // data would even start -- is unknown. Report 0 data rows,
+            // exact, and do NOT headScan/index past the budget limit: doing
+            // so would lex the still-open header field's tail as bogus data
+            // records. The header cells themselves (capped + flagged) are
+            // already pinned by buildShape and served by ls_header_cell.
+            doc.complete = true;
+            doc.total_rows = 0;
+        } else {
+            doc.complete = false;
+            headScan(doc);
+        }
     }
 
     doc.dialect = .{
@@ -356,14 +504,11 @@ pub fn openWithAllocator(gpa: std.mem.Allocator, path: [*:0]const u8, options: ?
         .quote = doc.quote orelse api.default_quote,
         .has_quote = doc.quote != null,
         .header = doc.has_header,
-        // csv-hardening RED SEED: encoding detection/transcode not implemented
-        // yet — report a placeholder so this compiles; the encoding behavior
-        // tests stay RED until the implementer resolves the real encoding.
-        .encoding = api.encoding_utf8,
+        .encoding = doc.encoding,
         .separator_forced = opt.separator != api.sniff,
         .quote_forced = opt.quote != api.sniff,
         .header_forced = opt.header != api.sniff,
-        .encoding_forced = false,
+        .encoding_forced = opt.encoding != api.encoding_auto,
     };
 
     // One worker for the document's lifetime: advances the frontier (AUTO) or
@@ -375,17 +520,40 @@ pub fn openWithAllocator(gpa: std.mem.Allocator, path: [*:0]const u8, options: ?
     return .ok;
 }
 
+/// The O(head) SOURCE-byte scan bound shared by `buildShape`'s record-1
+/// decode and `headScan`: `LS_OPEN_HEAD_MAX_BYTES` minus the BOM, clamped to
+/// the file's true (post-BOM) content length.
+fn headSourceLimit(doc: *const Document) usize {
+    const budget: usize = if (head_budget > doc.bom_len) @intCast(head_budget - doc.bom_len) else 0;
+    return @min(budget, doc.content.len);
+}
+
 /// Decode record 1, fix the column count, decide the header, and (when the
-/// header is on) retain its cells. Returns false only on allocation failure.
+/// header is on) retain its cells. Bounded to the O(head) budget (requirement
+/// 9 / BOUNDED RECORD 1): a record 1 that doesn't terminate within it still
+/// yields a column count (>= 1, the fields decoded so far) and a display-
+/// capped, truncation-flagged final field; when record 1 is ALSO data row 0
+/// (header off) its capped decode is pinned (see Document.row0_pinned_*) so
+/// ls_window_set never has to re-scan the pathological record. When record 1
+/// IS the effective header instead, `data_start` becomes the budget cut point
+/// only as a marker -- the caller (openWithAllocator) sees `record1_capped &&
+/// has_header` and reports 0 data rows instead of headScan-ing from there
+/// (the header's true end is unknown, so there is no confirmed data, and
+/// nothing may lex the still-open header field's tail as bogus rows). Every
+/// cell is ALSO subject to the LS_CELL_MAX_BYTES display cap regardless of
+/// capping (header/row-0 cells are never re-decoded after open). Returns
+/// false only on allocation failure.
 fn buildShape(doc: *Document, opt: api.OpenOptions) bool {
     var tmp_buf: std.ArrayList(u8) = .empty;
     var tmp_refs: std.ArrayList(CellRef) = .empty;
-    const rec0_next = lexInto(doc.content, 0, doc.sep, doc.quote, null, &tmp_buf, &tmp_refs, doc.gpa) catch {
+    const lim = headSourceLimit(doc);
+    const res = lexInto(doc.content, 0, doc.sep, doc.quote, null, api.cell_max_bytes, lim, doc.encoding, &tmp_buf, &tmp_refs, doc.gpa) catch {
         tmp_buf.deinit(doc.gpa);
         tmp_refs.deinit(doc.gpa);
         return false;
     };
     doc.column_count = @intCast(tmp_refs.items.len);
+    doc.record1_capped = res.capped;
 
     var all_numeric = true;
     for (tmp_refs.items) |ref| {
@@ -412,7 +580,20 @@ fn buildShape(doc: *Document, opt: api.OpenOptions) bool {
             tmp_refs.deinit(doc.gpa);
             return false;
         };
-        doc.data_start = rec0_next;
+        doc.data_start = res.next;
+    } else if (doc.record1_capped) {
+        doc.row0_pinned_buf = tmp_buf.toOwnedSlice(doc.gpa) catch {
+            tmp_buf.deinit(doc.gpa);
+            tmp_refs.deinit(doc.gpa);
+            return false;
+        };
+        doc.row0_pinned_refs = tmp_refs.toOwnedSlice(doc.gpa) catch {
+            doc.gpa.free(doc.row0_pinned_buf);
+            doc.row0_pinned_buf = &.{};
+            tmp_refs.deinit(doc.gpa);
+            return false;
+        };
+        doc.data_start = 0; // record 1 is data row 0
     } else {
         tmp_buf.deinit(doc.gpa);
         tmp_refs.deinit(doc.gpa);
@@ -426,12 +607,11 @@ fn buildShape(doc: *Document, opt: api.OpenOptions) bool {
 /// are fully indexed here (complete + exact immediately, per the ABI pin).
 fn headScan(doc: *Document) void {
     const content = doc.content;
-    const budget: usize = if (head_budget > doc.bom_len) @intCast(head_budget - doc.bom_len) else 0;
-    const lim = @min(budget, content.len); // recordBounds requires limit <= content.len
+    const lim = headSourceLimit(doc); // == min(budget, content.len)
     var i: usize = @intCast(doc.data_start);
     var row: u64 = 0;
-    while (i < content.len and i < budget) {
-        const b = recordBounds(content, i, doc.sep, doc.quote, lim);
+    while (i < lim) {
+        const b = recordBounds(content, i, doc.sep, doc.quote, lim, doc.encoding);
         if (b.capped) break; // record spills past the head budget: leave for later
         if (doc.bom_len + b.next > head_budget) break; // keep bytes_scanned <= budget
         i = b.next;
@@ -465,6 +645,8 @@ fn freeDoc(doc: *Document) void {
     if (doc.scope_mask.len > 0) doc.gpa.free(doc.scope_mask);
     if (doc.header_buf.len > 0) doc.gpa.free(doc.header_buf);
     if (doc.header_refs.len > 0) doc.gpa.free(doc.header_refs);
+    if (doc.row0_pinned_buf.len > 0) doc.gpa.free(doc.row0_pinned_buf);
+    if (doc.row0_pinned_refs.len > 0) doc.gpa.free(doc.row0_pinned_refs);
     if (doc.mapping) |m| posix.munmap(m);
     _ = c.pthread_cond_destroy(&doc.cond);
     _ = c.pthread_mutex_destroy(&doc.mutex);
@@ -596,7 +778,7 @@ fn scanChunk(doc: *Document, start_off: u64, start_row: u64) ChunkResult {
     while (row < target) {
         if (doc.stop_atomic.load(.monotonic)) return .{ .end_offset = i, .end_row = row, .eof = false, .checkpoint = null };
         if (i >= content.len) return .{ .end_offset = i, .end_row = row, .eof = true, .checkpoint = null };
-        const b = recordBounds(content, i, doc.sep, doc.quote, content.len);
+        const b = recordBounds(content, i, doc.sep, doc.quote, content.len, doc.encoding);
         i = b.next;
         row += 1;
         if (b.next >= content.len) return .{ .end_offset = i, .end_row = row, .eof = true, .checkpoint = null };
@@ -685,7 +867,9 @@ pub export fn ls_index_poll(doc: *const api.Doc) callconv(.c) api.ScanProgress {
 
 /// See api/lesssheet.h `ls_window_set`. Never advances the frontier; re-lexes
 /// the requested rows (behind the frontier) from the nearest checkpoint into
-/// the owned window buffer, evicting the previous window.
+/// the owned window buffer, evicting the previous window. Every cell is
+/// decoded through `decodeUnit` (the document's resolved encoding) and
+/// display-capped to LS_CELL_MAX_BYTES (requirement 8).
 pub export fn ls_window_set(doc: *api.Doc, first_row: u64, row_count: u32) callconv(.c) api.RowRange {
     const d: *Document = @ptrCast(@alignCast(doc));
 
@@ -697,31 +881,54 @@ pub export fn ls_window_set(doc: *api.Doc, first_row: u64, row_count: u32) callc
 
     if (d.column_count == 0) return .{ .first_row = first_row, .row_count = 0 };
     const clamped: u64 = @min(@as(u64, row_count), @as(u64, api.window_max_rows));
+    if (clamped == 0) return .{ .first_row = first_row, .row_count = 0 };
+
+    // BOUNDED RECORD 1 (requirement 9): when record 1 is ALSO data row 0
+    // (header off) and never terminated within the O(head) budget, its
+    // bounded decode was pinned at open (see buildShape) because the
+    // frontier never claims a row whose true extent past the budget is
+    // unknown. Served directly here so row 0 stays instantly available,
+    // independent of the frontier/checkpoint machinery below.
+    var pinned_rows: u64 = 0;
+    if (first_row == 0 and d.record1_capped and !d.has_header and d.row0_pinned_refs.len > 0) {
+        for (d.row0_pinned_refs) |ref| {
+            const start = d.win_buf.items.len;
+            d.win_buf.appendSlice(d.gpa, d.row0_pinned_buf[ref.start .. ref.start + ref.len]) catch break;
+            d.win_refs.append(d.gpa, .{ .start = start, .len = ref.len, .truncated = ref.truncated }) catch break;
+        }
+        pinned_rows = 1;
+        d.win_rows = 1;
+    }
+    if (pinned_rows >= clamped) return .{ .first_row = first_row, .row_count = pinned_rows };
+
+    const next_row = first_row + pinned_rows;
+    const remaining = clamped - pinned_rows;
 
     d.lock();
     const avail_end = if (d.complete) d.total_rows else d.frontier_rows;
     var materialize: u64 = 0;
     var cp: Checkpoint = .{ .row = 0, .offset = d.data_start };
-    if (first_row < avail_end) {
-        materialize = @min(clamped, avail_end - first_row);
-        cp = findCheckpoint(d.checkpoints.items, first_row);
+    if (next_row < avail_end) {
+        materialize = @min(remaining, avail_end - next_row);
+        cp = findCheckpoint(d.checkpoints.items, next_row);
     }
     d.unlock();
 
-    if (materialize == 0) return .{ .first_row = first_row, .row_count = 0 };
+    if (materialize == 0) return .{ .first_row = first_row, .row_count = pinned_rows };
 
-    // Skip from the checkpoint to first_row, then decode `materialize` rows.
+    // Skip from the checkpoint to next_row, then decode `materialize` rows.
     var off: usize = @intCast(cp.offset);
     var r = cp.row;
-    while (r < first_row) : (r += 1) {
-        off = recordBounds(d.content, off, d.sep, d.quote, d.content.len).next;
+    while (r < next_row) : (r += 1) {
+        off = recordBounds(d.content, off, d.sep, d.quote, d.content.len, d.encoding).next;
     }
     var produced: u64 = 0;
     while (produced < materialize) : (produced += 1) {
-        off = lexInto(d.content, off, d.sep, d.quote, d.column_count, &d.win_buf, &d.win_refs, d.gpa) catch break;
+        const res = lexInto(d.content, off, d.sep, d.quote, d.column_count, api.cell_max_bytes, d.content.len, d.encoding, &d.win_buf, &d.win_refs, d.gpa) catch break;
+        off = res.next;
     }
-    d.win_rows = produced;
-    return .{ .first_row = first_row, .row_count = produced };
+    d.win_rows = pinned_rows + produced;
+    return .{ .first_row = first_row, .row_count = pinned_rows + produced };
 }
 
 /// Largest checkpoint with `.row <= row` (checkpoints[0].row == 0 always).
@@ -762,23 +969,26 @@ pub export fn ls_header_cell(doc: *const api.Doc, col: u32) callconv(.c) api.Str
     return .{ .ptr = d.header_buf.ptr + ref.start, .len = ref.len };
 }
 
-/// See api/lesssheet.h `ls_cell_truncated`. csv-hardening RED SEED: the
-/// LS_CELL_MAX_BYTES display cap is not implemented yet, so this always
-/// reports "not truncated" (and ls_cell serves the full cell) — the huge-cell
-/// behavior tests stay RED. Zero allocation; total function; never fails.
+/// See api/lesssheet.h `ls_cell_truncated`. Same (row, col) domain and
+/// window/borrow rules as ls_cell; reports whether the LS_CELL_MAX_BYTES
+/// display cap cut the served cell (set alongside the cell's CellRef by
+/// lexInto). Zero allocation; total function; never fails.
 pub export fn ls_cell_truncated(doc: *const api.Doc, row: u64, col: u32) callconv(.c) bool {
-    _ = doc;
-    _ = row;
-    _ = col;
-    return false;
+    const d = asDoc(doc);
+    if (col >= d.column_count) return false;
+    if (row < d.win_first or row >= d.win_first + d.win_rows) return false;
+    const idx = (row - d.win_first) * d.column_count + col;
+    if (idx >= d.win_refs.items.len) return false;
+    return d.win_refs.items[@intCast(idx)].truncated;
 }
 
-/// See api/lesssheet.h `ls_header_cell_truncated`. csv-hardening RED SEED (see
-/// ls_cell_truncated). Zero allocation; total function; never fails.
+/// See api/lesssheet.h `ls_header_cell_truncated`. Same semantics as
+/// ls_cell_truncated for the effective header record. Zero allocation; total
+/// function; never fails.
 pub export fn ls_header_cell_truncated(doc: *const api.Doc, col: u32) callconv(.c) bool {
-    _ = doc;
-    _ = col;
-    return false;
+    const d = asDoc(doc);
+    if (!d.has_header or col >= d.column_count or col >= d.header_refs.len) return false;
+    return d.header_refs[col].truncated;
 }
 
 // ---------------------------------------------------------------------------
@@ -855,152 +1065,434 @@ pub export fn ls_jump_poll(doc: *const api.Doc) callconv(.c) api.JumpStatus {
 }
 
 // ---------------------------------------------------------------------------
+// Encoding: SOURCE code-unit decode, fused directly into the lexer below (see
+// api/lesssheet.h TEXT AND ENCODING). There is no separate "transcode the
+// buffer, then lex it" pass: `decodeUnit` decodes exactly ONE source code
+// unit (1 byte for UTF-8 pass-through / Latin-1 / Windows-1252 ASCII range,
+// 1 byte for a Latin-1/Windows-1252 high byte, 2 or 4 bytes for a UTF-16 code
+// unit or surrogate pair) into its UTF-8 output on every call, so every scan
+// (head, background index, jump, search, window materialization) transcodes
+// ONLY the source bytes it actually visits -- the streaming/windowed
+// transcode the ARCH requires, with zero extra buffering or bookkeeping.
+// Because sep/quote/CR/LF are always a single ASCII byte, comparing a unit's
+// 1-byte output against them is correct for every encoding (a multi-byte
+// output unit, or any raw byte >= 0x80, can never equal one).
+// ---------------------------------------------------------------------------
+
+/// One decoded SOURCE code unit: `src_len` source bytes consumed, `out[0
+/// ..out_len]` its UTF-8 output (1-4 bytes). A unit is atomic for both
+/// structural comparison (see `unitIsByte`) and the LS_CELL_MAX_BYTES cap
+/// (never split), which is what guarantees the cap always cuts at a UTF-8
+/// code-point boundary.
+const Unit = struct {
+    src_len: usize,
+    out: [4]u8 = undefined,
+    out_len: u8 = 1,
+};
+
+/// True iff `u`'s entire output is the single byte `b` (the only shape that
+/// can ever compare equal to a separator/quote/CR/LF byte, all of which are
+/// < 0x80 by construction).
+inline fn unitIsByte(u: Unit, b: u8) bool {
+    return u.out_len == 1 and u.out[0] == b;
+}
+
+fn replacementUnit(src_len: usize) Unit {
+    var u: Unit = .{ .src_len = src_len };
+    @memcpy(u.out[0..3], &std.unicode.replacement_character_utf8);
+    u.out_len = 3;
+    return u;
+}
+
+/// Decode the SOURCE code unit at `off` (SOURCE bytes; `content` is always
+/// the document's full post-BOM source buffer), or null if no complete unit
+/// is available before `limit` -- every caller treats that exactly like
+/// hitting `limit` (`capped`), the same as the pre-csv-hardening byte-wise
+/// bound check.
+inline fn decodeUnit(content: []const u8, off: usize, limit: usize, encoding: u8) ?Unit {
+    if (off >= limit) return null;
+    // UTF-8 (the default / by far most common case) is the fast path: one
+    // raw byte in, one raw byte out, no lookahead -- see
+    // `decodeUtf8PassthroughUnit` for why grouping multibyte sequences here
+    // is unnecessary (the display cap fixes up the boundary after the fact).
+    if (encoding == api.encoding_utf8) return decodeUtf8PassthroughUnit(content, off);
+    return switch (encoding) {
+        api.encoding_utf16le => decodeUtf16Unit(content, off, limit, true),
+        api.encoding_utf16be => decodeUtf16Unit(content, off, limit, false),
+        api.encoding_latin1 => decodeLatin1Unit(content, off),
+        api.encoding_windows1252 => decodeWindows1252Unit(content, off),
+        else => unreachable, // validateOptions/resolveEncoding only ever produce the above
+    };
+}
+
+/// ISO-8859-1: every byte value IS its codepoint (never U+FFFD from decoding).
+fn decodeLatin1Unit(content: []const u8, off: usize) Unit {
+    const b = content[off];
+    if (b < 0x80) return .{ .src_len = 1, .out = .{ b, 0, 0, 0 }, .out_len = 1 };
+    var u: Unit = .{ .src_len = 1 };
+    u.out_len = std.unicode.utf8Encode(b, &u.out) catch unreachable; // 0x80-0xFF: always 2 bytes
+    return u;
+}
+
+/// Windows-1252 0x80-0x9F is a fixed codepoint table (five undefined bytes
+/// map to U+FFFD); 0xA0-0xFF is identical to Latin-1.
+const windows1252_high: [32]u21 = .{
+    0x20AC, 0xFFFD, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021,
+    0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0xFFFD, 0x017D, 0xFFFD,
+    0xFFFD, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,
+    0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0xFFFD, 0x017E, 0x0178,
+};
+
+fn decodeWindows1252Unit(content: []const u8, off: usize) Unit {
+    const b = content[off];
+    if (b < 0x80) return .{ .src_len = 1, .out = .{ b, 0, 0, 0 }, .out_len = 1 };
+    const cp: u21 = if (b < 0xA0) windows1252_high[b - 0x80] else b;
+    var u: Unit = .{ .src_len = 1 };
+    u.out_len = std.unicode.utf8Encode(cp, &u.out) catch unreachable;
+    return u;
+}
+
+/// One UTF-16 code unit (2 bytes) or surrogate pair (4 bytes). Ill-formed /
+/// lone surrogates -> U+FFFD (2 consumed bytes). A high surrogate that can't
+/// be paired within `limit` defers (returns null) UNLESS `limit` is the true
+/// end of content, in which case it is a genuinely dangling unit -> U+FFFD.
+fn decodeUtf16Unit(content: []const u8, off: usize, limit: usize, little: bool) ?Unit {
+    if (off + 2 > limit) return null;
+    const endian: std.builtin.Endian = if (little) .little else .big;
+    const cu0 = std.mem.readInt(u16, content[off..][0..2], endian);
+    if (std.unicode.utf16IsHighSurrogate(cu0)) {
+        if (off + 4 <= limit) {
+            const cu1 = std.mem.readInt(u16, content[off + 2 ..][0..2], endian);
+            if (std.unicode.utf16IsLowSurrogate(cu1)) {
+                const cp = std.unicode.utf16DecodeSurrogatePair(&[_]u16{ cu0, cu1 }) catch unreachable;
+                var u: Unit = .{ .src_len = 4 };
+                u.out_len = std.unicode.utf8Encode(cp, &u.out) catch unreachable;
+                return u;
+            }
+        } else if (limit != content.len) {
+            return null; // budget-capped: defer to a future call with more room
+        }
+        return replacementUnit(2); // lone / dangling high surrogate
+    }
+    if (std.unicode.utf16IsLowSurrogate(cu0)) return replacementUnit(2); // lone low surrogate
+    if (cu0 < 0x80) return .{ .src_len = 2, .out = .{ @intCast(cu0), 0, 0, 0 }, .out_len = 1 };
+    var u: Unit = .{ .src_len = 2 };
+    u.out_len = std.unicode.utf8Encode(cu0, &u.out) catch unreachable;
+    return u;
+}
+
+/// UTF-8 pass-through (Option A): bytes are NEVER validated or rewritten (an
+/// invalid byte survives unchanged -- see requirement 7). This is the hot
+/// path (the default, and by far the most common, encoding): ALWAYS a
+/// singleton raw byte, exactly like the pre-csv-hardening byte-wise lexer,
+/// so scanning an all-ASCII/UTF-8 document costs no more than it did before.
+/// A cap that lands inside a multibyte sequence is fixed up once per
+/// (truncated) field by `utf8TrimToBoundary`, not per byte here.
+inline fn decodeUtf8PassthroughUnit(content: []const u8, off: usize) Unit {
+    return .{ .src_len = 1, .out = .{ content[off], 0, 0, 0 }, .out_len = 1 };
+}
+
+fn utf8LeadLen(b: u8) usize {
+    return switch (b) {
+        0x00...0x7F => 1,
+        0xC0...0xDF => 2,
+        0xE0...0xEF => 3,
+        0xF0...0xF7 => 4,
+        else => 1, // stray continuation / invalid lead byte: singleton
+    };
+}
+
+/// For the UTF-8 pass-through path only: `bytes` was stored one raw byte at a
+/// time (see `decodeUtf8PassthroughUnit`), so a cap/limit cut can land in the
+/// middle of a multibyte sequence. Returns the length to KEEP so the result
+/// never ends on a split code point (requirement 8), fixing the boundary up
+/// ONCE per truncated field rather than paying a lookahead per byte scanned.
+/// O(1) for the overwhelming common case (the last byte is plain ASCII or
+/// already a bare lead byte); at most a 3-byte backward walk otherwise.
+/// Invalid UTF-8 (Option A: never rewritten) is otherwise left exactly as-is.
+fn utf8TrimToBoundary(bytes: []const u8) usize {
+    if (bytes.len == 0 or bytes[bytes.len - 1] < 0x80) return bytes.len;
+    var back: usize = 0;
+    while (back < 3 and back < bytes.len and (bytes[bytes.len - 1 - back] & 0xC0) == 0x80) : (back += 1) {}
+    if (back >= bytes.len) return bytes.len; // defensive: nothing but continuation bytes
+    const lead_pos = bytes.len - 1 - back;
+    const n = utf8LeadLen(bytes[lead_pos]);
+    if (n == 1) return bytes.len; // no real lead byte found (stray continuations): leave as-is
+    if (lead_pos + n <= bytes.len) return bytes.len; // sequence is already complete
+    return lead_pos; // incomplete: cut before the dangling lead byte
+}
+
+// ---------------------------------------------------------------------------
 // The parameterized, quote-aware lexer (RFC-4180 generalized; quote NONE).
-// All three functions agree on record boundaries.
+// All three functions agree on record boundaries and now decode SOURCE bytes
+// through `decodeUnit`, so they are correct for whichever encoding produced
+// the document's UTF-8 (see the ENCODING section above).
 // ---------------------------------------------------------------------------
 
 const Bounds = struct { next: usize, capped: bool };
+
+/// Advance from `i` (decoding units of `encoding`) until a sep/CR/LF unit
+/// (not consumed) or `limit` (ran out, `hit_limit`). Shared by the unquoted
+/// scan and the post-closing-quote trailing-junk scan (both stop the same way).
+const Scan = struct { pos: usize, hit_limit: bool };
+
+fn scanToStructural(content: []const u8, start: usize, sep: u8, limit: usize, encoding: u8) Scan {
+    var i = start;
+    while (true) {
+        const u = decodeUnit(content, i, limit, encoding) orelse return .{ .pos = i, .hit_limit = true };
+        if (unitIsByte(u, sep) or unitIsByte(u, '\n') or unitIsByte(u, '\r')) return .{ .pos = i, .hit_limit = false };
+        i += u.src_len;
+    }
+}
 
 /// Find where the record at `pos` ends. Scans no further than `limit`
 /// (<= content.len); `capped` is true iff the record failed to terminate
 /// before `limit` (used to bound the head-budget scan). Quote state protects
 /// embedded separators / CR / LF.
-fn recordBounds(content: []const u8, pos: usize, sep: u8, quote: ?u8, limit: usize) Bounds {
+fn recordBounds(content: []const u8, pos: usize, sep: u8, quote: ?u8, limit: usize, encoding: u8) Bounds {
     var i = pos;
-    const n = limit;
     const cl = content.len;
     while (true) {
-        if (quote != null and i < n and content[i] == quote.?) {
-            i += 1;
-            while (i < n) {
-                if (content[i] == quote.?) {
-                    if (i + 1 < cl and content[i + 1] == quote.?) {
-                        i += 2;
-                    } else {
-                        i += 1;
+        if (quote) |q| {
+            const first = decodeUnit(content, i, limit, encoding);
+            if (first != null and unitIsByte(first.?, q)) {
+                i += first.?.src_len;
+                while (true) {
+                    const u = decodeUnit(content, i, limit, encoding) orelse
+                        return .{ .next = limit, .capped = limit != cl };
+                    if (unitIsByte(u, q)) {
+                        const peek = decodeUnit(content, i + u.src_len, limit, encoding);
+                        if (peek != null and unitIsByte(peek.?, q)) {
+                            i += u.src_len + peek.?.src_len;
+                            continue;
+                        }
+                        i += u.src_len;
                         break;
                     }
-                } else i += 1;
+                    i += u.src_len;
+                }
             }
-            if (i >= n) return if (n == cl) .{ .next = cl, .capped = false } else .{ .next = n, .capped = true };
-            while (i < n and content[i] != sep and content[i] != '\n' and content[i] != '\r') i += 1;
-        } else {
-            while (i < n and content[i] != sep and content[i] != '\n' and content[i] != '\r') i += 1;
         }
-        if (i >= n) return if (n == cl) .{ .next = cl, .capped = false } else .{ .next = n, .capped = true };
-        const ch = content[i];
-        if (ch == sep) {
-            i += 1;
+        const s = scanToStructural(content, i, sep, limit, encoding);
+        if (s.hit_limit) return .{ .next = limit, .capped = limit != cl };
+        i = s.pos;
+        const u = decodeUnit(content, i, limit, encoding).?; // present: hit_limit was false
+        if (unitIsByte(u, sep)) {
+            i += u.src_len;
             continue;
         }
-        if (ch == '\r') return .{ .next = if (i + 1 < cl and content[i + 1] == '\n') i + 2 else i + 1, .capped = false };
-        return .{ .next = i + 1, .capped = false }; // '\n'
+        if (unitIsByte(u, '\r')) {
+            const nxt = decodeUnit(content, i + u.src_len, limit, encoding);
+            const next_i = if (nxt != null and unitIsByte(nxt.?, '\n')) i + u.src_len + nxt.?.src_len else i + u.src_len;
+            return .{ .next = next_i, .capped = false };
+        }
+        return .{ .next = i + u.src_len, .capped = false }; // '\n'
     }
 }
 
 /// Count the fields of the record at `pos` (no decode, no alloc), scanning no
 /// further than `limit`. `quoted` reports whether any field opened with the
 /// quote byte (feeds the sniffer's "active quote" signal). Used by the sniffer.
-fn countFields(content: []const u8, pos: usize, sep: u8, quote: ?u8, limit: usize) struct { count: u32, next: usize, quoted: bool } {
+fn countFields(content: []const u8, pos: usize, sep: u8, quote: ?u8, limit: usize, encoding: u8) struct { count: u32, next: usize, quoted: bool } {
     var i = pos;
-    const n = limit;
-    const cl = content.len;
     var count: u32 = 0;
     var quoted = false;
     while (true) {
-        if (quote != null and i < n and content[i] == quote.?) {
-            quoted = true;
-            i += 1;
-            while (i < n) {
-                if (content[i] == quote.?) {
-                    if (i + 1 < cl and content[i + 1] == quote.?) {
-                        i += 2;
-                    } else {
-                        i += 1;
+        if (quote) |q| {
+            const first = decodeUnit(content, i, limit, encoding);
+            if (first != null and unitIsByte(first.?, q)) {
+                quoted = true;
+                i += first.?.src_len;
+                while (true) {
+                    const u = decodeUnit(content, i, limit, encoding) orelse break;
+                    if (unitIsByte(u, q)) {
+                        const peek = decodeUnit(content, i + u.src_len, limit, encoding);
+                        if (peek != null and unitIsByte(peek.?, q)) {
+                            i += u.src_len + peek.?.src_len;
+                            continue;
+                        }
+                        i += u.src_len;
                         break;
                     }
-                } else i += 1;
+                    i += u.src_len;
+                }
             }
-            while (i < n and content[i] != sep and content[i] != '\n' and content[i] != '\r') i += 1;
-        } else {
-            while (i < n and content[i] != sep and content[i] != '\n' and content[i] != '\r') i += 1;
         }
+        const s = scanToStructural(content, i, sep, limit, encoding);
         count += 1;
-        if (i >= n) return .{ .count = count, .next = i, .quoted = quoted };
-        const ch = content[i];
-        if (ch == sep) {
-            i += 1;
+        if (s.hit_limit) return .{ .count = count, .next = limit, .quoted = quoted };
+        i = s.pos;
+        const u = decodeUnit(content, i, limit, encoding).?;
+        if (unitIsByte(u, sep)) {
+            i += u.src_len;
             continue;
         }
-        if (ch == '\r') return .{ .count = count, .next = if (i + 1 < cl and content[i + 1] == '\n') i + 2 else i + 1, .quoted = quoted };
-        return .{ .count = count, .next = i + 1, .quoted = quoted };
+        if (unitIsByte(u, '\r')) {
+            const nxt = decodeUnit(content, i + u.src_len, limit, encoding);
+            const next_i = if (nxt != null and unitIsByte(nxt.?, '\n')) i + u.src_len + nxt.?.src_len else i + u.src_len;
+            return .{ .count = count, .next = next_i, .quoted = quoted };
+        }
+        return .{ .count = count, .next = i + u.src_len, .quoted = quoted };
+    }
+}
+
+/// Append one decoded unit's UTF-8 output to `buf` (from `start`) unless the
+/// LS_CELL_MAX_BYTES cap is already reached or would be exceeded, in which
+/// case nothing is appended (never a partial unit -- this is what guarantees
+/// the served cell is cut at a code-point boundary) and `truncated.*` latches
+/// true. Once latched, no further unit is ever stored for this field (a
+/// later, smaller unit must not "fit" into room a bigger skipped one left
+/// behind).
+fn storeCapped(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, start: usize, u: Unit, cap: ?usize, truncated: *bool) !void {
+    if (truncated.*) return;
+    if (cap) |cap_bytes| {
+        if (buf.items.len - start + u.out_len > cap_bytes) {
+            truncated.* = true;
+            return;
+        }
+    }
+    try buf.appendSlice(gpa, u.out[0..u.out_len]);
+}
+
+/// Decode the quoted body starting right after the opening quote (`i`),
+/// collapsing doubled quotes to one literal, storing (subject to `cap`) into
+/// `buf` from `start`. Returns the position right after the closing quote, or
+/// signals `hit_limit` if the quote never closes within `limit`.
+const QuoteResult = struct { pos: usize, hit_limit: bool };
+
+fn consumeQuotedBody(
+    content: []const u8,
+    start_at: usize,
+    start: usize,
+    q: u8,
+    limit: usize,
+    encoding: u8,
+    store: bool,
+    cap: ?usize,
+    truncated: *bool,
+    buf: *std.ArrayList(u8),
+    gpa: std.mem.Allocator,
+) !QuoteResult {
+    var i = start_at;
+    while (true) {
+        const u = decodeUnit(content, i, limit, encoding) orelse return .{ .pos = limit, .hit_limit = true };
+        if (unitIsByte(u, q)) {
+            const peek = decodeUnit(content, i + u.src_len, limit, encoding);
+            if (peek != null and unitIsByte(peek.?, q)) {
+                if (store) try storeCapped(buf, gpa, start, u, cap, truncated);
+                i += u.src_len + peek.?.src_len;
+                continue;
+            }
+            return .{ .pos = i + u.src_len, .hit_limit = false };
+        }
+        if (store) try storeCapped(buf, gpa, start, u, cap, truncated);
+        i += u.src_len;
+    }
+}
+
+/// Decode units from `i` until a sep/CR/LF unit (not stored) or `limit` (ran
+/// out); stores (subject to `cap`) exactly like `consumeQuotedBody`. Shared by
+/// the unquoted-field case and the post-closing-quote trailing-junk case.
+fn storeToStructural(
+    content: []const u8,
+    start_at: usize,
+    start: usize,
+    sep: u8,
+    limit: usize,
+    encoding: u8,
+    store: bool,
+    cap: ?usize,
+    truncated: *bool,
+    buf: *std.ArrayList(u8),
+    gpa: std.mem.Allocator,
+) !Scan {
+    var i = start_at;
+    while (true) {
+        const u = decodeUnit(content, i, limit, encoding) orelse return .{ .pos = limit, .hit_limit = true };
+        if (unitIsByte(u, sep) or unitIsByte(u, '\n') or unitIsByte(u, '\r')) return .{ .pos = i, .hit_limit = false };
+        if (store) try storeCapped(buf, gpa, start, u, cap, truncated);
+        i += u.src_len;
     }
 }
 
 /// Decode the record at `pos` into `buf`/`refs`. `want` == null decodes every
 /// field (no padding); `want` == N produces exactly N refs (decoding the first
 /// N fields, padding missing ones with the empty cell, scanning the rest for
-/// the boundary). Returns the next record's offset.
+/// the boundary). Each stored cell is capped to at most `cap` UTF-8 bytes
+/// (null == uncapped, used by SEARCH so it sees the full cell) at a
+/// code-point boundary, flagging `CellRef.truncated`; scanning for the
+/// record/field boundary is NEVER bounded by `cap` (only by `limit`), so a
+/// field longer than `cap` is still fully accounted for. `limit` bounds how
+/// many SOURCE bytes this call may look at (<= content.len); `capped` in the
+/// result mirrors `recordBounds`: record 1's O(head) bound (requirement 9)
+/// passes a real limit, every other caller passes content.len (unbounded).
 fn lexInto(
     content: []const u8,
     pos: usize,
     sep: u8,
     quote: ?u8,
     want: ?u32,
+    cap: ?usize,
+    limit: usize,
+    encoding: u8,
     buf: *std.ArrayList(u8),
     refs: *std.ArrayList(CellRef),
     gpa: std.mem.Allocator,
-) !usize {
+) !Bounds {
     var i = pos;
-    const n = content.len;
+    const cl = content.len;
     var produced: u32 = 0;
     while (true) {
         const store = want == null or produced < want.?;
         const start = buf.items.len;
-        if (quote != null and i < n and content[i] == quote.?) {
-            i += 1;
-            while (i < n) {
-                const ch = content[i];
-                if (ch == quote.?) {
-                    if (i + 1 < n and content[i + 1] == quote.?) {
-                        if (store) try buf.append(gpa, quote.?);
-                        i += 2;
-                    } else {
-                        i += 1;
-                        break;
-                    }
-                } else {
-                    if (store) try buf.append(gpa, ch);
-                    i += 1;
-                }
-            }
-            while (i < n and content[i] != sep and content[i] != '\n' and content[i] != '\r') {
-                if (store) try buf.append(gpa, content[i]);
-                i += 1;
-            }
-        } else {
-            while (i < n and content[i] != sep and content[i] != '\n' and content[i] != '\r') {
-                if (store) try buf.append(gpa, content[i]);
-                i += 1;
+        var truncated = false;
+        var hit_limit = false;
+
+        if (quote) |q| {
+            const first = decodeUnit(content, i, limit, encoding);
+            if (first != null and unitIsByte(first.?, q)) {
+                i += first.?.src_len;
+                const qr = try consumeQuotedBody(content, i, start, q, limit, encoding, store, cap, &truncated, buf, gpa);
+                hit_limit = qr.hit_limit;
+                i = qr.pos;
             }
         }
-        if (store) try refs.append(gpa, .{ .start = start, .len = buf.items.len - start });
+        if (!hit_limit) {
+            const sr = try storeToStructural(content, i, start, sep, limit, encoding, store, cap, &truncated, buf, gpa);
+            hit_limit = sr.hit_limit;
+            i = sr.pos;
+        }
+
+        const was_truncated = truncated or hit_limit;
+        if (store) {
+            // UTF-8 pass-through stores raw bytes one at a time (the hot,
+            // zero-lookahead path -- see decodeUtf8PassthroughUnit), so a cut
+            // field may end mid code point; fix the boundary up once here
+            // rather than paying a lookahead per byte scanned.
+            if (was_truncated and encoding == api.encoding_utf8) {
+                buf.shrinkRetainingCapacity(start + utf8TrimToBoundary(buf.items[start..]));
+            }
+            try refs.append(gpa, .{ .start = start, .len = buf.items.len - start, .truncated = was_truncated });
+        }
         produced += 1;
-        if (i >= n) {
+
+        if (hit_limit) {
             if (want) |w| while (produced < w) : (produced += 1) try refs.append(gpa, .{ .start = 0, .len = 0 });
-            return n;
+            return .{ .next = limit, .capped = limit != cl };
         }
-        const ch = content[i];
-        if (ch == sep) {
-            i += 1;
+
+        const u = decodeUnit(content, i, limit, encoding).?; // present: hit_limit was false
+        if (unitIsByte(u, sep)) {
+            i += u.src_len;
             continue;
         }
-        const next: usize = if (ch == '\r')
-            (if (i + 1 < n and content[i + 1] == '\n') i + 2 else i + 1)
-        else
-            i + 1;
+        var next_i = i + u.src_len;
+        if (unitIsByte(u, '\r')) {
+            const nxt = decodeUnit(content, next_i, limit, encoding);
+            if (nxt != null and unitIsByte(nxt.?, '\n')) next_i += nxt.?.src_len;
+        }
         if (want) |w| while (produced < w) : (produced += 1) try refs.append(gpa, .{ .start = 0, .len = 0 });
-        return next;
+        return .{ .next = next_i, .capped = false };
     }
 }
 
@@ -1012,8 +1504,11 @@ const Resolved = struct { sep: u8, quote: ?u8 };
 
 /// Resolve the effective separator/quote: forced parameters are fixed, the
 /// rest are sniffed over the head sample. The sniffer never selects NONE and
-/// never selects a value equal to a forced parameter.
-fn sniffDialect(content: []const u8, opt: api.OpenOptions) Resolved {
+/// never selects a value equal to a forced parameter. `content` is the
+/// document's (already BOM-stripped) SOURCE bytes; sniffing decodes it
+/// through `decodeUnit(encoding)`, so the ASCII-structural candidate bytes
+/// (`, ; \t | " '`) are found correctly regardless of source encoding.
+fn sniffDialect(content: []const u8, opt: api.OpenOptions, encoding: u8) Resolved {
     const sep_forced = opt.separator != api.sniff;
     const quote_none_forced = opt.quote == api.quote_none;
     const quote_byte_forced = opt.quote >= 0;
@@ -1054,7 +1549,7 @@ fn sniffDialect(content: []const u8, opt: api.OpenOptions) Resolved {
     var best: ?Score = null;
     for (seps[0..sn]) |s| {
         for (quotes[0..qn]) |q| {
-            const sc = scorePair(content, s, q);
+            const sc = scorePair(content, s, q, encoding);
             if (best == null or betterThan(sc, best.?)) {
                 best = sc;
                 best_sep = s;
@@ -1065,7 +1560,7 @@ fn sniffDialect(content: []const u8, opt: api.OpenOptions) Resolved {
     return .{ .sep = best_sep, .quote = best_quote };
 }
 
-fn scorePair(content: []const u8, sep: u8, quote: ?u8) Score {
+fn scorePair(content: []const u8, sep: u8, quote: ?u8, encoding: u8) Score {
     var hist = [_]u32{0} ** (max_field_hist + 1);
     var total: u32 = 0;
     var records: u32 = 0;
@@ -1073,7 +1568,7 @@ fn scorePair(content: []const u8, sep: u8, quote: ?u8) Score {
     var i: usize = 0;
     const limit = @min(content.len, sniff_byte_cap);
     while (i < limit and records < sniff_record_cap) {
-        const r = countFields(content, i, sep, quote, limit);
+        const r = countFields(content, i, sep, quote, limit, encoding);
         hist[@min(@as(usize, r.count), max_field_hist)] += 1;
         if (r.quoted) active = true;
         total += 1;
@@ -1464,18 +1959,20 @@ fn searchScanChunk(doc: *Document, start_off: u64, start_row: u64) SearchChunk {
         if (i >= content.len) return .{ .end_offset = i, .end_row = row, .eof = true, .checkpoint = null, .matches = matches };
         doc.search_scratch.clearRetainingCapacity();
         doc.search_refs.clearRetainingCapacity();
-        const next = lexInto(content, i, doc.sep, doc.quote, doc.column_count, &doc.search_scratch, &doc.search_refs, doc.gpa) catch {
+        // SEARCH matches the FULL cell, not the display-capped bytes (cap =
+        // null; see requirement 10 / api/lesssheet.h SEARCH).
+        const res = lexInto(content, i, doc.sep, doc.quote, doc.column_count, null, content.len, doc.encoding, &doc.search_scratch, &doc.search_refs, doc.gpa) catch {
             // Decode allocation failure: count no match and advance the boundary.
-            const nb = recordBounds(content, i, doc.sep, doc.quote, content.len);
+            const nb = recordBounds(content, i, doc.sep, doc.quote, content.len, doc.encoding);
             i = nb.next;
             row += 1;
             if (nb.next >= content.len) return .{ .end_offset = i, .end_row = row, .eof = true, .checkpoint = null, .matches = matches };
             continue;
         };
         if (matchRecord(doc.w_ctx, doc.search_scratch.items, doc.search_refs.items) != null) matches += 1;
-        i = next;
+        i = res.next;
         row += 1;
-        if (next >= content.len) return .{ .end_offset = i, .end_row = row, .eof = true, .checkpoint = null, .matches = matches };
+        if (res.next >= content.len) return .{ .end_offset = i, .end_row = row, .eof = true, .checkpoint = null, .matches = matches };
     }
     return .{ .end_offset = i, .end_row = row, .eof = false, .checkpoint = .{ .row = row, .offset = i }, .matches = matches };
 }
@@ -1549,18 +2046,19 @@ fn relexBlock(doc: *Document, b: u64, lo: u64, hi: u64, dir: api.SearchDir) ?Mat
     var off: usize = @intCast(cp.offset);
     var row = cp.row;
     while (row < lo and off < doc.content.len) : (row += 1) {
-        off = recordBounds(doc.content, off, doc.sep, doc.quote, doc.content.len).next;
+        off = recordBounds(doc.content, off, doc.sep, doc.quote, doc.content.len, doc.encoding).next;
     }
     var result: ?Match = null;
     while (row < hi and off < doc.content.len) : (row += 1) {
         doc.nav_scratch.clearRetainingCapacity();
         doc.nav_refs.clearRetainingCapacity();
-        const next = lexInto(doc.content, off, doc.sep, doc.quote, doc.column_count, &doc.nav_scratch, &doc.nav_refs, doc.gpa) catch break;
+        // NAVIGATION also matches the FULL cell (cap = null), same as the scan.
+        const res = lexInto(doc.content, off, doc.sep, doc.quote, doc.column_count, null, doc.content.len, doc.encoding, &doc.nav_scratch, &doc.nav_refs, doc.gpa) catch break;
         if (matchRecord(ctx, doc.nav_scratch.items, doc.nav_refs.items)) |col| {
             result = .{ .row = row, .col = col };
             if (dir == .forward) return result;
         }
-        off = next;
+        off = res.next;
     }
     return result;
 }
@@ -1610,9 +2108,9 @@ fn countInBlockUpTo(doc: *Document, b: u64, row: u64) u64 {
     while (r <= row and off < doc.content.len) : (r += 1) {
         doc.nav_scratch.clearRetainingCapacity();
         doc.nav_refs.clearRetainingCapacity();
-        const next = lexInto(doc.content, off, doc.sep, doc.quote, doc.column_count, &doc.nav_scratch, &doc.nav_refs, doc.gpa) catch break;
+        const res = lexInto(doc.content, off, doc.sep, doc.quote, doc.column_count, null, doc.content.len, doc.encoding, &doc.nav_scratch, &doc.nav_refs, doc.gpa) catch break;
         if (matchRecord(ctx, doc.nav_scratch.items, doc.nav_refs.items)) |_| count += 1;
-        off = next;
+        off = res.next;
     }
     return count;
 }

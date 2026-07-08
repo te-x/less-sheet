@@ -282,6 +282,16 @@ final class DocumentModel {
         return window.rows[idx]
     }
 
+    /// Per-cell display-truncation flags for a data row, PARALLEL to
+    /// `cells(forRow:)` (mirrors `RowWindow.truncated`, ARCH req. 13/20). Rows
+    /// outside the window return `nil`, same rule as `cells(forRow:)`.
+    func truncated(forRow row: Int) -> [Bool]? {
+        let start = Int(window.firstRow)
+        let idx = row - start
+        guard idx >= 0, idx < window.truncated.count else { return nil }
+        return window.truncated[idx]
+    }
+
     var displayRowCount: Int {
         Int(min(rowCountInfo.count, UInt64(Int.max)))
     }
@@ -328,6 +338,16 @@ final class DocumentModel {
             return Array(repeating: "", count: visibleColumns.count)
         }
         return visibleColumns.map { $0 < full.count ? full[$0] : "" }
+    }
+
+    /// Visible-column truncation flags for a data row (ARCH req. 13/20),
+    /// false-padded while not yet loaded — same shape as `visibleBodyCells`.
+    /// Driven entirely by the core's per-cell flag; never re-measures cells.
+    func visibleBodyTruncated(forRow row: Int) -> [Bool] {
+        guard let full = truncated(forRow: row) else {
+            return Array(repeating: false, count: visibleColumns.count)
+        }
+        return visibleColumns.map { $0 < full.count ? full[$0] : false }
     }
 
     // MARK: - Column visibility (pure model; grid reflows)
