@@ -284,6 +284,33 @@ final class DocumentModel {
         desiredStart = start
         desiredCount = count
         window = session.setWindow(firstRow: start, rowCount: count)
+        growColumnWidthsToFitWindow()
+    }
+
+    /// Interim "column width scales with content, up to a point" (full column
+    /// ergonomics is slice 5): grow — never shrink — each visible column to fit
+    /// the just-materialized window's cells, capped at maxColumnWidth. Runs only
+    /// on materialization (scroll-settle / jump), not the per-frame scroll path;
+    /// monotone so it converges and never jitters; only reassigns `columnWidths`
+    /// (triggering a reflow) when a width actually grows.
+    private func growColumnWidthsToFitWindow() {
+        guard columnCount > 0, !window.rows.isEmpty, columnWidths.count == columnCount else { return }
+        let bodyFont = NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
+        var widths = columnWidths
+        var grew = false
+        for c in visibleColumns where c < widths.count && widths[c] < GridMetrics.maxColumnWidth {
+            var w = widths[c]
+            for row in window.rows where c < row.count {
+                let cellW = Self.textWidth(row[c], bodyFont) + GridMetrics.cellHPadding * 2
+                if cellW > w {
+                    w = cellW
+                    if w >= GridMetrics.maxColumnWidth { break }
+                }
+            }
+            let capped = min(w, GridMetrics.maxColumnWidth)
+            if capped > widths[c] + 0.5 { widths[c] = capped; grew = true }
+        }
+        if grew { columnWidths = widths }
     }
 
     /// Cells for a data row, read from the currently materialized window.
