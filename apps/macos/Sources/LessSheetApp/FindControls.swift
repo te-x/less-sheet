@@ -118,13 +118,17 @@ struct FindControlView: View {
     // Find popup"). Disabled while Off and the draft composes nothing, so it
     // never reads as dead text.
     private var filterRow: some View {
-        Toggle("Filter to matches", isOn: filterBinding)
-            .toggleStyle(.switch)
-            .controlSize(.mini)
-            .font(.caption)
-            .disabled(!model.isFiltered && !model.canApplyFilter)
-            .frame(maxWidth: .infinity)   // label far-left, switch far-right
-            .accessibilityElement(children: .contain)
+        HStack(spacing: 8) {
+            Text("Filter to matches").font(.caption)
+            Spacer(minLength: 8)
+            Toggle("", isOn: filterBinding)
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .controlSize(.mini)
+        }
+        .disabled(!model.isFiltered && !model.canApplyFilter)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Filter to matches")
     }
 
     /// On = apply the current find draft as the active filter; Off = clear it.

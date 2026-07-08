@@ -77,6 +77,11 @@ struct OverlayView: View {
 
             GlassEffectContainer(spacing: 8) {
                 HStack(alignment: .bottom, spacing: 8) {
+                    // The filtered banner rides the control row, left of Find,
+                    // while a filter is active (reveals/fades with the row).
+                    if model.filterBanner != nil {
+                        FilterBannerView(model: model)
+                    }
                     FindControlView(model: model)
                     JumpControlView(model: model)
                     HeaderButton(model: model)
