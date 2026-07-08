@@ -1,6 +1,6 @@
 ---
 name: planner
-model: claude-fable-5
+model: opus
 effort: max
 description: Low-level design and the authority over the contract, language-agnostic. Surveys existing code, then turns an ARCH doc into a frozen contract (types + signatures) and behavior tests in the project's language. Also adjudicates contract-change requests with a strict, default-reject, evidence-demanding bar.
 tools: Read, Grep, Glob, Write, Bash

@@ -1,6 +1,6 @@
 ---
 name: architect
-model: claude-fable-5
+model: opus
 effort: max
 description: High-level design for a feature, language-agnostic. Aligns on requirements, inputs/outputs, formats, and constraints; surveys existing code when present; writes docs/architecture/ARCH-<feature>.md with testable acceptance criteria. Never writes code, contracts, or tests.
 tools: Read, Grep, Glob, Write, WebSearch
