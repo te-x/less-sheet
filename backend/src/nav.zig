@@ -6,6 +6,12 @@
 //! filter.zig). Uses per-block counts to skip empty blocks, then re-lexes
 //! only the target block(s) via the document's nav scratch — O(one block
 //! re-lex), never O(file). See api/lesssheet.h SEARCH and FILTERED VIEWS.
+//!
+//! Also owns the sparse-checkpoint lookup (`bestCheckpoint`, shared by
+//! window.zig and this file's own `nthMatchInBlock`) and, for
+//! ARCH-huge-row-filtered, `nthMatchInBlock`'s per-row window-scan-cap bound
+//! + the `oversizedMatch` lookup into a filter's recorded oversized-row match
+//! results — see base.OversizedMatch.
 
 const api = @import("api");
 const base = @import("base.zig");
@@ -15,6 +21,8 @@ const matcher = @import("matcher.zig");
 const Document = base.Document;
 const MatchCtx = base.MatchCtx;
 const CellRef = base.CellRef;
+const Checkpoint = base.Checkpoint;
+const OversizedMatch = base.OversizedMatch;
 const checkpoint_interval = base.checkpoint_interval;
 
 /// A found match: `row` is an ORIGINAL data-row number; `col` the matched
@@ -123,25 +131,110 @@ pub fn positionOf(doc: *Document, block_counts: []const u64, filter_ctx: ?MatchC
     return sum + countInBlockUpTo(doc, filter_ctx, primary_ctx, b, row);
 }
 
+/// Largest entry in a sorted (`.row` ascending) checkpoint list with
+/// `.row <= row`, or null when the list is empty or every entry's row > row.
+fn checkpointAtOrBefore(list: []const Checkpoint, row: u64) ?Checkpoint {
+    var lo: usize = 0;
+    var hi: usize = list.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (list[mid].row <= row) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return if (lo == 0) null else list[lo - 1];
+}
+
+/// Largest checkpoint with `.row <= row` (checkpoints[0].row == 0 always).
+fn findCheckpoint(checkpoints: []const Checkpoint, row: u64) Checkpoint {
+    return checkpointAtOrBefore(checkpoints, row).?;
+}
+
+/// `findCheckpoint`, but also considers the extra checkpoints the frontier
+/// drops immediately after an oversized row (ARCH-huge-row-budget decision 2)
+/// when one lands closer to `row` — this is what lets ls_window_set's skip-
+/// from-checkpoint loop (window.windowSet / windowSetFiltered) and this
+/// file's own nthMatchInBlock reach a row after a huge row without re-
+/// scanning it. Caller holds the document mutex (reads `d.checkpoints` /
+/// `d.oversized_checkpoints`).
+pub fn bestCheckpoint(d: *Document, row: u64) Checkpoint {
+    var best = findCheckpoint(d.checkpoints.items, row);
+    if (checkpointAtOrBefore(d.oversized_checkpoints.items, row)) |alt| {
+        if (alt.row > best.row) best = alt;
+    }
+    return best;
+}
+
+/// The recorded FULL-cell filter-match result for OVERSIZED row `row` (see
+/// base.OversizedMatch / filter.filterScanChunk), or null when `row` has no
+/// entry (never happens for a row already inside the filter's counted region
+/// — see Document.filter_oversized_matches — a defensive fallback only).
+/// `list` is row-ascending (the filter-scan's own cursor is monotonic,
+/// contiguous, and single-owner, so it can never re-stage or reorder a row —
+/// simpler than `oversized_checkpoints`, which is shared across scanners), so
+/// a plain binary search suffices.
+pub fn oversizedMatch(list: []const OversizedMatch, row: u64) ?bool {
+    var lo: usize = 0;
+    var hi: usize = list.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (list[mid].row == row) return list[mid].matched;
+        if (list[mid].row < row) lo = mid + 1 else hi = mid;
+    }
+    return null;
+}
+
 /// Locate the ORIGINAL row/offset of the `need`-th (0-based) row satisfying
 /// `ctx` within block `b` (rows [b*interval, min((b+1)*interval, hi_bound))),
-/// re-lexing from its checkpoint. Caller holds the mutex.
+/// re-lexing from its checkpoint. ARCH-huge-row-filtered: `ctx` must be the
+/// ACTIVE FILTER's own predicate (filter.filterCtx) — true of both current
+/// callers (window.windowSetFiltered and search.resolveNavLockedFiltered, via
+/// nthMatchLocation below) — since that is what lets an OVERSIZED candidate's
+/// match be taken from the already-recorded `doc.filter_oversized_matches`
+/// (base.OversizedMatch) instead of re-testing it: the per-row lex is bounded
+/// to the window scan cap, and a capped (oversized) row is skipped via the
+/// checkpoint the frontier drops immediately after it (ARCH-huge-row-budget
+/// decision 2) rather than by re-scanning its remaining bytes. Caller holds
+/// the mutex.
 fn nthMatchInBlock(doc: *Document, ctx: MatchCtx, b: u64, hi_bound: u64, need: u64) ?SourceLoc {
     if (b >= doc.checkpoints.items.len) return null;
     const cp = doc.checkpoints.items[@intCast(b)];
     const block_hi = @min((b + 1) * checkpoint_interval, hi_bound);
+    const scan_cap: usize = @intCast(api.window_row_scan_max_bytes);
     var off: usize = @intCast(cp.offset);
     var row = cp.row;
     var seen: u64 = 0;
-    while (row < block_hi and off < doc.content.len) : (row += 1) {
+    while (row < block_hi and off < doc.content.len) {
+        const row_off = off;
+        const row_limit = @min(off +| scan_cap, doc.content.len);
         doc.nav_scratch.clearRetainingCapacity();
         doc.nav_refs.clearRetainingCapacity();
-        const res = lexer.lexInto(doc.content, off, doc.sep, doc.quote, doc.column_count, null, doc.content.len, doc.encoding, &doc.nav_scratch, &doc.nav_refs, doc.gpa) catch return null;
+        const res = lexer.lexInto(doc.content, off, doc.sep, doc.quote, doc.column_count, null, row_limit, doc.encoding, &doc.nav_scratch, &doc.nav_refs, doc.gpa) catch return null;
+        if (res.capped) {
+            // OVERSIZED: the match is decided from the filter-scan's already-
+            // recorded FULL-cell result, never re-tested on this bounded
+            // prefix and never by re-lexing to the row's true end.
+            if (oversizedMatch(doc.filter_oversized_matches.items, row) orelse false) {
+                if (seen == need) return .{ .row = row, .offset = row_off };
+                seen += 1;
+            }
+            const target_row = row + 1;
+            const skip_cp = bestCheckpoint(doc, target_row);
+            off = @intCast(skip_cp.offset);
+            row = skip_cp.row;
+            while (row < target_row) : (row += 1) {
+                off = lexer.recordBounds(doc.content, off, doc.sep, doc.quote, doc.content.len, doc.encoding).next;
+            }
+            continue;
+        }
         if (matcher.matchRecord(ctx, doc.nav_scratch.items, doc.nav_refs.items) != null) {
-            if (seen == need) return .{ .row = row, .offset = off };
+            if (seen == need) return .{ .row = row, .offset = row_off };
             seen += 1;
         }
         off = res.next;
+        row += 1;
     }
     return null;
 }

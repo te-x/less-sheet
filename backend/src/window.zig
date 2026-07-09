@@ -80,7 +80,7 @@ pub fn windowSet(d: *Document, first_row: u64, row_count: u32) api.RowRange {
     var cp: Checkpoint = .{ .row = 0, .offset = d.data_start };
     if (next_row < avail_end) {
         materialize = @min(remaining, avail_end - next_row);
-        cp = bestCheckpoint(d, next_row);
+        cp = nav.bestCheckpoint(d, next_row);
     }
     d.unlock();
 
@@ -121,7 +121,7 @@ pub fn windowSet(d: *Document, first_row: u64, row_count: u32) api.RowRange {
         // its (possibly gigabytes of) remaining bytes.
         const target_row = next_row + produced;
         d.lock();
-        const skip_cp = bestCheckpoint(d, target_row);
+        const skip_cp = nav.bestCheckpoint(d, target_row);
         d.unlock();
         off = @intCast(skip_cp.offset);
         var rr = skip_cp.row;
@@ -137,10 +137,25 @@ pub fn windowSet(d: *Document, first_row: u64, row_count: u32) api.RowRange {
 /// coordinates (row i = the i-th matching data row). Locates the source
 /// row/offset of filtered index `first_row` via the filter's per-block
 /// counters (O(checkpoints) + a bounded in-block re-lex — never O(matches)),
-/// then walks forward re-lexing candidate rows, skipping non-matches, to
-/// serve up to `clamped` consecutive filtered rows. Holds the mutex for the
-/// whole call (bounded: O(checkpoints) + O(window) re-lex) — simpler and
-/// still safe on the caller/UI thread; see api/lesssheet.h FILTERED VIEWS.
+/// then walks forward, testing candidate rows to serve up to `clamped`
+/// consecutive filtered rows.
+///
+/// ARCH-huge-row-filtered: the per-candidate TEST lex is bounded to
+/// `api.window_row_scan_max_bytes` SOURCE bytes, exactly like windowSet's
+/// identity path above. A candidate whose terminator isn't found within the
+/// cap is OVERSIZED, and its FULL-cell match is NEVER re-decided here — that
+/// would mean either deciding on a bounded prefix (wrong: could drop a row
+/// that only matches in its tail) or re-lexing to its true end (the hang this
+/// bounds) — it is instead taken from `d.filter_oversized_matches`, the
+/// record the background filter-scan already staged for every oversized row
+/// it crossed (see filter.filterScanChunk / base.OversizedMatch). A matching
+/// oversized row is served as a bounded PREFIX (display-capped cells,
+/// `ls_row_oversized` true), same as the identity huge-row path; either way
+/// (matched or not) the walk advances past it via the checkpoint the
+/// frontier drops immediately after it (ARCH-huge-row-budget decision 2),
+/// never by re-scanning its remaining bytes. Holds the mutex for the whole
+/// call (bounded: O(checkpoints) + O(budget) re-lex) — simpler and still safe
+/// on the caller/UI thread; see api/lesssheet.h FILTERED VIEWS.
 fn windowSetFiltered(d: *Document, first_row: u64, clamped: u64) api.RowRange {
     d.lock();
     defer d.unlock();
@@ -150,19 +165,52 @@ fn windowSetFiltered(d: *Document, first_row: u64, clamped: u64) api.RowRange {
     const start = nav.nthMatchLocation(d, d.filter_block_counts.items, fctx, d.filter_rows, first_row) orelse
         return .{ .first_row = first_row, .row_count = 0 };
 
+    const scan_cap: usize = @intCast(api.window_row_scan_max_bytes);
     var produced: u64 = 0;
     var off: usize = @intCast(start.offset);
     var row = start.row;
     while (produced < materialize and row < d.filter_rows and off < d.content.len) {
-        // Test the FULL cell (cap = null), same rule as SEARCH, using the nav
-        // scratch (mutex already held throughout this call).
+        // Bound the SOURCE bytes scanned testing this ONE candidate to the
+        // per-row cap (ARCH-huge-row-filtered), exactly like windowSet.
+        const row_limit = @min(off +| scan_cap, d.content.len);
+        // Test the FULL cell within the bound (cap = null), same rule as
+        // SEARCH, using the nav scratch (mutex already held throughout this
+        // call).
         d.nav_scratch.clearRetainingCapacity();
         d.nav_refs.clearRetainingCapacity();
-        const test_res = lexer.lexInto(d.content, off, d.sep, d.quote, d.column_count, null, d.content.len, d.encoding, &d.nav_scratch, &d.nav_refs, d.gpa) catch break;
+        const test_res = lexer.lexInto(d.content, off, d.sep, d.quote, d.column_count, null, row_limit, d.encoding, &d.nav_scratch, &d.nav_refs, d.gpa) catch break;
+        if (test_res.capped) {
+            // OVERSIZED candidate: consult the background filter-scan's
+            // already-recorded FULL-cell match -- never re-tested on this
+            // bounded prefix (would wrongly decide on a prefix) and never by
+            // re-lexing to the row's true end (would hang).
+            const matched = nav.oversizedMatch(d.filter_oversized_matches.items, row) orelse false;
+            if (matched) {
+                // Re-lex the same bounded prefix WITH the display cap
+                // directly into the window -- a bounded prefix, flagged.
+                _ = lexer.lexInto(d.content, off, d.sep, d.quote, d.column_count, api.cell_max_bytes, row_limit, d.encoding, &d.win_buf, &d.win_refs, d.gpa) catch break;
+                d.win_source.append(d.gpa, row) catch break;
+                d.win_oversized.append(d.gpa, true) catch break;
+                produced += 1;
+                if (produced >= materialize) break; // that was the last row wanted
+            }
+            // Advance past the oversized row's true end via the checkpoint
+            // the frontier drops immediately after it (decision 2), instead
+            // of re-scanning its (possibly gigabytes of) remaining bytes.
+            const target_row = row + 1;
+            const skip_cp = nav.bestCheckpoint(d, target_row);
+            off = @intCast(skip_cp.offset);
+            row = skip_cp.row;
+            while (row < target_row) : (row += 1) {
+                off = lexer.recordBounds(d.content, off, d.sep, d.quote, d.content.len, d.encoding).next;
+            }
+            continue;
+        }
         if (matcher.matchRecord(fctx, d.nav_scratch.items, d.nav_refs.items) != null) {
             // Re-lex the same row WITH the display cap directly into the window.
-            _ = lexer.lexInto(d.content, off, d.sep, d.quote, d.column_count, api.cell_max_bytes, d.content.len, d.encoding, &d.win_buf, &d.win_refs, d.gpa) catch break;
+            _ = lexer.lexInto(d.content, off, d.sep, d.quote, d.column_count, api.cell_max_bytes, row_limit, d.encoding, &d.win_buf, &d.win_refs, d.gpa) catch break;
             d.win_source.append(d.gpa, row) catch break;
+            d.win_oversized.append(d.gpa, false) catch break;
             produced += 1;
         }
         off = test_res.next;
@@ -170,41 +218,6 @@ fn windowSetFiltered(d: *Document, first_row: u64, clamped: u64) api.RowRange {
     }
     d.win_rows = produced;
     return .{ .first_row = first_row, .row_count = produced };
-}
-
-/// Largest entry in a sorted (`.row` ascending) checkpoint list with
-/// `.row <= row`, or null when the list is empty or every entry's row > row.
-fn checkpointAtOrBefore(list: []const Checkpoint, row: u64) ?Checkpoint {
-    var lo: usize = 0;
-    var hi: usize = list.len;
-    while (lo < hi) {
-        const mid = lo + (hi - lo) / 2;
-        if (list[mid].row <= row) {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-    return if (lo == 0) null else list[lo - 1];
-}
-
-/// Largest checkpoint with `.row <= row` (checkpoints[0].row == 0 always).
-fn findCheckpoint(checkpoints: []const Checkpoint, row: u64) Checkpoint {
-    return checkpointAtOrBefore(checkpoints, row).?;
-}
-
-/// `findCheckpoint`, but also considers the extra checkpoints the frontier
-/// drops immediately after an oversized row (ARCH-huge-row-budget decision 2)
-/// when one lands closer to `row` — this is what lets the skip-from-
-/// checkpoint loop (and windowSet's oversized-row recovery) reach a row after
-/// a huge row without re-scanning it. Caller holds the document mutex (reads
-/// `d.checkpoints` / `d.oversized_checkpoints`).
-fn bestCheckpoint(d: *Document, row: u64) Checkpoint {
-    var best = findCheckpoint(d.checkpoints.items, row);
-    if (checkpointAtOrBefore(d.oversized_checkpoints.items, row)) |alt| {
-        if (alt.row > best.row) best = alt;
-    }
-    return best;
 }
 
 /// See api/lesssheet.h `ls_cell`. Zero allocation; total function.
@@ -258,10 +271,11 @@ pub fn sourceRow(d: *const Document, row: u64) u64 {
 
 /// See api/lesssheet.h `ls_row_oversized`. Same window/borrow domain as ls_cell
 /// / sourceRow (win_oversized[i] is populated by ls_window_set alongside
-/// win_refs/win_source — ARCH-huge-row-budget). While filtered, windowSetFiltered
-/// never bounds its per-row scan (out of this feature's scope — see
-/// api/lesssheet.h ls_window_set's FILTERED VIEWS paragraph), so `win_oversized`
-/// stays empty and every filtered row correctly reports false ("served whole").
+/// win_refs/win_source — ARCH-huge-row-budget / ARCH-huge-row-filtered).
+/// Populated identically in either view: windowSet (identity) appends one
+/// entry per materialized row, and windowSetFiltered (FILTERED VIEWS) does
+/// too — including for a giant matching row served as a bounded prefix (true)
+/// — so this reports the real per-row signal in both coordinate spaces.
 /// Total function; ZERO allocation; never fails; never scans.
 pub fn rowOversized(d: *const Document, row: u64) bool {
     if (row < d.win_first or row >= d.win_first + d.win_rows) return false;

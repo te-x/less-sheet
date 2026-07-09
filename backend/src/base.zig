@@ -1,8 +1,8 @@
 //! Shared document state: the `Document` aggregate, the small value types its
-//! fields embed (`CellRef`, `Checkpoint`, `MatchCtx`, `Decimal`), the
-//! api.Doc<->Document casts, and the cross-module tunables. Every other
-//! sibling module builds on this one; this module imports no siblings (see
-//! src/root.zig's module-boundary note).
+//! fields embed (`CellRef`, `Checkpoint`, `OversizedMatch`, `MatchCtx`,
+//! `Decimal`), the api.Doc<->Document casts, and the cross-module tunables.
+//! Every other sibling module builds on this one; this module imports no
+//! siblings (see src/root.zig's module-boundary note).
 
 const std = @import("std");
 const api = @import("api");
@@ -28,6 +28,15 @@ pub const CellRef = struct { start: usize, len: usize, truncated: bool = false }
 
 /// A sparse row-index entry: data row `row` begins at content offset `offset`.
 pub const Checkpoint = struct { row: u64, offset: u64 };
+
+/// ARCH-huge-row-filtered: the FULL-cell filter-match result the background
+/// filter-scan already decided for OVERSIZED row `row` (source extent >
+/// LS_WINDOW_ROW_SCAN_MAX_BYTES) — see filter.filterScanChunk and Document's
+/// `filter_oversized_matches`. Lets the FILTERED window path (window.
+/// windowSetFiltered / nav.nthMatchInBlock) honor that already-decided FULL-
+/// cell match without re-scanning the row. Backend-internal only — never
+/// crosses the ABI.
+pub const OversizedMatch = struct { row: u64, matched: bool };
 
 /// A resolved request, evaluated against a decoded record. Built from the
 /// document under the lock (nav) or from the worker's lock-free snapshot (scan).
@@ -122,10 +131,12 @@ pub const Document = struct {
     // (headScan / index's background scanChunk / a search or filter scan)
     // FIRST advances the shared frontier past it. Row-ascending, but NOT
     // aligned to checkpoint_interval like `checkpoints` (nav.zig's block-
-    // direct-indexing must not see these) -- window.zig's bestCheckpoint
-    // consults BOTH lists so ls_window_set's skip-from-checkpoint loop can
-    // reach a row after a huge row without re-scanning the huge row's bytes.
-    // O(oversized rows), never O(rows): most documents never append here.
+    // direct-indexing must not see these) -- nav.zig's bestCheckpoint
+    // consults BOTH lists so ls_window_set's skip-from-checkpoint loop (and,
+    // under a filter, nav.nthMatchInBlock's) can reach a row after a huge row
+    // without re-scanning the huge row's bytes. O(oversized rows), never
+    // O(rows): drainOversized's dedup guard keeps exactly one entry per
+    // oversized row, never a re-drained duplicate.
     oversized_checkpoints: std.ArrayList(Checkpoint),
     // Lock-free staging area for the ONE scan chunk currently executing (see
     // stageOversized/drainOversized below): never two chunks run concurrently
@@ -218,6 +229,23 @@ pub const Document = struct {
     // Per-index-block filter-match counters (owned): O(checkpoints) always,
     // aligned 1:1 with `checkpoints`, exactly like the search job's block_counts.
     filter_block_counts: std.ArrayList(u64),
+    // ARCH-huge-row-filtered: per-OVERSIZED-row filter-match record (see
+    // OversizedMatch) -- lets the FILTERED window path (window.
+    // windowSetFiltered / nav.nthMatchInBlock) honor the background filter-
+    // scan's FULL-cell match decision for a giant row without re-scanning it.
+    // `filter_oversized_stage` is lock-free staging exclusive to the ONE
+    // filter-scan chunk currently executing (mirrors `oversized_stage`, but
+    // filter-only: no other scan tests the filter predicate). At commit time
+    // (filter.commitFilter) it drains into `filter_oversized_matches`, the
+    // persistent, FILTER-GENERATION-scoped list (reset in setFilter alongside
+    // filter_block_counts) -- UNCONDITIONALLY, since the filter's own counted
+    // region always grows on every commit, unlike the shared
+    // oversized_checkpoints (gated on which scan first advanced the shared
+    // frontier). Row-ascending (the filter-scan's own cursor is monotonic,
+    // contiguous, and single-owner, so it can never re-stage or reorder a
+    // row). O(oversized rows), never O(rows)/O(matches).
+    filter_oversized_stage: std.ArrayList(OversizedMatch),
+    filter_oversized_matches: std.ArrayList(OversizedMatch),
     // Worker match-scan scratch + request snapshot (worker-only; lock-free
     // during a chunk; refreshed under the lock when filter_gen changes). Also
     // the lock-free snapshot a concurrent SEARCH chunk composes against while
@@ -292,6 +320,8 @@ pub fn freeDoc(doc: *Document) void {
     doc.nav_scratch.deinit(doc.gpa);
     doc.nav_refs.deinit(doc.gpa);
     doc.filter_block_counts.deinit(doc.gpa);
+    doc.filter_oversized_stage.deinit(doc.gpa);
+    doc.filter_oversized_matches.deinit(doc.gpa);
     doc.filter_scratch.deinit(doc.gpa);
     doc.filter_refs.deinit(doc.gpa);
     doc.wf_value.deinit(doc.gpa);
@@ -328,9 +358,10 @@ pub fn searchProgress(doc: *Document, off: u64) f64 {
 // beginOversizedChunk once before its loop and stageOversized per row; the
 // loop's caller (already holding the mutex at commit time -- see
 // index.workerMain's plain-chunk commit, search.commitSearch,
-// filter.commitFilter) calls drainOversized once. window.zig's
+// filter.commitFilter) calls drainOversized once. nav.zig's
 // checkpointAtOrBefore/bestCheckpoint are the only readers of
-// `oversized_checkpoints` (always under the mutex).
+// `oversized_checkpoints` (always under the mutex; called from window.zig's
+// ls_window_set paths and from nav.zig's own nthMatchInBlock).
 // ---------------------------------------------------------------------------
 
 /// Reset the lock-free oversized-row staging area (see stageOversized) before
@@ -363,14 +394,23 @@ pub fn stageOversized(doc: *Document, row: u64, start: u64, end: u64) void {
 /// index.scanChunk / search.commitSearch / filter.commitFilter): a chunk
 /// re-walking already-frontier-covered ground (search/filter catching up to
 /// an index that got there first) would otherwise re-stage rows out of the
-/// row-ascending order window.checkpointAtOrBefore's binary search relies on
-/// — discarding it is safe because whichever scan advanced the frontier
-/// through those rows FIRST already staged+drained them. Caller holds the
-/// document mutex (or is headScan during open, provably uncontended: the
-/// worker has not spawned yet). Best-effort: an OOM here only costs a future
-/// re-scan of the affected row, never correctness.
+/// row-ascending order nav.checkpointAtOrBefore's binary search relies on —
+/// discarding it is safe because whichever scan advanced the frontier through
+/// those rows FIRST already staged+drained them. Each staged entry is only
+/// appended if its `.row` strictly exceeds the current last entry's `.row`
+/// (REVIEW-huge-row-budget-1 finding 2): keeps the list sorted BY
+/// CONSTRUCTION, robust even if a future change let a second mid-block
+/// frontier overlap occur (today there is at most one — left mid-block only
+/// by headScan at open, so at most one straddling chunk can ever re-walk
+/// already-drained rows). Caller holds the document mutex (or is headScan
+/// during open, provably uncontended: the worker has not spawned yet).
+/// Best-effort: an OOM here only costs a future re-scan of the affected row,
+/// never correctness.
 pub fn drainOversized(doc: *Document, advancing: bool) void {
-    if (advancing and doc.oversized_stage.items.len > 0) {
-        doc.oversized_checkpoints.appendSlice(doc.gpa, doc.oversized_stage.items) catch {};
+    if (!advancing) return;
+    for (doc.oversized_stage.items) |cp| {
+        const n = doc.oversized_checkpoints.items.len;
+        if (n > 0 and cp.row <= doc.oversized_checkpoints.items[n - 1].row) continue;
+        doc.oversized_checkpoints.append(doc.gpa, cp) catch {};
     }
 }

@@ -208,6 +208,8 @@ pub fn openWithAllocator(gpa: std.mem.Allocator, path: [*:0]const u8, options: ?
         .filter_fold = false,
         .filter_scope_mask = &.{},
         .filter_block_counts = .empty,
+        .filter_oversized_stage = .empty,
+        .filter_oversized_matches = .empty,
         .filter_scratch = .empty,
         .filter_refs = .empty,
         .wf_value = .empty,

@@ -78,6 +78,34 @@ const FilterChunk = struct {
     matches: u64,
 };
 
+/// ARCH-huge-row-filtered: stage row `row`'s FULL-cell filter-match decision
+/// (`matched`) IFF its SOURCE extent [start, end) exceeded the per-row window
+/// scan cap — mirrors base.stageOversized's size test, but records the match
+/// decision itself (never scan-relevant offsets) so the FILTERED window path
+/// can honor it later without re-scanning (see base.OversizedMatch / window.
+/// windowSetFiltered / nav.nthMatchInBlock). Lock-free: exclusive to the ONE
+/// filter-scan chunk currently executing (same guarantee as `oversized_stage`
+/// — see filterScanChunk's caller-serialization note on Document).
+fn stageOversizedMatch(doc: *Document, row: u64, start: u64, end: u64, matched: bool) void {
+    if (end - start <= api.window_row_scan_max_bytes) return;
+    doc.filter_oversized_stage.append(doc.gpa, .{ .row = row, .matched = matched }) catch {};
+}
+
+/// Fold this filter-scan chunk's staged oversized-row match records (see
+/// stageOversizedMatch) into the persistent `filter_oversized_matches` list —
+/// UNCONDITIONALLY, unlike base.drainOversized's `advancing`-gated drain of
+/// the SHARED `oversized_checkpoints`: filterScanChunk always starts exactly
+/// where the filter's OWN cursor (filter_rows) left off, so it can never
+/// re-stage an already-recorded row, regardless of whether this chunk was
+/// also the one advancing the shared frontier. Caller holds the document
+/// mutex. Best-effort: an OOM here only costs a future re-scan of the
+/// affected row, never correctness.
+fn drainOversizedMatches(doc: *Document) void {
+    if (doc.filter_oversized_stage.items.len > 0) {
+        doc.filter_oversized_matches.appendSlice(doc.gpa, doc.filter_oversized_stage.items) catch {};
+    }
+}
+
 /// Lex + test the filter predicate for one block of data rows. Reads only
 /// immutable mmap bytes + the worker's lock-free filter snapshot (doc.wf_ctx,
 /// refreshed by refreshFilterWorkerCtx). Matches the FULL cell (cap = null),
@@ -89,6 +117,7 @@ pub fn filterScanChunk(doc: *Document, start_off: u64, start_row: u64) FilterChu
     var matches: u64 = 0;
     const target = ((start_row / checkpoint_interval) + 1) * checkpoint_interval;
     base.beginOversizedChunk(doc);
+    doc.filter_oversized_stage.clearRetainingCapacity(); // ARCH-huge-row-filtered
     while (row < target) {
         if (doc.stop_atomic.load(.monotonic)) return .{ .end_offset = i, .end_row = row, .eof = false, .checkpoint = null, .matches = matches };
         if (i >= content.len) return .{ .end_offset = i, .end_row = row, .eof = true, .checkpoint = null, .matches = matches };
@@ -100,15 +129,22 @@ pub fn filterScanChunk(doc: *Document, start_off: u64, start_row: u64) FilterChu
         const res = lexer.lexInto(content, i, doc.sep, doc.quote, doc.column_count, null, content.len, doc.encoding, &doc.filter_scratch, &doc.filter_refs, doc.gpa) catch {
             const nb = lexer.recordBounds(content, i, doc.sep, doc.quote, content.len, doc.encoding);
             base.stageOversized(doc, row, @intCast(i), @intCast(nb.next));
+            stageOversizedMatch(doc, row, @intCast(i), @intCast(nb.next), false);
             i = nb.next;
             row += 1;
             if (nb.next >= content.len) return .{ .end_offset = i, .end_row = row, .eof = true, .checkpoint = null, .matches = matches };
             continue;
         };
-        if (matcher.matchRecord(doc.wf_ctx, doc.filter_scratch.items, doc.filter_refs.items) != null) matches += 1;
+        // ARCH-huge-row-filtered: this is the ONLY place a giant row's match
+        // is ever decided (FULL-cell, cap = null) -- recorded via
+        // stageOversizedMatch so the FILTERED window path can honor it
+        // without re-scanning.
+        const matched = matcher.matchRecord(doc.wf_ctx, doc.filter_scratch.items, doc.filter_refs.items) != null;
+        if (matched) matches += 1;
         // This scan also feeds the base row index (ARCH-huge-row-budget): see
         // the matching comment in search.searchScanChunk.
         base.stageOversized(doc, row, @intCast(i), @intCast(res.next));
+        stageOversizedMatch(doc, row, @intCast(i), @intCast(res.next), matched);
         i = res.next;
         row += 1;
         if (res.next >= content.len) return .{ .end_offset = i, .end_row = row, .eof = true, .checkpoint = null, .matches = matches };
@@ -152,6 +188,10 @@ pub fn commitFilter(doc: *Document, res: FilterChunk) void {
     }
     // ARCH-huge-row-budget: see the matching comment in search.commitSearch.
     base.drainOversized(doc, advancing);
+    // ARCH-huge-row-filtered: drain this chunk's staged oversized-row filter-
+    // match records UNCONDITIONALLY (never gated on `advancing`, unlike the
+    // shared oversized_checkpoints above) — see drainOversizedMatches.
+    drainOversizedMatches(doc);
     if (res.eof) {
         doc.complete = true;
         doc.total_rows = doc.filter_rows;
@@ -324,6 +364,7 @@ pub fn setFilter(d: *Document, request: *const api.SearchRequest) bool {
 
     // Reset the counted region / counters; the filter-scan restarts from row 0.
     d.filter_block_counts.clearRetainingCapacity();
+    d.filter_oversized_matches.clearRetainingCapacity(); // ARCH-huge-row-filtered
     d.filter_total = 0;
     d.filter_total_exact = false;
     d.filter_rows = 0;
