@@ -249,15 +249,24 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
         emitLayoutFramesIfEnabled()
     }
 
-    /// Total table (single-column) width: data columns + the empty filler
-    /// columns that carry the spreadsheet fill to the right window edge.
+    /// The single table column's width: exactly the viewport when the data
+    /// columns fit inside it, and the data width only when the data genuinely
+    /// overflows (the sole case that warrants a horizontal scroller). The empty
+    /// filler columns carry the spreadsheet fill to the right edge as a DRAWING
+    /// device — the row view paints their hairlines and clips at the column width.
     private func refreshColumnWidth() {
         let dataWidth = widths.reduce(0, +)
         let viewportW = scroll.contentView.bounds.width
         fillerColumns = viewportW > dataWidth
             ? Int(ceil((viewportW - dataWidth) / GridMetrics.fillerColumnWidth)) : 0
-        let total = dataWidth + CGFloat(fillerColumns) * GridMetrics.fillerColumnWidth
-        let target = max(total, viewportW)
+        // Fill to the viewport, never past it. The old `dataWidth + fillerColumns
+        // * fillerWidth` overshot by up to one filler width (ceil rounds the
+        // filler count up), leaving a permanent sliver of horizontal overscroll —
+        // i.e. a spurious horizontal scroller even for a few short columns. The
+        // filler hairlines still fill the width (drawn by the row view, clipped
+        // at the column edge); only the column's own width is clamped, so nothing
+        // scrolls horizontally unless the real data is wider than the viewport.
+        let target = max(dataWidth, viewportW)
         if abs(column.width - target) > 0.5 { column.width = target }
     }
 
