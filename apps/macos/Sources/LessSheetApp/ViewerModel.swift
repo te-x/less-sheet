@@ -317,7 +317,7 @@ final class DocumentModel {
         let lo = max(start, firstVisibleRow)
         let hi = min(start + window.rows.count, firstVisibleRow + max(lastVisibleCount, 1))
         guard lo < hi else { return }
-        let bodyFont = NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
+        let bodyFont = NSFont.monospacedSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
         var widths = columnWidths
         var grew = false
         for c in visibleColumns where c < widths.count && widths[c] < GridMetrics.maxColumnWidth {
@@ -433,7 +433,7 @@ final class DocumentModel {
     }
 
     static func rowNumberWidth(digits: Int) -> CGFloat {
-        let font = NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
+        let font = NSFont.monospacedDigitSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .regular)
         let sample = String(repeating: "8", count: max(1, digits)) as NSString
         return ceil(sample.size(withAttributes: [.font: font]).width) + GridMetrics.rowNumberHPadding * 2
             + GridMetrics.oversizedMarkerReserve
@@ -1067,7 +1067,7 @@ final class DocumentModel {
 
     static func measureColumnWidths(header: [String]?, sample: [[String]], columnCount: Int) -> [CGFloat] {
         guard columnCount > 0 else { return [] }
-        let bodyFont = NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
+        let bodyFont = NSFont.monospacedSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
         let headFont = NSFont.systemFont(ofSize: NSFont.systemFontSize, weight: .semibold)
         var widths = [CGFloat](repeating: GridMetrics.minColumnWidth, count: columnCount)
         for c in 0..<columnCount {

@@ -838,7 +838,11 @@ final class SheetRowView: NSTableRowView {
     override var isEmphasized: Bool { get { false } set {} }   // never draw selection emphasis
     override func drawSelection(in dirtyRect: NSRect) {}       // pure viewer
 
-    private static let font = NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
+    // Data cells: SF Mono (fully monospaced) so the file's content reads like the
+    // raw file and columns line up. MUST match the width-measurement font in
+    // DocumentModel (measureColumnWidths / growColumnWidthsToFitWindow) or the
+    // columns would be sized for the wrong glyphs.
+    private static let font = NSFont.monospacedSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
 
     override func draw(_ dirtyRect: NSRect) {
         NSColor.textBackgroundColor.setFill()
@@ -1003,7 +1007,11 @@ final class GridGutterView: NSView, NSViewToolTipOwner {
 
     override var isFlipped: Bool { true }
 
-    private static let font = NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
+    // Row numbers are chrome (generated line numbers, not file data): keep the
+    // tabular-digit font — NOT the data cells' SF Mono — so digits stay aligned,
+    // but one size smaller than the data. MUST match the gutter-width measurement
+    // (DocumentModel.rowNumberWidth).
+    private static let font = NSFont.monospacedDigitSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .regular)
 
     /// Honest oversized-row tooltip (no "load completely" affordance exists —
     /// ARCH non-goal, purely informational). Deliberately names NO byte
