@@ -299,7 +299,15 @@ final class DocumentModel {
     /// the just-materialized window's cells, capped at maxColumnWidth. Runs only
     /// on materialization (scroll-settle / jump), not the per-frame scroll path;
     /// monotone so it converges and never jitters; only reassigns `columnWidths`
-    /// (triggering a reflow) when a width actually grows.
+    /// (triggering a reflow) when a width actually grows. A cell the core already
+    /// clipped — display-TRUNCATED (`RowWindow.truncated`), or any cell of an
+    /// OVERSIZED row (`RowWindow.oversized`, ARCH-huge-row-budget) — is excluded
+    /// from the measurement: it isn't the cell's real content, just a cut prefix,
+    /// so growing a column to fit it shows no more of the cell (the truncation
+    /// mark still shows) while it CAN force a spurious horizontal scroller on an
+    /// otherwise normal-width landing (the giant-row case). Such a cell simply
+    /// leaves its column at its current width; normal cells still grow it as
+    /// before.
     private func growColumnWidthsToFitWindow() {
         guard columnCount > 0, !window.rows.isEmpty, columnWidths.count == columnCount else { return }
         // Measure only the VISIBLE slice (~a viewport), not the whole buffered
@@ -315,8 +323,11 @@ final class DocumentModel {
         for c in visibleColumns where c < widths.count && widths[c] < GridMetrics.maxColumnWidth {
             var w = widths[c]
             for r in lo..<hi {
-                let row = window.rows[r - start]
+                let idx = r - start
+                if idx < window.oversized.count, window.oversized[idx] { continue }
+                let row = window.rows[idx]
                 guard c < row.count else { continue }
+                if idx < window.truncated.count, c < window.truncated[idx].count, window.truncated[idx][c] { continue }
                 let cellW = Self.textWidth(row[c], bodyFont) + GridMetrics.cellHPadding * 2
                 if cellW > w {
                     w = cellW

@@ -23,7 +23,10 @@ import SwiftUI
 //   scrollview minY 0  the scroll view fills the window from its top edge, so
 //                    content scrolls up UNDER the band and frosts through it.
 // The faded row-number gutter is a fixed left strip (pinned against horizontal
-// scroll, synced vertically to the table's rows).
+// scroll, synced vertically to the table's rows) that ALSO fills the full
+// window height and sits BEHIND the band, exactly like the scroll view: row
+// numbers scroll up under the band and frost through it just like the data,
+// and row 0's number rests at the same baseline as row 0's data.
 
 // MARK: - Grid geometry (shared derivations over GridMetrics)
 
@@ -185,8 +188,8 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
         band.cornerRadius = 0
 
         container.addSubview(scroll)
-        container.addSubview(band)      // in front of scroll: rows frost under it
-        container.addSubview(gutter)    // in front of scroll (below the band)
+        container.addSubview(gutter)    // in front of scroll, BEHIND the band: numbers frost under it too
+        container.addSubview(band)      // in front of scroll + gutter: both frost under it
         container.addSubview(header)    // in front of the band: titles legible
 
         refreshLayoutMetrics()
@@ -240,8 +243,12 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
         // Header: the bottom 22 pt of the band, aligned with the data columns.
         header.frame = NSRect(x: gw, y: b.height - NativeGrid.bandHeight,
                               width: max(0, b.width - gw), height: NativeGrid.headerHeight)
-        // Gutter: the fixed left strip below the band.
-        gutter.frame = NSRect(x: 0, y: 0, width: gw, height: max(0, b.height - NativeGrid.bandHeight))
+        // Gutter: the fixed left strip, FULL window height (like the scroll
+        // view) so its row numbers scroll up under the band and frost through
+        // it exactly like the data, instead of stopping dead at the band's
+        // bottom edge. z-order (behind the band, above the scroll) does the
+        // actual frosting; the frame just gives it the room to draw into.
+        gutter.frame = NSRect(x: 0, y: 0, width: gw, height: b.height)
         header.contentOffsetX = scroll.contentView.bounds.origin.x
         refreshColumnWidth()
         header.needsDisplay = true
@@ -254,7 +261,11 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
     /// overflows (the sole case that warrants a horizontal scroller). The empty
     /// filler columns carry the spreadsheet fill to the right edge as a DRAWING
     /// device — the row view paints their hairlines and clips at the column width.
-    private func refreshColumnWidth() {
+    /// `site` labels the probe line with the caller (diagnostic only): "layout"
+    /// from `layoutContainer`, "scroll" from `clipBoundsChanged` re-syncing
+    /// against the clip's OWN width changes (e.g. a vertical scroller
+    /// inserting/removing itself) independent of the gutter/container frame.
+    private func refreshColumnWidth(site: String = "layout") {
         let dataWidth = widths.reduce(0, +)
         let viewportW = scroll.contentView.bounds.width
         fillerColumns = viewportW > dataWidth
@@ -268,6 +279,11 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
         // scrolls horizontally unless the real data is wider than the viewport.
         let target = max(dataWidth, viewportW)
         if abs(column.width - target) > 0.5 { column.width = target }
+        ColWidthProbe.log(
+            site: site, total: dataWidth, viewport: viewportW, scrollFrame: scroll.frame.width,
+            documentWidth: table.frame.width, columnWidth: column.width, filler: fillerColumns,
+            hScrollerHidden: scroll.horizontalScroller?.isHidden ?? true
+        )
     }
 
     // MARK: Model -> AppKit
@@ -498,12 +514,26 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
             model.viewportChanged(firstVisibleRow: first, visibleRowCount: visible.length)
         }
 
-        // The row-number gutter may widen when bigger numbers scroll in.
+        // The row-number gutter may widen when bigger numbers scroll in — a
+        // full relayout (frames + column/filler width) when it does.
         let gw = model.rowNumberColumnWidth()
         if abs(gw - gutterWidth) > 0.5 {
             gutterWidth = gw
             layoutContainer()
         }
+        // The clip's OWN width can also change independent of the gutter — e.g.
+        // a vertical scroller inserting/removing itself as the row-count
+        // estimate crosses its need threshold (this can settle a tick AFTER
+        // `layoutContainer` last read `scroll.contentView.bounds.width`, since
+        // that read races the scroller's own internal tile — PROVEN by
+        // LESSSHEET_LOG_COLWIDTH: a "layout" reading can show `colwidth` matching
+        // a since-shrunk `viewport` one tick later). Re-sync the column/filler
+        // width to the FRESH, now-settled clip width on every scroll/bounds tick
+        // (cheap: O(visibleColumns)) so a stale, too-wide `column.width` can
+        // never linger and force a spurious horizontal scroller (or hide a
+        // genuine one) — `layoutContainer` already covers this when the gutter
+        // branch above ran; harmless to re-run.
+        refreshColumnWidth(site: "scroll")
 
         header.contentOffsetX = clip.bounds.origin.x
         header.needsDisplay = true
@@ -601,6 +631,10 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
         ScrollProbe.noteFrame("band", yDown(band.bounds, band))
         ScrollProbe.noteFrame("header", yDown(header.bounds, header))
         ScrollProbe.noteFrame("scrollview", yDown(scroll.bounds, scroll))
+        // Additive (not a pinned label): proves the gutter frame extends to the
+        // window top (minY 0), matching band/scrollview, instead of stopping at
+        // the band's old bottom edge (54) — the headless half of the bug-#1 fix.
+        ScrollProbe.noteFrame("gutter", yDown(gutter.bounds, gutter))
         if dataRowCount > 0 {
             ScrollProbe.noteFrame("row1", yDown(table.rect(ofRow: 0), table))
         }
@@ -758,10 +792,15 @@ final class GridHeaderView: NSView {
 /// horizontally), drawing the number for each currently-visible data row at that
 /// row's live y-position (queried from the table, so it stays exactly aligned
 /// through scroll and landing). Secondary color + tabular numerals so it reads
-/// as chrome, not data; filler rows carry no number. Rows flagged OVERSIZED
-/// (ARCH-huge-row-budget req. 7 — `RowWindow.oversized` / `ls_row_oversized`)
-/// additionally draw a small tinted SF Symbol before the number, with a
-/// hover tooltip explaining the budget.
+/// as chrome, not data; filler rows carry no number. Its frame spans the FULL
+/// window height and sits BEHIND the band (added before it in z-order) — just
+/// like the data scroll view — so a scrolled-up row number travels under the
+/// band and frosts through the glass exactly like the data, rather than
+/// stopping dead at the band's edge; at rest row 0's number lands at the same
+/// baseline as row 0's data. Rows flagged OVERSIZED (ARCH-huge-row-budget
+/// req. 7 — `RowWindow.oversized` / `ls_row_oversized`) additionally draw a
+/// small tinted SF Symbol before the number, with a hover tooltip explaining
+/// the budget.
 final class GridGutterView: NSView, NSViewToolTipOwner {
     weak var controller: NativeGridController?
 

@@ -190,6 +190,45 @@ enum ScrollProbe {
     }
 }
 
+// Diagnostic: report the grid's column-width geometry — the visible data
+// columns' summed width, the clip/viewport width, the scroll view's own frame
+// width, the NSTableView documentView's frame width, the single table
+// column's width, the synthetic filler-column count, and whether the LIVE
+// horizontal scroller widget is actually hidden right now — so "does the data
+// fit without a horizontal scroller" is a MEASUREMENT (total/docwidth/colwidth
+// <= viewport, AND hscroller_hidden=true) rather than an eyeball, whether the
+// cause is a giant-row cell that must not have pushed a column past the
+// viewport, or a STALE width read (e.g. `scroll.contentView.bounds` not yet
+// settled to a just-set `scroll.frame`, or `documentView`/`column.width`
+// disagreeing with the clip) that left AppKit's OWN scroller-needed
+// determination stuck showing one even after the widths agree again.
+// `site` distinguishes WHERE in the layout/scroll cycle the reading was taken
+// (e.g. "layout" — inside `layoutContainer`'s `refreshColumnWidth`, right
+// after `scroll.frame` is (re)set — vs "scroll" — from a live
+// `clipBoundsChanged`, once AppKit has actually settled the clip/scroller
+// geometry): the two can legitimately differ for one tick if a width read is
+// stale (this is exactly how the giant-file "spurious horizontal scroller
+// on short columns" bug was pinned down: a "layout" reading whose `viewport`
+// hadn't yet accounted for a vertical scroller about to insert itself, vs the
+// next "scroll" reading with the settled, narrower one). Inert unless
+// LESSSHEET_LOG_COLWIDTH is set.
+@MainActor
+enum ColWidthProbe {
+    static let enabled = ProcessInfo.processInfo.environment["LESSSHEET_LOG_COLWIDTH"] != nil
+
+    static func log(
+        site: String, total: CGFloat, viewport: CGFloat, scrollFrame: CGFloat,
+        documentWidth: CGFloat, columnWidth: CGFloat, filler: Int, hScrollerHidden: Bool
+    ) {
+        guard enabled else { return }
+        FileHandle.standardError.write(Data(String(
+            format: "lesssheet.colwidth site=\(site) total=%.1f viewport=%.1f scrollframe=%.1f"
+                + " docwidth=%.1f colwidth=%.1f filler=%d hscroller_hidden=\(hScrollerHidden)\n",
+            total, viewport, scrollFrame, documentWidth, columnWidth, filler
+        ).utf8))
+    }
+}
+
 // Verification-only: prove the header toggle PRESERVES the viewport position
 // (keeps the same physical/file record at the data-area top across the on/off
 // re-derivation, NOT scrolling to row 0 and NOT drifting by the ±1 header
