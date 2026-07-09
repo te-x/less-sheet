@@ -10,4 +10,16 @@
 import Foundation
 
 LaunchTiming.begin()
+
+// Halve the tooltip show delay before AppKit spins up (NSToolTipManager reads
+// `NSInitialToolTipDelay`, in ms, near launch — SwiftUI's `.help()` bridges to
+// it). Baseline: `defaults read -g NSInitialToolTipDelay` is unset on a stock
+// system, so AppKit falls back to its built-in default — widely corroborated
+// at ~2000 ms (e.g. the macOS 12.4 restored-preference discussion), so half is
+// 1000 ms. Set on THIS APP's own preferences domain (not `-g`/NSGlobalDomain):
+// it forces the effective delay for LessSheet's tooltips, wins over any
+// global value now or set later, and never touches the user's actual
+// system-wide default on disk.
+UserDefaults.standard.set(1_000, forKey: "NSInitialToolTipDelay")
+
 LessSheetApp.main()

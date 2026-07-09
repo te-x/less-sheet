@@ -22,7 +22,10 @@ struct HeaderButton: View {
     @Bindable var model: DocumentModel
 
     private var on: Bool { model.dialect.hasHeader }
-    private var tooltip: String { on ? "File contains header" : "File contains no header" }
+    private var tooltip: String {
+        on ? "First row is a header — click to treat it as data"
+           : "First row is data — click to treat it as a header"
+    }
 
     var body: some View {
         Button {
@@ -121,7 +124,7 @@ struct DialectPopupButton: View {
                     .offset(y: -(DialectPopup.height(for: kind) + OverlayMetrics.popupGap))
             }
         }
-        .help(DialectGlyph.pillLabel(kind))
+        .help(DialectGlyph.pillTooltip(kind))
         .accessibilityLabel(DialectGlyph.pillLabel(kind))
         .accessibilityValue(DialectGlyph.pillValue(kind, model.dialect))
         .accessibilityHint(overridden ? "Set by you" : "Guessed")
@@ -284,6 +287,18 @@ enum DialectGlyph {
         case .header: return "First row is header"
         case .separator: return "Separator"
         case .quote: return "Quote character"
+        }
+    }
+
+    /// The overlay tooltip for a separator/quote pill button (fuller than
+    /// `pillLabel`, explaining what a click does); unused by the pills for
+    /// `.header` (which has its own tooltip), kept here so the switch stays
+    /// exhaustive.
+    static func pillTooltip(_ kind: PillKind) -> String {
+        switch kind {
+        case .separator: return "Column separator — click to change (comma, tab, semicolon, …)"
+        case .quote: return "Quote character — click to change"
+        case .header: return "First row is a header (toggle)"
         }
     }
 

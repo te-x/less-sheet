@@ -151,7 +151,7 @@ struct JumpControlView: View {
                     .offset(y: -(OverlayMetrics.jumpPopupHeight + OverlayMetrics.popupGap))
             }
         }
-        .help("Jump to row")
+        .help("Jump to a specific row number")
         .accessibilityLabel("Jump to row")
         .onChange(of: model.jumpFlow) { _, flow in
             switch flow {
@@ -377,7 +377,7 @@ struct SettingsButton: View {
         }
         .buttonStyle(.plain)
         .glassChrome(.regular.interactive(), in: Circle())
-        .help("Settings")
+        .help("Settings — header, separator, quote, text encoding, and column visibility")
         .accessibilityLabel("Settings")
     }
 }

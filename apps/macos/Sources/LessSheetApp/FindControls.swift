@@ -60,7 +60,7 @@ struct FindControlView: View {
                     .offset(y: -(popupHeight + OverlayMetrics.popupGap))
             }
         }
-        .help("Find")
+        .help("Find text or a value in a column")
         .accessibilityLabel("Find")
         .onChange(of: model.findFocusRequests) { _, _ in
             // ⌘F: open + focus (keyboard reveal path).
