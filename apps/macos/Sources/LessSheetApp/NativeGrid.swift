@@ -214,6 +214,11 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
 
         built = true
 
+        // Verification: headless proxy for a HELD elastic overscroll bounce
+        // (no synthetic input events, no TCC prompt) — see EstimateReloadProbe.
+        // Inert unless LESSSHEET_SIMULATE_OVERSCROLL is set.
+        EstimateReloadProbe.armIfRequested(on: self)
+
         // Verification: the plain grid-content dump captures the LIVE table
         // (cacheDisplay) once it is built + sized — deterministic, unlike the
         // first-paint .task which races this makeNSView. Probe / overlay / find
@@ -264,7 +269,9 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
     /// `site` labels the probe line with the caller (diagnostic only): "layout"
     /// from `layoutContainer`, "scroll" from `clipBoundsChanged` re-syncing
     /// against the clip's OWN width changes (e.g. a vertical scroller
-    /// inserting/removing itself) independent of the gutter/container frame.
+    /// inserting/removing itself) independent of the gutter/container frame,
+    /// "estimate" from `syncRowCountEstimate` re-syncing against the SAME kind
+    /// of clip-width change when it happens AT REST (no scroll to catch it).
     private func refreshColumnWidth(site: String = "layout") {
         let dataWidth = widths.reduce(0, +)
         let viewportW = scroll.contentView.bounds.width
@@ -364,21 +371,9 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
         }
 
         // Row-count estimate refined (grows/shrinks toward exact as the index
-        // advances): update the scrollbar via reloadData, NOT noteNumberOfRows-
-        // Changed. On a table with 10^8 rows the latter is O(row-count delta) —
-        // 250-400 ms when the estimate jumps by millions between polls, blocking
-        // the main thread — whereas reloadData is O(viewport). Preserve the clip
-        // origin so the viewport row does not visibly jump (rows are absolute at
-        // row*rowHeight; ARCH criterion 5/6). reloadData on refinement is
-        // explicitly sanctioned by the ARCH.
-        let rows = numberOfRows(in: table)
-        if rows != lastRowCount {
-            lastRowCount = rows
-            let origin = scroll.contentView.bounds.origin
-            table.reloadData()
-            scroll.contentView.scroll(to: origin)
-            scroll.reflectScrolledClipView(scroll.contentView)
-        }
+        // advances): keep the scrollbar in sync — deferred while the clip is
+        // mid an elastic overscroll bounce (see `syncRowCountEstimate` below).
+        syncRowCountEstimate()
 
         // Data filled in (window paged) or highlights changed: redraw visibles.
         refreshVisibleRows()
@@ -388,6 +383,91 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
             model.pendingScrollRow = nil
             landOn(row: Int(min(target, UInt64(Int.max))))
         }
+    }
+
+    // MARK: Row-count estimate <-> elastic-overscroll guard
+
+    /// Re-syncs everything the row-count estimate drives, at rest, with no
+    /// scroll required: the column/filler width (always — see the
+    /// `refreshColumnWidth` call below) and the scrollbar extent (via
+    /// `reloadData`, never `noteNumberOfRowsChanged` — on a 10^8-row table the
+    /// latter is O(row-count delta): 250-400 ms when the estimate jumps by
+    /// millions between polls, blocking the main thread; `reloadData` is
+    /// O(viewport) — explicitly sanctioned by the ARCH, REVIEW-7). The
+    /// scrollbar-extent reload is SKIPPED while the clip is mid an elastic
+    /// overscroll bounce on EITHER axis (a live drag past the top/left edge,
+    /// or its spring bounce-back still returning): `reloadData` plus the
+    /// clip-origin restore below it would
+    /// otherwise perturb the bounds WHILE AppKit's own rubber-band animation
+    /// is mid-flight, visibly resetting/resuming it — the flash reported in
+    /// the first few seconds after opening a large file, exactly the window
+    /// `DocumentModel.startPolling` spends refining `rowCountInfo` (near
+    /// every 100 ms tick; confirmed via `LESSSHEET_LOG_ESTIMATE` +
+    /// `LESSSHEET_SIMULATE_OVERSCROLL` — see `EstimateReloadProbe`). Skipping
+    /// leaves `lastRowCount` stale, so this simply retries on the next
+    /// `apply()` (the next poll tick) or scroll tick — cheap, and
+    /// self-flushing the instant the bounce settles back into range: EVERY
+    /// tick of the settle, including its very last one, fires
+    /// `clipBoundsChanged`, which also calls this — no separate release-
+    /// triggered rescan is needed, and nothing is left stale once the user
+    /// stops interacting or indexing completes (the next scroll or poll picks
+    /// it up). The clip origin is restored across an applied reload so the
+    /// visible row never jumps (rows are absolute at row*rowHeight; ARCH
+    /// criterion 5/6).
+    @discardableResult
+    private func syncRowCountEstimate() -> Bool {
+        let rows = numberOfRows(in: table)
+        guard rows != lastRowCount else { return false }
+
+        // The vertical scroller's need — hence the viewport's AVAILABLE width
+        // for `column.width` — is driven by this SAME estimate, but inserting
+        // or removing it changes the clip's FRAME size, not its bounds ORIGIN:
+        // no `boundsDidChangeNotification` fires for that (the notification is
+        // specifically bounds-independent-of-frame), so `clipBoundsChanged`
+        // alone can never observe it and a stale, too-wide `column.width`
+        // lingers — a spurious horizontal scroller AT REST, no scroll required
+        // to trigger OR to fix it. Re-run the (lightweight, origin-untouched:
+        // no `reloadData`, no `scroll(to:)`) column-width sync here on every
+        // estimate change instead, so `column.width` matches the SETTLED clip
+        // even at rest. Unconditional (not overscroll-gated): it never touches
+        // the clip origin, so it cannot cause the reload collision below.
+        refreshColumnWidth(site: "estimate")
+
+        let (overX, overY) = overscrollAxes()
+        let origin = scroll.contentView.bounds.origin
+        EstimateReloadProbe.noteDecision(
+            applied: !(overX || overY), rows: rows, lastRows: lastRowCount,
+            origin: origin, overscrollX: overX, overscrollY: overY
+        )
+        guard !overX, !overY else { return false }
+        lastRowCount = rows
+        table.reloadData()
+        scroll.contentView.scroll(to: origin)
+        scroll.reflectScrolledClipView(scroll.contentView)
+        return true
+    }
+
+    /// Whether the clip is CURRENTLY beyond the natural (non-overscrolled)
+    /// range on each axis — a live elastic drag past an edge, or its spring
+    /// bounce-back animation still returning there. Mirrors the SAME clamp
+    /// math `landOn` already uses for y (the top content inset; content
+    /// height vs. viewport height at the bottom) plus the equivalent for x,
+    /// with a small tolerance for floating-point settle noise.
+    private func overscrollAxes() -> (x: Bool, y: Bool) {
+        let clip = scroll.contentView
+        let origin = clip.bounds.origin
+        let tolerance: CGFloat = 0.5
+
+        let contentHeight = CGFloat(numberOfRows(in: table)) * NativeGrid.rowHeight
+        let viewportHeight = max(clip.bounds.height, scroll.bounds.height)
+        let minY = -NativeGrid.contentInsetTop
+        let maxY = max(minY, contentHeight - viewportHeight)
+        let overY = origin.y < minY - tolerance || origin.y > maxY + tolerance
+
+        let maxX = max(0, table.frame.width - clip.bounds.width)
+        let overX = origin.x < -tolerance || origin.x > maxX + tolerance
+
+        return (x: overX, y: overY)
     }
 
     // MARK: Landing (O(viewport))
@@ -538,6 +618,13 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
         header.contentOffsetX = clip.bounds.origin.x
         header.needsDisplay = true
         gutter.needsDisplay = true
+
+        // Flush a row-count-estimate reload `apply()` deferred while this same
+        // clip was mid an elastic overscroll bounce (see `syncRowCountEstimate`):
+        // EVERY scroll tick lands here, including the bounce's settling one, so
+        // this is how a deferred reload gets applied the instant it is safe
+        // again, without waiting for the next poll-driven `apply()`.
+        syncRowCountEstimate()
 
         // Reconfigure the visible rows from the CURRENT window on every scroll,
         // not only when the window identity changes. During a fast fling a row
