@@ -373,6 +373,20 @@ final class DocumentModel {
         return window.oversized[idx]
     }
 
+    /// Whether a data row's cells are already SERVABLE — the materialized
+    /// window has reached it — as opposed to being within the row-count
+    /// estimate but past the scan frontier (the case `cells(forRow:)` /
+    /// `visibleBodyCells(forRow:)` return `nil` / empty-padded for). The grid
+    /// uses this to distinguish "still loading" from a genuinely empty row —
+    /// both otherwise render identically empty — and draws a subtle loading
+    /// placeholder for the former instead of silently blank cells (PROJECT:
+    /// constant feedback, no silent stalls). Same window-membership rule as
+    /// `cells(forRow:)`; unrelated to filtering (a filtered window's `cells`
+    /// already reflect the filtered view under that same rule).
+    func rowLoaded(forRow row: Int) -> Bool {
+        cells(forRow: row) != nil
+    }
+
     var displayRowCount: Int {
         Int(min(rowCountInfo.count, UInt64(Int.max)))
     }

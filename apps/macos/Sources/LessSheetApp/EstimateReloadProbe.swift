@@ -67,6 +67,21 @@ enum EstimateReloadProbe {
         ).utf8))
     }
 
+    /// Logs a stranded-past-EOF re-anchor (`NativeGridController.
+    /// reanchorIfStrandedPastNewEnd`, the estimate-COLLAPSE fix): the estimate
+    /// shrank enough to leave the (static, non-bouncing) viewport resting past
+    /// the new end, so it was snapped back to the new bottom edge instead of
+    /// left stranded. Gated by the SAME `LESSSHEET_LOG_ESTIMATE` flag as
+    /// `noteDecision` — both trace the estimate poll's effect on the live
+    /// viewport.
+    static func noteReanchor(fromY: CGFloat, toY: CGFloat, rows: Int, lastRows: Int) {
+        guard logEnabled else { return }
+        FileHandle.standardError.write(Data(String(
+            format: "lesssheet.estimate.reanchor from_y=%.1f to_y=%.1f rows=%d last=%d at_ms=%d\n",
+            fromY, toY, rows, lastRows, elapsedMs()
+        ).utf8))
+    }
+
     /// Called once the live grid is built (`NativeGridController.makeContainer`):
     /// forces + holds a simulated overscroll if armed, so the natural
     /// estimate-refinement reloads (driven by the REAL background indexer, not
@@ -116,6 +131,111 @@ enum EstimateReloadProbe {
         scroll.reflectScrolledClipView(clip)
         log("lesssheet.estimate.overscroll_released at_ms=\(elapsedMs())")
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { NSApp.terminate(nil) }
+    }
+
+    private static func log(_ line: String) {
+        FileHandle.standardError.write(Data((line + "\n").utf8))
+    }
+}
+
+// Verification-only: headless proxy for "the user scrolled the live
+// scrollbar to the current (possibly wildly over-estimated) end and let go"
+// — the estimate-COLLAPSE repro (a huge head-extrapolated total, e.g. one
+// final multi-GB row inflating a small-row-density extrapolation by orders
+// of magnitude, that later collapses toward the true count as the background
+// indexer reaches it). There is no scroll-to-position probe (no synthetic
+// input event / TCC-prompting API is used anywhere in this app), so this
+// parks the clip directly at the CURRENT estimate's bottom edge — the same
+// one-time-force technique `EstimateReloadProbe` already uses for its
+// overscroll-hold simulation — then lets the REAL background indexer run
+// completely unmodified and watches whether the viewport re-anchors the
+// instant the estimate collapses (`lesssheet.estimate.reanchor`, logged by
+// `EstimateReloadProbe.noteReanchor` when LESSSHEET_LOG_ESTIMATE=1 is also
+// set) instead of staying stranded past the new end. Self-terminates once the
+// estimate goes exact or the timeout elapses — independent of
+// LESSSHEET_DUMP_EXIT, since this is a one-shot diagnostic run, not a normal
+// viewing session.
+//
+//   LESSSHEET_SIMULATE_ESTIMATE_COLLAPSE=1      Arm the probe.
+//   LESSSHEET_SIMULATE_ESTIMATE_COLLAPSE_MS     Max wait for the estimate to
+//     go exact before giving up and quitting (default 60000).
+@MainActor
+enum EstimateCollapseProbe {
+    private static let env = ProcessInfo.processInfo.environment
+    static let active = env["LESSSHEET_SIMULATE_ESTIMATE_COLLAPSE"] != nil
+
+    private static var armed = false
+    private static var watchTask: Task<Void, Never>?
+    private static let start = DispatchTime.now()
+
+    private static func elapsedMs() -> Int {
+        let t0 = start   // see EstimateReloadProbe.elapsedMs for the ordering note
+        return Int((DispatchTime.now().uptimeNanoseconds &- t0.uptimeNanoseconds) / 1_000_000)
+    }
+
+    /// Called once the live grid is built (mirrors `EstimateReloadProbe.
+    /// armIfRequested`): park after the container's own post-open settling, so
+    /// the one-shot force survives to the first poll-driven estimate tick.
+    static func armIfRequested(on controller: NativeGridController) {
+        guard active, !armed else { return }
+        armed = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { park(on: controller) }
+    }
+
+    /// Forces the clip to the bottom edge of the CURRENT estimate — exactly
+    /// where a scrollbar drag to "the end" would leave it — using the same
+    /// clamp math `NativeGridController.landOn` / `overscrollAxes` use.
+    private static func park(on controller: NativeGridController) {
+        let clip = controller.scroll.contentView
+        let rows = controller.numberOfRows(in: controller.table)
+        let maxY = maxYFor(rows: rows, controller: controller)
+        clip.scroll(to: NSPoint(x: 0, y: maxY))
+        controller.scroll.reflectScrolledClipView(clip)
+        log("lesssheet.collapse.parked rows=\(rows) y=\(maxY)"
+            + " known_total=\(controller.model.rowCountInfo.count) exact=\(controller.model.rowCountInfo.isExact)"
+            + " at_ms=\(elapsedMs())")
+        watch(controller: controller, parkedRows: rows)
+    }
+
+    private static func maxYFor(rows: Int, controller: NativeGridController) -> CGFloat {
+        let clip = controller.scroll.contentView
+        let contentHeight = CGFloat(rows) * GridMetrics.rowHeight
+        let viewportHeight = max(clip.bounds.height, controller.scroll.bounds.height)
+        let restTop = -(GridMetrics.titleBarInset + GridMetrics.rowHeight)
+        return max(restTop, contentHeight - viewportHeight)
+    }
+
+    /// Polls the REAL (unmodified) indexer's progress: on every rows-count
+    /// change, logs the clip origin against the freshly-recomputed valid
+    /// range so "stranded" is a measured boolean, not an eyeball. Also drives
+    /// `apply()` itself each tick — headless windows get no implicit
+    /// `updateNSView` (see `HeaderToggleProbe`) — so the real fix path (and
+    /// the colwidth probe it shares) actually runs on a schedule independent
+    /// of whatever else happens to poke the view tree.
+    private static func watch(controller: NativeGridController, parkedRows: Int) {
+        let maxWaitMs = env["LESSSHEET_SIMULATE_ESTIMATE_COLLAPSE_MS"].flatMap(Int.init) ?? 60_000
+        watchTask = Task { @MainActor in
+            var lastLoggedRows = parkedRows
+            while elapsedMs() < maxWaitMs {
+                controller.apply()
+                let rows = controller.numberOfRows(in: controller.table)
+                if rows != lastLoggedRows {
+                    lastLoggedRows = rows
+                    let origin = controller.scroll.contentView.bounds.origin
+                    let maxY = maxYFor(rows: rows, controller: controller)
+                    let stranded = origin.y > maxY + 0.5
+                    log("lesssheet.collapse.tick rows=\(rows) origin_y=\(origin.y) max_y=\(maxY)"
+                        + " stranded=\(stranded) at_ms=\(elapsedMs())")
+                }
+                if controller.model.rowCountInfo.isExact {
+                    log("lesssheet.collapse.exact rows=\(rows) at_ms=\(elapsedMs())")
+                    break
+                }
+                try? await Task.sleep(for: .milliseconds(150))
+            }
+            log("lesssheet.collapse.done at_ms=\(elapsedMs())")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { NSApp.terminate(nil) }
+        }
     }
 
     private static func log(_ line: String) {

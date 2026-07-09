@@ -219,6 +219,31 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
         // Inert unless LESSSHEET_SIMULATE_OVERSCROLL is set.
         EstimateReloadProbe.armIfRequested(on: self)
 
+        // Verification: headless proxy for "the user scrolled the live
+        // scrollbar to the current (possibly wildly over-estimated) end and
+        // let go" — the estimate-COLLAPSE repro. No scroll-to-position probe
+        // exists, so this parks the clip directly, then watches the REAL
+        // background indexer and logs whether the viewport re-anchors instead
+        // of staying stranded. Inert unless LESSSHEET_SIMULATE_ESTIMATE_COLLAPSE
+        // is set; see EstimateCollapseProbe.
+        EstimateCollapseProbe.armIfRequested(on: self)
+
+        // Verification-only: force the live grid's scroll position to a
+        // specific row BEFORE the capture below, so a not-yet-servable
+        // region (rows within the estimate but past the scan frontier — the
+        // loading-placeholder case, see `SheetRowView.pending`) can be
+        // screenshotted without a live scroll gesture (no scroll-to-position
+        // probe exists; mirrors `EstimateCollapseProbe`'s direct
+        // `clip.scroll(to:)` technique). Composes with the ordinary
+        // LESSSHEET_DUMP_FRAME / LESSSHEET_DUMP_EXIT capture below — no
+        // bespoke path or termination of its own. Inert unless
+        // LESSSHEET_LIVE_SCROLL_ROW is set.
+        if let rowStr = ProcessInfo.processInfo.environment["LESSSHEET_LIVE_SCROLL_ROW"], let row = Int(rowStr) {
+            let y = CGFloat(row) * NativeGrid.rowHeight - NativeGrid.contentInsetTop
+            scroll.contentView.scroll(to: NSPoint(x: 0, y: y))
+            scroll.reflectScrolledClipView(scroll.contentView)
+        }
+
         // Verification: the plain grid-content dump captures the LIVE table
         // (cacheDisplay) once it is built + sized — deterministic, unlike the
         // first-paint .task which races this makeNSView. Probe / overlay / find
@@ -433,6 +458,21 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
         // the clip origin, so it cannot cause the reload collision below.
         refreshColumnWidth(site: "estimate")
 
+        // An estimate COLLAPSE (the discovered true row count lands far below
+        // the head-extrapolated one the user was scrolling against — e.g. one
+        // final multi-GB row inflating the extrapolation by orders of
+        // magnitude) can leave the viewport resting PAST the newly-shrunk
+        // valid range. Unlike a live elastic bounce, nothing is animating the
+        // clip — its origin is static — so the "self-flushes the instant the
+        // bounce settles" healing the overscroll guard below relies on never
+        // fires, and the user is left stranded past the true EOF forever (see
+        // `reanchorIfStrandedPastNewEnd`). Re-anchor BEFORE the overscroll
+        // check, so a stranded landing reads as an ordinary in-range sync
+        // below and the reload proceeds right away instead of deferring
+        // forever. A no-op when the estimate grew, or the current origin is
+        // already within the new range (the overwhelmingly common case).
+        reanchorIfStrandedPastNewEnd(rows: rows)
+
         let (overX, overY) = overscrollAxes()
         let origin = scroll.contentView.bounds.origin
         EstimateReloadProbe.noteDecision(
@@ -445,6 +485,39 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
         scroll.contentView.scroll(to: origin)
         scroll.reflectScrolledClipView(scroll.contentView)
         return true
+    }
+
+    /// Re-entrancy guard for `reanchorIfStrandedPastNewEnd`'s own
+    /// `clip.scroll(to:)` call, which can synchronously re-enter this file's
+    /// `clipBoundsChanged` -> `syncRowCountEstimate` (AppKit's bounds-changed
+    /// notification is not documented to skip a same-value set, so relying on
+    /// "the origin no longer needs correcting" to stop a recursion would be
+    /// unproven). The flag makes the recursion provably bounded regardless: a
+    /// re-entrant call always finds `reanchoring` true and returns before
+    /// touching the clip again — any further work the re-entrant call does is
+    /// merely redundant (idempotent reload/restore), never unbounded.
+    private var reanchoring = false
+
+    /// Snaps the clip's Y origin down to the new bottom edge when the
+    /// estimate SHRANK enough to leave it resting past it — the stranded-
+    /// past-EOF case (see `syncRowCountEstimate`). Mirrors `landOn`'s own end
+    /// clamp exactly, so the re-anchored position is indistinguishable from a
+    /// genuine jump-to-end landing: the last row settles above the EOF
+    /// overscroll filler, never mid-air past it. Never fires on growth (the
+    /// new maxY only rises) or when the current origin is already inside the
+    /// new range — the ordinary case on every file, pathological or not.
+    private func reanchorIfStrandedPastNewEnd(rows: Int) {
+        guard rows < lastRowCount, !reanchoring else { return }
+        let clip = scroll.contentView
+        let contentHeight = CGFloat(rows) * NativeGrid.rowHeight
+        let viewportHeight = max(clip.bounds.height, scroll.bounds.height)
+        let maxY = max(-NativeGrid.contentInsetTop, contentHeight - viewportHeight)
+        let before = clip.bounds.origin.y
+        guard before > maxY else { return }
+        reanchoring = true
+        clip.scroll(to: NSPoint(x: clip.bounds.origin.x, y: maxY))
+        reanchoring = false
+        EstimateReloadProbe.noteReanchor(fromY: before, toY: maxY, rows: rows, lastRows: lastRowCount)
     }
 
     /// Whether the clip is CURRENTLY beyond the natural (non-overscrolled)
@@ -660,11 +733,19 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
         rv.controller = self
         if row < dataRowCount {
             rv.isFiller = false
+            // Not-yet-servable (within the estimated range but past the
+            // materialized scan frontier): `visibleBodyCells` already empty-
+            // pads it exactly like a genuinely empty row, so this flag is
+            // what lets the row view tell the two apart and draw a loading
+            // placeholder instead of silently blank cells (PROJECT: constant
+            // feedback, no silent stalls).
+            rv.pending = !model.rowLoaded(forRow: row)
             rv.cells = model.visibleBodyCells(forRow: row)
             rv.truncated = model.visibleBodyTruncated(forRow: row)
             rv.highlights = model.cellHighlights(forRow: row)
         } else {
             rv.isFiller = true
+            rv.pending = false
             rv.cells = []
             rv.truncated = []
             rv.highlights = []
@@ -744,6 +825,14 @@ final class SheetRowView: NSTableRowView {
     var truncated: [Bool] = []
     var highlights: [SheetCellHighlight] = []
     var isFiller = false
+    /// A data row within the estimated range but NOT YET SERVABLE — past the
+    /// materialized scan frontier (`DocumentModel.cells(forRow:)` returned
+    /// `nil`) — as opposed to a genuinely empty row. `cells` is already
+    /// empty-padded identically for both, so this is the ONLY signal that
+    /// distinguishes "still loading" from "loaded and blank": it drives a
+    /// subtle placeholder bar per empty cell instead of rendering nothing.
+    /// Always false for filler rows (past EOF is not a loading state).
+    var pending = false
 
     override var isFlipped: Bool { true }
     override var isEmphasized: Bool { get { false } set {} }   // never draw selection emphasis
@@ -771,6 +860,8 @@ final class SheetRowView: NSTableRowView {
             if i < cells.count, !cells[i].isEmpty {
                 SheetRowView.drawText(cells[i], in: cell.insetBy(dx: GridMetrics.cellHPadding, dy: 0),
                                       font: SheetRowView.font, color: .labelColor, alignment: .left)
+            } else if pending {
+                SheetRowView.drawPendingPlaceholder(in: cell)
             }
             if i < truncated.count, truncated[i] {
                 SheetRowView.drawTruncationMarker(in: cell)
@@ -808,6 +899,25 @@ final class SheetRowView: NSTableRowView {
                          width: diameter, height: diameter)
         NSColor.secondaryLabelColor.withAlphaComponent(0.6).setFill()
         NSBezierPath(ovalIn: dot).fill()
+    }
+
+    /// The "still loading" placeholder for a not-yet-servable cell (`pending`
+    /// — new request: a subtle, native-consistent affordance so scrolling
+    /// ahead of the scan frontier reads as "loading", never as silently-empty
+    /// data). One flat, low-alpha rounded bar approximating a redacted line
+    /// of text — the same idea as SwiftUI's `.redacted(reason: .placeholder)`,
+    /// hand-drawn here since this view paints its own cells. Deliberately
+    /// STATIC — no shimmer/animation — so it costs exactly one extra fill per
+    /// empty cell on the scroll path (same order of cost as the highlight
+    /// fills above) and never schedules a redraw loop of its own.
+    static func drawPendingPlaceholder(in cell: NSRect) {
+        let inset = cell.insetBy(dx: GridMetrics.cellHPadding, dy: 0)
+        guard inset.width > 4, inset.height > 4 else { return }
+        let barHeight = min(9, inset.height * 0.4)
+        let bar = NSRect(x: inset.minX, y: inset.minY + (inset.height - barHeight) / 2,
+                         width: inset.width * 0.55, height: barHeight)
+        NSColor.labelColor.withAlphaComponent(0.08).setFill()
+        NSBezierPath(roundedRect: bar, xRadius: barHeight / 2, yRadius: barHeight / 2).fill()
     }
 
     /// Single-line, tail-truncated text drawn vertically centered in `rect`.
@@ -895,11 +1005,18 @@ final class GridGutterView: NSView, NSViewToolTipOwner {
 
     private static let font = NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
 
-    /// "Row exceeds the display budget…" tooltip text (ARCH-huge-row-budget
-    /// decision 4). No "load completely" affordance exists (ARCH non-goal) —
-    /// purely informational.
+    /// Honest oversized-row tooltip (no "load completely" affordance exists —
+    /// ARCH non-goal, purely informational). Deliberately names NO byte
+    /// figure: the row's SOURCE extent is bounded by the core's SCAN budget
+    /// (`LS_WINDOW_ROW_SCAN_MAX_BYTES`, ~1 MiB — how far it reads to find the
+    /// row's shape), but what actually reaches the screen is the much
+    /// smaller per-cell DISPLAY cap (`LS_CELL_MAX_BYTES`, 4 KiB) further
+    /// clipped to the column's on-screen width — typically well under 100
+    /// characters. Naming "~1 MB" (the earlier copy) described neither figure
+    /// and misled the user about how much they were actually seeing; better
+    /// to promise nothing quantitative.
     static let oversizedTooltip =
-        "Row exceeds the display budget — showing the first ~1 MB. Full content isn't loaded."
+        "This row is too large to display in full — showing a preview only; the rest of its content isn't loaded."
 
     /// The oversized-row marker: a small `exclamationmark.circle` (distinct
     /// from the per-cell "…" truncation dot, which means "column too narrow" —
