@@ -3168,3 +3168,170 @@ test "abi: LS_WINDOW_ROW_SCAN_MAX_BYTES is pinned and ls_row_oversized links" {
     try std.testing.expectEqual(false, api.ls_row_oversized(od.doc, 0)); // normal row
     try std.testing.expectEqual(false, api.ls_row_oversized(od.doc, 999)); // out of range
 }
+
+// ===========================================================================
+// huge-row-FILTERED slice (ARCH-huge-row-filtered). Frozen; planner-owned.
+// Extends the huge-row-budget WINDOW bound to the FILTERED view path: a filtered
+// view materialize landing on / crossing a giant row (source extent >
+// LS_WINDOW_ROW_SCAN_MAX_BYTES) must be O(budget), NOT O(giant-row bytes) --
+// WITHOUT changing filter MATCHING semantics. Matching stays FULL-cell and is
+// decided by the BACKGROUND filter-scan (ls_filter_set, cap = null); the
+// synchronous ls_window_set path must NOT re-decide a row's match by scanning it
+// in the foreground. A giant MATCHING filtered row is served exactly like the
+// identity path: a bounded PREFIX (each cell <= LS_CELL_MAX_BYTES; columns past
+// the per-row scan cap padded to "") with ls_row_oversized(filtered_index) TRUE.
+//
+// Contract basis (NO new api/ surface -- the giant rows' recorded match results
+// stay backend-internal, never crossing the ABI): the FUNCTION-LEVEL ls_window_set
+// contract in api/lesssheet.h already promises "never scans past the per-row cap
+// ... safe to call on the UI thread for ANY row size" and applies IN EITHER VIEW
+// (FILTERED VIEWS: "ls_window_set never scans, in either view"); ls_row_oversized
+// is already defined over a FILTERED index while a filter is active. This feature
+// makes the FILTERED path deliver that already-frozen promise.
+//
+// Naming: hrf<n>, mapping ARCH acceptance 1-4. Like the identity hr* tests, the
+// fixtures put the giant row just OVER the cap (~1.1 MiB, reusing hr_over_cap_bytes)
+// so the RED seed (windowSetFiltered still re-lexes unbounded and never flags a
+// filtered row oversized) still materializes them in ~1 ms: the tests pin
+// CORRECTNESS + the oversized flag + the BOUND (a column past the per-row scan cap
+// is served "", proving the giant row was NOT fully re-lexed) -- never wall-clock.
+// The <100 ms landing is the same frontend probe as the identity path (criterion 1).
+// ---------------------------------------------------------------------------
+
+/// Append ONE giant data row to `buf`: its FIRST cell is `hr_over_cap_bytes` of
+/// filler, so its SECOND cell (col 1) lies entirely PAST the per-row window scan
+/// cap. `needle_in_prefix` = the filler is preceded by "needle", so the giant row
+/// matches a "needle" filter within its VISIBLE (display-capped) prefix; otherwise
+/// the filler is pure 'X' and the row's ONLY "needle" is its col-1 TAIL -- a
+/// full-cell match the BACKGROUND filter-scan finds but a bounded foreground
+/// prefix cannot (the tail-match crux, ARCH criterion 2).
+fn appendGiantRow(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), needle_in_prefix: bool) !void {
+    const blob = try gpa.alloc(u8, hr_over_cap_bytes);
+    defer gpa.free(blob);
+    @memset(blob, 'X');
+    if (needle_in_prefix) try buf.appendSlice(gpa, "needle");
+    try buf.appendSlice(gpa, blob);
+    try buf.appendSlice(gpa, if (needle_in_prefix) ",TAIL\n" else ",needle\n");
+}
+
+test "hrf1-bounded: a filtered window crossing a giant MATCHING row serves it as a bounded prefix + flag; rows before/after whole (ARCH 1,4)" {
+    const gpa = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    try buf.appendSlice(gpa, "k,v\n"); //        texty record 1 -> header, 2 columns
+    try buf.appendSlice(gpa, "m0,needle\n"); //  source 0: match (normal)
+    try buf.appendSlice(gpa, "x1,plain\n"); //   source 1: no match
+    try appendGiantRow(gpa, &buf, true); //      source 2: GIANT, matches in its prefix
+    try buf.appendSlice(gpa, "x3,plain\n"); //   source 3: no match
+    try buf.appendSlice(gpa, "m4,needle\n"); //  source 4: match (normal)
+
+    var od = try openBytes(buf.items);
+    defer od.deinit();
+    try setFilter(od.doc, textReq("needle")); // sources 0,2,4 -> filtered 0,1,2
+    const f = try waitFilterDone(od.doc);
+    try std.testing.expectEqual(@as(u64, 3), f.total); // the giant row counted full-cell
+
+    // ONE materialize spanning the giant row (filtered index 1) -- the O(budget)
+    // crossing (ARCH criterion 1). The RED seed re-lexes the giant row unbounded.
+    const r = api.ls_window_set(od.doc, 0, api.window_max_rows);
+    try std.testing.expectEqual(@as(u64, 3), r.row_count);
+    // filtered 0 == source 0: a NORMAL matching row, served whole, NOT oversized.
+    try std.testing.expectEqual(@as(u64, 0), api.ls_source_row(od.doc, 0));
+    try std.testing.expectEqual(false, api.ls_row_oversized(od.doc, 0));
+    try expectCell(od.doc, 0, 1, "needle");
+    // filtered 1 == source 2: the GIANT matching row, served as a BOUNDED PREFIX
+    // (ARCH criterion 4). Its visible cell obeys the per-cell display cap and the
+    // row is FLAGGED oversized in FILTERED coordinates.
+    try std.testing.expectEqual(@as(u64, 2), api.ls_source_row(od.doc, 1));
+    try std.testing.expectEqual(true, api.ls_row_oversized(od.doc, 1)); // RED on seed
+    try std.testing.expect(api.ls_cell(od.doc, 1, 0).slice().len <= api.cell_max_bytes);
+    try std.testing.expectEqual(true, api.ls_cell_truncated(od.doc, 1, 0));
+    // col 1 lies past the per-row scan cap -> padded to "": proves the giant row
+    // was NOT fully re-lexed (the RED seed reaches the tail and serves "TAIL").
+    try expectCell(od.doc, 1, 1, ""); // RED on seed
+    // filtered 2 == source 4: the row AFTER the giant one, served whole -- reached
+    // via the checkpoint dropped after the oversized row, not by re-scanning it.
+    try std.testing.expectEqual(@as(u64, 4), api.ls_source_row(od.doc, 2));
+    try std.testing.expectEqual(false, api.ls_row_oversized(od.doc, 2));
+    try expectCell(od.doc, 2, 1, "needle");
+}
+
+test "hrf2-tailmatch: a giant row matching only in its TAIL (past the cap) still appears in the filtered view, served bounded (ARCH 1,2)" {
+    const gpa = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    try buf.appendSlice(gpa, "k,v\n"); //        header, 2 columns
+    try buf.appendSlice(gpa, "m0,needle\n"); //  source 0: match (normal)
+    try appendGiantRow(gpa, &buf, false); //     source 1: GIANT, matches ONLY via its col-1 tail
+    try buf.appendSlice(gpa, "m2,needle\n"); //  source 2: match (normal)
+
+    var od = try openBytes(buf.items);
+    defer od.deinit();
+    try setFilter(od.doc, textReq("needle")); // FULL-cell match -> sources 0,1,2
+    const f = try waitFilterDone(od.doc);
+    // Criterion 2: the giant row is counted because the BACKGROUND scan matched
+    // its FULL cell (the needle past the 1 MiB cap) -- never decided on a prefix.
+    try std.testing.expectEqual(@as(u64, 3), f.total);
+    try std.testing.expectEqual(@as(u64, 3), api.ls_row_count_get(od.doc).count);
+
+    const r = api.ls_window_set(od.doc, 0, api.window_max_rows);
+    try std.testing.expectEqual(@as(u64, 3), r.row_count);
+    // The giant row IS present at filtered index 1 (source 1): the window path
+    // honored the background full-cell match WITHOUT re-scanning to the tail. A
+    // foreground prefix decision (the wrong fix) would find no needle in the
+    // prefix and DROP the row, shifting filtered 1 to source 2.
+    try std.testing.expectEqual(@as(u64, 0), api.ls_source_row(od.doc, 0));
+    try std.testing.expectEqual(@as(u64, 1), api.ls_source_row(od.doc, 1));
+    try std.testing.expectEqual(@as(u64, 2), api.ls_source_row(od.doc, 2));
+    // Served as a bounded prefix: flagged oversized, col 0 display-capped, and the
+    // col-1 tail (which HOLDS the match) is past the scan cap -> served "" (the
+    // match is real but not visible in the served prefix).
+    try std.testing.expectEqual(true, api.ls_row_oversized(od.doc, 1)); // RED on seed
+    try std.testing.expect(api.ls_cell(od.doc, 1, 0).slice().len <= api.cell_max_bytes);
+    try std.testing.expectEqual(true, api.ls_cell_truncated(od.doc, 1, 0));
+    try expectCell(od.doc, 1, 1, ""); // RED on seed
+    // The normal rows around it are NOT oversized and serve their real cells.
+    try std.testing.expectEqual(false, api.ls_row_oversized(od.doc, 0));
+    try std.testing.expectEqual(false, api.ls_row_oversized(od.doc, 2));
+    try expectCell(od.doc, 0, 1, "needle");
+    try expectCell(od.doc, 2, 1, "needle");
+}
+
+test "hrf3-nav: filter count / source mapping / jump-under-filter / find-within-filter cross a giant row unchanged (ARCH 3)" {
+    const gpa = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    try buf.appendSlice(gpa, "k,v\n");
+    try buf.appendSlice(gpa, "m0,needle\n"); //  source 0: match  -> filtered 0
+    try buf.appendSlice(gpa, "x1,plain\n"); //   source 1: no match
+    try appendGiantRow(gpa, &buf, false); //     source 2: GIANT tail-match -> filtered 1
+    try buf.appendSlice(gpa, "x3,plain\n"); //   source 3: no match
+    try buf.appendSlice(gpa, "m4,needle\n"); //  source 4: match  -> filtered 2
+
+    var od = try openBytes(buf.items);
+    defer od.deinit();
+    try setFilter(od.doc, textReq("needle"));
+    // filter_total counts the giant row (full-cell) among the matches (ARCH 3).
+    try std.testing.expectEqual(@as(u64, 3), (try waitFilterDone(od.doc)).total);
+
+    // Source mapping is correct ACROSS the giant row (filtered 1 == the giant,
+    // source 2), and the rows around it map to their originals.
+    _ = api.ls_window_set(od.doc, 0, api.window_max_rows);
+    try std.testing.expectEqual(@as(u64, 0), api.ls_source_row(od.doc, 0));
+    try std.testing.expectEqual(@as(u64, 2), api.ls_source_row(od.doc, 1));
+    try std.testing.expectEqual(@as(u64, 4), api.ls_source_row(od.doc, 2));
+
+    // Jump under the filter: an ORIGINAL row number lands on the nearest match's
+    // FILTERED index -- the resolution crosses the giant row and stays exact.
+    api.ls_jump_start(od.doc, 3); // nearest match >= 3 is source 4 -> filtered 2
+    try std.testing.expectEqual(@as(u64, 2), (try waitJumpDone(od.doc)).landed_row);
+    api.ls_jump_start(od.doc, 1); // nearest match >= 1 is the giant (source 2) -> filtered 1
+    try std.testing.expectEqual(@as(u64, 1), (try waitJumpDone(od.doc)).landed_row);
+
+    // Find within the filter still counts the giant row (full-cell) among matches
+    // (all three filtered rows contain "needle"): counts stay exact and complete.
+    try startSearch(od.doc, textReq("needle"));
+    const s = try waitSearchDone(od.doc);
+    try std.testing.expectEqual(@as(u64, 3), s.total);
+    try std.testing.expectEqual(true, s.total_exact);
+}
