@@ -42,15 +42,24 @@ pub fn headScan(doc: *Document) void {
     const lim = headSourceLimit(doc); // == min(budget, content.len)
     var i: usize = @intCast(doc.data_start);
     var row: u64 = 0;
+    base.beginOversizedChunk(doc);
     while (i < lim) {
         const b = lexer.recordBounds(content, i, doc.sep, doc.quote, lim, doc.encoding);
         if (b.capped) break; // record spills past the head budget: leave for later
         if (doc.bom_len + b.next > head_budget) break; // keep bytes_scanned <= budget
+        // ARCH-huge-row-budget: this row's source extent may exceed the
+        // WINDOW's per-row scan cap (LS_WINDOW_ROW_SCAN_MAX_BYTES, much
+        // smaller than the O(head) budget above) even though headScan itself
+        // -- like every frontier scan -- always finds the row's true end.
+        base.stageOversized(doc, row, @intCast(i), @intCast(b.next));
         i = b.next;
         row += 1;
         if (row % checkpoint_interval == 0) doc.checkpoints.append(doc.gpa, .{ .row = row, .offset = i }) catch {};
         if (b.next >= content.len) break;
     }
+    // headScan is the document's very first frontier advance (the worker has
+    // not spawned yet): always the leading edge, so always drained.
+    base.drainOversized(doc, true);
     doc.frontier_offset = i;
     doc.frontier_rows = row;
     if (i >= content.len) {
@@ -220,6 +229,9 @@ pub fn workerMain(doc: *Document) void {
         doc.frontier_offset = res.end_offset;
         doc.frontier_rows = res.end_row;
         if (res.checkpoint) |cp| doc.checkpoints.append(doc.gpa, cp) catch {};
+        // scanChunk always starts exactly at the frontier: always the leading
+        // edge, so always drained (see base.drainOversized).
+        base.drainOversized(doc, true);
         if (res.eof) {
             doc.complete = true;
             doc.total_rows = doc.frontier_rows;
@@ -248,16 +260,20 @@ const ChunkResult = struct {
 };
 
 /// Lex records from `start_off`/`start_row` up to the next `checkpoint_interval`
-/// multiple, or EOF, or a stop request. Reads only immutable mmap bytes.
+/// multiple, or EOF, or a stop request. Reads only immutable mmap bytes; also
+/// stages any oversized row it crosses (base.stageOversized) for the caller
+/// to drain at commit time (base.drainOversized) -- ARCH-huge-row-budget.
 fn scanChunk(doc: *Document, start_off: u64, start_row: u64) ChunkResult {
     const content = doc.content;
     var i: usize = @intCast(start_off);
     var row = start_row;
     const target = ((start_row / checkpoint_interval) + 1) * checkpoint_interval;
+    base.beginOversizedChunk(doc);
     while (row < target) {
         if (doc.stop_atomic.load(.monotonic)) return .{ .end_offset = i, .end_row = row, .eof = false, .checkpoint = null };
         if (i >= content.len) return .{ .end_offset = i, .end_row = row, .eof = true, .checkpoint = null };
         const b = lexer.recordBounds(content, i, doc.sep, doc.quote, content.len, doc.encoding);
+        base.stageOversized(doc, row, @intCast(i), @intCast(b.next));
         i = b.next;
         row += 1;
         if (b.next >= content.len) return .{ .end_offset = i, .end_row = row, .eof = true, .checkpoint = null };

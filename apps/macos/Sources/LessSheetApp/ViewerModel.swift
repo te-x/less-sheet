@@ -27,6 +27,13 @@ enum GridMetrics {
     /// horizontal scroll and sized to the largest VISIBLE 1-based number.
     static let rowNumberHPadding: CGFloat = 8
     static let rowNumberMinDigits = 2
+    /// Extra gutter width reserved, UNCONDITIONALLY, for the oversized-row
+    /// marker (ARCH-huge-row-budget req. 7) drawn before the row number.
+    /// Reserved regardless of whether any currently-visible row is oversized
+    /// so the gutter's width never changes as oversized rows scroll in/out —
+    /// a scroll-triggered geometry change is exactly the class of bug the
+    /// column-width-growth fixes upstream had to correct.
+    static let oversizedMarkerReserve: CGFloat = 14
     /// End-of-file overscroll: rows of empty filler grid kept BELOW the last
     /// data row so the user can scroll a little past it and the bottom-right
     /// floating controls never cover the final rows. 5 rows (110 pt) clears the
@@ -342,6 +349,19 @@ final class DocumentModel {
         return window.truncated[idx]
     }
 
+    /// Whether a data row is OVERSIZED (ARCH-huge-row-budget req. 3/7): its
+    /// SOURCE extent exceeded the core's per-row window scan cap, so it was
+    /// served as a bounded prefix (mirrors `RowWindow.oversized`). `false` for
+    /// rows outside the currently materialized window, same rule as
+    /// `cells(forRow:)` / `truncated(forRow:)` — the gutter simply shows no
+    /// marker until a re-window catches up, exactly like a blank row.
+    func rowOversized(forRow row: Int) -> Bool {
+        let start = Int(window.firstRow)
+        let idx = row - start
+        guard idx >= 0, idx < window.oversized.count else { return false }
+        return window.oversized[idx]
+    }
+
     var displayRowCount: Int {
         Int(min(rowCountInfo.count, UInt64(Int.max)))
     }
@@ -391,6 +411,7 @@ final class DocumentModel {
         let font = NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
         let sample = String(repeating: "8", count: max(1, digits)) as NSString
         return ceil(sample.size(withAttributes: [.font: font]).width) + GridMetrics.rowNumberHPadding * 2
+            + GridMetrics.oversizedMarkerReserve
     }
 
     // MARK: - Grid view helpers (shared by the live grid and the dump grid)

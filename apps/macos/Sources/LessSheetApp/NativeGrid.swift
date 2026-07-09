@@ -758,17 +758,40 @@ final class GridHeaderView: NSView {
 /// horizontally), drawing the number for each currently-visible data row at that
 /// row's live y-position (queried from the table, so it stays exactly aligned
 /// through scroll and landing). Secondary color + tabular numerals so it reads
-/// as chrome, not data; filler rows carry no number.
-final class GridGutterView: NSView {
+/// as chrome, not data; filler rows carry no number. Rows flagged OVERSIZED
+/// (ARCH-huge-row-budget req. 7 — `RowWindow.oversized` / `ls_row_oversized`)
+/// additionally draw a small tinted SF Symbol before the number, with a
+/// hover tooltip explaining the budget.
+final class GridGutterView: NSView, NSViewToolTipOwner {
     weak var controller: NativeGridController?
 
     override var isFlipped: Bool { true }
 
     private static let font = NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
 
+    /// "Row exceeds the display budget…" tooltip text (ARCH-huge-row-budget
+    /// decision 4). No "load completely" affordance exists (ARCH non-goal) —
+    /// purely informational.
+    static let oversizedTooltip =
+        "Row exceeds the display budget — showing the first ~1 MB. Full content isn't loaded."
+
+    /// The oversized-row marker: a small `exclamationmark.circle` (distinct
+    /// from the per-cell "…" truncation dot, which means "column too narrow" —
+    /// this means "more source exists past this row's served prefix"), tinted
+    /// so it reads as an alert, not chrome.
+    private static let markerImage: NSImage? = {
+        guard let base = NSImage(systemSymbolName: "exclamationmark.circle", accessibilityDescription: oversizedTooltip)
+        else { return nil }
+        let config = NSImage.SymbolConfiguration(pointSize: 10, weight: .regular)
+            .applying(.init(paletteColors: [.systemOrange]))
+        return base.withSymbolConfiguration(config)
+    }()
+    private static let markerSide: CGFloat = 12
+
     override func draw(_ dirtyRect: NSRect) {
         NSColor.textBackgroundColor.setFill()
         bounds.fill()
+        removeAllToolTips() // re-registered below for whatever is visible now
         guard let c = controller else { return }
         let table = c.table
         let visible = table.rows(in: table.visibleRect)
@@ -789,11 +812,23 @@ final class GridGutterView: NSView {
                 let cell = NSRect(x: 0, y: local.minY, width: w - GridMetrics.rowNumberHPadding, height: local.height)
                 SheetRowView.drawText(String(source + 1), in: cell, font: GridGutterView.font,
                                       color: .secondaryLabelColor, alignment: .right)
+                if c.model.rowOversized(forRow: row), let marker = GridGutterView.markerImage {
+                    let markerRect = NSRect(
+                        x: 2, y: local.minY + (local.height - GridGutterView.markerSide) / 2,
+                        width: GridGutterView.markerSide, height: GridGutterView.markerSide
+                    )
+                    marker.draw(in: markerRect)
+                    addToolTip(markerRect, owner: self, userData: nil)
+                }
             }
         }
         // Right hairline separating the gutter from the data.
         grid.setFill()
         NSRect(x: w - NativeGrid.hairline, y: 0, width: NativeGrid.hairline, height: bounds.height).fill()
+    }
+
+    func view(_ view: NSView, stringForToolTip tag: NSView.ToolTipTag, point: NSPoint, userData: UnsafeMutableRawPointer?) -> String {
+        GridGutterView.oversizedTooltip
     }
 }
 

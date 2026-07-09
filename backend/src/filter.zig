@@ -88,19 +88,27 @@ pub fn filterScanChunk(doc: *Document, start_off: u64, start_row: u64) FilterChu
     var row = start_row;
     var matches: u64 = 0;
     const target = ((start_row / checkpoint_interval) + 1) * checkpoint_interval;
+    base.beginOversizedChunk(doc);
     while (row < target) {
         if (doc.stop_atomic.load(.monotonic)) return .{ .end_offset = i, .end_row = row, .eof = false, .checkpoint = null, .matches = matches };
         if (i >= content.len) return .{ .end_offset = i, .end_row = row, .eof = true, .checkpoint = null, .matches = matches };
         doc.filter_scratch.clearRetainingCapacity();
         doc.filter_refs.clearRetainingCapacity();
+        // Matches the FULL cell (cap = null), same rule as SEARCH -- never
+        // bounded by the WINDOW's per-row scan cap (ARCH-huge-row-budget only
+        // byte-bounds ls_window_set).
         const res = lexer.lexInto(content, i, doc.sep, doc.quote, doc.column_count, null, content.len, doc.encoding, &doc.filter_scratch, &doc.filter_refs, doc.gpa) catch {
             const nb = lexer.recordBounds(content, i, doc.sep, doc.quote, content.len, doc.encoding);
+            base.stageOversized(doc, row, @intCast(i), @intCast(nb.next));
             i = nb.next;
             row += 1;
             if (nb.next >= content.len) return .{ .end_offset = i, .end_row = row, .eof = true, .checkpoint = null, .matches = matches };
             continue;
         };
         if (matcher.matchRecord(doc.wf_ctx, doc.filter_scratch.items, doc.filter_refs.items) != null) matches += 1;
+        // This scan also feeds the base row index (ARCH-huge-row-budget): see
+        // the matching comment in search.searchScanChunk.
+        base.stageOversized(doc, row, @intCast(i), @intCast(res.next));
         i = res.next;
         row += 1;
         if (res.next >= content.len) return .{ .end_offset = i, .end_row = row, .eof = true, .checkpoint = null, .matches = matches };
@@ -142,6 +150,8 @@ pub fn commitFilter(doc: *Document, res: FilterChunk) void {
         doc.frontier_rows = res.end_row;
         if (res.checkpoint) |cp| doc.checkpoints.appendAssumeCapacity(cp);
     }
+    // ARCH-huge-row-budget: see the matching comment in search.commitSearch.
+    base.drainOversized(doc, advancing);
     if (res.eof) {
         doc.complete = true;
         doc.total_rows = doc.filter_rows;

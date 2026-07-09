@@ -24,12 +24,16 @@ const empty_str: api.Str = .{ .ptr = "", .len = 0 };
 /// the requested rows (behind the frontier) from the nearest checkpoint into
 /// the owned window buffer, evicting the previous window. Every cell is
 /// decoded through `decodeUnit` (the document's resolved encoding) and
-/// display-capped to LS_CELL_MAX_BYTES (requirement 8).
+/// display-capped to LS_CELL_MAX_BYTES (requirement 8). ARCH-huge-row-budget:
+/// the SOURCE bytes scanned per row are ALSO bounded to
+/// `api.window_row_scan_max_bytes`, so this stays O(min(row bytes, cap) x
+/// rows) regardless of row size (see the materialize loop below).
 pub fn windowSet(d: *Document, first_row: u64, row_count: u32) api.RowRange {
     // Evict the previous window regardless of the outcome.
     d.win_buf.clearRetainingCapacity();
     d.win_refs.clearRetainingCapacity();
     d.win_source.clearRetainingCapacity();
+    d.win_oversized.clearRetainingCapacity();
     d.win_first = first_row;
     d.win_rows = 0;
 
@@ -57,6 +61,11 @@ pub fn windowSet(d: *Document, first_row: u64, row_count: u32) api.RowRange {
             d.win_refs.append(d.gpa, .{ .start = start, .len = ref.len, .truncated = ref.truncated }) catch break;
         }
         d.win_source.append(d.gpa, 0) catch {}; // identity: row 0's source is row 0
+        // Record 1 spilled past the (far larger) O(head) budget, so it also
+        // exceeds the window scan cap: this pinned prefix is OVERSIZED by the
+        // same "served bounded; more source exists" definition (ARCH-huge-
+        // row-budget / requirement 9).
+        d.win_oversized.append(d.gpa, true) catch {};
         pinned_rows = 1;
         d.win_rows = 1;
     }
@@ -71,23 +80,54 @@ pub fn windowSet(d: *Document, first_row: u64, row_count: u32) api.RowRange {
     var cp: Checkpoint = .{ .row = 0, .offset = d.data_start };
     if (next_row < avail_end) {
         materialize = @min(remaining, avail_end - next_row);
-        cp = findCheckpoint(d.checkpoints.items, next_row);
+        cp = bestCheckpoint(d, next_row);
     }
     d.unlock();
 
     if (materialize == 0) return .{ .first_row = first_row, .row_count = pinned_rows };
 
-    // Skip from the checkpoint to next_row, then decode `materialize` rows.
+    // Skip from the checkpoint to next_row. This never crosses an oversized
+    // row's bytes: `cp` already lands at/after the checkpoint the frontier
+    // drops immediately after every oversized row it scans (ARCH-huge-row-
+    // budget decision 2), and any oversized row before next_row has
+    // necessarily already been scanned (next_row < avail_end).
     var off: usize = @intCast(cp.offset);
     var r = cp.row;
     while (r < next_row) : (r += 1) {
         off = lexer.recordBounds(d.content, off, d.sep, d.quote, d.content.len, d.encoding).next;
     }
+
+    const scan_cap: usize = @intCast(api.window_row_scan_max_bytes);
     var produced: u64 = 0;
-    while (produced < materialize) : (produced += 1) {
-        const res = lexer.lexInto(d.content, off, d.sep, d.quote, d.column_count, api.cell_max_bytes, d.content.len, d.encoding, &d.win_buf, &d.win_refs, d.gpa) catch break;
+    while (produced < materialize) {
+        // Bound the SOURCE bytes scanned for this ONE row to the per-row cap:
+        // a row whose terminator isn't found within it is served as a bounded
+        // prefix (cells stay individually display-capped, as before) and
+        // flagged oversized — this call never re-lexes a giant row's full
+        // bytes.
+        const row_limit = @min(off +| scan_cap, d.content.len);
+        const res = lexer.lexInto(d.content, off, d.sep, d.quote, d.column_count, api.cell_max_bytes, row_limit, d.encoding, &d.win_buf, &d.win_refs, d.gpa) catch break;
         d.win_source.append(d.gpa, next_row + produced) catch {}; // identity: source == physical row
-        off = res.next;
+        d.win_oversized.append(d.gpa, res.capped) catch {};
+        produced += 1;
+        if (!res.capped) {
+            off = res.next;
+            continue;
+        }
+        if (produced >= materialize) break; // that was the last row wanted
+        // Oversized: `res.next` is only the cap boundary, not the row's true
+        // end — locate the next row via the checkpoint the frontier already
+        // dropped right after this one (decision 2) instead of re-scanning
+        // its (possibly gigabytes of) remaining bytes.
+        const target_row = next_row + produced;
+        d.lock();
+        const skip_cp = bestCheckpoint(d, target_row);
+        d.unlock();
+        off = @intCast(skip_cp.offset);
+        var rr = skip_cp.row;
+        while (rr < target_row) : (rr += 1) {
+            off = lexer.recordBounds(d.content, off, d.sep, d.quote, d.content.len, d.encoding).next;
+        }
     }
     d.win_rows = pinned_rows + produced;
     return .{ .first_row = first_row, .row_count = pinned_rows + produced };
@@ -132,19 +172,37 @@ fn windowSetFiltered(d: *Document, first_row: u64, clamped: u64) api.RowRange {
     return .{ .first_row = first_row, .row_count = produced };
 }
 
-/// Largest checkpoint with `.row <= row` (checkpoints[0].row == 0 always).
-fn findCheckpoint(checkpoints: []const Checkpoint, row: u64) Checkpoint {
-    var best: Checkpoint = checkpoints[0];
+/// Largest entry in a sorted (`.row` ascending) checkpoint list with
+/// `.row <= row`, or null when the list is empty or every entry's row > row.
+fn checkpointAtOrBefore(list: []const Checkpoint, row: u64) ?Checkpoint {
     var lo: usize = 0;
-    var hi: usize = checkpoints.len;
+    var hi: usize = list.len;
     while (lo < hi) {
         const mid = lo + (hi - lo) / 2;
-        if (checkpoints[mid].row <= row) {
-            best = checkpoints[mid];
+        if (list[mid].row <= row) {
             lo = mid + 1;
         } else {
             hi = mid;
         }
+    }
+    return if (lo == 0) null else list[lo - 1];
+}
+
+/// Largest checkpoint with `.row <= row` (checkpoints[0].row == 0 always).
+fn findCheckpoint(checkpoints: []const Checkpoint, row: u64) Checkpoint {
+    return checkpointAtOrBefore(checkpoints, row).?;
+}
+
+/// `findCheckpoint`, but also considers the extra checkpoints the frontier
+/// drops immediately after an oversized row (ARCH-huge-row-budget decision 2)
+/// when one lands closer to `row` — this is what lets the skip-from-
+/// checkpoint loop (and windowSet's oversized-row recovery) reach a row after
+/// a huge row without re-scanning it. Caller holds the document mutex (reads
+/// `d.checkpoints` / `d.oversized_checkpoints`).
+fn bestCheckpoint(d: *Document, row: u64) Checkpoint {
+    var best = findCheckpoint(d.checkpoints.items, row);
+    if (checkpointAtOrBefore(d.oversized_checkpoints.items, row)) |alt| {
+        if (alt.row > best.row) best = alt;
     }
     return best;
 }
@@ -199,13 +257,15 @@ pub fn sourceRow(d: *const Document, row: u64) u64 {
 }
 
 /// See api/lesssheet.h `ls_row_oversized`. Same window/borrow domain as ls_cell
-/// / sourceRow. SEED STUB (RED): windowSet does not yet bound the per-row
-/// source scan to `api.window_row_scan_max_bytes`, so no row is flagged — this
-/// always returns false. The build-cell implementer will (per ARCH-huge-row-
-/// budget) bound windowSet's skip + materialize loops to that cap, store the
-/// per-row oversized flag on the Document parallel to `win_source`, drop a
-/// checkpoint after each oversized row, and return the stored flag here. Total
-/// function; ZERO allocation; never fails; never scans.
-pub fn rowOversized(_: *const Document, _: u64) bool {
-    return false;
+/// / sourceRow (win_oversized[i] is populated by ls_window_set alongside
+/// win_refs/win_source — ARCH-huge-row-budget). While filtered, windowSetFiltered
+/// never bounds its per-row scan (out of this feature's scope — see
+/// api/lesssheet.h ls_window_set's FILTERED VIEWS paragraph), so `win_oversized`
+/// stays empty and every filtered row correctly reports false ("served whole").
+/// Total function; ZERO allocation; never fails; never scans.
+pub fn rowOversized(d: *const Document, row: u64) bool {
+    if (row < d.win_first or row >= d.win_first + d.win_rows) return false;
+    const idx: usize = @intCast(row - d.win_first);
+    if (idx >= d.win_oversized.items.len) return false;
+    return d.win_oversized.items[idx];
 }

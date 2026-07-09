@@ -85,16 +85,20 @@ pub fn searchScanChunk(doc: *Document, start_off: u64, start_row: u64, filtered:
     var matches: u64 = 0;
     var filter_matches: u64 = 0;
     const target = ((start_row / checkpoint_interval) + 1) * checkpoint_interval;
+    base.beginOversizedChunk(doc);
     while (row < target) {
         if (doc.stop_atomic.load(.monotonic)) return .{ .end_offset = i, .end_row = row, .eof = false, .checkpoint = null, .matches = matches, .filter_matches = filter_matches };
         if (i >= content.len) return .{ .end_offset = i, .end_row = row, .eof = true, .checkpoint = null, .matches = matches, .filter_matches = filter_matches };
         doc.search_scratch.clearRetainingCapacity();
         doc.search_refs.clearRetainingCapacity();
         // SEARCH matches the FULL cell, not the display-capped bytes (cap =
-        // null; see requirement 10 / api/lesssheet.h SEARCH).
+        // null; see requirement 10 / api/lesssheet.h SEARCH). Never bounded by
+        // the WINDOW's per-row scan cap either -- ARCH-huge-row-budget only
+        // byte-bounds ls_window_set, never find/filter.
         const res = lexer.lexInto(content, i, doc.sep, doc.quote, doc.column_count, null, content.len, doc.encoding, &doc.search_scratch, &doc.search_refs, doc.gpa) catch {
             // Decode allocation failure: count no match and advance the boundary.
             const nb = lexer.recordBounds(content, i, doc.sep, doc.quote, content.len, doc.encoding);
+            base.stageOversized(doc, row, @intCast(i), @intCast(nb.next));
             i = nb.next;
             row += 1;
             if (nb.next >= content.len) return .{ .end_offset = i, .end_row = row, .eof = true, .checkpoint = null, .matches = matches, .filter_matches = filter_matches };
@@ -106,6 +110,11 @@ pub fn searchScanChunk(doc: *Document, start_off: u64, start_row: u64, filtered:
             if (filt_ok) filter_matches += 1;
         }
         if (filt_ok and matcher.matchRecord(doc.w_ctx, doc.search_scratch.items, doc.search_refs.items) != null) matches += 1;
+        // This scan also feeds the base row index (ARCH-huge-row-budget): stage
+        // a post-row checkpoint if this row's source extent exceeds the
+        // WINDOW's per-row scan cap, so a later ls_window_set reaching a row
+        // this search's own frontier advance passed can skip it.
+        base.stageOversized(doc, row, @intCast(i), @intCast(res.next));
         i = res.next;
         row += 1;
         if (res.next >= content.len) return .{ .end_offset = i, .end_row = row, .eof = true, .checkpoint = null, .matches = matches, .filter_matches = filter_matches };
@@ -159,6 +168,10 @@ pub fn commitSearch(doc: *Document, res: SearchChunk, filtered: bool) void {
         doc.frontier_rows = res.end_row;
         if (res.checkpoint) |cp| doc.checkpoints.appendAssumeCapacity(cp);
     }
+    // ARCH-huge-row-budget: fold this chunk's staged oversized-row checkpoints
+    // in IFF this chunk was the one advancing the frontier (same `advancing`
+    // that gates the sibling `checkpoints` append above).
+    base.drainOversized(doc, advancing);
     if (res.eof) {
         doc.complete = true;
         doc.total_rows = doc.search_rows;

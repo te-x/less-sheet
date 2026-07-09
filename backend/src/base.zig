@@ -116,6 +116,25 @@ pub const Document = struct {
     mutex: c.pthread_mutex_t,
     cond: c.pthread_cond_t,
     checkpoints: std.ArrayList(Checkpoint),
+    // ARCH-huge-row-budget: an extra checkpoint dropped immediately AFTER
+    // every row whose source extent exceeded LS_WINDOW_ROW_SCAN_MAX_BYTES
+    // (row `r+1` at oversized row `r`'s true end), found by whichever scan
+    // (headScan / index's background scanChunk / a search or filter scan)
+    // FIRST advances the shared frontier past it. Row-ascending, but NOT
+    // aligned to checkpoint_interval like `checkpoints` (nav.zig's block-
+    // direct-indexing must not see these) -- window.zig's bestCheckpoint
+    // consults BOTH lists so ls_window_set's skip-from-checkpoint loop can
+    // reach a row after a huge row without re-scanning the huge row's bytes.
+    // O(oversized rows), never O(rows): most documents never append here.
+    oversized_checkpoints: std.ArrayList(Checkpoint),
+    // Lock-free staging area for the ONE scan chunk currently executing (see
+    // stageOversized/drainOversized below): never two chunks run concurrently
+    // for the same document (a single worker thread, or a degraded caller
+    // holding the document mutex throughout its own synchronous loop), so
+    // this needs no lock while a chunk runs. The chunk's caller drains it into
+    // `oversized_checkpoints` under the mutex at commit time -- mirroring the
+    // `search_scratch`-style worker-scratch pattern already used below.
+    oversized_stage: std.ArrayList(Checkpoint),
     frontier_rows: u64,
     frontier_offset: u64,
     complete: bool,
@@ -221,6 +240,11 @@ pub const Document = struct {
     win_buf: std.ArrayList(u8),
     win_refs: std.ArrayList(CellRef),
     win_source: std.ArrayList(u64),
+    // win_oversized[i] mirrors win_source[i]: true iff materialized row
+    // win_first+i's SOURCE extent exceeded LS_WINDOW_ROW_SCAN_MAX_BYTES, so it
+    // was served as a bounded prefix (see ls_row_oversized / ARCH-huge-row-
+    // budget). Set by windowSet alongside win_refs/win_source.
+    win_oversized: std.ArrayList(bool),
     win_first: u64,
     win_rows: u64,
 
@@ -254,9 +278,12 @@ pub fn asDocMut(doc: *const api.Doc) *Document {
 /// safe to destroy.
 pub fn freeDoc(doc: *Document) void {
     doc.checkpoints.deinit(doc.gpa);
+    doc.oversized_checkpoints.deinit(doc.gpa);
+    doc.oversized_stage.deinit(doc.gpa);
     doc.win_buf.deinit(doc.gpa);
     doc.win_refs.deinit(doc.gpa);
     doc.win_source.deinit(doc.gpa);
+    doc.win_oversized.deinit(doc.gpa);
     doc.block_counts.deinit(doc.gpa);
     doc.search_scratch.deinit(doc.gpa);
     doc.search_refs.deinit(doc.gpa);
@@ -292,4 +319,58 @@ pub fn searchProgress(doc: *Document, off: u64) f64 {
     const covered = off - doc.data_start;
     const p = @as(f64, @floatFromInt(covered)) / @as(f64, @floatFromInt(span));
     return if (p > 1.0) 1.0 else p;
+}
+
+// ---------------------------------------------------------------------------
+// ARCH-huge-row-budget: oversized-row checkpoint staging. Every scan loop
+// that may advance the shared frontier past a row's true end (index.zig's
+// headScan / scanChunk, search.searchScanChunk, filter.filterScanChunk) calls
+// beginOversizedChunk once before its loop and stageOversized per row; the
+// loop's caller (already holding the mutex at commit time -- see
+// index.workerMain's plain-chunk commit, search.commitSearch,
+// filter.commitFilter) calls drainOversized once. window.zig's
+// checkpointAtOrBefore/bestCheckpoint are the only readers of
+// `oversized_checkpoints` (always under the mutex).
+// ---------------------------------------------------------------------------
+
+/// Reset the lock-free oversized-row staging area (see stageOversized) before
+/// a NEW scan chunk begins accumulating into it. Guarantees a clean slate
+/// even when a PREVIOUS chunk's drain was skipped (an unrelated OOM guard
+/// returning early elsewhere) — a stale entry could otherwise leak into a
+/// later, unrelated chunk's drain and break `oversized_checkpoints`'s row-
+/// ascending invariant (see drainOversized).
+pub fn beginOversizedChunk(doc: *Document) void {
+    doc.oversized_stage.clearRetainingCapacity();
+}
+
+/// If the record spanning SOURCE bytes [start, end) exceeded the per-row
+/// window-scan cap (LS_WINDOW_ROW_SCAN_MAX_BYTES), stage a checkpoint
+/// immediately AFTER it (row `row + 1` at offset `end`) — see ARCH-huge-row-
+/// budget decision 2. Lock-free: exclusive to whichever single chunk is
+/// currently executing (never two concurrently for the same document — one
+/// worker thread, or a degraded caller holding the document mutex throughout;
+/// see `oversized_stage`'s doc comment on Document). A normal-sized row
+/// returns before touching anything.
+pub fn stageOversized(doc: *Document, row: u64, start: u64, end: u64) void {
+    if (end - start <= api.window_row_scan_max_bytes) return;
+    doc.oversized_stage.append(doc.gpa, .{ .row = row + 1, .offset = end }) catch {};
+}
+
+/// Fold this chunk's staged oversized-row checkpoints into the persistent
+/// `oversized_checkpoints` list `ls_window_set`/`ls_row_oversized` consult,
+/// IFF this chunk was the one ADVANCING the shared frontier (computed exactly
+/// like the sibling `checkpoints` append at each call site — see
+/// index.scanChunk / search.commitSearch / filter.commitFilter): a chunk
+/// re-walking already-frontier-covered ground (search/filter catching up to
+/// an index that got there first) would otherwise re-stage rows out of the
+/// row-ascending order window.checkpointAtOrBefore's binary search relies on
+/// — discarding it is safe because whichever scan advanced the frontier
+/// through those rows FIRST already staged+drained them. Caller holds the
+/// document mutex (or is headScan during open, provably uncontended: the
+/// worker has not spawned yet). Best-effort: an OOM here only costs a future
+/// re-scan of the affected row, never correctness.
+pub fn drainOversized(doc: *Document, advancing: bool) void {
+    if (advancing and doc.oversized_stage.items.len > 0) {
+        doc.oversized_checkpoints.appendSlice(doc.gpa, doc.oversized_stage.items) catch {};
+    }
 }
