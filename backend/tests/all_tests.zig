@@ -2988,3 +2988,183 @@ test "abi: the filter C symbols are callable through extern linkage; enum values
     c_linked_filter.ls_filter_clear(od.doc);
     try std.testing.expectEqual(api.FilterState.idle, c_linked_filter.ls_filter_poll(od.doc).state);
 }
+
+// ===========================================================================
+// huge-row-budget slice (ARCH-huge-row-budget). Frozen; planner-owned. Bounds
+// the SYNCHRONOUS window scan (ls_window_set) to LS_WINDOW_ROW_SCAN_MAX_BYTES
+// per row so a huge row/cell can never block the caller (UI) thread: such a row
+// is served as a bounded PREFIX and flagged by the NEW per-row ls_row_oversized
+// (window/borrow domain identical to ls_source_row). Semantics pinned in
+// api/lesssheet.h (the LS_WINDOW_ROW_SCAN_MAX_BYTES comment, ls_row_oversized,
+// the re-qualified ls_window_set cost) and mirrored in contracts/api.zig.
+// Naming: hr<criterion>, mapping ARCH acceptance 3-6.
+//
+// NOTE on the PRIMARY criteria (1-2, the <100 ms landing on sparse5g / big2g):
+// those are WALL-CLOCK, environment-sensitive, and multi-GB — a FRONTEND probe
+// (the sparse5g jump proxy in the ARCH regression loop), NOT a Zig unit test.
+// These fixtures put the huge row just OVER the cap (~1.1 MiB) so the RED seed
+// still materializes them in ~1 ms; the tests pin CORRECTNESS + the oversized
+// flag, not wall-clock. The no-re-scan guarantee (criterion 4 / checkpoint-
+// after-oversized) is pinned here only as far as a unit test can: a window
+// positioned after the huge row must serve the correct cells (which, once the
+// window scan is bounded, is possible ONLY via a checkpoint dropped after the
+// oversized row); the timing half is the same frontend probe.
+// ---------------------------------------------------------------------------
+
+/// A source span comfortably OVER the per-row window scan cap, yet small enough
+/// that the whole fixture is ~1.1 MiB (see the NOTE above).
+const hr_over_cap_bytes: usize = @intCast(api.window_row_scan_max_bytes + 64 * 1024);
+
+/// Build a 2-column (header "a,b") document: `before` small rows, then ONE huge
+/// row whose SOURCE extent exceeds LS_WINDOW_ROW_SCAN_MAX_BYTES (first cell is
+/// `hr_over_cap_bytes` of 'X', second cell "TAIL"), then `after` small rows.
+/// Every non-huge data row `i` is exactly "a{i},b{i}". Returns the bytes (caller
+/// frees) and the 0-based data-row index of the huge row (== `before`). The
+/// fixture stays < LS_OPEN_HEAD_MAX_BYTES, so it is fully indexed by open (exact
+/// count) and the huge row is behind the frontier immediately.
+fn genHugeRowDoc(gpa: std.mem.Allocator, before: usize, after: usize) !struct { bytes: []u8, huge_row: u64 } {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(gpa);
+    var line: [32]u8 = undefined;
+    try buf.appendSlice(gpa, "a,b\n"); // texty record 1 -> header
+    var i: usize = 0;
+    while (i < before) : (i += 1) {
+        try buf.appendSlice(gpa, try std.fmt.bufPrint(&line, "a{d},b{d}\n", .{ i, i }));
+    }
+    const blob = try gpa.alloc(u8, hr_over_cap_bytes);
+    defer gpa.free(blob);
+    @memset(blob, 'X');
+    try buf.appendSlice(gpa, blob); // the huge row's first cell (> the scan cap)
+    try buf.appendSlice(gpa, ",TAIL\n");
+    i = 0;
+    while (i < after) : (i += 1) {
+        const r = before + 1 + i;
+        try buf.appendSlice(gpa, try std.fmt.bufPrint(&line, "a{d},b{d}\n", .{ r, r }));
+    }
+    return .{ .bytes = try buf.toOwnedSlice(gpa), .huge_row = @intCast(before) };
+}
+
+test "hr3-served: an oversized row is a bounded prefix + flagged; rows before it are whole (ARCH 3)" {
+    const gpa = std.testing.allocator;
+    const doc = try genHugeRowDoc(gpa, 3, 0); // rows 0,1,2 small; row 3 huge
+    defer gpa.free(doc.bytes);
+    var od = try openBytes(doc.bytes);
+    defer od.deinit();
+    try expectDims(od.doc, 4, 2); // fully indexed at open
+
+    const r = api.ls_window_set(od.doc, 0, 16);
+    try std.testing.expectEqual(@as(u64, 4), r.row_count);
+    // Rows BEFORE the huge row: full content, NOT oversized.
+    var buf: [16]u8 = undefined;
+    var i: u64 = 0;
+    while (i < doc.huge_row) : (i += 1) {
+        try expectCell(od.doc, i, 0, try std.fmt.bufPrint(&buf, "a{d}", .{i}));
+        try expectCell(od.doc, i, 1, try std.fmt.bufPrint(&buf, "b{d}", .{i}));
+        try std.testing.expectEqual(false, api.ls_row_oversized(od.doc, i));
+    }
+    // The huge row: served as a bounded prefix — its visible cell obeys the
+    // per-cell display cap (unchanged) and the row is FLAGGED oversized.
+    try std.testing.expect(api.ls_cell(od.doc, doc.huge_row, 0).slice().len <= api.cell_max_bytes);
+    try std.testing.expectEqual(true, api.ls_cell_truncated(od.doc, doc.huge_row, 0));
+    try std.testing.expectEqual(true, api.ls_row_oversized(od.doc, doc.huge_row));
+    // Total function: out-of-window / out-of-range rows are never oversized.
+    try std.testing.expectEqual(false, api.ls_row_oversized(od.doc, 999));
+}
+
+test "hr4-reach: a window after an oversized row serves correct cells; the huge row is flagged (ARCH 4)" {
+    const gpa = std.testing.allocator;
+    const doc = try genHugeRowDoc(gpa, 2, 3); // rows 0,1 small; row 2 huge; rows 3,4,5 small
+    defer gpa.free(doc.bytes);
+    var od = try openBytes(doc.bytes);
+    defer od.deinit();
+    try expectDims(od.doc, 6, 2);
+
+    // Reaching rows AFTER the huge row serves their EXACT cells. Once the
+    // synchronous window scan is bounded to the cap, this is possible only via
+    // a checkpoint dropped after the oversized row (ARCH decision 2); we pin
+    // correctness here, the <100 ms no-rescan half is the frontend probe.
+    const after0 = doc.huge_row + 1;
+    var buf: [16]u8 = undefined;
+    const ra = api.ls_window_set(od.doc, after0, 8);
+    try std.testing.expectEqual(@as(u64, 3), ra.row_count);
+    var i: u64 = after0;
+    while (i < 6) : (i += 1) {
+        try expectCell(od.doc, i, 0, try std.fmt.bufPrint(&buf, "a{d}", .{i}));
+        try expectCell(od.doc, i, 1, try std.fmt.bufPrint(&buf, "b{d}", .{i}));
+        try std.testing.expectEqual(false, api.ls_row_oversized(od.doc, i));
+    }
+    // A window SPANNING [huge, after]: the huge row is flagged oversized and the
+    // rows after it are still served correctly in the SAME window.
+    const rs = api.ls_window_set(od.doc, doc.huge_row, 4);
+    try std.testing.expectEqual(@as(u64, 4), rs.row_count);
+    try std.testing.expectEqual(true, api.ls_row_oversized(od.doc, doc.huge_row));
+    try std.testing.expectEqual(false, api.ls_row_oversized(od.doc, doc.huge_row + 1));
+    try expectCell(od.doc, doc.huge_row + 1, 0, try std.fmt.bufPrint(&buf, "a{d}", .{doc.huge_row + 1}));
+}
+
+test "hr6-fullcell: search AND filter still match the FULL cell past the window scan cap (ARCH 6)" {
+    const gpa = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    try buf.appendSlice(gpa, "h\n"); // header (single column)
+    const blob = try gpa.alloc(u8, hr_over_cap_bytes);
+    defer gpa.free(blob);
+    @memset(blob, 'a');
+    try buf.appendSlice(gpa, blob); // > the per-row window scan cap of filler
+    try buf.appendSlice(gpa, "NEEDLE\n"); // the ONLY match, past BOTH caps
+
+    var od = try openBytes(buf.items);
+    defer od.deinit();
+    // Data row 0 (the giant cell) is served oversized + display-capped.
+    _ = api.ls_window_set(od.doc, 0, 1);
+    try std.testing.expect(api.ls_cell(od.doc, 0, 0).slice().len <= api.cell_max_bytes);
+    try std.testing.expectEqual(true, api.ls_cell_truncated(od.doc, 0, 0));
+    try std.testing.expectEqual(true, api.ls_row_oversized(od.doc, 0));
+    // SEARCH scans the WHOLE cell (never the scan cap): the match past the cap
+    // is still counted and navigable — the window bound must NOT touch search.
+    try std.testing.expectEqual(@as(u64, 1), try searchTotal(od.doc, textReq("NEEDLE")));
+    try expectFound(try navAndWait(od.doc, 0, .forward), 0, 0, 1);
+    // FILTER (same match machinery) also matches past the cap: 1 matching row.
+    try setFilter(od.doc, textReq("NEEDLE"));
+    try std.testing.expectEqual(@as(u64, 1), (try waitFilterDone(od.doc)).total);
+}
+
+test "hr5-count: an oversized row counts as exactly one row; the frontier is unaffected (ARCH 5)" {
+    const gpa = std.testing.allocator;
+    const doc = try genHugeRowDoc(gpa, 4, 4); // 4 + 1 huge + 4 = 9 data rows
+    defer gpa.free(doc.bytes);
+    var od = try openBytes(doc.bytes);
+    defer od.deinit();
+    // The huge row is ONE row: 9 data rows exact, and the frontier covers the
+    // whole file (bytes_scanned == file size, complete) — the count/estimate
+    // machinery is untouched by the window-side cap.
+    try expectDims(od.doc, 9, 2);
+    const p = api.ls_index_poll(od.doc);
+    try std.testing.expectEqual(true, p.complete);
+    try std.testing.expectEqual(p.bytes_total, p.bytes_scanned);
+    // Feature tie (RED on the seed): the huge row IS flagged when materialized,
+    // and it is still counted as exactly one.
+    _ = api.ls_window_set(od.doc, 0, api.window_max_rows);
+    try std.testing.expectEqual(true, api.ls_row_oversized(od.doc, doc.huge_row));
+    try std.testing.expectEqual(@as(u64, 9), api.ls_row_count_get(od.doc).count);
+}
+
+// ---------------------------------------------------------------------------
+// Public C ABI: the constant + ls_row_oversized are pinned to the header and
+// callable through extern linkage (regression/linkage guard; the seed links and
+// reports false, so this stays green from the seed).
+// ---------------------------------------------------------------------------
+
+const c_linked_hugerow = struct {
+    extern fn ls_row_oversized(doc: *const api.Doc, row: u64) bool;
+};
+
+test "abi: LS_WINDOW_ROW_SCAN_MAX_BYTES is pinned and ls_row_oversized links" {
+    try std.testing.expectEqual(@as(u64, 1024 * 1024), api.window_row_scan_max_bytes);
+    var od = try openBytes("h\nsmall\n");
+    defer od.deinit();
+    winAll(od.doc);
+    try std.testing.expectEqual(false, c_linked_hugerow.ls_row_oversized(od.doc, 0));
+    try std.testing.expectEqual(false, api.ls_row_oversized(od.doc, 0)); // normal row
+    try std.testing.expectEqual(false, api.ls_row_oversized(od.doc, 999)); // out of range
+}

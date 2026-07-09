@@ -512,3 +512,12 @@ pub export fn ls_filter_poll(doc: *const api.Doc) callconv(.c) api.FilterStatus 
 pub export fn ls_source_row(doc: *const api.Doc, row: u64) callconv(.c) u64 {
     return window.sourceRow(asDoc(doc), row);
 }
+
+/// See api/lesssheet.h `ls_row_oversized`. Same window/borrow domain as ls_cell
+/// / ls_source_row (the per-row flag is set by ls_window_set alongside the
+/// served cells). SEED (RED): forwards to window.rowOversized, which returns
+/// false until the build cell bounds the window scan. Total function; ZERO
+/// allocation; never fails; never scans.
+pub export fn ls_row_oversized(doc: *const api.Doc, row: u64) callconv(.c) bool {
+    return window.rowOversized(asDoc(doc), row);
+}

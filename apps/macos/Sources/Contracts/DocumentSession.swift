@@ -77,11 +77,23 @@ public struct RowWindow: Equatable, Sendable {
     /// DISPLAY-ONLY — the full cell is still searchable (grids render a
     /// truncation indicator from this flag, ARCH req. 13/20).
     public let truncated: [[Bool]]
+    /// Per-ROW OVERSIZED flags, PARALLEL to `rows`: `oversized[i]` is true iff
+    /// row `firstRow + i`'s SOURCE extent exceeded the core's per-row window
+    /// scan cap (`LS_WINDOW_ROW_SCAN_MAX_BYTES`, `ls_row_oversized`), so the row
+    /// was served as a bounded PREFIX — more source exists past the served
+    /// cells and the row's true end may lie past this window. ONE flag per row
+    /// (NOT per cell): same length as `rows`, empty only when `rows` is empty.
+    /// DISTINCT from `truncated` (the per-cell OUTPUT display cap): this is the
+    /// whole-row SOURCE scan cap. Grids draw a per-row gutter marker from this,
+    /// distinct from the per-cell "…" truncation indicator (ARCH-huge-row-budget
+    /// req. 7); the live visual is a human-eyes check.
+    public let oversized: [Bool]
 
-    public init(firstRow: UInt64, rows: [[String]], truncated: [[Bool]] = []) {
+    public init(firstRow: UInt64, rows: [[String]], truncated: [[Bool]] = [], oversized: [Bool] = []) {
         self.firstRow = firstRow
         self.rows = rows
         self.truncated = truncated
+        self.oversized = oversized
     }
 }
 

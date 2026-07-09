@@ -105,13 +105,19 @@ public final class CoreDocumentSession: DocumentSession, @unchecked Sendable {
         let range = ls_window_set(doc, firstRow, clamped)
         var rows = [[String]]()
         var truncated = [[Bool]]()
+        var oversized = [Bool]()
         rows.reserveCapacity(Int(range.row_count))
         truncated.reserveCapacity(Int(range.row_count))
+        oversized.reserveCapacity(Int(range.row_count))
         for row in range.first_row..<(range.first_row + range.row_count) {
             rows.append((0..<columnCount).map { Self.copyCell(ls_cell(doc, row, UInt32($0))) })
             truncated.append((0..<columnCount).map { ls_cell_truncated(doc, row, UInt32($0)) })
+            // Per-row OVERSIZED flag (ls_row_oversized): true iff the row's
+            // source extent exceeded LS_WINDOW_ROW_SCAN_MAX_BYTES and it was
+            // served as a bounded prefix. Window lane, so under the same lock.
+            oversized.append(ls_row_oversized(doc, row))
         }
-        return RowWindow(firstRow: range.first_row, rows: rows, truncated: truncated)
+        return RowWindow(firstRow: range.first_row, rows: rows, truncated: truncated, oversized: oversized)
     }
 
     public func startJump(to targetRow: UInt64) {

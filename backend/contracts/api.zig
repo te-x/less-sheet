@@ -93,6 +93,15 @@ pub const encoding_windows1252: u8 = 4;
 /// ls_header_cell_truncated.
 pub const cell_max_bytes: usize = 4096;
 
+/// Mirrors LS_WINDOW_ROW_SCAN_MAX_BYTES: the per-row SOURCE-byte scan cap for
+/// the SYNCHRONOUS window path (ls_window_set). A row whose source extent
+/// exceeds this is served as a bounded PREFIX and flagged by ls_row_oversized;
+/// this bounds ls_window_set to O(min(row bytes, this) * rows) — safe on the UI
+/// thread for any row size. DISTINCT from `cell_max_bytes` (the per-cell OUTPUT
+/// display cap, far smaller); both apply. See the header's TEXT AND ENCODING /
+/// the LS_WINDOW_ROW_SCAN_MAX_BYTES comment.
+pub const window_row_scan_max_bytes: u64 = 1024 * 1024;
+
 /// Sniffer candidates in pinned tie-break preference order (see the header's
 /// DIALECT SNIFFING section).
 pub const separator_candidates: []const u8 = ",;\t|";
@@ -311,6 +320,7 @@ pub const ls_filter_set = core.ls_filter_set;
 pub const ls_filter_clear = core.ls_filter_clear;
 pub const ls_filter_poll = core.ls_filter_poll;
 pub const ls_source_row = core.ls_source_row;
+pub const ls_row_oversized = core.ls_row_oversized;
 
 /// Zig-level seam for tests: identical to `ls_open` but with an explicit
 /// allocator. `ls_open` == `openWithAllocator(default allocator, ...)`.
@@ -371,4 +381,6 @@ comptime {
         @compileError("signature drift: ls_filter_poll");
     if (@TypeOf(core.ls_source_row) != fn (*const Doc, u64) callconv(.c) u64)
         @compileError("signature drift: ls_source_row");
+    if (@TypeOf(core.ls_row_oversized) != fn (*const Doc, u64) callconv(.c) bool)
+        @compileError("signature drift: ls_row_oversized");
 }

@@ -65,7 +65,8 @@
  *     accessor and poll (ls_dialect_get, ls_column_count, ls_row_count_get,
  *     ls_index_poll, ls_cell, ls_cell_truncated, ls_header_cell,
  *     ls_header_cell_truncated, ls_jump_poll, ls_search_poll, ls_filter_poll,
- *     ls_source_row) and ls_jump_cancel / ls_search_cancel / ls_filter_clear
+ *     ls_source_row, ls_row_oversized) and ls_jump_cancel / ls_search_cancel /
+ *     ls_filter_clear
  *     performs ZERO heap allocation and
  *     never fails; out-of-range access returns the empty string / a
  *     well-defined value. Additionally, once every scan has reported a
@@ -305,7 +306,8 @@
  *     scans are running (jump-scans, match-scans, AND filter-scans): it
  *     cancels and joins
  *     all core-owned threads for that document before releasing storage.
- *   - Window lane — ls_window_set, ls_cell, ls_source_row, ls_header_cell:
+ *   - Window lane — ls_window_set, ls_cell, ls_source_row, ls_row_oversized,
+ *     ls_header_cell:
  *     one caller
  *     thread at a time (callers serialize these among themselves). They are
  *     safe to call concurrently with the poll/control lane and with the
@@ -508,6 +510,24 @@ extern "C" {
  * ls_header_cell_truncated. Display-only: SEARCH still scans the full cell.
  */
 #define LS_CELL_MAX_BYTES (4096)
+
+/*
+ * Per-row SOURCE-byte scan cap for the SYNCHRONOUS window path (ls_window_set).
+ * While materializing a window the core scans at most this many source bytes
+ * per row seeking that row's terminator; a row whose source extent exceeds this
+ * cap is served as a bounded PREFIX (the fields decoded within the cap, the
+ * last display-capped, any remaining columns padded to the empty string) and
+ * flagged by ls_row_oversized. This bounds ls_window_set to
+ * O(min(row bytes, this) x rows), so it is safe on the UI thread for ANY row
+ * size; finding a huge row's true end (to reach later rows and to count it) is
+ * the background frontier's job, off the caller thread.
+ *
+ * DISTINCT from LS_CELL_MAX_BYTES, and both apply: that caps a single cell's
+ * OUTPUT (display) bytes; this caps the SOURCE bytes SCANNED for a whole row
+ * (and is far larger). Cells within the scanned prefix are still individually
+ * display-capped by LS_CELL_MAX_BYTES / flagged by ls_cell_truncated.
+ */
+#define LS_WINDOW_ROW_SCAN_MAX_BYTES (1024 * 1024)
 
 /* ------------------------------------------------------------------------- */
 /* Types                                                                      */
@@ -921,12 +941,16 @@ ls_scan_progress ls_index_poll(const ls_doc *doc);
  * contiguous materialized range, which always starts at first_row (row_count
  * 0 when no requested row is behind the frontier or in the document).
  *
- * ls_window_set NEVER advances the frontier and never scans: cost is
- * O(window bytes) re-lexing from the nearest index checkpoint, so it is the
- * only synchronous-fast path and is safe to call on the UI thread. Rows
- * beyond the frontier become servable by advancing the frontier (background
- * index, ls_jump_start, or a match-scan) and then re-issuing ls_window_set
- * with the same range. May allocate (through the document's allocator); on
+ * ls_window_set NEVER advances the frontier and never scans past the per-row
+ * cap: cost is O(min(row bytes, LS_WINDOW_ROW_SCAN_MAX_BYTES) x rows) re-lexing
+ * from the nearest index checkpoint, so it is the only synchronous-fast path
+ * and is safe to call on the UI thread for ANY row size (this was "O(window
+ * bytes)", which held only when every row was bounded). A row whose source
+ * extent exceeds the per-row scan cap is served as a bounded PREFIX and flagged
+ * by ls_row_oversized (see it); its true end is found later by the background
+ * frontier, after which rows AFTER it become servable. Rows beyond the frontier
+ * become servable by advancing the frontier (background index, ls_jump_start,
+ * or a match-scan) and then re-issuing ls_window_set with the same range. May allocate (through the document's allocator); on
  * internal failure it degrades to a shorter (possibly empty) returned range
  * — it never fails. Invalidates all previously borrowed ls_str of this
  * document.
@@ -983,6 +1007,32 @@ ls_str ls_header_cell(const ls_doc *doc, uint32_t col);
  * display-only semantics as ls_cell_truncated. ZERO allocation; never fails.
  */
 bool ls_header_cell_truncated(const ls_doc *doc, uint32_t col);
+
+/*
+ * Whether view row `row` is OVERSIZED: its SOURCE extent exceeded
+ * LS_WINDOW_ROW_SCAN_MAX_BYTES, so ls_window_set served it as a bounded PREFIX
+ * (the fields decoded within the per-row scan cap — the last display-capped,
+ * any remaining columns the empty string) instead of the whole row. True means
+ * MORE SOURCE EXISTS past the served cells and the row's true end may lie past
+ * this window; the cells that ARE served still obey every normal rule (quoting,
+ * the truncate/pad rule, the LS_CELL_MAX_BYTES display cap + ls_cell_truncated).
+ *
+ * This is a PER-ROW signal, DISTINCT from the per-cell ls_cell_truncated (the
+ * OUTPUT display cap on one cell): a normal row may have a display-capped cell
+ * without being oversized, and an oversized row's served cell(s) may or may not
+ * be display-capped. Frontends draw a per-row gutter marker from this, distinct
+ * from the per-cell truncation indicator.
+ *
+ *   row — 0-based, 64-bit view-relative data-row index (a FILTERED index while
+ *         a filter is active — see FILTERED VIEWS), interpreted exactly as
+ *         ls_cell / ls_source_row interpret it. Only rows inside the currently
+ *         materialized window are defined.
+ * Total function: returns false for any `row` outside the materialized window
+ * or the view's row range, and for any row served whole. Identical window/borrow
+ * domain to ls_cell / ls_source_row (set by ls_window_set alongside the served
+ * cells). ZERO allocation; never fails; never scans.
+ */
+bool ls_row_oversized(const ls_doc *doc, uint64_t row);
 
 /* ------------------------------------------------------------------------- */
 /* Jump-scans (asynchronous; shared frontier; any thread)                     */

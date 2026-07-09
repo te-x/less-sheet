@@ -197,3 +197,15 @@ pub fn sourceRow(d: *const Document, row: u64) u64 {
     if (idx >= d.win_source.items.len) return api.no_row;
     return d.win_source.items[idx];
 }
+
+/// See api/lesssheet.h `ls_row_oversized`. Same window/borrow domain as ls_cell
+/// / sourceRow. SEED STUB (RED): windowSet does not yet bound the per-row
+/// source scan to `api.window_row_scan_max_bytes`, so no row is flagged — this
+/// always returns false. The build-cell implementer will (per ARCH-huge-row-
+/// budget) bound windowSet's skip + materialize loops to that cap, store the
+/// per-row oversized flag on the Document parallel to `win_source`, drop a
+/// checkpoint after each oversized row, and return the stored flag here. Total
+/// function; ZERO allocation; never fails; never scans.
+pub fn rowOversized(_: *const Document, _: u64) bool {
+    return false;
+}
