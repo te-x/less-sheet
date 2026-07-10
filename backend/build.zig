@@ -58,23 +58,35 @@ pub fn build(b: *std.Build) void {
     // reads a GENERATED corpus + manifest.json via an injected `corpus` options
     // module (`corpus.dir` = the directory holding the light corpus).
     //
-    // RED SEED (planner freeze): the `corpus` module EXISTS so the frozen test
-    // COMPILES, but the generator run is deliberately NOT wired, so `corpus.dir`
-    // points at a path with no manifest.json -> the sweep fails at runtime with
-    // error.CorpusNotGenerated (behavior RED, not a compile/import failure).
+    // Hermetic generate-at-test (AC1): shell to the workspace-level, clean-room
+    // generator (tools/csvgen/, outside this component) with a fixed seed into
+    // a build-MANAGED cache dir -- never committed, never a hard-coded path --
+    // and inject that dir as `corpus.dir`. zig build's cwd is the build root
+    // (backend/), hence the "../tools/csvgen/..." paths resolved via
+    // b.pathFromRoot.
     //
-    // IMPLEMENTER makes it GREEN (this file is NOT frozen): run the generator
-    // into a build-cache dir, inject that dir as `corpus.dir`, and gate the
-    // behavior-test run on it -- e.g. replacing the placeholder addOption below:
-    //   const gen = b.addSystemCommand(&.{ "python3",
-    //       b.pathFromRoot("../tools/csvgen/gen.py"), "--all", "--seed", "1337", "--out" });
-    //   const corpus_dir = gen.addOutputDirectoryArg("corpus");
-    //   corpus_opts.addOptionPath("dir", corpus_dir);        // <- replaces addOption
-    //   run_behavior_tests.step.dependOn(&gen.step);         // <- generate before tests
-    // and run tools/csvgen/selftest.py as the AC7 oracle guard (fail-fast).
-    // Nothing generated is committed; python3 is a documented gate prerequisite.
+    // AC7 oracle guard: the generator's own selftest.py must pass BEFORE its
+    // output is trusted, so the generate step depends on it -- a regressed
+    // generator/oracle fails the build loudly instead of letting the AC2-4
+    // sweeps pass vacuously against bad fixtures.
+    const gen_selftest = b.addSystemCommand(&.{
+        "python3",
+        b.pathFromRoot("../tools/csvgen/selftest.py"),
+    });
+
+    const gen = b.addSystemCommand(&.{
+        "python3",
+        b.pathFromRoot("../tools/csvgen/gen.py"),
+        "--all",
+        "--seed",
+        "1337",
+        "--out",
+    });
+    gen.step.dependOn(&gen_selftest.step); // trust the oracle before generating from it
+    const corpus_dir = gen.addOutputDirectoryArg("corpus");
+
     const corpus_opts = b.addOptions();
-    corpus_opts.addOption([]const u8, "dir", "/nonexistent/lesssheet-corpus--generate-step-not-wired");
+    corpus_opts.addOptionPath("dir", corpus_dir);
     const corpus_mod = corpus_opts.createModule();
 
     // Behavior tests (planner-owned, tests/) import only the contract module
@@ -92,6 +104,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_behavior_tests = b.addRunArtifact(behavior_tests);
+    run_behavior_tests.step.dependOn(&gen.step); // corpus must exist before tests run
     const test_step = b.step("test", "Run behavior tests");
     test_step.dependOn(&run_behavior_tests.step);
 }

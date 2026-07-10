@@ -10,3 +10,4 @@ xcuserdata/
 
 # Generated icon artifacts (source of truth: branding/icon.svg)
 branding/generated/
+__pycache__/

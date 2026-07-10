@@ -9,6 +9,11 @@ FROZEN_PATHS=( "Sources/Contracts" "Tests" "Package.swift" )
 # delete the link products — otherwise the gate can certify binaries still linked
 # against an OLD core (proven both directions by experiment, REVIEW-6-frontend).
 # Object caches survive; only the final links are redone (seconds).
-CONFORMANCE_CMD='(cd ../../backend && zig build) && rm -rf .build/*/debug/LessSheet .build/*/debug/*.xctest .build/*/release/LessSheet .build/*/release/*.xctest && swift build'
+# csv-corpus AC5: generate the 5 representative corpus files (git-ignored .build/
+# corpus-cache) the frozen CorpusColdOpenTests launch probe reads. Hermetic +
+# deterministic (fixed seed); the clean-room generator is stdlib-Python (a gate
+# prerequisite). The backend build.zig generate-step covers the AC2-4 sweep; this
+# covers only the macOS UI-sample. Heavy cases stay out of the gate (on-demand perf).
+CONFORMANCE_CMD='(cd ../../backend && zig build) && rm -rf .build/*/debug/LessSheet .build/*/debug/*.xctest .build/*/release/LessSheet .build/*/release/*.xctest && swift build && python3 ../../tools/csvgen/gen.py --case unicode_emoji --case eol_crlf --case wide_100k_cols --case enc_utf16le --case happy_numeric --seed 1337 --out .build/corpus-cache'
 BEHAVIOR_CMD="swift test"
 CONTRACT_HOWTO="Data types: struct/enum (Codable where crossing the wire). Signatures: protocol in Sources/Contracts; implementations declare conformance so swiftc enforces the signature, and a frozen test pins it via 'let _: any Foo = FooImpl()'. Tests: XCTest/swift-testing under Tests/. Implementations in Sources/<Target>; keep SwiftUI views thin over the protocol layer. UI-app schemes may need 'xcodebuild -scheme <App> build/test' instead of swift build/test — adjust the commands."
