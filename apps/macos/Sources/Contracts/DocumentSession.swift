@@ -233,6 +233,25 @@ public protocol DocumentSession: AnyObject, Sendable {
     /// filter it is the identity on servable rows. Never blocks; never scans.
     func sourceRow(_ viewRow: UInt64) -> UInt64?
 
+    /// LOSSLESS full-cell read for CLIPBOARD COPY (ARCH-select-copy; mirrors
+    /// `ls_cell_copy`) — the display-capped `setWindow`/`ls_cell` path cannot
+    /// serve a cell longer than the 4 KiB display cap, so copy uses THIS. Reads
+    /// the COMPLETE content of the cell at (`row`, `column`) — same addressing as
+    /// a windowed cell (0-based, view-relative; a FILTERED index while a filter is
+    /// active) — up to `maxBytes` of UTF-8 (cut at a code-point boundary), WITHOUT
+    /// the display cap. ADDITIVE: existing conformers are unaffected (the RED
+    /// default below), and it is WINDOW-INDEPENDENT — it neither requires nor
+    /// disturbs `setWindow`'s window, so copy runs without moving the viewport.
+    ///
+    /// Returns a `CopiedCell` mapping `ls_copy_result`: `.ok` with the (possibly
+    /// per-cell-`truncated`) `text`; `.pending` when `row` is past the scan
+    /// frontier (advance it — a jump — and retry); `.noCell` when no such cell
+    /// exists (`column >= columnCount`, or `row` past an EXACT row count). Poll/
+    /// control lane in the core: SAFE from any thread, so the frontend calls it
+    /// off the main thread to build a large copy (AC4). `maxBytes` is the caller's
+    /// per-cell cap (`CopyBudget.perCellMaxBytes`, ~1 MiB).
+    func copyCell(row: UInt64, column: Int, maxBytes: Int) -> CopiedCell
+
     /// Release the core handle. Idempotent; nothing else may be called
     /// afterwards.
     func close()
@@ -252,6 +271,19 @@ public extension DocumentSession {
     /// GREEN (a real column-windowed fetch).
     func setWindow(firstRow: UInt64, rowCount: Int, columns: Range<Int>) -> RowWindow {
         setWindow(firstRow: firstRow, rowCount: rowCount)
+    }
+
+    /// DEFAULT (RED seed) for the lossless full-cell copy read: reports `.noCell`
+    /// for every cell, so NOTHING copies through it. Keeps existing conformers
+    /// compiling before the bridge lands (`copyCell` is a PROTOCOL REQUIREMENT —
+    /// declared in the body above, not only here — so a real override is
+    /// dispatched through `any DocumentSession` via the witness table). A
+    /// conformer wires copy to the core by OVERRIDING this to call `ls_cell_copy`
+    /// (fill a `maxBytes` buffer, map `ls_copy_result` → `CopiedCell`), which is
+    /// exactly what flips the copy-bridge test from RED (this default: `.noCell`)
+    /// to GREEN (the real lossless read, including a > 4 KiB cell copied whole).
+    func copyCell(row: UInt64, column: Int, maxBytes: Int) -> CopiedCell {
+        CopiedCell(status: .noCell, text: "", truncated: false)
     }
 }
 
