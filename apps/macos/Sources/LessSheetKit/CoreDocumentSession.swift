@@ -46,6 +46,20 @@ public final class CoreDocumentSession: DocumentSession, @unchecked Sendable {
     private let doc: OpaquePointer
     private let lock = NSLock()
     private var isClosed = false
+    /// A REUSED scratch buffer for `copyCell` (select-copy), grown on demand
+    /// and never shrunk — guarded by its OWN lock, distinct from the window
+    /// lane's `lock` above (copyCell is poll/control-lane and must stay
+    /// independent of it; see `copyCell`'s doc). A large copy calls
+    /// `copyCell` per cell (potentially millions of times for a big
+    /// selection); allocating + zero-filling a fresh `perCellMaxBytes`
+    /// (~1 MiB) buffer on EVERY call would dominate the whole build's cost
+    /// for no reason, since the SAME cap is used call after call within one
+    /// copy — reusing the backing storage (while still passing THIS call's
+    /// own `maxBytes` as the core's `buf_len`, so a smaller cap still
+    /// truncates correctly even with a larger buffer sitting behind it)
+    /// turns that into a one-time allocation per session.
+    private let copyBufferLock = NSLock()
+    private var copyBuffer: [UInt8] = []
 
     public let columnCount: Int
     public let dialect: DialectReport
@@ -326,6 +340,53 @@ public final class CoreDocumentSession: DocumentSession, @unchecked Sendable {
         defer { lock.unlock() }
         let row = ls_source_row(doc, viewRow)
         return row == UInt64(LS_NO_ROW) ? nil : row
+    }
+
+    // MARK: - Copy bridge (select-copy; ARCH-select-copy AC3) — ls_cell_copy.
+    // Poll/control lane (api/lesssheet.h THREADING): safe from ANY thread at
+    // any time, concurrently with the window lane's `lock` — it neither reads
+    // nor evicts the materialized window. UNLIKE setWindow/sourceRow above,
+    // this deliberately does NOT take `lock`: that is exactly what lets a
+    // background copy worker fill a `CopyBudget`-bounded selection while the
+    // UI keeps scrolling (ls_window_set / ls_cell) undisturbed (AC4).
+
+    /// OVERRIDES the RED default (`DocumentSession`'s `.noCell`-for-everything
+    /// extension): fills a `maxBytes` buffer via `ls_cell_copy` and maps
+    /// `ls_copy_result` to `CopiedCell` — `.ok` with the decoded UTF-8 text
+    /// (and the core's `truncated` flag), `.pending` past the scan frontier,
+    /// `.noCell` for an out-of-range column/row. `maxBytes <= 0` (or a column
+    /// outside `UInt32`'s domain, never a valid column) copies nothing rather
+    /// than allocate/convert — the core itself would report exactly this for
+    /// an out-of-range column, so this is a graceful shortcut, not new
+    /// behavior.
+    public func copyCell(row: UInt64, column: Int, maxBytes: Int) -> CopiedCell {
+        guard let col = UInt32(exactly: column) else {
+            return CopiedCell(status: .noCell, text: "", truncated: false)
+        }
+        let capacity = max(maxBytes, 0)
+        copyBufferLock.lock()
+        defer { copyBufferLock.unlock() }
+        // Grow-only reuse (see the property doc): a call with a SMALLER cap
+        // than the buffer's current size must still pass ITS OWN `capacity`
+        // as `buf_len` below (never the buffer's larger true size), so a
+        // per-cell cap change between calls still truncates correctly.
+        if copyBuffer.count < capacity {
+            copyBuffer = [UInt8](repeating: 0, count: capacity)
+        }
+        var outLen = 0
+        var outTruncated = false
+        let result = copyBuffer.withUnsafeMutableBufferPointer { buf in
+            ls_cell_copy(doc, row, col, buf.baseAddress, capacity, &outLen, &outTruncated)
+        }
+        switch result.rawValue {
+        case ls_copy_result.RawValue(LS_COPY_OK.rawValue):
+            let text = outLen > 0 ? String(decoding: copyBuffer[0..<outLen], as: UTF8.self) : ""
+            return CopiedCell(status: .ok, text: text, truncated: outTruncated)
+        case ls_copy_result.RawValue(LS_COPY_PENDING.rawValue):
+            return CopiedCell(status: .pending, text: "", truncated: false)
+        default:   // LS_COPY_NO_CELL
+            return CopiedCell(status: .noCell, text: "", truncated: false)
+        }
     }
 
     public func close() {

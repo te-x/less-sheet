@@ -64,6 +64,7 @@ struct GridView: View {
         _ = model.isFiltered
         _ = model.visibleColumns
         _ = model.columnWidths
+        _ = model.selection
         return NativeGridRepresentable(model: model)
             .background(Color(nsColor: .textBackgroundColor))
     }
@@ -105,7 +106,7 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
 
     let container = GridContainerView()
     let scroll = NSScrollView()
-    let table = NSTableView()
+    let table = SheetTableView()
     let header = GridHeaderView()
     let gutter = GridGutterView()
     let band = NSGlassEffectView()
@@ -119,6 +120,10 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
     // the SAME x a full, unwindowed draw would give it; ARCH AC4/AC5).
     private(set) var widths: [CGFloat] = []
     private(set) var headerLabels: [String] = []
+    /// Absolute column indices PARALLEL to `widths`/`headerLabels` (ARCH-
+    /// select-copy): the click→cell mapping's column half — position `i`
+    /// here is the SAME absolute column `widths[i]` is the width of.
+    private(set) var absoluteColumns: [Int] = []
     private(set) var columnFirstX: CGFloat = 0
     private(set) var fillerColumns = 0
     private(set) var gutterWidth: CGFloat = 0
@@ -169,8 +174,13 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
         scroll.scrollerInsets = NSEdgeInsets(top: -NativeGrid.contentInsetTop, left: 0, bottom: 0, right: 0)
 
         // The table: one full-width column; every cell + hairline + highlight is
-        // drawn by the row view (fastest, pixel control). No selection, no drag-
-        // resize, uniform row height => O(1) geometry at any row count.
+        // drawn by the row view (fastest, pixel control), uniform row height =>
+        // O(1) geometry at any row count. NSTableView's OWN row selection/
+        // column-resize machinery stays off (selectionHighlightStyle .none,
+        // allowsColumnResizing false, etc.) — ARCH-select-copy's rectangular
+        // CELL selection + resize are hand-built (SheetTableView / GridHeaderView)
+        // since AppKit has no native equivalent for either; row hit-testing
+        // (`row(at:)`) and first-responder/event routing ARE reused (framework).
         column.width = 400
         column.resizingMask = []
         table.addTableColumn(column)
@@ -178,7 +188,7 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
         table.intercellSpacing = .zero
         table.backgroundColor = .textBackgroundColor
         table.headerView = nil                       // sticky header is drawn separately
-        table.selectionHighlightStyle = .none        // pure viewer: no selection
+        table.selectionHighlightStyle = .none        // our OWN cell selection overlay, not the table's
         table.allowsColumnResizing = false
         table.allowsColumnReordering = false
         table.allowsColumnSelection = false
@@ -189,6 +199,7 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
         table.columnAutoresizingStyle = .noColumnAutoresizing
         table.dataSource = self
         table.delegate = self
+        table.controller = self
         scroll.documentView = table
 
         header.controller = self
@@ -266,6 +277,17 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
                 _ = FrameDump.captureLiveGrid(to: path)
                 FrameDump.terminateIfRequested()
             }
+        }
+
+        // ARCH-select-copy: make the data table first responder once it is
+        // actually in a window, so Cmd+A / Cmd+C / arrow-key selection work the
+        // moment a document opens, with no preceding click required. Deferred
+        // (the container isn't attached to a window yet at this point in
+        // makeNSView) and one-shot — a later re-open does NOT repeat this, so
+        // it never steals focus from a field the user is actively using.
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.container.window?.makeFirstResponder(self.table)
         }
         return container
     }
@@ -364,7 +386,14 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
         model.horizontalViewportChanged(viewportX: clip.origin.x, viewportWidth: clip.width)
         widths = model.windowWidths()
         headerLabels = model.windowHeaderLabels()
+        absoluteColumns = model.windowAbsoluteColumns()
         columnFirstX = CGFloat(model.columnWindow.firstX)
+        // The header's resize hit-zones (ARCH-select-copy AC5) sit at fixed
+        // OFFSETS from this same geometry — AppKit does not re-derive cursor
+        // rects on a mere content-offset/width change (only on a frame change
+        // or an explicit invalidate), so poke it here alongside every place
+        // that already marks the header for a repaint.
+        container.window?.invalidateCursorRects(for: header)
     }
 
     /// The single funnel for model-driven grid updates (idempotent). Called from
@@ -794,13 +823,206 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
             rv.cells = model.windowBodyCells(forRow: row)
             rv.truncated = model.windowBodyTruncated(forRow: row)
             rv.highlights = model.windowCellHighlights(forRow: row)
+            rv.selectionMarks = model.windowSelectionMarks(forRow: row)
         } else {
             rv.isFiller = true
             rv.pending = false
             rv.cells = []
             rv.truncated = []
             rv.highlights = []
+            rv.selectionMarks = []
         }
+    }
+
+    // MARK: Selection + copy + resize (ARCH-select-copy) — NSResponder mouse/
+    // keyboard events (SheetTableView/GridHeaderView/GridGutterView) + the
+    // responder chain's standard selectAll:/copy: actions drive the pure
+    // `Selecting`/`CopyBuilding`/`ColumnSizing` models on `DocumentModel`;
+    // this section only maps AppKit geometry <-> the pure (row, column) /
+    // window-index space those models speak. Column resize hit-testing lives
+    // on `GridHeaderView` itself (it owns the header's own geometry/cursor
+    // rects); this section is the shared row/column arithmetic + the model
+    // hand-off both the header and the data table route through.
+
+    /// Maps a point in the TABLE's local coordinate space to the (row,
+    /// column) cell under it — the read-side of `SheetRowView.draw`'s layout
+    /// (there is no native per-subcolumn hit test: one real `NSTableColumn`
+    /// carries every custom-drawn visible column). Clamps to the nearest
+    /// data row / in-window column when the point falls outside them
+    /// (dragging past an edge extends to that edge — ordinary spreadsheet
+    /// drag behavior); nil only when the column window is empty.
+    private func cellAt(_ point: NSPoint) -> GridCell? {
+        guard let index = windowColumnIndex(atX: point.x), index < absoluteColumns.count else { return nil }
+        return GridCell(row: UInt64(rowAt(point)), column: absoluteColumns[index])
+    }
+
+    /// The data row at a TABLE-local point, clamped to `0 ..< dataRowCount`
+    /// (never into the filler/overscroll strip, and never below row 0 for a
+    /// point above the table's own top edge).
+    private func rowAt(_ point: NSPoint) -> Int {
+        guard dataRowCount > 0 else { return 0 }
+        if point.y < 0 { return 0 }
+        let row = table.row(at: point)
+        return row < 0 ? dataRowCount - 1 : min(row, dataRowCount - 1)
+    }
+
+    /// The window-local index (into `widths`/`absoluteColumns`) at a LOCAL
+    /// x-offset in the TABLE's (== `columnFirstX`'s) coordinate space, via
+    /// the SAME sequential accumulation `SheetRowView.draw` uses to POSITION
+    /// each column. Clamps to the nearest edge column past the window's
+    /// start/end (a scrolled dead zone or the filler strip); nil only when
+    /// the window holds no columns.
+    private func windowColumnIndex(atX x: CGFloat) -> Int? {
+        guard !widths.isEmpty else { return nil }
+        var cursor = columnFirstX
+        for (i, w) in widths.enumerated() {
+            if x < cursor + w { return i }
+            cursor += w
+        }
+        return widths.count - 1
+    }
+
+    /// Mouse down on a data cell (`SheetTableView`): plain click selects it;
+    /// shift-click extends the live selection. Makes the table first
+    /// responder so keyboard navigation / Cmd+A / Cmd+C follow immediately.
+    func mouseDown(_ event: NSEvent, in view: NSView) {
+        container.window?.makeFirstResponder(table)
+        guard let cell = cellAt(view.convert(event.locationInWindow, from: nil)) else { return }
+        if event.modifierFlags.contains(.shift) {
+            model.extendSelection(toRow: cell.row, column: cell.column)
+        } else {
+            model.selectCell(row: cell.row, column: cell.column)
+        }
+        refreshSelectionDisplay()
+    }
+
+    /// Drag over the data cells: extends the selection live to whatever cell
+    /// is under the (possibly out-of-bounds) drag point — `cellAt` clamps.
+    func mouseDragged(_ event: NSEvent, in view: NSView) {
+        guard let cell = cellAt(view.convert(event.locationInWindow, from: nil)) else { return }
+        model.extendSelection(toRow: cell.row, column: cell.column)
+        refreshSelectionDisplay()
+    }
+
+    /// Mouse up on a data cell: the selection is already live from
+    /// `mouseDown`/`mouseDragged` — nothing further to apply.
+    func mouseUp(_ event: NSEvent, in view: NSView) {}
+
+    /// Gutter click: whole-row select; shift-click extends a whole-row
+    /// selection to this row (ARCH: composed from `extend(_:to:in:)`).
+    func gutterMouseDown(atY y: CGFloat, shift: Bool) {
+        container.window?.makeFirstResponder(table)
+        let row = UInt64(rowAt(NSPoint(x: 0, y: y)))
+        if shift {
+            model.extendSelectionToWholeRow(row)
+        } else {
+            model.selectWholeRow(row)
+        }
+        refreshSelectionDisplay()
+    }
+
+    /// Header click OUTSIDE a resize hit-zone: whole-column select;
+    /// shift-click extends a whole-column selection to this column. `x` is
+    /// ABSOLUTE — the SAME `columnFirstX`-rooted space `windowColumnIndex`/
+    /// `cellAt` already use, NOT `GridHeaderView`'s own descrolled local
+    /// space; `GridHeaderView.handleClick` re-bases its local click x to this
+    /// space (`+ contentOffsetX`) before calling here (ARCH-select-copy round
+    /// 2, finding 1 — a prior version of that call passed the raw local x,
+    /// which only ever matched this absolute space at zero horizontal
+    /// scroll).
+    func headerMouseDown(atX x: CGFloat, shift: Bool) {
+        guard let index = windowColumnIndex(atX: x), index < absoluteColumns.count else { return }
+        container.window?.makeFirstResponder(table)
+        let column = absoluteColumns[index]
+        if shift {
+            model.extendSelectionToWholeColumn(column)
+        } else {
+            model.selectWholeColumn(column)
+        }
+        refreshSelectionDisplay()
+    }
+
+    /// Arrow / shift-arrow (via `SheetTableView`'s `NSStandardKeyBindingResponding`
+    /// overrides — `interpretKeyEvents` does the key -> action translation,
+    /// framework-native).
+    func moveSelection(_ direction: SelectionDirection, extending: Bool) {
+        model.moveSelection(direction, extending: extending)
+        refreshSelectionDisplay()
+    }
+
+    /// Cmd+A (via `SheetTableView.selectAll(_:)`, the standard responder-chain
+    /// action the stock Edit menu already sends — no custom menu wiring).
+    func selectAll() {
+        model.selectAll()
+        refreshSelectionDisplay()
+    }
+
+    /// Cmd+C (via `SheetTableView.copy(_:)`, same standard-action path as
+    /// `selectAll`): kicks off the off-main copy build; see
+    /// `DocumentModel.copySelection`. Nothing to refresh here — copying
+    /// never changes the selection or the viewport.
+    func copySelection() {
+        model.copySelection()
+    }
+
+    /// Esc (via `SheetTableView.cancelOperation(_:)` — ARCH-select-copy
+    /// round 2, finding 2): cancels an in-flight copy exactly like the
+    /// notice's own Cancel button; see `DocumentModel.cancelCopy`. A no-op
+    /// when nothing is copying, so Esc otherwise behaves exactly as before.
+    func cancelCopy() {
+        model.cancelCopy()
+    }
+
+    /// Immediate, targeted redraw after a selection change — O(visible
+    /// rows), never a `reloadData()`: the same `enumerateAvailableRowViews`
+    /// sweep `refreshVisibleRows` already uses for highlight/data changes
+    /// (`configure` re-reads the fresh `model.windowSelectionMarks`). Called
+    /// directly so a drag-select feels live rather than waiting on the next
+    /// SwiftUI `apply()` cycle; `model.selection` is ALSO tracked by
+    /// `GridView.body` as a safety net for any path that doesn't call this.
+    private func refreshSelectionDisplay() {
+        refreshVisibleRows()
+    }
+
+    // MARK: Column resize + auto-fit (ARCH-select-copy AC5) — hit-testing and
+    // cursor feedback live on `GridHeaderView` (it owns the header's
+    // geometry); this is the O(1) model hand-off + the minimal targeted
+    // AppKit refresh, never a `reloadData()`/full relayout.
+
+    /// Drag-resize: `windowIndex` is a position in `widths` (the header's own
+    /// hit-test already resolved which one); forwards to the model (O(1))
+    /// then does the minimal AppKit refresh a width change needs.
+    func resizeColumn(windowIndex: Int, toWidth width: CGFloat) {
+        model.resizeWindowColumn(windowIndex, toWidth: Double(width))
+        refreshAfterWidthChange()
+    }
+
+    /// Double-click auto-fit: forwards to the model (O(visible rows) to
+    /// measure, per the contract) then the same minimal refresh as a resize.
+    func autoFitColumn(windowIndex: Int) {
+        model.autoFitWindowColumn(windowIndex)
+        refreshAfterWidthChange()
+        // The auto-fit ALSO resets the column's auto baseline
+        // (`columnWidths`), which `apply()`'s change-detection compares
+        // against `lastColumnWidths` — sync it now so a LATER, unrelated
+        // SwiftUI update cycle never sees a stale mismatch and pays a
+        // surprise full `reloadData()` for a change already handled here.
+        lastColumnWidths = model.columnWidths
+    }
+
+    /// O(1)/O(window) re-sync of exactly what a width change affects — never
+    /// a `table.reloadData()` (ARCH AC5: "O(1) per resize... no all-column
+    /// relayout"): re-pull this tick's window widths/offset + gutter/total
+    /// width, resize the scrollable column/filler count to the fresh total,
+    /// and repaint the header + visible rows (their OWN `draw` reads the
+    /// fresh `widths`/`c.widths` arrays, so no data reload is needed).
+    private func refreshAfterWidthChange() {
+        refreshLayoutMetrics()
+        refreshColumnWindow()
+        refreshColumnWidth(site: "resize")
+        header.needsDisplay = true
+        gutter.needsDisplay = true
+        table.enumerateAvailableRowViews { rowView, _ in rowView.needsDisplay = true }
     }
 
     // MARK: NSTableViewDataSource / Delegate
@@ -866,7 +1088,9 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
 /// right hairline, the filler-column hairlines out to the right edge, and a
 /// full-width bottom hairline — the spreadsheet fill, one view per row (recycled
 /// by NSTableView). Tabular numerals; semantic colors (dark mode automatic);
-/// find highlights subtle/strong. Header/filler rows never carry highlights.
+/// find highlights subtle/strong; the ARCH-select-copy selection overlay reuses
+/// the SAME accent-fill/border language (`selectionMarks`, below). Header/filler
+/// rows never carry highlights or selection marks.
 final class SheetRowView: NSTableRowView {
     weak var controller: NativeGridController?
     var cells: [String] = []
@@ -875,6 +1099,12 @@ final class SheetRowView: NSTableRowView {
     /// core's flag is rendered as-is, never re-derived from measured text.
     var truncated: [Bool] = []
     var highlights: [SheetCellHighlight] = []
+    /// Selection-overlay state per visible column (ARCH-select-copy AC1),
+    /// PARALLEL to `cells`/`highlights` — precomputed by the model
+    /// (`DocumentModel.windowSelectionMarks`), never derived here: `draw`
+    /// stays a flat, O(visible columns) per-frame read, exactly like the
+    /// find-highlight fill it reuses.
+    var selectionMarks: [SelectionMark] = []
     var isFiller = false
     /// A data row within the estimated range but NOT YET SERVABLE — past the
     /// materialized scan frontier (`DocumentModel.cells(forRow:)` returned
@@ -917,6 +1147,14 @@ final class SheetRowView: NSTableRowView {
             case .strong: accent.withAlphaComponent(0.42).setFill(); cell.fill()
             case .none: break
             }
+            // ARCH-select-copy AC1: the selection overlay reuses this SAME
+            // accent-fill language, layered on top of (never instead of) a
+            // find highlight — a cell can be both matched AND selected.
+            let mark = i < selectionMarks.count ? selectionMarks[i] : .none
+            if mark.isSelected {
+                accent.withAlphaComponent(0.15).setFill()
+                cell.fill()
+            }
             if i < cells.count, !cells[i].isEmpty {
                 SheetRowView.drawText(cells[i], in: cell.insetBy(dx: GridMetrics.cellHPadding, dy: 0),
                                       font: SheetRowView.font, color: .labelColor, alignment: .left)
@@ -931,6 +1169,9 @@ final class SheetRowView: NSTableRowView {
                 let p = NSBezierPath(rect: cell.insetBy(dx: 0.75, dy: 0.75))
                 p.lineWidth = 1.5
                 p.stroke()
+            }
+            if mark.isSelected {
+                SheetRowView.drawSelectionBorder(mark, in: cell, accent: accent)
             }
             grid.setFill()
             NSRect(x: x + w - NativeGrid.hairline, y: 0, width: NativeGrid.hairline, height: h).fill()
@@ -959,6 +1200,24 @@ final class SheetRowView: NSTableRowView {
                          width: diameter, height: diameter)
         NSColor.secondaryLabelColor.withAlphaComponent(0.6).setFill()
         NSBezierPath(ovalIn: dot).fill()
+    }
+
+    /// The selection RANGE border (ARCH-select-copy AC1): strokes only the
+    /// side(s) of `cell` that sit on the selection rect's OUTER edge (an
+    /// interior selected cell gets the accent fill only, drawn above — no
+    /// stroke), so a multi-cell selection reads as one continuous outlined
+    /// range rather than a grid of individually-boxed cells. Mirrors the
+    /// find "current match" border's weight/inset for a consistent look.
+    static func drawSelectionBorder(_ mark: SelectionMark, in cell: NSRect, accent: NSColor) {
+        accent.setStroke()
+        let r = cell.insetBy(dx: 0.75, dy: 0.75)
+        let path = NSBezierPath()
+        path.lineWidth = 1.5
+        if mark.borderTop { path.move(to: NSPoint(x: r.minX, y: r.minY)); path.line(to: NSPoint(x: r.maxX, y: r.minY)) }
+        if mark.borderBottom { path.move(to: NSPoint(x: r.minX, y: r.maxY)); path.line(to: NSPoint(x: r.maxX, y: r.maxY)) }
+        if mark.borderLeft { path.move(to: NSPoint(x: r.minX, y: r.minY)); path.line(to: NSPoint(x: r.minX, y: r.maxY)) }
+        if mark.borderRight { path.move(to: NSPoint(x: r.maxX, y: r.minY)); path.line(to: NSPoint(x: r.maxX, y: r.maxY)) }
+        path.stroke()
     }
 
     /// The "still loading" placeholder for a not-yet-servable cell (`pending`
@@ -995,12 +1254,83 @@ final class SheetRowView: NSTableRowView {
     }
 }
 
+// MARK: - Data table (ARCH-select-copy: mouse/keyboard selection + copy)
+
+/// The data table. `NSTableView` already gives row hit-testing (`row(at:)`)
+/// and first-responder/event routing (framework); this subclass adds ONLY
+/// what AppKit has no equivalent for — mapping a click's x-offset to one of
+/// our custom-drawn SUB-columns (there is exactly one real `NSTableColumn`;
+/// `SheetRowView` paints every visible column itself) — by forwarding raw
+/// mouse/keyboard events to the controller, which drives the pure
+/// `Selecting` model. Arrow-key navigation rides `interpretKeyEvents` (AppKit's
+/// OWN key-binding table for `NSStandardKeyBindingResponding` — the same
+/// mechanism `NSTextView` uses for arrow-key motion), and Cmd+A / Cmd+C ride
+/// the stock Edit menu's standard `selectAll:`/`copy:` responder-chain
+/// actions — no custom menu items or key-code parsing either way.
+final class SheetTableView: NSTableView {
+    weak var controller: NativeGridController?
+
+    override var acceptsFirstResponder: Bool { true }
+
+    override func mouseDown(with event: NSEvent) {
+        controller?.mouseDown(event, in: self)
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        controller?.mouseDragged(event, in: self)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        controller?.mouseUp(event, in: self)
+    }
+
+    override func keyDown(with event: NSEvent) {
+        // Translates the raw key event into one of the `moveXxx`/
+        // `moveXxxAndModifySelection` calls below via AppKit's default key
+        // bindings (arrows / shift-arrows) — framework-native, no hand-rolled
+        // key-code switch. Anything the table doesn't handle beeps/forwards
+        // exactly as a plain NSResponder would (the default `doCommand(by:)`).
+        interpretKeyEvents([event])
+    }
+
+    override func moveUp(_ sender: Any?) { controller?.moveSelection(.up, extending: false) }
+    override func moveDown(_ sender: Any?) { controller?.moveSelection(.down, extending: false) }
+    override func moveLeft(_ sender: Any?) { controller?.moveSelection(.left, extending: false) }
+    override func moveRight(_ sender: Any?) { controller?.moveSelection(.right, extending: false) }
+    override func moveUpAndModifySelection(_ sender: Any?) { controller?.moveSelection(.up, extending: true) }
+    override func moveDownAndModifySelection(_ sender: Any?) { controller?.moveSelection(.down, extending: true) }
+    override func moveLeftAndModifySelection(_ sender: Any?) { controller?.moveSelection(.left, extending: true) }
+    override func moveRightAndModifySelection(_ sender: Any?) { controller?.moveSelection(.right, extending: true) }
+
+    override func selectAll(_ sender: Any?) { controller?.selectAll() }
+    // `copy(_:)` is not a declared-overridable NSResponder/NSTableView method
+    // in this SDK (unlike `selectAll(_:)`, which NSTableView already declares
+    // for its own row selection) — it reaches the responder chain purely via
+    // Objective-C selector dispatch (`NSApplication.sendAction`), so `@objc`
+    // (not `override`) is what makes the stock Edit menu's Copy item find it.
+    @objc func copy(_ sender: Any?) { controller?.copySelection() }
+
+    // `cancelOperation(_:)` is the OTHER standard `NSStandardKeyBindingResponding`
+    // action (alongside `moveUp:`/`selectAll:` above) — the default key-binding
+    // table maps Esc to it — so overriding it (ARCH-select-copy round 2, finding
+    // 2) needs no key-code parsing or menu wiring either: Esc while the grid (not
+    // some other field/popup) is first responder now cancels an in-flight copy,
+    // same as the notice's own Cancel button.
+    override func cancelOperation(_ sender: Any?) { controller?.cancelCopy() }
+}
+
 // MARK: - Sticky header (drawn, scrolls horizontally with its columns)
 
 /// The column-title row. Transparent (the glass band shows through, data frosts
 /// under it), semibold titles, per-column hairlines, a bottom hairline. Its
 /// content offset tracks the table's horizontal scroll so it moves with the
-/// columns; it never scrolls vertically (pinned in the band).
+/// columns; it never scrolls vertically (pinned in the band). ALSO owns the
+/// column resize / auto-fit hit-testing (ARCH-select-copy AC5): a header
+/// click elsewhere selects the whole column; a click/drag ON (or a
+/// double-click of) a column's trailing hairline resizes/auto-fits it
+/// instead — AppKit's own cursor-rect mechanism (`resetCursorRects`/
+/// `addCursorRect`, the same facility `NSSplitView` uses for its dividers)
+/// shows `.resizeLeftRight` over that zone with no manual push/pop bookkeeping.
 final class GridHeaderView: NSView {
     weak var controller: NativeGridController?
     var contentOffsetX: CGFloat = 0
@@ -1010,8 +1340,94 @@ final class GridHeaderView: NSView {
     /// resolves under this view's appearance, so it is dark in a dark capture.
     var capturesBackground = false
 
+    /// Half-width of the draggable hit-zone straddling a column's trailing
+    /// hairline — wide enough to grab reliably, narrow enough not to steal
+    /// ordinary header clicks (whole-column select) from nearby content.
+    private static let resizeHitHalfWidth: CGFloat = 3
+    private var resizingIndex: Int?
+    private var resizeStartX: CGFloat = 0
+    private var resizeStartWidth: CGFloat = 0
+
     override var isFlipped: Bool { true }
     override var isOpaque: Bool { false }
+
+    /// The window-local column index (`controller.widths`' index space)
+    /// whose TRAILING hairline sits under HEADER-LOCAL `x`, or nil — there is
+    /// no native per-subcolumn hit test (one real `NSTableColumn` carries
+    /// every custom-drawn visible column), so this walks the SAME sequential
+    /// layout `draw` uses, in this view's own (already-descrolled) space.
+    private func resizeIndex(atLocalX x: CGFloat) -> Int? {
+        guard let c = controller else { return nil }
+        var edge = c.columnFirstX - contentOffsetX
+        for (i, w) in c.widths.enumerated() {
+            edge += w
+            if abs(x - edge) <= Self.resizeHitHalfWidth { return i }
+        }
+        return nil
+    }
+
+    override func resetCursorRects() {
+        guard let c = controller else { return }
+        var edge = c.columnFirstX - contentOffsetX
+        for w in c.widths {
+            edge += w
+            addCursorRect(
+                NSRect(x: edge - Self.resizeHitHalfWidth, y: 0, width: Self.resizeHitHalfWidth * 2, height: bounds.height),
+                cursor: .resizeLeftRight
+            )
+        }
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        handleClick(atLocalX: point.x, doubleClick: event.clickCount >= 2, shift: event.modifierFlags.contains(.shift))
+    }
+
+    /// The resize-vs-select dispatch `mouseDown(with:)` performs, factored out
+    /// so it is directly callable with a known HEADER-LOCAL x — no synthetic
+    /// `NSEvent` (mirrors how `NativeGridController.headerMouseDown`/
+    /// `gutterMouseDown` are themselves directly callable; `SelectCopyProbe`
+    /// drives this to regression-test the fix below). `x` is in THIS view's
+    /// own (already-descrolled) local space — exactly the space
+    /// `resetCursorRects`/`resizeIndex` already use, and exactly what
+    /// `mouseDown(with:)` converts an event into.
+    ///
+    /// BUG FIX (ARCH-select-copy round 2, finding 1): the non-resize
+    /// (whole-column-select) branch hands off to `NativeGridController.
+    /// headerMouseDown(atX:)` -> `windowColumnIndex(atX:)`, whose cursor
+    /// starts at the ABSOLUTE `columnFirstX` — the same absolute space the
+    /// data-cell path (`cellAt`) and the gutter path (via `table.convert`)
+    /// already hand it. This view's own local `x` is DESCROLLED (`draw`
+    /// paints at `columnFirstX - contentOffsetX`), so it must be re-based to
+    /// absolute (`+ contentOffsetX`) before crossing that hand-off — passing
+    /// the raw local `x` (the previous bug) silently mismapped every click
+    /// once scrolled horizontally: a descrolled x is always <= the absolute x
+    /// it corresponds to, so it landed on an EARLIER (often the very first)
+    /// window column instead of the one actually under the cursor.
+    func handleClick(atLocalX x: CGFloat, doubleClick: Bool, shift: Bool) {
+        guard let c = controller else { return }
+        if let index = resizeIndex(atLocalX: x) {
+            if doubleClick {
+                c.autoFitColumn(windowIndex: index)
+            } else {
+                resizingIndex = index
+                resizeStartX = x
+                resizeStartWidth = index < c.widths.count ? c.widths[index] : GridMetrics.minColumnWidth
+            }
+            return
+        }
+        c.headerMouseDown(atX: x + contentOffsetX, shift: shift)
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard let index = resizingIndex, let c = controller else { return }
+        let point = convert(event.locationInWindow, from: nil)
+        c.resizeColumn(windowIndex: index, toWidth: resizeStartWidth + (point.x - resizeStartX))
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        resizingIndex = nil
+    }
 
     override func draw(_ dirtyRect: NSRect) {
         guard let c = controller else { return }
@@ -1067,6 +1483,17 @@ final class GridGutterView: NSView, NSViewToolTipOwner {
     weak var controller: NativeGridController?
 
     override var isFlipped: Bool { true }
+
+    /// Gutter click (ARCH-select-copy AC1): whole-row select; shift-click
+    /// extends a whole-row selection. Converts straight to the TABLE's local
+    /// space (same row-height/positions as this view, just x=0-aligned)
+    /// rather than routing through this view's own coordinates — the
+    /// controller's row math already expects table-local points.
+    override func mouseDown(with event: NSEvent) {
+        guard let c = controller else { return }
+        let tablePoint = c.table.convert(event.locationInWindow, from: nil)
+        c.gutterMouseDown(atY: tablePoint.y, shift: event.modifierFlags.contains(.shift))
+    }
 
     // Row numbers are chrome (generated line numbers, not file data): keep the
     // tabular-digit font — NOT the data cells' SF Mono — so digits stay aligned,

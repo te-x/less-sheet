@@ -74,6 +74,17 @@ struct OverlayView: View {
                     .accessibilityHidden(true)
             }
 
+            // ARCH-select-copy AC2: a brief, subtle "what was copied" notice —
+            // floats above the control row, auto-cleared by the model after a
+            // readable beat (`DocumentModel.completeCopy`), never blocking or
+            // requiring dismissal.
+            if let notice = model.copyNotice {
+                CopyNoticeView(model: model, text: notice)
+                    .padding(.trailing, 24)
+                    .padding(.bottom, 24 + OverlayMetrics.controlSize + 10)
+                    .transition(.opacity.combined(with: .move(edge: .bottom)))
+            }
+
             GlassEffectContainer(spacing: 8) {
                 HStack(alignment: .bottom, spacing: 8) {
                     // The filtered banner rides the control row, left of Find,
@@ -97,6 +108,42 @@ struct OverlayView: View {
         // and the title-bar filename all stay put).
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Viewer controls")
+        .animation(.easeInOut(duration: 0.2), value: model.copyNotice)
+    }
+}
+
+/// The post-copy notice pill (ARCH-select-copy AC2) — same glass language as
+/// the control row. While the copy is STILL RUNNING (`model.copyInFlight`,
+/// round 2 finding 2) it carries a Cancel button + an Esc affordance,
+/// mirroring the jump-scanning popup's own Cancel/`onExitCommand`
+/// (`JumpControlView.scanning` below) — the grid's own `SheetTableView.
+/// cancelOperation(_:)` override is the PRIMARY way Esc reaches
+/// `DocumentModel.cancelCopy` (it fires whenever the grid itself is first
+/// responder, the common case right after ⌘C); this is the belt-and-
+/// suspenders match for whatever else might hold focus. Once the build
+/// finishes, `copyInFlight` flips false and this reverts to a static label —
+/// nothing left to cancel.
+struct CopyNoticeView: View {
+    @Bindable var model: DocumentModel
+    let text: String
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text(text)
+                .font(.caption)
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+            if model.copyInFlight {
+                Button("Cancel", role: .cancel) { model.cancelCopy() }
+                    .buttonStyle(.plain)
+                    .font(.caption)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .glassChrome(.regular, in: Capsule())
+        .onExitCommand { if model.copyInFlight { model.cancelCopy() } }
+        .accessibilityLabel(model.copyInFlight ? "\(text). Press Escape to cancel." : text)
     }
 }
 

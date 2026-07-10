@@ -147,6 +147,25 @@ enum SheetCellHighlight: Equatable {
     case strong
 }
 
+/// One cell's selection-overlay state (ARCH-select-copy AC1): whether it is
+/// inside the live selection rect, and which of its FOUR sides sit on the
+/// rect's OUTER boundary — an interior selected cell gets the accent fill
+/// only (`isSelected`), a boundary cell ALSO gets a border stroke on the
+/// matching side(s), so a multi-cell selection reads as one continuous
+/// outlined range rather than a grid of individually-boxed cells. Mirrors
+/// `SheetCellHighlight`'s role: precomputed OUTSIDE the draw loop (by
+/// `DocumentModel.windowSelectionMarks`) so `SheetRowView.draw` stays a flat,
+/// O(visible columns) per-frame read — never a per-cell model call.
+struct SelectionMark: Equatable {
+    var isSelected = false
+    var borderTop = false
+    var borderBottom = false
+    var borderLeft = false
+    var borderRight = false
+
+    static let none = SelectionMark()
+}
+
 /// Pins a view to the leading edge of its enclosing ScrollView by counter-
 /// translating the horizontal scroll (GPU-composited via `visualEffect`, so it
 /// never lags the scroll the way a state round-trip would). Disabled for the

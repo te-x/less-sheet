@@ -343,6 +343,10 @@ struct ContentView: View {
                 // Verification: park the viewport, toggle the header, and prove the
                 // same file record stays in view (it logs + terminates itself).
                 HeaderToggleProbe.run(model: model)
+            } else if SelectCopyProbe.active {
+                // Verification: drive selection/copy/resize directly against the
+                // model (ARCH-select-copy) — logs + terminates itself.
+                SelectCopyProbe.run(model: model)
             } else if FrameDump.liveGridInitialDumpPath == nil {
                 // Overlay / find / settings / overscroll etc. render off a SwiftUI
                 // mirror here; the plain grid-content scene instead self-captures

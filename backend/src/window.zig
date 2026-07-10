@@ -10,6 +10,7 @@
 
 const api = @import("api");
 const base = @import("base.zig");
+const enc = @import("encoding.zig");
 const lexer = @import("lexer.zig");
 const matcher = @import("matcher.zig");
 const nav = @import("nav.zig");
@@ -284,46 +285,225 @@ pub fn rowOversized(d: *const Document, row: u64) bool {
     return d.win_oversized.items[idx];
 }
 
-
-/// See api/lesssheet.h `ls_cell_copy`. RED SEED — the bounded full-cell read is
-/// NOT yet implemented: it serves the EMPTY string for every servable cell
-/// (out_len 0), so the frozen behavior test (cc*) is RED on the full-cell
-/// content, on truncation, on the no-borrow copy, and on the PENDING / NO_CELL
-/// status machine, while `zig build` still compiles (the comptime pin + C-ABI
-/// export are satisfied). It touches only `column_count` (immutable), so it
-/// cannot fault, overrun `buf`, or race.
+/// See api/lesssheet.h `ls_cell_copy`: the bounded, window-INDEPENDENT,
+/// LOSSLESS full-cell read. Poll/control lane: never touches or evicts the
+/// materialized window (win_buf/win_refs/win_first/win_rows are untouched
+/// throughout — the read COPIES into the caller's buffer, so its output is
+/// unaffected by a later ls_window_set, on any thread — the cc4 no-borrow
+/// test pins this) and never scans or advances the frontier.
 ///
-/// GREEN path (the build implementer's work — window-INDEPENDENT, poll/control
-/// lane, ZERO heap alloc, NEVER scans/advances the frontier):
-///   * NO_CELL when `d.column_count == 0` or `col >= d.column_count`, or when
-///     `row` is at/beyond an EXACT end (identity: `row >= d.total_rows` while
-///     `d.complete`; filtered: `row >= d.filter_total` while `d.filter_state ==
-///     .done`).
-///   * Locate `row`'s content offset WITHOUT scanning: the pinned bounded
-///     record-1 row 0 (`row0_pinned_*`, identity view) serves directly; else,
-///     under `d.lock()`, read `avail_end = if (d.complete) d.total_rows else
-///     d.frontier_rows` and, if `row < avail_end`, take `nav.bestCheckpoint(d,
-///     row)` (by value) and unlock. A `row >= avail_end` that is not pinned is
-///     PENDING (its offset is unknown until the frontier advances). Filtered
-///     (`d.filter_state != .idle`): interpret `row` in FILTERED coordinates via
-///     `nav.nthMatchLocation` over `d.filter_block_counts` (like
-///     windowSetFiltered); `row >= d.filter_total` counted-so-far is PENDING.
-///   * From the checkpoint, skip to `row` (`lexer.recordBounds`) and decode
-///     ONLY column `col` into `buf[0..buf_len]`, reusing the lexer's
-///     storeCapped/utf8TrimToBoundary discipline with `cap = buf_len` and a
-///     per-row SOURCE bound of `api.window_row_scan_max_bytes` (identical to
-///     windowSet, so cost stays O(min(row bytes, cap))). Set `out_len.*` to the
-///     bytes written and `out_truncated.*` iff the cell's full transcoded
-///     content exceeds them (buf_len OR the per-row source cap — an OVERSIZED
-///     row is a bounded prefix, `out_truncated` true). Return `.ok`.
-/// The read COPIES into the caller buffer (no ls_str borrow), so its output is
-/// unaffected by a later ls_window_set — the cc no-borrow test pins this.
+///   * NO_CELL when `d.column_count == 0` or `col >= d.column_count`
+///     (checked first, independent of `row`); else `row` at/beyond an EXACT
+///     end (identity: `row >= d.total_rows` while `d.complete`; filtered:
+///     `row >= d.filter_total` while `d.filter_state == .done` — see
+///     `cellCopyFiltered`).
+///   * Located WITHOUT scanning: the pinned bounded record-1 row 0
+///     (`record1_capped && !has_header`, identity view only — see
+///     `windowSet`'s identical special case) sits at content offset
+///     `data_start` (always 0 here) directly, bypassing the frontier (which
+///     never claims a row whose extent past the O(head) budget is unknown —
+///     that row is pathologically "oversized" from its very first byte, so
+///     `decodeCellAt` below naturally bounds it exactly like any other
+///     oversized row). A filtered view defers entirely to
+///     `cellCopyFiltered` (FILTERED coordinates, `nav.nthMatchLocation` —
+///     the same machinery `windowSetFiltered` uses). Otherwise a `row`
+///     behind the frontier is found via `nav.bestCheckpoint` (by value,
+///     under `d.lock()`) plus the SAME checkpoint-to-row skip loop
+///     `windowSet` uses — never crosses an oversized row's bytes, for the
+///     same reason: `row < avail_end` guarantees any oversized row before it
+///     was already scanned, so `bestCheckpoint` already lands past it. A
+///     `row` at/beyond the frontier (and not pinned) is PENDING: its offset
+///     isn't known yet.
+///   * `decodeColumn` (below) then decodes ONLY column `col` from that
+///     offset — never the rest of the row — bounded to the SAME per-row
+///     SOURCE cap `windowSet` uses (`api.window_row_scan_max_bytes`) and to
+///     the caller's `buf_len` OUTPUT cap, reusing the `utf8TrimToBoundary`
+///     fixup so a cut cell never ends mid code point. `out_truncated.*` is
+///     set iff either cap actually cut the cell (an OVERSIZED row is served
+///     as a bounded, flagged prefix, like `ls_row_oversized`). Always `.ok`
+///     once a row is located: a located row always has a well-defined
+///     (possibly empty or bounded) cell. ZERO heap allocation on this path
+///     (see `decodeColumn`); the filtered path's use of the shared
+///     `nav_scratch` re-lex scratch is the one exception, mirroring
+///     `windowSetFiltered`.
 pub fn cellCopy(d: *Document, row: u64, col: u32, buf: ?[*]u8, buf_len: usize, out_len: *usize, out_truncated: *bool) api.CopyResult {
-    _ = row;
-    _ = buf;
-    _ = buf_len;
     out_len.* = 0;
     out_truncated.* = false;
     if (d.column_count == 0 or col >= d.column_count) return .no_cell;
-    return .ok; // RED: serves nothing (out_len 0) instead of the full cell.
+
+    if (d.filter_state != .idle) return cellCopyFiltered(d, row, col, buf, buf_len, out_len, out_truncated);
+
+    // BOUNDED RECORD 1 (identity view only — mirrors windowSet's pinned-row-0
+    // branch): row 0's true extent runs past the O(head) budget, and
+    // therefore past the (far smaller) window scan cap too, so it is served
+    // exactly like any other oversized row, from offset `data_start` (always
+    // 0 in this configuration), bypassing the frontier entirely.
+    if (row == 0 and d.record1_capped and !d.has_header and d.row0_pinned_refs.len > 0) {
+        return decodeCellAt(d, @intCast(d.data_start), col, buf, buf_len, out_len, out_truncated);
+    }
+
+    d.lock();
+    const avail_end = if (d.complete) d.total_rows else d.frontier_rows;
+    if (row >= avail_end) {
+        const exact = d.complete;
+        d.unlock();
+        return if (exact) .no_cell else .pending;
+    }
+    const cp = nav.bestCheckpoint(d, row);
+    d.unlock();
+
+    // Skip from the checkpoint to `row` — identical to windowSet's skip loop,
+    // and safe for the same reason (see windowSet's comment on its own loop).
+    var off: usize = @intCast(cp.offset);
+    var r = cp.row;
+    while (r < row) : (r += 1) {
+        off = lexer.recordBounds(d.content, off, d.sep, d.quote, d.content.len, d.encoding).next;
+    }
+    return decodeCellAt(d, off, col, buf, buf_len, out_len, out_truncated);
+}
+
+/// `ls_cell_copy` while a filter is active (FILTERED VIEWS): locate FILTERED
+/// index `row`'s ORIGINAL row/offset via `nav.nthMatchLocation` — O(checkpoints)
+/// + a bounded in-block re-lex, the same machinery `windowSetFiltered` uses —
+/// then decode column `col` from there exactly like the identity path. Holds
+/// the mutex for the whole call (bounded: O(checkpoints) + one scan-capped
+/// row decode), mirroring `windowSetFiltered`.
+fn cellCopyFiltered(d: *Document, row: u64, col: u32, buf: ?[*]u8, buf_len: usize, out_len: *usize, out_truncated: *bool) api.CopyResult {
+    d.lock();
+    defer d.unlock();
+    if (row >= d.filter_total) return if (d.filter_state == .done) .no_cell else .pending;
+    const fctx = filter.filterCtx(d);
+    const loc = nav.nthMatchLocation(d, d.filter_block_counts.items, fctx, d.filter_rows, row) orelse {
+        // Defensive only: `row < filter_total` guarantees the counted region
+        // has this many matches already, so this should be unreachable; if
+        // it ever triggers, retrying would not change the outcome.
+        return .no_cell;
+    };
+    return decodeCellAt(d, @intCast(loc.offset), col, buf, buf_len, out_len, out_truncated);
+}
+
+/// Decode column `col` of the row starting at content offset `off`, bounded
+/// to `api.window_row_scan_max_bytes` SOURCE bytes (the SAME per-row cap
+/// `windowSet` uses) and to `buf_len` OUTPUT bytes. Always `.ok`: a located
+/// row always has a well-defined (possibly empty or bounded-prefix) cell.
+fn decodeCellAt(d: *Document, off: usize, col: u32, buf: ?[*]u8, buf_len: usize, out_len: *usize, out_truncated: *bool) api.CopyResult {
+    const scan_cap: usize = @intCast(api.window_row_scan_max_bytes);
+    const row_limit = @min(off +| scan_cap, d.content.len);
+    const res = decodeColumn(d.content, off, d.sep, d.quote, row_limit, d.encoding, col, buf, buf_len);
+    out_len.* = res.len;
+    out_truncated.* = res.truncated;
+    return .ok;
+}
+
+/// Append one decoded unit's UTF-8 output to `buf[0..buf_len]` at
+/// `out_len.*` unless the cap is already reached or would be exceeded (never
+/// a partial unit, so the written bytes are only ever cut at a unit boundary
+/// — the `utf8TrimToBoundary` fixup in `decodeColumn` then fixes up the rarer
+/// UTF-8-pass-through case where a "unit" is a single raw byte that can
+/// itself land mid code point), latching `cap_truncated.*` and storing
+/// nothing further once set. Mirrors lexer.zig's private `storeCapped`,
+/// adapted to a raw fixed buffer instead of an ArrayList so the caller does
+/// ZERO heap allocation.
+fn storeUnit(buf: ?[*]u8, buf_len: usize, out_len: *usize, cap_truncated: *bool, u: enc.Unit) void {
+    if (cap_truncated.*) return;
+    if (out_len.* + @as(usize, u.out_len) > buf_len) {
+        cap_truncated.* = true;
+        return;
+    }
+    if (buf) |b| @memcpy(b[out_len.* .. out_len.* + u.out_len], u.out[0..u.out_len]);
+    out_len.* += u.out_len;
+}
+
+/// Decode ONLY column `col` of the record starting at SOURCE offset `start`
+/// into `buf[0..buf_len]` (nothing written when `col`'s field doesn't exist —
+/// a ragged row — or `buf_len` is 0). Mirrors lexer.lexInto's per-field decode
+/// (quote handling, structural sep/CR/LF scanning, the `utf8TrimToBoundary`
+/// fixup on a cut field) but touches no ArrayList or allocator: fields before
+/// `col` are scanned WITHOUT storing, and decoding stops the instant `col` is
+/// resolved (found, cut, or padded) — it never looks at the rest of the row.
+/// `limit` bounds the SOURCE bytes visited (the caller's per-row scan cap, or
+/// `content.len` for the unbounded pinned-row-0 decode); ZERO heap
+/// allocation.
+///
+/// `truncated` is true iff `col`'s full transcoded content exceeds the
+/// written bytes: `buf_len` cut it, or `limit` is an ARTIFICIAL bound
+/// (`limit != content.len` — the per-row source scan cap) reached before
+/// `col` could be located or fully decoded. Reaching the TRUE end of the
+/// content (`limit == content.len`) with no more separators is simply a
+/// ragged/short row: `col` beyond it pads to the empty, UNTRUNCATED cell —
+/// nothing is missing.
+fn decodeColumn(
+    content: []const u8,
+    start: usize,
+    sep: u8,
+    quote: ?u8,
+    limit: usize,
+    encoding: u8,
+    col: u32,
+    buf: ?[*]u8,
+    buf_len: usize,
+) struct { len: usize, truncated: bool } {
+    const artificial = limit != content.len;
+    var i = start;
+    var produced: u32 = 0;
+    while (true) {
+        const store = produced == col;
+        var out_len: usize = 0;
+        var cap_truncated = false;
+        var hit_limit = false;
+
+        if (quote) |q| {
+            if (enc.decodeUnit(content, i, limit, encoding)) |first| {
+                if (enc.unitIsByte(first, q)) {
+                    i += first.src_len;
+                    while (true) {
+                        const u = enc.decodeUnit(content, i, limit, encoding) orelse {
+                            hit_limit = true;
+                            break;
+                        };
+                        if (enc.unitIsByte(u, q)) {
+                            const peek = enc.decodeUnit(content, i + u.src_len, limit, encoding);
+                            if (peek != null and enc.unitIsByte(peek.?, q)) {
+                                if (store) storeUnit(buf, buf_len, &out_len, &cap_truncated, u);
+                                i += u.src_len + peek.?.src_len;
+                                continue;
+                            }
+                            i += u.src_len;
+                            break;
+                        }
+                        if (store) storeUnit(buf, buf_len, &out_len, &cap_truncated, u);
+                        i += u.src_len;
+                    }
+                }
+            }
+        }
+        if (!hit_limit) {
+            while (true) {
+                const u = enc.decodeUnit(content, i, limit, encoding) orelse {
+                    hit_limit = true;
+                    break;
+                };
+                if (enc.unitIsByte(u, sep) or enc.unitIsByte(u, '\n') or enc.unitIsByte(u, '\r')) break;
+                if (store) storeUnit(buf, buf_len, &out_len, &cap_truncated, u);
+                i += u.src_len;
+            }
+        }
+
+        const was_truncated = cap_truncated or (hit_limit and artificial);
+        if (store) {
+            if (was_truncated and encoding == api.encoding_utf8) {
+                if (buf) |b| out_len = enc.utf8TrimToBoundary(b[0..out_len]);
+            }
+            return .{ .len = out_len, .truncated = was_truncated };
+        }
+        if (hit_limit) return .{ .len = 0, .truncated = artificial };
+
+        produced += 1;
+        const u = enc.decodeUnit(content, i, limit, encoding).?; // present: hit_limit was false
+        if (enc.unitIsByte(u, sep)) {
+            i += u.src_len;
+            continue;
+        }
+        return .{ .len = 0, .truncated = false }; // record terminator: col beyond -> ragged pad
+    }
 }

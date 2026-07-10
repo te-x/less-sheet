@@ -116,6 +116,13 @@ final class DocumentModel {
     private(set) var visibility = ColumnVisibility(columnCount: 0, hiddenColumns: [])
     private(set) var jumpFlow: JumpFlow = .idle
 
+    // Selection + copy (ARCH-select-copy AC1-4): the live rectangular
+    // selection (index space; nil = nothing selected) and a brief post-copy
+    // status line (ARCH AC2: "a subtle notice"). Both session-scoped, reset
+    // on every (re-)open like the find/filter state below.
+    private(set) var selection: Selection?
+    private(set) var copyNotice: String?
+
     // Find (search) session state: the editable draft + the active search's
     // display (highlights render exactly while `display.request` is non-nil).
     // The draft survives Esc / dialect re-open (query-retained semantics).
@@ -166,6 +173,11 @@ final class DocumentModel {
     private let findControl = FindControl()
     private let filterControl = FilterControl()
     private let cellMatcher = CellMatcher()
+    /// The pure selection geometry, TSV copy builder, and column-width algebra
+    /// (ARCH-select-copy) — same layering as the collaborators above.
+    private let selectionModel = SelectionModel()
+    private let copyBuilder = TSVCopyBuilder()
+    private let columnSizer = ColumnSizer()
     /// The direction of the outstanding search navigation (drives the wrap
     /// notice's start/end choice when a poll reports exhaustion).
     private var searchNavDirection: SearchDirection = .forward
@@ -206,6 +218,26 @@ final class DocumentModel {
     private var pollTask: Task<Void, Never>?
     private var fadeTask: Task<Void, Never>?
     private var wrapNavTask: Task<Void, Never>?
+    /// Whether a copy build is currently running off-main. `private(set)` (not
+    /// fully private) so verification (`SelectCopyProbe`) can poll for a
+    /// SPECIFIC copy's completion without racing a stale `copyNotice` left
+    /// over from a PRIOR copy (`copyNotice` alone can't tell "this" copy's
+    /// completion apart from the last one's, since consecutive copies can
+    /// legitimately produce identical notice text).
+    private(set) var copyInFlight = false
+    private var copyNoticeTask: Task<Void, Never>?
+    /// The off-main copy build (ARCH-select-copy round 2, findings 2/3):
+    /// stored so a fresh ⌘C, Esc, or the "Copying…" notice's Cancel button
+    /// can cancel a running one (`cancelCopy`) rather than leaving it to
+    /// finish unseen. See `cancelCopy`'s doc comment for exactly what
+    /// cancellation can and cannot interrupt.
+    private var copyTask: Task<Void, Never>?
+    /// Manual column-width overrides (ARCH-select-copy AC5), keyed by ABSOLUTE
+    /// column index — session-scoped, reset on every (re-)open. Layered over
+    /// the AUTO baseline (`columnWidths`) via `ColumnSizing.effectiveWidths`
+    /// wherever a width is read for drawing/layout; `growColumnWidthsToFitWindow`
+    /// skips an overridden column so auto-grow never fights it.
+    private var manualColumnWidths: [Int: Double] = [:]
 
     init(opener: any DocumentSessionOpening = CoreSessionOpener()) {
         self.opener = opener
@@ -277,6 +309,14 @@ final class DocumentModel {
             self.filterSnapshot = nil
             self.filterDocumentRows = nil
             self.pendingScrollRow = nil
+            // Session-scoped select-copy state dies with the old handle too
+            // (ARCH-select-copy): row/column indices from a prior document are
+            // meaningless here, and a pending copy has nothing left to copy —
+            // `cancelCopy` cancels any in-flight build against the OLD handle
+            // (about to be closed above) and clears its UI state in one call.
+            self.selection = nil
+            self.manualColumnWidths = [:]
+            self.cancelCopy()
             self.phase = .document
             startPolling()
         } catch {
@@ -446,11 +486,20 @@ final class DocumentModel {
         // a debug build, not merely theoretical (this loop's whole reason for
         // existing is to pay that cost exactly ONCE per width batch).
         let source = columnWidths
+        // Hoisted alongside `source` for the SAME reason (see above): an
+        // EMPTY manual map (the common case) makes the per-iteration check
+        // below one dictionary-is-empty test, not a hash + lookup, 100k times.
+        let manual = manualColumnWidths
         var widths = [Double](repeating: 0, count: cols.count)
         var total: CGFloat = 0
         for i in 0..<cols.count {
             let c = cols[i]
-            let w = c < source.count ? source[c] : GridMetrics.minColumnWidth
+            let auto = c < source.count ? source[c] : GridMetrics.minColumnWidth
+            // EFFECTIVE width (ARCH-select-copy AC5): a manual override wins,
+            // regardless of the auto baseline — this is what keeps
+            // `cachedLayoutWidths`/`cachedTotalVisibleWidth` (the column-
+            // window geometry + total-width inputs) honest about a resize.
+            let w = manual.isEmpty ? auto : (manual[c].map { CGFloat($0) } ?? auto)
             widths[i] = Double(w)
             total += w
         }
@@ -544,6 +593,11 @@ final class DocumentModel {
         for pos in inWindow {
             let c = cols[pos]
             guard c < columnWidths.count else { continue }
+            // A manually-resized column is FROZEN (ARCH-select-copy AC5:
+            // auto-grow never overrides a manual width) — skip measuring it
+            // so its auto baseline (and the effective-width cache) stay
+            // exactly as the user set them until they clear/auto-fit it.
+            guard manualColumnWidths[c] == nil else { continue }
             let rel = c - base
             var w = Self.textWidth(columnLabel(c), headFont)
             for r in lo..<hi {
@@ -709,9 +763,11 @@ final class DocumentModel {
     // fine — it is NOT what the live grid draws; see the window-bound
     // counterparts below for that (ARCH-column-windowing).
 
-    /// Frozen widths of the visible columns, in render order.
+    /// Frozen widths of the visible columns, in render order — EFFECTIVE
+    /// widths (ARCH-select-copy AC5: a manual override wins over the auto
+    /// baseline), see `effectiveWidths(for:)`.
     func visibleWidths() -> [CGFloat] {
-        visibleColumns.map { $0 < columnWidths.count ? columnWidths[$0] : GridMetrics.minColumnWidth }
+        effectiveWidths(for: visibleColumns)
     }
 
     /// Header labels of the visible columns (effective names or generic A/B/C).
@@ -752,14 +808,40 @@ final class DocumentModel {
     }
 
     /// Widths of the current column window, in render order — what the live
-    /// grid draws (`NativeGridController.widths`).
+    /// grid draws (`NativeGridController.widths`); EFFECTIVE widths, see
+    /// `effectiveWidths(for:)`.
     func windowWidths() -> [CGFloat] {
-        windowColumns().map { $0 < columnWidths.count ? columnWidths[$0] : GridMetrics.minColumnWidth }
+        effectiveWidths(for: windowColumns())
+    }
+
+    /// `columns`' EFFECTIVE widths (`ColumnSizing.effectiveWidths`, "manual
+    /// wins" — ARCH-select-copy AC5): builds a COLUMNS-local `auto`/`manual`
+    /// pair so the contract call stays O(columns.count) — a window or the
+    /// visible-columns list, never O(columnCount) beyond what the caller
+    /// already asked for — then folds them through the contract.
+    private func effectiveWidths(for columns: [Int]) -> [CGFloat] {
+        guard !columns.isEmpty else { return [] }
+        let auto = columns.map { $0 < columnWidths.count ? Double(columnWidths[$0]) : Double(GridMetrics.minColumnWidth) }
+        var manual: [Int: Double] = [:]
+        if !manualColumnWidths.isEmpty {
+            for (i, c) in columns.enumerated() {
+                if let w = manualColumnWidths[c] { manual[i] = w }
+            }
+        }
+        return columnSizer.effectiveWidths(auto: auto, manual: manual).map { CGFloat($0) }
     }
 
     /// Header labels of the current column window, in render order.
     func windowHeaderLabels() -> [String] {
         windowColumns().map { columnLabel($0) }
+    }
+
+    /// Absolute column indices of the current column window, in render
+    /// order — PARALLEL to `windowWidths()`/`windowHeaderLabels()`: the
+    /// click→cell mapping's column half (ARCH-select-copy). Position `i`
+    /// here is the SAME absolute column `windowWidths()[i]` is the width of.
+    func windowAbsoluteColumns() -> [Int] {
+        windowColumns()
     }
 
     /// Column-window cells for a data row, empty-padded while not yet loaded
@@ -786,6 +868,359 @@ final class DocumentModel {
     var totalVisibleWidth: CGFloat {
         refreshLayoutWidthsIfNeeded()
         return cachedTotalVisibleWidth
+    }
+
+    // MARK: - Selection (ARCH-select-copy AC1) — pure index-space state
+    // driven by `Selecting` (`SelectionModel`); the grid's mouse/keyboard/
+    // gutter/header event routing (NativeGridController) is the only caller.
+    // O(1) in the extent, so Cmd+A on the largest document is free — see
+    // `Selecting`'s doc comment.
+
+    /// The document's selectable extent RIGHT NOW: `rowCountInfo.count`
+    /// already reports the FILTERED count while a filter is active (the
+    /// same domain every other row index in this model uses), so a
+    /// selection is naturally scoped to the current view mode with no extra
+    /// branching here.
+    private func selectionExtent() -> GridExtent {
+        GridExtent(rowCount: rowCountInfo.count, columnCount: columnCount)
+    }
+
+    /// A plain click.
+    func selectCell(row: UInt64, column: Int) {
+        selection = selectionModel.select(GridCell(row: row, column: column), in: selectionExtent())
+    }
+
+    /// A drag or shift-click: anchor kept, active moves to the clicked cell.
+    /// Nothing selected yet: falls back to a plain click (there is no
+    /// anchor to extend from).
+    func extendSelection(toRow row: UInt64, column: Int) {
+        guard let current = selection else { selectCell(row: row, column: column); return }
+        selection = selectionModel.extend(current, to: GridCell(row: row, column: column), in: selectionExtent())
+    }
+
+    /// Arrow / shift-arrow: `extending` false collapses + steps (arrow);
+    /// true keeps the anchor and steps only the active corner (shift-arrow).
+    /// A no-op with nothing selected yet — there is no cell to step from.
+    func moveSelection(_ direction: SelectionDirection, extending: Bool) {
+        guard let current = selection else { return }
+        let extent = selectionExtent()
+        selection = extending ? selectionModel.extend(current, direction, in: extent)
+                               : selectionModel.move(current, direction, in: extent)
+    }
+
+    /// A gutter click: the whole (capped) row.
+    func selectWholeRow(_ row: UInt64) {
+        selection = selectionModel.wholeRow(row, in: selectionExtent())
+    }
+
+    /// A header click: the whole (capped) column.
+    func selectWholeColumn(_ column: Int) {
+        selection = selectionModel.wholeColumn(column, in: selectionExtent())
+    }
+
+    /// A shift-click on the gutter (ARCH: whole-row EXTEND is "composed by
+    /// the frontend from extend(_:to:in:)"): keep the anchor, extend to the
+    /// clicked row spanning every column. Nothing selected yet: falls back
+    /// to a plain whole-row select.
+    func extendSelectionToWholeRow(_ row: UInt64) {
+        guard let current = selection else { selectWholeRow(row); return }
+        let extent = selectionExtent()
+        guard !extent.isEmpty else { return }
+        selection = selectionModel.extend(current, to: GridCell(row: row, column: extent.lastColumn), in: extent)
+    }
+
+    /// A shift-click on the header — the whole-column analog of
+    /// `extendSelectionToWholeRow`.
+    func extendSelectionToWholeColumn(_ column: Int) {
+        guard let current = selection else { selectWholeColumn(column); return }
+        let extent = selectionExtent()
+        guard !extent.isEmpty else { return }
+        selection = selectionModel.extend(current, to: GridCell(row: extent.lastRow, column: column), in: extent)
+    }
+
+    /// Cmd+A: the capped extent from the origin — O(1) for any document size.
+    func selectAll() {
+        selection = selectionModel.selectAll(in: selectionExtent())
+    }
+
+    /// Per-column selection-overlay state for a data row over the current
+    /// column WINDOW (ARCH AC1), O(window) — the selection analog of
+    /// `windowCellHighlights`; `SheetRowView.draw` reads this directly (no
+    /// per-cell model call on the draw path).
+    func windowSelectionMarks(forRow row: Int) -> [SelectionMark] {
+        guard let rect = selection?.rect else { return [] }
+        let cols = windowColumns()
+        guard !cols.isEmpty else { return [] }
+        let r = UInt64(row)
+        return cols.map { column in
+            guard rect.contains(GridCell(row: r, column: column)) else { return .none }
+            return SelectionMark(isSelected: true, borderTop: r == rect.top, borderBottom: r == rect.bottom,
+                                  borderLeft: column == rect.left, borderRight: column == rect.right)
+        }
+    }
+
+    // MARK: - Copy (ARCH-select-copy AC2-4; round 2 findings 2/3)
+
+    /// ⌘C: snapshot the LIVE selection rect and build the TSV payload OFF
+    /// the main thread (`Task.detached` — the builder/budget/rect/fetch
+    /// closure are all `Sendable`, AC4) via a fetch closure over
+    /// `session.copyCell` (poll/control lane — lock-free, so the UI keeps
+    /// scrolling live while a big copy runs), then write the pasteboard and
+    /// show a brief notice back on the main actor — the SAME `await
+    /// self?...` actor hand-off `startPolling` already uses below, no
+    /// explicit `DispatchQueue`/`MainActor.run` needed. A no-op with nothing
+    /// selected or no open session. A copy already running is CANCELLED
+    /// first (`cancelCopy`) rather than ignored (finding 2): the new
+    /// selection snapshot supersedes the old one, so racing two pasteboard
+    /// writes would only ever want the LATEST to win — cancelling makes
+    /// that the only possible outcome instead of blocking on a stale one.
+    ///
+    /// Before building, gives the background index a bounded chance to
+    /// advance the scan frontier to the selection's bottom row
+    /// (`advanceFrontier`, finding 3): without this, a selection made soon
+    /// after opening a large file — before AUTO indexing has caught up —
+    /// copies only up to the frontier and reports `.stoppedAtFrontier`
+    /// (`CopyBuilding.build` rule 6) even though the rest of the rows exist
+    /// and would be servable moments later.
+    ///
+    /// PERFORMANCE NOTE (measured, not a bug): `ls_cell_copy` re-locates its
+    /// row from the nearest index checkpoint (every 2048 rows, backend
+    /// `checkpoint_interval`) on EVERY call, independently — unlike the
+    /// paged `setWindow`/`ls_cell` the scrolling grid uses (which amortizes
+    /// that cost across a whole page), so a copy spanning many rows AND
+    /// columns can take real, human-noticeable time (a 100k-row x 3-column
+    /// selection measured ~80 s off-main). This is why the ARCH calls for
+    /// the "Copying…" affordance below rather than assuming near-instant
+    /// completion — and why that affordance now carries a Cancel escape
+    /// hatch (finding 2) for exactly that long tail; deliberately NOT
+    /// "fixed" by routing this through `setWindow` instead — that would
+    /// evict/thrash the SAME live window the on-screen grid is scrolling
+    /// through, exactly the interference `ls_cell_copy` (window-INDEPENDENT)
+    /// exists to avoid (AC4: "the UI keeps scrolling... undisturbed").
+    /// Main-thread responsiveness is unaffected either way (verified:
+    /// `SelectCopyProbe`'s heartbeat stays under budget for the whole
+    /// build) — only wall-clock completion time is.
+    func copySelection() {
+        guard let session, let rect = selection?.rect else { return }
+        cancelCopy()   // supersede any copy already running (see doc above)
+        copyInFlight = true
+        // ARCH AC2 ("an instant result for small selections + a subtle
+        // 'Copying…'... notice for large ones"): shown only if the build is
+        // STILL running after a short readable-but-not-flashy delay, so a
+        // fast/small copy's result never flickers through an interstitial.
+        Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(300))
+            guard let self, !Task.isCancelled, self.copyInFlight else { return }
+            self.copyNotice = "Copying…"
+        }
+        let builder = copyBuilder
+        let budget = CopyBudget.standard
+        let fetch: CopyCellFetch = { row, column in session.copyCell(row: row, column: column, maxBytes: budget.perCellMaxBytes) }
+        copyTask = Task.detached { [weak self] in
+            await Self.advanceFrontier(session: session, to: rect.bottom)
+            guard !Task.isCancelled else { return }
+            let report = builder.build(rect, budget: budget, fetch: fetch)
+            guard !Task.isCancelled else { return }
+            await self?.completeCopy(report)
+        }
+    }
+
+    /// How long `advanceFrontier` waits for AUTO indexing to reach the
+    /// selection's bottom row before giving up and building anyway — bounded
+    /// so a copy can never hang on an arbitrarily slow scan. One poll every
+    /// `frontierPollInterval`, up to `frontierPollMaxTicks` times.
+    private static let frontierPollInterval: Duration = .milliseconds(50)
+    private static let frontierPollMaxTicks = 40   // ~2 s total
+
+    /// Pre-advances the core's scan frontier toward `target` (ARCH-select-
+    /// copy round 2, finding 3) by reusing the SAME jump-scan primitives a
+    /// real Jump-to-row uses (`DocumentSession.startJump`/`jumpStatus`) — but
+    /// deliberately bypasses `beginJump`/`jumpFlow`/the viewport: `startJump`
+    /// is a plain core call independent of this view-model's OWN jump-
+    /// presentation state machine, and `jumpStatus` is a side-effect-free
+    /// poll safe to call from any thread (`DocumentSession` is `Sendable`) —
+    /// so this is invisible to the user (no jump popup, no scroll) while
+    /// still unlocking rows for the copy that follows. Returns as soon as
+    /// the target is behind the frontier (`startJump`'s contract: already
+    /// `.done` when it returns if so — the common case costs one extra pair
+    /// of non-blocking calls and nothing else) or after
+    /// `frontierPollMaxTicks` polls, whichever comes first; cancellable
+    /// (checked every tick — `cancelCopy` relies on this for a prompt
+    /// response while a copy is waiting here, its most likely spot). Shares
+    /// the core's single scan slot with a real jump/find — an existing,
+    /// accepted trade-off (see `DocumentSession.startJump`'s doc comment).
+    private static func advanceFrontier(session: any DocumentSession, to target: UInt64) async {
+        session.startJump(to: target)
+        if case .done = session.jumpStatus() { return }
+        for _ in 0..<frontierPollMaxTicks {
+            if Task.isCancelled { return }
+            try? await Task.sleep(for: frontierPollInterval)
+            if case .done = session.jumpStatus() { return }
+        }
+    }
+
+    private func completeCopy(_ report: CopyReport) {
+        // The build (or its wait) may have run to completion in the
+        // background AFTER `cancelCopy` already cleared this copy's state
+        // (best-effort cancellation — see that method's doc comment): never
+        // let a superseded/cancelled result reach the pasteboard or notice.
+        guard !Task.isCancelled else { return }
+        copyTask = nil
+        copyInFlight = false
+        Self.writeToPasteboard(report.text)
+        copyNoticeTask?.cancel()
+        copyNotice = Self.noticeText(for: report)
+        copyNoticeTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(3))
+            guard let self, !Task.isCancelled else { return }
+            self.copyNotice = nil
+        }
+    }
+
+    /// Cancels an in-flight copy (Esc, the "Copying…" notice's Cancel
+    /// button, or a fresh ⌘C superseding it — ARCH-select-copy round 2,
+    /// finding 2). Best-effort over the BUILD itself: `TSVCopyBuilder.build`
+    /// is a tight synchronous loop with no cancellation checkpoint of its
+    /// own (reviewer-verified-correct pure logic, out of scope for this
+    /// round's fixes), so an already-running fetch loop keeps running to
+    /// completion in the background rather than stopping mid-cell.
+    /// `advanceFrontier`'s wait — the common
+    /// place a cancel actually lands, since on a lagging index it dominates
+    /// the latency before the build even starts — DOES poll in a cancellable
+    /// loop and stops within one tick. Either way, what this method
+    /// guarantees unconditionally: the UI-visible state clears immediately
+    /// (no perpetual "Copying…"), and any result the orphaned task
+    /// eventually produces is silently dropped (`completeCopy` checks
+    /// `Task.isCancelled` before touching the pasteboard or the notice).
+    func cancelCopy() {
+        copyTask?.cancel()
+        copyTask = nil
+        copyNoticeTask?.cancel()
+        copyNoticeTask = nil
+        copyInFlight = false
+        copyNotice = nil
+    }
+
+    /// A TSV type + a plain-string type (ARCH AC3: "sets both a TSV type and
+    /// a plain-string type on NSPasteboard"); `.tabularText` is the standard
+    /// tab-delimited spreadsheet clipboard type Excel/Numbers both read.
+    private static func writeToPasteboard(_ text: String) {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .tabularText)
+        pasteboard.setString(text, forType: .string)
+    }
+
+    /// The honest "what was copied" notice (ARCH AC2). Sentence case, user
+    /// vocabulary — matches `FindCopy.status`'s style.
+    private static func noticeText(for report: CopyReport) -> String {
+        switch report.outcome {
+        case .complete:
+            return report.rowCount <= 1 ? "Copied" : "Copied \(report.rowCount) rows"
+        case .stoppedAtBudget, .stoppedAtCellCap:
+            let mb = max(1, report.byteCount / (1024 * 1024))
+            return "Copied the first ~\(mb) MB — \(report.rowCount) rows"
+        case .stoppedAtFrontier:
+            return "Copied \(report.rowCount) row\(report.rowCount == 1 ? "" : "s") so far — still loading the rest"
+        }
+    }
+
+    // MARK: - Column resize + auto-fit (ARCH-select-copy AC5)
+
+    /// The width actually drawn for absolute `column`: the manual override
+    /// if present, else the auto baseline — `ColumnSizing`'s "manual wins"
+    /// rule, O(1) (a single dictionary lookup).
+    private func effectiveWidth(_ column: Int) -> CGFloat {
+        if let manual = manualColumnWidths[column] { return CGFloat(manual) }
+        return column < columnWidths.count ? columnWidths[column] : GridMetrics.minColumnWidth
+    }
+
+    /// Drag-resize: `windowIndex` is a position in the CURRENT column window
+    /// (`windowWidths()`'s index space — exactly what the grid hit-tests the
+    /// trailing hairline against), so resolving the absolute column and its
+    /// cache slot is O(1) — no all-visible-columns search ("ride the
+    /// column-window offsets"). Sets an explicit manual width (floored at
+    /// `minColumnWidth`) that STICKS: `windowWidths()`/`totalVisibleWidth`
+    /// return it regardless of what auto-grow measures underneath from here
+    /// on (`growColumnWidthsToFitWindow` skips it).
+    func resizeWindowColumn(_ windowIndex: Int, toWidth width: Double) {
+        let cols = windowColumns()
+        guard cols.indices.contains(windowIndex) else { return }
+        let column = cols[windowIndex]
+        let previous = effectiveWidth(column)
+        manualColumnWidths = columnSizer.resized(
+            manual: manualColumnWidths, column: column, to: width, minWidth: Double(GridMetrics.minColumnWidth)
+        )
+        syncEffectiveWidthCache(column: column, windowIndex: windowIndex, previous: previous)
+    }
+
+    /// Double-click auto-fit: clears the manual override AND resets the
+    /// column's AUTO baseline to the exact fit over its VISIBLE window
+    /// content (O(visible rows), never O(rows)) — so it is back in auto
+    /// mode at the fitted width and can grow again as new content scrolls
+    /// in (`ColumnSizing.autoFit`'s contract).
+    func autoFitWindowColumn(_ windowIndex: Int) {
+        let cols = windowColumns()
+        guard cols.indices.contains(windowIndex) else { return }
+        let column = cols[windowIndex]
+        let previous = effectiveWidth(column)
+        let fitted = columnSizer.autoFit(
+            contentWidths: measuredContentWidths(forColumn: column),
+            minWidth: Double(GridMetrics.minColumnWidth), maxWidth: Double(GridMetrics.maxColumnWidth)
+        )
+        manualColumnWidths = columnSizer.cleared(manual: manualColumnWidths, column: column)
+        if column < columnWidths.count { columnWidths[column] = CGFloat(fitted) }
+        syncEffectiveWidthCache(column: column, windowIndex: windowIndex, previous: previous)
+    }
+
+    /// O(1) sync of the visible-position caches (`cachedLayoutWidths`/
+    /// `cachedTotalVisibleWidth` — otherwise rebuilt only on a STRUCTURAL
+    /// change, see `refreshLayoutWidthsIfNeeded`) after ONE column's
+    /// effective width changed, so a resize drag never pays that O(visible
+    /// columns) rebuild (ARCH AC5: "O(1) per resize... no all-column
+    /// relayout"). `windowIndex` maps to visible-position `columnWindow.
+    /// first + windowIndex` with no search, by construction of
+    /// `windowColumns()`. A no-op while the caches are already stale (a
+    /// pending full rebuild picks up the fresh value on its own).
+    private func syncEffectiveWidthCache(column: Int, windowIndex: Int, previous: CGFloat) {
+        guard !layoutWidthsStale else { return }
+        let updated = effectiveWidth(column)
+        guard updated != previous else { return }
+        let position = columnWindow.first + windowIndex
+        if cachedLayoutWidths.indices.contains(position) {
+            cachedLayoutWidths[position] = Double(updated)
+        }
+        cachedTotalVisibleWidth += updated - previous
+    }
+
+    /// The measured pixel widths — header + each VISIBLE row's cell,
+    /// O(visible rows) — for absolute `column` (`ColumnSizing.autoFit`'s
+    /// `contentWidths` input; padding pre-added per the contract doc).
+    /// Mirrors `growColumnWidthsToFitWindow`'s own measurement (same fonts/
+    /// padding/oversized-row and truncated-cell exclusions) so a double-click
+    /// and the passive auto-grow agree on what "fits."
+    private func measuredContentWidths(forColumn column: Int) -> [Double] {
+        let bodyFont = NSFont.monospacedSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
+        let headFont = NSFont.systemFont(ofSize: NSFont.systemFontSize, weight: .semibold)
+        let padding = GridMetrics.cellHPadding * 2
+        var widths = [Double(Self.textWidth(columnLabel(column), headFont) + padding)]
+
+        let start = Int(window.firstRow)
+        let lo = max(start, firstVisibleRow)
+        let hi = min(start + window.rows.count, firstVisibleRow + max(lastVisibleCount, 1))
+        guard lo < hi else { return widths }
+        let rel = column - window.firstColumn
+        guard rel >= 0 else { return widths }
+
+        for r in lo..<hi {
+            let idx = r - start
+            if idx < window.oversized.count, window.oversized[idx] { continue }
+            let row = window.rows[idx]
+            guard rel < row.count else { continue }
+            if idx < window.truncated.count, rel < window.truncated[idx].count, window.truncated[idx][rel] { continue }
+            widths.append(Double(Self.textWidth(row[rel], bodyFont) + padding))
+        }
+        return widths
     }
 
     // MARK: - Column visibility (pure model; grid reflows)
@@ -1169,6 +1604,7 @@ final class DocumentModel {
             findSession = findControl.invalidated(findSession)
             searchNavDirection = .forward
             jumpFlow = .idle
+            selection = nil   // the coordinate space just changed (ARCH-select-copy)
             filterSnapshot = session.filterStatus()
             rowCountInfo = session.rowCount()
             landViewport(on: 0)
@@ -1196,6 +1632,7 @@ final class DocumentModel {
         findSession = findControl.invalidated(findSession)
         searchNavDirection = .forward
         jumpFlow = .idle
+        selection = nil   // the coordinate space just changed (ARCH-select-copy)
         landViewport(on: anchor)
         startPolling()
     }
