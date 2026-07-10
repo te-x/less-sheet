@@ -54,14 +54,41 @@ pub fn build(b: *std.Build) void {
     const install_lib = b.addInstallFile(repacked, "lib/liblesssheet.a");
     b.getInstallStep().dependOn(&install_lib.step);
 
-    // Behavior tests (planner-owned, tests/) import only the contract module.
+    // csv-corpus (ARCH-csv-corpus): the frozen sweep in tests/all_tests.zig
+    // reads a GENERATED corpus + manifest.json via an injected `corpus` options
+    // module (`corpus.dir` = the directory holding the light corpus).
+    //
+    // RED SEED (planner freeze): the `corpus` module EXISTS so the frozen test
+    // COMPILES, but the generator run is deliberately NOT wired, so `corpus.dir`
+    // points at a path with no manifest.json -> the sweep fails at runtime with
+    // error.CorpusNotGenerated (behavior RED, not a compile/import failure).
+    //
+    // IMPLEMENTER makes it GREEN (this file is NOT frozen): run the generator
+    // into a build-cache dir, inject that dir as `corpus.dir`, and gate the
+    // behavior-test run on it -- e.g. replacing the placeholder addOption below:
+    //   const gen = b.addSystemCommand(&.{ "python3",
+    //       b.pathFromRoot("../tools/csvgen/gen.py"), "--all", "--seed", "1337", "--out" });
+    //   const corpus_dir = gen.addOutputDirectoryArg("corpus");
+    //   corpus_opts.addOptionPath("dir", corpus_dir);        // <- replaces addOption
+    //   run_behavior_tests.step.dependOn(&gen.step);         // <- generate before tests
+    // and run tools/csvgen/selftest.py as the AC7 oracle guard (fail-fast).
+    // Nothing generated is committed; python3 is a documented gate prerequisite.
+    const corpus_opts = b.addOptions();
+    corpus_opts.addOption([]const u8, "dir", "/nonexistent/lesssheet-corpus--generate-step-not-wired");
+    const corpus_mod = corpus_opts.createModule();
+
+    // Behavior tests (planner-owned, tests/) import only the contract module
+    // (`api`) and the injected corpus locator (`corpus`).
     const behavior_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/all_tests.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
-            .imports = &.{.{ .name = "api", .module = api_mod }},
+            .imports = &.{
+                .{ .name = "api", .module = api_mod },
+                .{ .name = "corpus", .module = corpus_mod },
+            },
         }),
     });
     const run_behavior_tests = b.addRunArtifact(behavior_tests);

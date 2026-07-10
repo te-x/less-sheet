@@ -3335,3 +3335,301 @@ test "hrf3-nav: filter count / source mapping / jump-under-filter / find-within-
     try std.testing.expectEqual(@as(u64, 3), s.total);
     try std.testing.expectEqual(true, s.total_exact);
 }
+
+// ===========================================================================
+// csv-corpus slice (ARCH-csv-corpus, AC2-AC4). Frozen; planner-owned.
+//
+// This sweep binds OUR parser to the clean-room generator's parser-agnostic
+// oracle: it iterates the GENERATED manifest.json and, for every non-heavy
+// case, asserts our output matches the manifest exactly where the manifest is
+// exact, and robustly where it is not. Coverage grows automatically with the
+// generator; nothing here is hard-coded per file. Uses ONLY the frozen public
+// C ABI via `@import("api")` -- no api/lesssheet.h change.
+//
+// RED -> GREEN (the seed).  The corpus dir is injected by backend/build.zig
+// (NOT frozen) through a generated `corpus` options module (corpus.dir). At
+// freeze that module EXISTS (so this file compiles) but the generator run is
+// deliberately NOT wired, so corpus.dir has no manifest.json and both tests
+// fail at loadCorpus with error.CorpusNotGenerated -- a crisp behavior RED
+// ("the corpus generate step is not wired"), never a compile/import failure.
+// The implementer makes it GREEN by adding, in build.zig, a b.addSystemCommand
+// that runs `python3 tools/csvgen/gen.py --all --seed 1337 --out <cache>`,
+// making the behavior-test run depend on it, and injecting <cache> as
+// corpus.dir (Options.addOptionPath) -- plus the AC7 selftest.py oracle guard.
+// Nothing generated is committed (hermetic generate-at-test).
+//
+// WHY WE FORCE THE ORACLE'S DIALECT (empirically validated over all 56 light
+// cases).  The manifest's column_count / data_row_count are defined RELATIVE
+// to the declared encoding + delimiter (selftest.py decodes per the declared
+// encoding/delimiter before counting), and the generator's has_header intent
+// is ground truth a sniffer cannot always recover:
+//   * an all-text single-record / no-header file trips our numeric-grammar
+//     header suggestion (would drop a data row), and
+//   * windows-1252 is, by the frozen contract (api/lesssheet.h TEXT AND
+//     ENCODING step 4), NOT auto-detectable -- it resolves to Latin-1.
+// So the sweep opens each case FORCING the manifest's encoding (mapped),
+// delimiter (where declared), and header (per has_header), MANUAL index, then
+// asserts our parser reproduces the oracle's STRUCTURE. This is the faithful,
+// satisfiable binding under the frozen contract. Detection/sniffing themselves
+// stay covered exhaustively by the hand-built c1/c2/c3 fixtures above; here we
+// bind the decode + record-boundary + truncate/pad + count machinery to the
+// adversarial oracle.
+//
+// THE ONE RECORD-MODEL CARVE-OUT.  Our frozen record model counts an empty
+// line as a record with a single empty field (api/lesssheet.h DELIMITED-TEXT),
+// while the manifest's Python-csv model counts only NON-empty data rows. They
+// agree except for a file with interior blank lines, where our count is a
+// superset (>= manifest). Asserting == there is contract-impossible (no api
+// change), so that dimension is robustness-only (exact + >= manifest). The
+// only such light case is blank_lines_interspersed (its manifest notes say so:
+// "5 non-empty data rows"); a rename or a NEW interior-blank case falls into
+// the strict-== branch and fails LOUD, prompting a planner review -- never a
+// silent pass. See recordModelDiverges.
+// ===========================================================================
+
+const corpus = @import("corpus");
+
+/// The generated corpus + its manifest, kept together: json.Value strings AND
+/// object keys may slice into `bytes` (object keys are always alloc_if_needed),
+/// so the buffer must outlive every `.object.get`/value read below.
+const Corpus = struct {
+    parsed: std.json.Parsed(std.json.Value),
+    bytes: []u8,
+    gpa: std.mem.Allocator,
+
+    fn deinit(self: *Corpus) void {
+        self.parsed.deinit();
+        self.gpa.free(self.bytes);
+    }
+
+    /// The `cases[]` array (generator-guaranteed shape; a corrupt manifest is a
+    /// loud panic, which the AC7 selftest.py guard prevents from ever shipping).
+    fn cases(self: *const Corpus) []std.json.Value {
+        return self.parsed.value.object.get("cases").?.array.items;
+    }
+};
+
+/// Load + parse <corpus.dir>/manifest.json. THE RED SEED lives here: at freeze
+/// corpus.dir has no manifest, so this returns error.CorpusNotGenerated.
+fn loadCorpus(gpa: std.mem.Allocator) !Corpus {
+    const io = std.testing.io;
+    const path = try std.fs.path.join(gpa, &.{ corpus.dir, "manifest.json" });
+    defer gpa.free(path);
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(16 * 1024 * 1024)) catch |e| {
+        std.debug.print(
+            "\n[csv-corpus] cannot read {s}: {t}\n" ++
+                "  the corpus generate step is NOT WIRED. In backend/build.zig add a\n" ++
+                "  b.addSystemCommand running `python3 tools/csvgen/gen.py --all --seed 1337\n" ++
+                "  --out <cache>`, make run_behavior_tests depend on it, and inject <cache>\n" ++
+                "  as the `corpus` option `dir` (Options.addOptionPath). Nothing is committed.\n",
+            .{ path, e },
+        );
+        return error.CorpusNotGenerated;
+    };
+    errdefer gpa.free(bytes);
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, bytes, .{});
+    return .{ .parsed = parsed, .bytes = bytes, .gpa = gpa };
+}
+
+// --- manifest field accessors (dynamic json.Value; total, tag-safe) ---------
+
+fn mObj(v: std.json.Value, key: []const u8) ?std.json.Value {
+    if (v != .object) return null;
+    return v.object.get(key);
+}
+fn mInt(v: std.json.Value, key: []const u8) ?i64 {
+    const x = mObj(v, key) orelse return null;
+    return switch (x) {
+        .integer => |i| i,
+        else => null,
+    };
+}
+fn mStr(v: std.json.Value, key: []const u8) ?[]const u8 {
+    const x = mObj(v, key) orelse return null;
+    return switch (x) {
+        .string => |s| s,
+        else => null,
+    };
+}
+fn mBool(v: std.json.Value, key: []const u8) bool {
+    const x = mObj(v, key) orelse return false;
+    return switch (x) {
+        .bool => |b| b,
+        else => false,
+    };
+}
+
+/// Manifest encoding string -> the concrete LS_ENCODING_* value to FORCE and to
+/// expect in the resolved dialect. null for "n/a" and the malformed
+/// "... (invalid|truncated|with NUL)" notes (open with AUTO; assert nothing).
+fn encConcrete(enc: []const u8) ?u8 {
+    if (std.mem.eql(u8, enc, "utf-8")) return api.encoding_utf8;
+    if (std.mem.eql(u8, enc, "utf-16le")) return api.encoding_utf16le;
+    if (std.mem.eql(u8, enc, "utf-16be")) return api.encoding_utf16be;
+    if (std.mem.eql(u8, enc, "latin-1")) return api.encoding_latin1;
+    if (std.mem.eql(u8, enc, "windows-1252")) return api.encoding_windows1252;
+    return null;
+}
+
+/// The single documented record-model carve-out (see the section header): our
+/// frozen "empty line == a record" model over-counts the manifest's non-empty
+/// data-row count for a file with interior blank lines.
+fn recordModelDiverges(name: []const u8) bool {
+    return std.mem.eql(u8, name, "blank_lines_interspersed");
+}
+
+/// Force the oracle's declared dialect (see the section header for why). MANUAL
+/// index: a light file (< head budget) is fully indexed at open, so the row
+/// count is exact immediately.
+fn forcedOptions(case: std.json.Value) api.OpenOptions {
+    var opts: api.OpenOptions = .{ .index_mode = api.index_manual };
+    if (mStr(case, "encoding")) |enc| {
+        if (encConcrete(enc)) |e| opts.encoding = @as(i32, e);
+    }
+    if (mStr(case, "delimiter")) |d| {
+        if (d.len == 1) opts.separator = @as(i32, d[0]);
+    }
+    opts.header = if (mBool(case, "has_header")) api.header_on else api.header_off;
+    return opts;
+}
+
+/// Materialize the head window and prove every served cell is BOUNDED by the
+/// display cap and safe to read (touch every served byte: an out-of-bounds
+/// borrow would trap under test safety). The robustness lane for AC2/AC3 --
+/// the only cell check available, since the manifest carries no cell text.
+fn sampleServableBounded(doc: *api.Doc) !void {
+    const r = api.ls_window_set(doc, 0, 64);
+    const col_cap: u32 = @min(api.ls_column_count(doc), 8);
+    var sum: usize = 0;
+    var row = r.first_row;
+    while (row < r.first_row + r.row_count) : (row += 1) {
+        _ = api.ls_row_oversized(doc, row);
+        var c: u32 = 0;
+        while (c < col_cap) : (c += 1) {
+            const cell = api.ls_cell(doc, row, c);
+            try std.testing.expect(cell.len <= api.cell_max_bytes);
+            _ = api.ls_cell_truncated(doc, row, c);
+            for (cell.slice()) |b| sum +%= b;
+        }
+    }
+    std.mem.doNotOptimizeAway(sum);
+}
+
+// ---------------------------------------------------------------------------
+// AC2 (exactness, well-formed) + AC3 (robustness, malformed / undefined dims).
+// One oracle-bound sweep over the whole light corpus.
+// ---------------------------------------------------------------------------
+
+test "corpus: parser output matches the manifest oracle across the light corpus (ARCH AC2/AC3)" {
+    const gpa = std.testing.allocator;
+    var cx = try loadCorpus(gpa);
+    defer cx.deinit();
+
+    var seen: usize = 0;
+    var malformed_seen: usize = 0;
+    var enc_mask: u8 = 0; // bit e set once a concrete encoding e is asserted
+
+    for (cx.cases()) |case| {
+        if (mBool(case, "heavy")) continue; // heavy cases: on-demand perf lane (AC6), never here
+        const file = mStr(case, "file") orelse return error.MalformedManifest;
+        if (std.mem.endsWith(u8, file, ".gz")) continue; // .csv.gz deferred (no gzip parser)
+        const name = mStr(case, "name") orelse return error.MalformedManifest;
+        errdefer std.debug.print("\n[csv-corpus] AC2/AC3 case: {s} ({s})\n", .{ name, file });
+
+        const path = try std.fs.path.joinZ(gpa, &.{ corpus.dir, file });
+        defer gpa.free(path);
+        const opts = forcedOptions(case);
+        var doc_opt: ?*api.Doc = null;
+        const st = api.ls_open(path.ptr, &opts, &doc_opt);
+        seen += 1;
+
+        if (mBool(case, "malformed")) {
+            malformed_seen += 1;
+            // AC3: opens lenient (LS_OK) OR a distinct documented status; never
+            // crash/hang/UB. The file exists and is readable, so the only
+            // legitimate outcomes are OK or the catch-all IO code.
+            try std.testing.expect(st == .ok or st == .io);
+            if (st == .ok) {
+                const doc = doc_opt.?;
+                defer api.ls_close(doc);
+                try sampleServableBounded(doc); // if it opens, cells serve bounded
+            }
+            continue;
+        }
+
+        // Well-formed: exact where the manifest field is an integer; robustness
+        // where it is "ragged"/null (that dimension simply is not asserted).
+        try std.testing.expectEqual(api.Status.ok, st);
+        const doc = doc_opt.?;
+        defer api.ls_close(doc);
+
+        if (mInt(case, "column_count")) |cc| {
+            try std.testing.expectEqual(@as(u32, @intCast(cc)), api.ls_column_count(doc));
+        }
+        if (mInt(case, "data_row_count")) |dr| {
+            const rc = api.ls_row_count_get(doc);
+            try std.testing.expectEqual(true, rc.exact); // light file: exact at open
+            const want = @as(u64, @intCast(dr));
+            if (recordModelDiverges(name)) {
+                try std.testing.expect(rc.count >= want); // interior blanks add records
+            } else {
+                try std.testing.expectEqual(want, rc.count);
+            }
+        }
+        if (mStr(case, "encoding")) |enc| {
+            if (encConcrete(enc)) |e| {
+                try std.testing.expectEqual(e, api.ls_dialect_get(doc).encoding);
+                enc_mask |= (@as(u8, 1) << @as(u3, @intCast(e)));
+            }
+        }
+        if (mStr(case, "delimiter")) |d| {
+            if (d.len == 1) try std.testing.expectEqual(@as(u8, d[0]), api.ls_dialect_get(doc).separator);
+        }
+        try sampleServableBounded(doc);
+    }
+
+    // COMPLETENESS FLOOR: a future weakening of `gen.py --all` cannot silently
+    // shrink coverage. The light corpus is 56 cases (8 malformed; all 5
+    // concrete encodings represented).
+    try std.testing.expect(seen >= 40);
+    try std.testing.expect(malformed_seen >= 5);
+    try std.testing.expect(@popCount(enc_mask) >= 5); // utf8/utf16le/utf16be/latin1/win1252
+}
+
+// ---------------------------------------------------------------------------
+// AC4 -- cold-open budget across every non-heavy case: ls_open + first window
+// materialize completes < 500 ms (O(head)/O(viewport), never O(file)). AUTO
+// dialect (the realistic sniff/detect cold path) + MANUAL index (no background
+// thread -> deterministic timing).
+// ---------------------------------------------------------------------------
+
+test "corpus: cold-open + first window is < 500 ms for every non-heavy case (ARCH AC4)" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var cx = try loadCorpus(gpa);
+    defer cx.deinit();
+
+    var seen: usize = 0;
+    for (cx.cases()) |case| {
+        if (mBool(case, "heavy")) continue;
+        const file = mStr(case, "file") orelse return error.MalformedManifest;
+        if (std.mem.endsWith(u8, file, ".gz")) continue;
+        const name = mStr(case, "name") orelse return error.MalformedManifest;
+        errdefer std.debug.print("\n[csv-corpus] AC4 cold-open case: {s} ({s})\n", .{ name, file });
+
+        const path = try std.fs.path.joinZ(gpa, &.{ corpus.dir, file });
+        defer gpa.free(path);
+
+        var doc_opt: ?*api.Doc = null;
+        const t0: std.Io.Clock.Timestamp = .now(io, .awake);
+        const st = api.ls_open(path.ptr, &manual, &doc_opt); // AUTO sniff/detect, MANUAL index
+        if (st == .ok) {
+            const doc = doc_opt.?;
+            defer api.ls_close(doc);
+            _ = api.ls_window_set(doc, 0, api.open_ready_min_rows); // first screen
+        }
+        try std.testing.expect(elapsedMs(t0) < 500);
+        seen += 1;
+    }
+    try std.testing.expect(seen >= 40); // completeness floor (see AC2/AC3 sweep)
+}
