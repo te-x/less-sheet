@@ -293,6 +293,19 @@ pub const FilterStatus = extern struct {
     total_exact: bool,
 };
 
+/// Mirrors `ls_copy_result`: the result of `ls_cell_copy` (the bounded full-cell
+/// read — see api/lesssheet.h FULL-CELL READ). Distinct, stable values.
+///   ok      — the cell was read (out_len bytes written, out_truncated valid).
+///   pending — `row` is at/beyond the scan frontier and not yet servable;
+///             advance the frontier (ls_jump_start) and retry. Never scans.
+///   no_cell — no such cell (col out of range, row at/past an EXACT end, or an
+///             empty document); retrying will not help.
+pub const CopyResult = enum(c_int) {
+    ok = 0,
+    pending = 1,
+    no_cell = 2,
+};
+
 // ---------------------------------------------------------------------------
 // Public surface (re-exported from the implementation; tests use only these).
 // ---------------------------------------------------------------------------
@@ -321,6 +334,9 @@ pub const ls_filter_clear = core.ls_filter_clear;
 pub const ls_filter_poll = core.ls_filter_poll;
 pub const ls_source_row = core.ls_source_row;
 pub const ls_row_oversized = core.ls_row_oversized;
+/// C ABI — the bounded, window-INDEPENDENT full-cell read (select-copy). Poll/
+/// control lane; copies into the caller buffer (no borrow). See api/lesssheet.h.
+pub const ls_cell_copy = core.ls_cell_copy;
 
 /// Zig-level seam for tests: identical to `ls_open` but with an explicit
 /// allocator. `ls_open` == `openWithAllocator(default allocator, ...)`.
@@ -383,4 +399,6 @@ comptime {
         @compileError("signature drift: ls_source_row");
     if (@TypeOf(core.ls_row_oversized) != fn (*const Doc, u64) callconv(.c) bool)
         @compileError("signature drift: ls_row_oversized");
+    if (@TypeOf(core.ls_cell_copy) != fn (*const Doc, u64, u32, ?[*]u8, usize, *usize, *bool) callconv(.c) CopyResult)
+        @compileError("signature drift: ls_cell_copy");
 }

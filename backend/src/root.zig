@@ -524,3 +524,16 @@ pub export fn ls_source_row(doc: *const api.Doc, row: u64) callconv(.c) u64 {
 pub export fn ls_row_oversized(doc: *const api.Doc, row: u64) callconv(.c) bool {
     return window.rowOversized(asDoc(doc), row);
 }
+
+
+// ---------------------------------------------------------------------------
+// Full-cell read (select-copy slice) — the bounded, window-INDEPENDENT LOSSLESS
+// cell read. Poll/control lane (asDocMut takes the frontier mutex); copies into
+// the caller buffer (no borrow); ZERO alloc; never fails. See api/lesssheet.h
+// FULL-CELL READ. RED SEED — see window.cellCopy for the stub + RED->GREEN path.
+// ---------------------------------------------------------------------------
+
+/// See api/lesssheet.h `ls_cell_copy`.
+pub export fn ls_cell_copy(doc: *const api.Doc, row: u64, col: u32, buf: ?[*]u8, buf_len: usize, out_len: *usize, out_truncated: *bool) callconv(.c) api.CopyResult {
+    return window.cellCopy(asDocMut(doc), row, col, buf, buf_len, out_len, out_truncated);
+}

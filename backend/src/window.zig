@@ -283,3 +283,47 @@ pub fn rowOversized(d: *const Document, row: u64) bool {
     if (idx >= d.win_oversized.items.len) return false;
     return d.win_oversized.items[idx];
 }
+
+
+/// See api/lesssheet.h `ls_cell_copy`. RED SEED — the bounded full-cell read is
+/// NOT yet implemented: it serves the EMPTY string for every servable cell
+/// (out_len 0), so the frozen behavior test (cc*) is RED on the full-cell
+/// content, on truncation, on the no-borrow copy, and on the PENDING / NO_CELL
+/// status machine, while `zig build` still compiles (the comptime pin + C-ABI
+/// export are satisfied). It touches only `column_count` (immutable), so it
+/// cannot fault, overrun `buf`, or race.
+///
+/// GREEN path (the build implementer's work — window-INDEPENDENT, poll/control
+/// lane, ZERO heap alloc, NEVER scans/advances the frontier):
+///   * NO_CELL when `d.column_count == 0` or `col >= d.column_count`, or when
+///     `row` is at/beyond an EXACT end (identity: `row >= d.total_rows` while
+///     `d.complete`; filtered: `row >= d.filter_total` while `d.filter_state ==
+///     .done`).
+///   * Locate `row`'s content offset WITHOUT scanning: the pinned bounded
+///     record-1 row 0 (`row0_pinned_*`, identity view) serves directly; else,
+///     under `d.lock()`, read `avail_end = if (d.complete) d.total_rows else
+///     d.frontier_rows` and, if `row < avail_end`, take `nav.bestCheckpoint(d,
+///     row)` (by value) and unlock. A `row >= avail_end` that is not pinned is
+///     PENDING (its offset is unknown until the frontier advances). Filtered
+///     (`d.filter_state != .idle`): interpret `row` in FILTERED coordinates via
+///     `nav.nthMatchLocation` over `d.filter_block_counts` (like
+///     windowSetFiltered); `row >= d.filter_total` counted-so-far is PENDING.
+///   * From the checkpoint, skip to `row` (`lexer.recordBounds`) and decode
+///     ONLY column `col` into `buf[0..buf_len]`, reusing the lexer's
+///     storeCapped/utf8TrimToBoundary discipline with `cap = buf_len` and a
+///     per-row SOURCE bound of `api.window_row_scan_max_bytes` (identical to
+///     windowSet, so cost stays O(min(row bytes, cap))). Set `out_len.*` to the
+///     bytes written and `out_truncated.*` iff the cell's full transcoded
+///     content exceeds them (buf_len OR the per-row source cap — an OVERSIZED
+///     row is a bounded prefix, `out_truncated` true). Return `.ok`.
+/// The read COPIES into the caller buffer (no ls_str borrow), so its output is
+/// unaffected by a later ls_window_set — the cc no-borrow test pins this.
+pub fn cellCopy(d: *Document, row: u64, col: u32, buf: ?[*]u8, buf_len: usize, out_len: *usize, out_truncated: *bool) api.CopyResult {
+    _ = row;
+    _ = buf;
+    _ = buf_len;
+    out_len.* = 0;
+    out_truncated.* = false;
+    if (d.column_count == 0 or col >= d.column_count) return .no_cell;
+    return .ok; // RED: serves nothing (out_len 0) instead of the full cell.
+}

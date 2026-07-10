@@ -3633,3 +3633,245 @@ test "corpus: cold-open + first window is < 500 ms for every non-heavy case (ARC
     }
     try std.testing.expect(seen >= 40); // completeness floor (see AC2/AC3 sweep)
 }
+
+// ===========================================================================
+// select-copy slice (ARCH-select-copy) — the SHARED api/ + BACKEND piece: the
+// bounded, window-INDEPENDENT LOSSLESS full-cell read ls_cell_copy. Frozen;
+// planner-owned. Maps ARCH acceptance criterion 3 (Copy is lossless + correct),
+// BACKEND portion: a cell past the 4 KiB display cap is read COMPLETE up to the
+// caller's byte cap; the truncated flag + the exact-cap, code-point-boundary
+// cut; a small cell reads byte-identical to ls_cell; the NO-BORROW (copy)
+// lifetime rule; and the PENDING / NO_CELL / window-independence status
+// contract (how an off-thread copy reads across the scan frontier). Semantics
+// pinned in api/lesssheet.h FULL-CELL READ / ls_cell_copy and mirrored in
+// contracts/api.zig (CopyResult + the comptime pin). The macOS selection / TSV
+// builder / async copy is a SEPARATE pass (frontend Contracts + Tests).
+//
+// Determinism: custom fixtures force the dialect + MANUAL index; a fixture no
+// larger than the head budget is fully indexed at open (exact count). The
+// big-cell fixtures sit just over the 4 KiB display cap but far under the 1 MiB
+// per-row source scan cap, so they are NORMAL (not oversized) rows — read whole
+// into a generous caller buffer.
+//
+// NOTE (RED seed): src/ ships a stub (window.cellCopy) that serves the EMPTY
+// string, so cc1..cc5 are RED on content/status while `zig build` still
+// compiles (the comptime pin + C-ABI export are satisfied). The RED->GREEN path
+// is documented on window.cellCopy.
+// ---------------------------------------------------------------------------
+
+const CopyOut = struct { result: api.CopyResult, len: usize, truncated: bool };
+
+/// Call ls_cell_copy into `buf`. The out-params are POISONED first, so a GREEN
+/// implementation that returns .ok/.no_cell/.pending but forgets to write them
+/// is caught by the assertions below.
+fn copyCell(doc: *const api.Doc, row: u64, col: u32, buf: []u8) CopyOut {
+    var len: usize = std.math.maxInt(usize);
+    var truncated: bool = true;
+    const result = api.ls_cell_copy(doc, row, col, buf.ptr, buf.len, &len, &truncated);
+    return .{ .result = result, .len = len, .truncated = truncated };
+}
+
+test "cc1: a cell past the display cap is read COMPLETE up to the caller's cap (ARCH 3 lossless)" {
+    const gpa = std.testing.allocator;
+    // Data row 0, col 0: 5000 bytes (4996 'a' then a distinctive "TAIL") — well
+    // over the 4 KiB display cap, well under the 1 MiB per-row source cap.
+    var cell0: std.ArrayList(u8) = .empty;
+    defer cell0.deinit(gpa);
+    var k: usize = 0;
+    while (k < 4996) : (k += 1) try cell0.append(gpa, 'a');
+    try cell0.appendSlice(gpa, "TAIL");
+    try std.testing.expectEqual(@as(usize, 5000), cell0.items.len);
+
+    var fixture: std.ArrayList(u8) = .empty;
+    defer fixture.deinit(gpa);
+    try fixture.appendSlice(gpa, "h1,h2\n");
+    try fixture.appendSlice(gpa, cell0.items);
+    try fixture.appendSlice(gpa, ",second\n");
+
+    var od = try openWith(fixture.items, .{ .separator = ',', .header = api.header_on, .index_mode = api.index_manual });
+    defer od.deinit();
+    try expectDims(od.doc, 1, 2);
+    winAll(od.doc);
+
+    // Contrast (unchanged / additive): ls_cell is still DISPLAY-capped + flagged.
+    try std.testing.expect(api.ls_cell(od.doc, 0, 0).slice().len <= api.cell_max_bytes);
+    try std.testing.expectEqual(true, api.ls_cell_truncated(od.doc, 0, 0));
+
+    const buf = try gpa.alloc(u8, 1 << 20); // ~1 MiB — the frontend's per-cell cap
+    defer gpa.free(buf);
+
+    // The FULL cell comes back: every byte, correct UTF-8, NOT truncated.
+    const c0 = copyCell(od.doc, 0, 0, buf);
+    try std.testing.expectEqual(api.CopyResult.ok, c0.result);
+    try std.testing.expectEqual(@as(usize, 5000), c0.len);
+    try std.testing.expectEqual(false, c0.truncated);
+    try std.testing.expectEqualStrings(cell0.items, buf[0..c0.len]);
+
+    // A neighbouring small cell reads whole too.
+    const c1 = copyCell(od.doc, 0, 1, buf);
+    try std.testing.expectEqual(api.CopyResult.ok, c1.result);
+    try std.testing.expectEqual(false, c1.truncated);
+    try std.testing.expectEqualStrings("second", buf[0..c1.len]);
+}
+
+test "cc2: over the caller's cap serves EXACTLY the cap, flagged, cut at a code-point boundary (ARCH 3)" {
+    const gpa = std.testing.allocator;
+    // (a) ASCII: the cap lands on a boundary -> exactly buf_len bytes served.
+    {
+        var fixture: std.ArrayList(u8) = .empty;
+        defer fixture.deinit(gpa);
+        try fixture.appendSlice(gpa, "h\n");
+        var k: usize = 0;
+        while (k < 5000) : (k += 1) try fixture.append(gpa, 'a'); // one big cell
+        try fixture.append(gpa, '\n');
+        var od = try openWith(fixture.items, .{ .separator = ',', .header = api.header_on, .index_mode = api.index_manual });
+        defer od.deinit();
+        var buf: [100]u8 = undefined;
+        const c = copyCell(od.doc, 0, 0, &buf);
+        try std.testing.expectEqual(api.CopyResult.ok, c.result);
+        try std.testing.expectEqual(@as(usize, 100), c.len); // exactly the cap
+        try std.testing.expectEqual(true, c.truncated);
+        for (buf[0..c.len]) |ch| try std.testing.expectEqual(@as(u8, 'a'), ch);
+    }
+    // (b) UTF-8: the cap falls INSIDE a 2-byte 'é' -> cut BEFORE it (99 bytes),
+    // never a split code point (mirrors the ls_cell display-cap rule, h13).
+    {
+        var fixture: std.ArrayList(u8) = .empty;
+        defer fixture.deinit(gpa);
+        try fixture.appendSlice(gpa, "h\n");
+        var k: usize = 0;
+        while (k < 99) : (k += 1) try fixture.append(gpa, 'a');
+        try fixture.appendSlice(gpa, "é"); // bytes at offsets 99, 100
+        k = 0;
+        while (k < 500) : (k += 1) try fixture.append(gpa, 'b');
+        try fixture.append(gpa, '\n');
+        var od = try openWith(fixture.items, .{ .separator = ',', .header = api.header_on, .index_mode = api.index_manual });
+        defer od.deinit();
+        var buf: [100]u8 = undefined;
+        const c = copyCell(od.doc, 0, 0, &buf);
+        try std.testing.expectEqual(api.CopyResult.ok, c.result);
+        try std.testing.expectEqual(true, c.truncated);
+        try std.testing.expectEqual(@as(usize, 99), c.len); // cut before the split 'é'
+        try std.testing.expect(std.unicode.utf8ValidateSlice(buf[0..c.len]));
+        for (buf[0..c.len]) |ch| try std.testing.expectEqual(@as(u8, 'a'), ch);
+    }
+}
+
+test "cc3: a small cell reads byte-identical to ls_cell; empty is OK/0; a bad column is NO_CELL (ARCH 3)" {
+    var od = try openWith("a,b,c\n1,,hello\np\n", .{ .separator = ',', .header = api.header_on, .index_mode = api.index_manual });
+    defer od.deinit();
+    try expectDims(od.doc, 2, 3);
+    winAll(od.doc);
+
+    var buf: [64]u8 = undefined;
+    // Byte-identical to ls_cell for every small cell of row 0 ("1","","hello").
+    const cols = [_]u32{ 0, 1, 2 };
+    for (cols) |col| {
+        const c = copyCell(od.doc, 0, col, &buf);
+        try std.testing.expectEqual(api.CopyResult.ok, c.result);
+        try std.testing.expectEqual(false, c.truncated);
+        try std.testing.expectEqualStrings(api.ls_cell(od.doc, 0, col).slice(), buf[0..c.len]);
+    }
+    // An EMBEDDED empty cell (row 0, col 1) is OK with zero length, not truncated.
+    const embedded = copyCell(od.doc, 0, 1, &buf);
+    try std.testing.expectEqual(api.CopyResult.ok, embedded.result);
+    try std.testing.expectEqual(@as(usize, 0), embedded.len);
+    try std.testing.expectEqual(false, embedded.truncated);
+    // A ragged-PADDED empty cell (row 1, col 2 — "p" padded to 3 columns) too.
+    const padded = copyCell(od.doc, 1, 2, &buf);
+    try std.testing.expectEqual(api.CopyResult.ok, padded.result);
+    try std.testing.expectEqual(@as(usize, 0), padded.len);
+    // A column at/past ls_column_count has no cell: NO_CELL (retrying won't help).
+    try std.testing.expectEqual(api.CopyResult.no_cell, copyCell(od.doc, 0, 3, &buf).result);
+}
+
+test "cc4: ls_cell_copy COPIES (no borrow) — its bytes survive a later ls_window_set (ARCH 3)" {
+    const gpa = std.testing.allocator;
+    const fixture = try genFixedRows(gpa, 10_000);
+    defer gpa.free(fixture);
+    var od = try openBytes(fixture);
+    defer od.deinit();
+    try scanToEnd(od.doc);
+
+    _ = api.ls_window_set(od.doc, 0, 64);
+    var buf: [64]u8 = undefined;
+    var expect: [8]u8 = undefined;
+    const want = fixedCell(&expect, 7);
+
+    const c = copyCell(od.doc, 7, 0, &buf);
+    try std.testing.expectEqual(api.CopyResult.ok, c.result);
+    try std.testing.expectEqualStrings(want, buf[0..c.len]);
+    try std.testing.expectEqualStrings(want, api.ls_cell(od.doc, 7, 0).slice()); // agrees with ls_cell
+
+    // Move the window FAR away — this evicts row 7 and invalidates every ls_str
+    // borrow. Bytes already COPIED into `buf` are unaffected (it is not a borrow).
+    _ = api.ls_window_set(od.doc, 9_000, 64);
+    try std.testing.expectEqualStrings(want, buf[0..c.len]); // still intact
+    try std.testing.expectEqualStrings("", api.ls_cell(od.doc, 7, 0).slice()); // ls_cell: evicted
+    // A FRESH copy of row 7 still works though the window sits at 9000
+    // (window-INDEPENDENT: row 7 is behind the frontier, no window needed).
+    const c2 = copyCell(od.doc, 7, 0, &buf);
+    try std.testing.expectEqual(api.CopyResult.ok, c2.result);
+    try std.testing.expectEqualStrings(want, buf[0..c2.len]);
+}
+
+test "cc5: PENDING beyond the frontier, NO_CELL past an exact end; reads are window-independent (ARCH 3)" {
+    const gpa = std.testing.allocator;
+    const fixture = try genFixedRows(gpa, 300_000); // 5.4 MB > head budget
+    defer gpa.free(fixture);
+    var od = try openBytes(fixture); // MANUAL: no background frontier advance
+    defer od.deinit();
+
+    var buf: [64]u8 = undefined;
+    var expect: [8]u8 = undefined;
+
+    // Row 0 is behind the open frontier and reads with NO ls_window_set at all
+    // (window-INDEPENDENT).
+    const head = copyCell(od.doc, 0, 0, &buf);
+    try std.testing.expectEqual(api.CopyResult.ok, head.result);
+    try std.testing.expectEqualStrings(fixedCell(&expect, 0), buf[0..head.len]);
+
+    // Row 260,000 starts at byte 4,680,000 > LS_OPEN_HEAD_MAX_BYTES: beyond the
+    // open frontier in MANUAL mode -> PENDING (advance the frontier and retry).
+    try std.testing.expectEqual(api.CopyResult.pending, copyCell(od.doc, 260_000, 0, &buf).result);
+
+    // Advance the frontier over it via the public jump machinery; the same read
+    // then succeeds — still with NO ls_window_set (window-INDEPENDENT).
+    api.ls_jump_start(od.doc, 260_000);
+    _ = try waitJumpDone(od.doc);
+    const deep = copyCell(od.doc, 260_000, 0, &buf);
+    try std.testing.expectEqual(api.CopyResult.ok, deep.result);
+    try std.testing.expectEqualStrings(fixedCell(&expect, 260_000), buf[0..deep.len]);
+
+    // With the count made EXACT, a row at/past the end is NO_CELL (not PENDING).
+    try scanToEnd(od.doc);
+    try expectDims(od.doc, 300_000, 2);
+    try std.testing.expectEqual(api.CopyResult.no_cell, copyCell(od.doc, 300_000, 0, &buf).result);
+    // A bad column is NO_CELL regardless of the row.
+    try std.testing.expectEqual(api.CopyResult.no_cell, copyCell(od.doc, 0, 2, &buf).result);
+}
+
+// ---------------------------------------------------------------------------
+// Public C ABI: the select-copy symbol is callable through extern linkage and
+// the ls_copy_result enum values are pinned (regression guard; green from seed).
+// ---------------------------------------------------------------------------
+
+const c_linked_copy = struct {
+    extern fn ls_cell_copy(doc: *const api.Doc, row: u64, col: u32, buf: ?[*]u8, buf_len: usize, out_len: *usize, out_truncated: *bool) api.CopyResult;
+};
+
+test "abi: the select-copy symbol links through extern linkage; ls_copy_result values pinned" {
+    try std.testing.expectEqual(@as(c_int, 0), @intFromEnum(api.CopyResult.ok));
+    try std.testing.expectEqual(@as(c_int, 1), @intFromEnum(api.CopyResult.pending));
+    try std.testing.expectEqual(@as(c_int, 2), @intFromEnum(api.CopyResult.no_cell));
+
+    var od = try openBytes("a,b\nx,y\n");
+    defer od.deinit();
+    winAll(od.doc);
+    var len: usize = 123;
+    var truncated: bool = true;
+    var buf: [8]u8 = undefined;
+    // A column past the count is NO_CELL through the C symbol (green from seed).
+    const res = c_linked_copy.ls_cell_copy(od.doc, 0, 9, &buf, buf.len, &len, &truncated);
+    try std.testing.expectEqual(api.CopyResult.no_cell, res);
+}

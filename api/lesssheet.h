@@ -7,7 +7,8 @@
  * library. It is frozen by the workspace-root planner: implementers on either
  * side may not change it (two-key change-request process only).
  *
- * Scope (viewer-ui + find-seek + csv-hardening + filtered-views slices):
+ * Scope (viewer-ui + find-seek + csv-hardening + filtered-views + select-copy
+ * slices):
  * open a document with
  * an optionally forced parse profile (separator / quote / header / ENCODING),
  * read the effective dialect report (now including the resolved encoding),
@@ -21,7 +22,11 @@
  * derived FILTER view over the same machinery: set a filter from an
  * ls_search_request and the row accessors, jumps, and searches then operate
  * in FILTERED coordinates (row i = the i-th matching data row), with each
- * match's original row number retrievable — see FILTERED VIEWS. The
+ * match's original row number retrievable — see FILTERED VIEWS. select-copy
+ * adds ls_cell_copy: a bounded, window-INDEPENDENT LOSSLESS read of a single
+ * cell's COMPLETE transcoded content into a caller-owned buffer (up to a
+ * caller-provided byte cap), so a frontend can faithfully copy cells whose
+ * content runs past the ls_cell display cap — see FULL-CELL READ. The
  * walking-skeleton head-window surface is superseded.
  *
  * csv-hardening adds two things to the delimited-text path without changing
@@ -57,7 +62,10 @@
  *     scanning (indexing, jump-scans, match-scans, AND filter-scans) NEVER
  *     invalidates a
  *     borrow. Callers copy at their own boundary; they never free anything
- *     obtained from the core.
+ *     obtained from the core. ls_cell_copy is the exception that proves the
+ *     rule: it does NOT borrow — it COPIES a cell's bytes into a caller-owned
+ *     buffer, so its output is owned by the caller and is NOT invalidated by a
+ *     later ls_window_set (on any thread). See FULL-CELL READ.
  *   - Allocation discipline: ls_open, ls_window_set, ls_search_start,
  *     ls_search_nav, and ls_filter_set are the only CALLS that may allocate
  *     (running background
@@ -65,7 +73,7 @@
  *     accessor and poll (ls_dialect_get, ls_column_count, ls_row_count_get,
  *     ls_index_poll, ls_cell, ls_cell_truncated, ls_header_cell,
  *     ls_header_cell_truncated, ls_jump_poll, ls_search_poll, ls_filter_poll,
- *     ls_source_row, ls_row_oversized) and ls_jump_cancel / ls_search_cancel /
+ *     ls_source_row, ls_row_oversized, ls_cell_copy) and ls_jump_cancel / ls_search_cancel /
  *     ls_filter_clear
  *     performs ZERO heap allocation and
  *     never fails; out-of-range access returns the empty string / a
@@ -206,9 +214,11 @@
  *     reinterpret their row arguments AND results in these FILTERED
  *     coordinates:
  *       * ls_row_count_get — reports m (matching rows); see COUNT below.
- *       * ls_window_set / ls_cell / ls_cell_truncated — address and serve the
- *         matching rows and their cells (every cell rule unchanged: quoting,
- *         the truncate/pad rule, the LS_CELL_MAX_BYTES display cap and flag).
+ *       * ls_window_set / ls_cell / ls_cell_truncated / ls_cell_copy — address
+ *         and serve the matching rows and their cells (every cell rule
+ *         unchanged: quoting, the truncate/pad rule, the LS_CELL_MAX_BYTES
+ *         display cap and flag; ls_cell_copy reads the FULL cell — FULL-CELL
+ *         READ — in these same filtered coordinates).
  *       * ls_jump_* — target is an ORIGINAL data-row number; see JUMP below.
  *       * ls_search_* — the find predicate is evaluated only over rows that
  *         satisfy the filter; see FIND below.
@@ -315,9 +325,14 @@
  *   - Poll/control lane — ls_dialect_get, ls_column_count, ls_row_count_get,
  *     ls_index_poll, ls_jump_start, ls_jump_cancel, ls_jump_poll,
  *     ls_search_start, ls_search_nav, ls_search_cancel, ls_search_poll,
- *     ls_filter_set, ls_filter_clear, ls_filter_poll: safe from any thread
- *     at any time (internally synchronized), except
- *     concurrently with ls_open/ls_close on the same document.
+ *     ls_filter_set, ls_filter_clear, ls_filter_poll, ls_cell_copy: safe from
+ *     any thread at any time (internally synchronized), except
+ *     concurrently with ls_open/ls_close on the same document. ls_cell_copy in
+ *     particular is safe on a background (copy) worker WHILE the window lane
+ *     runs on another thread: it is window-INDEPENDENT (neither reads nor
+ *     evicts the materialized window) and copies into the caller's buffer, so a
+ *     frontend can copy a large selection off-thread while the UI keeps
+ *     scrolling (ls_window_set / ls_cell) undisturbed.
  *   - Distinct documents are fully independent.
  *
  * TEXT AND ENCODING (source encoding detection + internal transcode to UTF-8)
@@ -369,7 +384,10 @@
  *     whether a served cell was cut. This cap is DISPLAY-ONLY: it never alters
  *     the source file, and SEARCH scans the full cell, not the capped bytes
  *     (see SEARCH and ls_search_request). Normal cells (<= the cap) are served
- *     whole with the flag false.
+ *     whole with the flag false. For a LOSSLESS read of a cell's COMPLETE
+ *     transcoded content PAST this display cap (e.g. clipboard copy), use
+ *     ls_cell_copy, which fills a caller buffer up to a caller-provided byte
+ *     cap — see FULL-CELL READ.
  *
  * DELIMITED-TEXT DIALECT (parameterized; RFC-4180 generalized)
  *   - Effective separator: one byte. Effective quote: one byte, or NONE
@@ -874,6 +892,32 @@ typedef struct ls_filter_status {
 } ls_filter_status;
 
 /* ------------------------------------------------------------------------- */
+/* Full-cell read result (select-copy slice — see FULL-CELL READ)             */
+/* ------------------------------------------------------------------------- */
+
+/*
+ * Result of ls_cell_copy, the bounded full-cell read. Distinct, stable values.
+ */
+typedef enum ls_copy_result {
+    /* The cell was read: *out_len UTF-8 bytes (<= buf_len) were written to
+     * buf, and *out_truncated is true iff the cell's full transcoded content
+     * is longer than those bytes (it was cut). An empty cell is LS_COPY_OK
+     * with *out_len 0 and *out_truncated false. */
+    LS_COPY_OK = 0,
+    /* `row` lies at/beyond the scan frontier: its byte offset is not yet known,
+     * so it is not yet servable, and nothing was written. Advance the frontier
+     * toward it with ls_jump_start (which reports progress) and retry —
+     * ls_cell_copy itself never scans and never advances the frontier. */
+    LS_COPY_PENDING = 1,
+    /* No such cell exists — col >= ls_column_count(), or `row` is at/beyond the
+     * view's row count when that count is EXACT (past the last row), or the
+     * document is empty; nothing was written. Distinct from LS_COPY_PENDING:
+     * retrying will NOT help (do not jump). While the row count is still an
+     * estimate, a row past the frontier is LS_COPY_PENDING, not this. */
+    LS_COPY_NO_CELL = 2,
+} ls_copy_result;
+
+/* ------------------------------------------------------------------------- */
 /* Lifecycle                                                                  */
 /* ------------------------------------------------------------------------- */
 
@@ -1033,6 +1077,66 @@ bool ls_header_cell_truncated(const ls_doc *doc, uint32_t col);
  * cells). ZERO allocation; never fails; never scans.
  */
 bool ls_row_oversized(const ls_doc *doc, uint64_t row);
+
+/* ------------------------------------------------------------------------- */
+/* Full-cell read (select-copy slice; window-INDEPENDENT; any thread)          */
+/* ------------------------------------------------------------------------- */
+
+/*
+ * Copy the COMPLETE content of the data cell at (row, col) — the same cell
+ * ls_cell addresses (quoting removed, the column-count truncate/pad rule
+ * applied, transcoded to UTF-8 per the resolved encoding) — into the caller's
+ * buffer, WITHOUT the LS_CELL_MAX_BYTES display cap. This is the LOSSLESS
+ * full-cell read the display-capped ls_cell cannot provide (a cell longer than
+ * the display cap is searchable but not readable through ls_cell); a frontend
+ * uses it to copy a selection to the clipboard faithfully.
+ *
+ *   row, col — addressed exactly as ls_cell: 0-based, 64-bit, view-relative
+ *              (a FILTERED index while a filter is active — see FILTERED VIEWS;
+ *              col is a physical column index). UNLIKE ls_cell, ls_cell_copy is
+ *              INDEPENDENT of the materialized window: it does not require,
+ *              consult, or disturb ls_window_set's window — it serves ANY row
+ *              the core can already locate without scanning.
+ *   buf, buf_len — the caller's output buffer and its capacity in bytes;
+ *              buf_len is the read's byte cap. buf may be NULL only when buf_len
+ *              is 0. The core writes at most buf_len UTF-8 bytes, cut at a UTF-8
+ *              code-point boundary (never a split code point), so the written
+ *              bytes are always valid UTF-8 (for valid source).
+ *   out_len, out_truncated — out-params (both non-NULL). On LS_COPY_OK,
+ *              *out_len is the byte count written (<= buf_len) and *out_truncated
+ *              is true iff the cell's full content exceeds them. On
+ *              LS_COPY_PENDING / LS_COPY_NO_CELL, *out_len is 0 and
+ *              *out_truncated is false (nothing was written).
+ *
+ * Returns LS_COPY_OK, LS_COPY_PENDING, or LS_COPY_NO_CELL (see ls_copy_result).
+ * A cell that fits is copied whole (*out_truncated false); one that exceeds
+ * buf_len is copied to exactly the boundary-cut prefix that fits (*out_truncated
+ * true). Servable rows are those the core can locate WITHOUT scanning — the
+ * same rows behind the scan frontier that ls_window_set can materialize (plus
+ * the pinned bounded record-1 row 0); a row at/beyond the frontier is
+ * LS_COPY_PENDING until the frontier advances over it (ls_jump_start / the AUTO
+ * indexer), exactly as such rows become servable to ls_window_set.
+ *
+ * COST is bounded: O(min(source bytes to reach and decode the cell,
+ * LS_WINDOW_ROW_SCAN_MAX_BYTES)) + O(min(cell bytes, buf_len)) output — the
+ * SAME per-row SOURCE-byte bound as ls_window_set, so it is safe on ANY thread
+ * for ANY row size and never blocks. For an OVERSIZED row (source extent to the
+ * target cell exceeds LS_WINDOW_ROW_SCAN_MAX_BYTES — see ls_row_oversized) the
+ * cell is served as a bounded prefix (possibly empty, for a column past the
+ * source bound) with *out_truncated true; ls_cell_copy never re-lexes a giant
+ * row's full bytes.
+ *
+ * OWNERSHIP: ls_cell_copy does NOT borrow — it COPIES into the caller's buffer,
+ * which the caller owns. Its output therefore has NO tie to the ls_str eviction
+ * rule: a subsequent ls_window_set (on this or any thread) never affects bytes
+ * already written. ZERO heap allocation; never fails (always a well-defined
+ * ls_copy_result). Poll/control lane — safe from ANY thread at any time,
+ * concurrently with the window lane and background scans (see THREADING), which
+ * is what lets a frontend copy a large selection off the UI thread.
+ */
+ls_copy_result ls_cell_copy(const ls_doc *doc, uint64_t row, uint32_t col,
+                            uint8_t *buf, size_t buf_len,
+                            size_t *out_len, bool *out_truncated);
 
 /* ------------------------------------------------------------------------- */
 /* Jump-scans (asynchronous; shared frontier; any thread)                     */
