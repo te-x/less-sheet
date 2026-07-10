@@ -61,21 +61,40 @@ public struct ScanProgress: Equatable, Sendable {
     }
 }
 
-/// One materialized row window (mirrors the result of `ls_window_set` plus
-/// the copied cells): `rows[i]` is data row `firstRow + i`, each exactly
-/// `columnCount` cells wide (truncate/pad applied by the core). `rows` may
-/// be shorter than requested — or empty — when the requested range extends
-/// beyond the scan frontier or the document; the missing rows become
-/// available by re-requesting after the frontier advances (poll-driven).
+/// One materialized row+column window (mirrors the result of `ls_window_set`
+/// plus the copied cells): `rows[i]` is data row `firstRow + i`, carrying the
+/// cells for the ABSOLUTE column range `[firstColumn, firstColumn + rows[i].count)`.
+/// The DEFAULT `firstColumn == 0` with each row `columnCount` cells wide is the
+/// original DENSE whole-row window (truncate/pad applied by the core) that
+/// `setWindow(firstRow:rowCount:)` returns — so every pre-column-window caller
+/// is unaffected. A COLUMN-WINDOWED fetch (`setWindow(firstRow:rowCount:columns:)`)
+/// instead sets `firstColumn` to the requested range's lower bound and makes each
+/// row exactly that range wide, so a wide document's per-window fetch is
+/// O(visible columns), NOT O(columnCount) — the horizontal analog of the row
+/// window (ARCH-column-windowing AC7). `rows` may be shorter than requested — or
+/// empty — when the requested range extends beyond the scan frontier or the
+/// document; the missing rows become available by re-requesting after the
+/// frontier advances (poll-driven).
 public struct RowWindow: Equatable, Sendable {
     public let firstRow: UInt64
+    /// The 0-based ABSOLUTE index of the first column carried by every row:
+    /// `rows[i][j]` is the cell at absolute column `firstColumn + j` (and the
+    /// parallel `truncated[i][j]` its flag). DEFAULTS to 0 — the dense
+    /// full-width window (`rows[i]` spans `[0, columnCount)`) that
+    /// `setWindow(firstRow:rowCount:)` and every pre-column-window caller
+    /// produces. A column-windowed fetch sets it to the requested range's lower
+    /// bound; a column-relative consumer maps an absolute column `c` to its slot
+    /// `c - firstColumn` in the row (in range iff
+    /// `firstColumn <= c < firstColumn + rows[i].count`).
+    public let firstColumn: Int
     public let rows: [[String]]
-    /// Per-cell display-truncation flags, PARALLEL to `rows`: `truncated[i][j]`
-    /// is true iff cell (i, j) was cut by the core's per-cell display cap
-    /// (`ls_cell_truncated`). Same shape as `rows` (each row's flags count ==
-    /// that row's cell count); empty only when `rows` is empty. The cut is
-    /// DISPLAY-ONLY — the full cell is still searchable (grids render a
-    /// truncation indicator from this flag, ARCH req. 13/20).
+    /// Per-cell display-truncation flags, PARALLEL to `rows` over the SAME
+    /// `[firstColumn, …)` column window: `truncated[i][j]` is true iff the cell
+    /// at absolute column `firstColumn + j` in row `firstRow + i` was cut by the
+    /// core's per-cell display cap (`ls_cell_truncated`). Same shape as `rows`
+    /// (each row's flags count == that row's cell count); empty only when `rows`
+    /// is empty. The cut is DISPLAY-ONLY — the full cell is still searchable
+    /// (grids render a truncation indicator from this flag, ARCH req. 13/20).
     public let truncated: [[Bool]]
     /// Per-ROW OVERSIZED flags, PARALLEL to `rows`: `oversized[i]` is true iff
     /// row `firstRow + i`'s SOURCE extent exceeded the core's per-row window
@@ -89,8 +108,9 @@ public struct RowWindow: Equatable, Sendable {
     /// req. 7); the live visual is a human-eyes check.
     public let oversized: [Bool]
 
-    public init(firstRow: UInt64, rows: [[String]], truncated: [[Bool]] = [], oversized: [Bool] = []) {
+    public init(firstRow: UInt64, firstColumn: Int = 0, rows: [[String]], truncated: [[Bool]] = [], oversized: [Bool] = []) {
         self.firstRow = firstRow
+        self.firstColumn = firstColumn
         self.rows = rows
         self.truncated = truncated
         self.oversized = oversized
@@ -125,8 +145,26 @@ public protocol DocumentSession: AnyObject, Sendable {
     /// Declare the viewport (+ scroll buffer) and materialize it: returns
     /// the rows of [firstRow, firstRow + rowCount) that are behind the scan
     /// frontier, copied. `rowCount` is clamped to the core's window cap.
-    /// Never scans; synchronous-fast.
+    /// Never scans; synchronous-fast. Returns a DENSE window: `firstColumn == 0`
+    /// and each row `columnCount` cells wide.
     func setWindow(firstRow: UInt64, rowCount: Int) -> RowWindow
+
+    /// COLUMN-WINDOWED materialize (ARCH-column-windowing AC7) — the horizontal
+    /// analog of the row window. Identical to `setWindow(firstRow:rowCount:)` in
+    /// the ROW dimension, but fetches ONLY the columns in `columns` (a half-open
+    /// ABSOLUTE column-index range — a `ColumnWindow.range`). The result's
+    /// `firstColumn` is `columns.lowerBound` (clamped to `0 ..< columnCount`) and
+    /// each returned row is exactly that range wide, so a wide document's
+    /// per-window fetch touches O(visible columns) cells, NOT O(columnCount) — a
+    /// column-relative consumer indexes absolute column `c` at `c - firstColumn`.
+    /// `columns` is clamped to `0 ..< columnCount`; an empty intersection yields
+    /// empty rows. Same window/borrow domain, row clamping, frontier, and
+    /// never-scans / synchronous-fast guarantees as the dense overload. A DEFAULT
+    /// protocol-extension implementation falls back to the dense
+    /// `setWindow(firstRow:rowCount:)` (a full-width window, `firstColumn == 0`)
+    /// so a conformer need not implement this to compile; a conformer that cares
+    /// about wide-document cost OVERRIDES it to make the fetch truly O(window).
+    func setWindow(firstRow: UInt64, rowCount: Int, columns: Range<Int>) -> RowWindow
 
     /// Start (or retarget) the async jump-scan toward a 0-based data row.
     /// Never blocks; if the target is behind the frontier the jump is
@@ -198,6 +236,23 @@ public protocol DocumentSession: AnyObject, Sendable {
     /// Release the core handle. Idempotent; nothing else may be called
     /// afterwards.
     func close()
+}
+
+public extension DocumentSession {
+    /// DEFAULT (dense fallback) for the column-windowed `setWindow`: ignores
+    /// `columns` and returns the full-width window from the dense
+    /// `setWindow(firstRow:rowCount:)` (`firstColumn == 0`, every row
+    /// `columnCount` cells wide). This keeps a conformer compiling before the
+    /// column-fetch impl lands — but it fetches ALL columns, so a conformer that
+    /// cares about wide-document cost MUST override this to fetch only `columns`
+    /// (ARCH-column-windowing AC7). The column overload is a PROTOCOL REQUIREMENT
+    /// (declared in the protocol body, not only here), so such an override is
+    /// dispatched through `any DocumentSession` via the witness table — which is
+    /// exactly what flips the AC7 fetch test from RED (this dense default) to
+    /// GREEN (a real column-windowed fetch).
+    func setWindow(firstRow: UInt64, rowCount: Int, columns: Range<Int>) -> RowWindow {
+        setWindow(firstRow: firstRow, rowCount: rowCount)
+    }
 }
 
 /// Opens document sessions through the core's C ABI. This is the ONLY entry

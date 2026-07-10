@@ -104,3 +104,33 @@ frozen `CorpusColdOpenTests` AC5 is the acceptance for AC1 and is NOT modified.
 
 ## Open questions
 None. The column-width behaviour is decided (see "Column-width behaviour" above).
+
+## Amendment — round 2: window the cell-FETCH too (2026-07-10, measured; user-directed)
+Round 1 (measure + draw windowing) shipped and is correct: `wide_100k_cols` 2974 → 579 ms (5.4×), all
+tests green EXCEPT AC5's own < 500 ms budget. Measurement (build-cell instrumentation, verified by the
+orchestrator's gate run: 73 tests, only AC5 red at 579 ms) showed the residual is
+`CoreDocumentSession.setWindow` fetching ALL columns — the frozen `RowWindow` is contractually DENSE
+("each row exactly `columnCount` cells wide") — at 2 FFI calls/cell (`ls_cell` + `ls_cell_truncated`) =
+~600k calls / ~180 ms for this fixture, AND it runs on EVERY vertical-scroll materialize (a latent
+wide-and-tall scroll cost, not just cold-open). **The round-1 note that "`RowWindow` stays eager — fine"
+is RETRACTED; measurement disproved it.**
+
+User's directive (2026-07-10): *the UI must do work proportional to the VISIBLE window (~20–50 columns ×
+~100 rows), never the document; when the core serves the window with time to spare, the UI must not
+squander it.* So the fetch must be O(visible) too.
+
+### Additional acceptance
+- **AC7 — the cell-FETCH is O(visible column window), not O(columnCount).** `setWindow` fetches only the
+  requested column range; a frozen test asserts the fetch volume (cells/FFI touched) for a first paint AND
+  a scroll-materialize is bounded by the visible window, independent of `columnCount` (the fetch analog of
+  AC2). `wide_100k_cols` cold-open robustly < 500 ms (target ~400 ms) — greening AC5 (= AC1) with margin.
+
+### Contract surface (ADDITIVE — minimize ripple)
+Frozen `DocumentSession` / `RowWindow` change, kept ADDITIVE so existing callers + frozen tests are
+unaffected: give the window transfer a column window (e.g. `setWindow` gains an optional column range / a
+`ColumnWindow`; `RowWindow` gains `firstColumn` defaulting to 0 = full/dense for back-compat), so the
+frontend's `materialize` fetches only the visible columns and column-relative consumers index off
+`firstColumn`. **No `api/`/backend change** — `ls_cell` already serves any single cell; the change is
+Swift-only. The planner amends + refreezes (`aidev: amend contract — column-fetch window`); a round-2
+implementer completes the impl (`CoreDocumentSession.setWindow` + the column-relative consumers) on top of
+the round-1 measure/draw windowing.
