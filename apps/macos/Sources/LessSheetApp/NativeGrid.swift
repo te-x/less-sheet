@@ -112,10 +112,22 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
     private let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("cells"))
 
     // Layout state mirrored from the model (read by the row/header/gutter draw).
+    // `widths`/`headerLabels` are the CURRENT HORIZONTAL COLUMN WINDOW only —
+    // a few tens to a few hundred columns, never all of them on a wide
+    // document (ARCH-column-windowing) — positioned starting at `columnFirstX`
+    // (the window's exact prefix-sum x-offset, so an in-window column lands at
+    // the SAME x a full, unwindowed draw would give it; ARCH AC4/AC5).
     private(set) var widths: [CGFloat] = []
     private(set) var headerLabels: [String] = []
+    private(set) var columnFirstX: CGFloat = 0
     private(set) var fillerColumns = 0
     private(set) var gutterWidth: CGFloat = 0
+    /// Sum of every VISIBLE column's width (`model.totalVisibleWidth`) —
+    /// independent of the column window — driving the scrollable table
+    /// column's width / filler-column count (`refreshColumnWidth`). O(visible
+    /// columns) to derive; refreshed only on a STRUCTURAL change
+    /// (`refreshLayoutMetrics`), never per scroll tick.
+    private var totalDataWidth: CGFloat = 0
 
     // Change-detection caches (avoid redundant reloads).
     private var lastOpenGeneration = -1
@@ -280,6 +292,10 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
         // actual frosting; the frame just gives it the room to draw into.
         gutter.frame = NSRect(x: 0, y: 0, width: gw, height: b.height)
         header.contentOffsetX = scroll.contentView.bounds.origin.x
+        // Re-derive the column window for the (possibly just-resized) clip
+        // BEFORE sizing the table column, so a width grown by newly-revealed
+        // columns is reflected in this SAME layout pass, not one tick later.
+        refreshColumnWindow()
         refreshColumnWidth()
         header.needsDisplay = true
         gutter.needsDisplay = true
@@ -291,14 +307,18 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
     /// overflows (the sole case that warrants a horizontal scroller). The empty
     /// filler columns carry the spreadsheet fill to the right edge as a DRAWING
     /// device — the row view paints their hairlines and clips at the column width.
-    /// `site` labels the probe line with the caller (diagnostic only): "layout"
-    /// from `layoutContainer`, "scroll" from `clipBoundsChanged` re-syncing
-    /// against the clip's OWN width changes (e.g. a vertical scroller
-    /// inserting/removing itself) independent of the gutter/container frame,
-    /// "estimate" from `syncRowCountEstimate` re-syncing against the SAME kind
-    /// of clip-width change when it happens AT REST (no scroll to catch it).
+    /// Uses `totalDataWidth` (ALL visible columns, model-cached) rather than
+    /// summing `widths` — `widths` is now just the horizontal column WINDOW
+    /// (ARCH-column-windowing), far narrower than the true scrollable extent
+    /// on a wide document. `site` labels the probe line with the caller
+    /// (diagnostic only): "layout" from `layoutContainer`, "scroll" from
+    /// `clipBoundsChanged` re-syncing against the clip's OWN width changes
+    /// (e.g. a vertical scroller inserting/removing itself) independent of
+    /// the gutter/container frame, "estimate" from `syncRowCountEstimate`
+    /// re-syncing against the SAME kind of clip-width change when it happens
+    /// AT REST (no scroll to catch it).
     private func refreshColumnWidth(site: String = "layout") {
-        let dataWidth = widths.reduce(0, +)
+        let dataWidth = totalDataWidth
         let viewportW = scroll.contentView.bounds.width
         fillerColumns = viewportW > dataWidth
             ? Int(ceil((viewportW - dataWidth) / GridMetrics.fillerColumnWidth)) : 0
@@ -320,12 +340,31 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
 
     // MARK: Model -> AppKit
 
-    /// Pull the current visible-column geometry + row-number gutter width from
-    /// the model. Cheap; run on every layout / open / hidden-column change.
+    /// Pull the STRUCTURAL geometry from the model: the row-number gutter
+    /// width and the total content width (`model.totalVisibleWidth`, O(visible
+    /// columns)). Run only on a structural change — build / open / hidden-
+    /// column reflow / filter toggle / a width-batch change — NEVER per
+    /// scroll tick (ARCH-column-windowing); see `refreshColumnWindow` for the
+    /// O(window) counterpart that IS safe on every tick.
     private func refreshLayoutMetrics() {
-        widths = model.visibleWidths()
-        headerLabels = model.headerLabels()
         gutterWidth = model.rowNumberColumnWidth()
+        totalDataWidth = model.totalVisibleWidth
+    }
+
+    /// (Re)derives the horizontal column window from the CURRENT scroll clip
+    /// (x-offset + viewport width) and pulls the window-bound widths/labels
+    /// the row/header views draw — the horizontal analog of `viewportChanged`'s
+    /// row window (ARCH-column-windowing). `model.horizontalViewportChanged`
+    /// is O(visible columns) of plain arithmetic (never O(columns) of text
+    /// layout) and a no-op once the window settles, so this is cheap enough
+    /// to call on EVERY layout pass and scroll tick — unlike
+    /// `refreshLayoutMetrics`, which stays gated to structural changes.
+    private func refreshColumnWindow() {
+        let clip = scroll.contentView.bounds
+        model.horizontalViewportChanged(viewportX: clip.origin.x, viewportWidth: clip.width)
+        widths = model.windowWidths()
+        headerLabels = model.windowHeaderLabels()
+        columnFirstX = CGFloat(model.columnWindow.firstX)
     }
 
     /// The single funnel for model-driven grid updates (idempotent). Called from
@@ -686,6 +725,15 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
         // never linger and force a spurious horizontal scroller (or hide a
         // genuine one) — `layoutContainer` already covers this when the gutter
         // branch above ran; harmless to re-run.
+        //
+        // Re-derive the horizontal column window for the CURRENT scroll x, so
+        // a horizontal drag/fling reveals newly-in-window columns (measured,
+        // fetched, drawn) exactly like `viewportChanged` does for a vertical
+        // one — O(window), never O(columnCount) (ARCH-column-windowing); a
+        // no-op once the window and widths settle. Already re-derived by
+        // `layoutContainer` when the gutter branch above ran; harmless (cheap)
+        // to re-run against the settled clip.
+        refreshColumnWindow()
         refreshColumnWidth(site: "scroll")
 
         header.contentOffsetX = clip.bounds.origin.x
@@ -734,15 +782,18 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
         if row < dataRowCount {
             rv.isFiller = false
             // Not-yet-servable (within the estimated range but past the
-            // materialized scan frontier): `visibleBodyCells` already empty-
+            // materialized scan frontier): `windowBodyCells` already empty-
             // pads it exactly like a genuinely empty row, so this flag is
             // what lets the row view tell the two apart and draw a loading
             // placeholder instead of silently blank cells (PROJECT: constant
             // feedback, no silent stalls).
             rv.pending = !model.rowLoaded(forRow: row)
-            rv.cells = model.visibleBodyCells(forRow: row)
-            rv.truncated = model.visibleBodyTruncated(forRow: row)
-            rv.highlights = model.cellHighlights(forRow: row)
+            // Column-WINDOW bound (ARCH-column-windowing) — O(window), never
+            // O(columnCount): the live grid only ever needs the columns it is
+            // about to draw, unlike the eager dump grid (FrameDump).
+            rv.cells = model.windowBodyCells(forRow: row)
+            rv.truncated = model.windowBodyTruncated(forRow: row)
+            rv.highlights = model.windowCellHighlights(forRow: row)
         } else {
             rv.isFiller = true
             rv.pending = false
@@ -851,7 +902,12 @@ final class SheetRowView: NSTableRowView {
         let h = bounds.height
         let grid = NSColor.gridColor
         let accent = NSColor.controlAccentColor
-        var x: CGFloat = 0
+        // `c.widths` is only the current horizontal column WINDOW
+        // (ARCH-column-windowing); start at its exact prefix-sum offset so an
+        // in-window column lands at the SAME x a full, unwindowed draw would
+        // give it (0 for a viewport-fitting file — ARCH AC4 — and the real
+        // scrolled-to offset otherwise).
+        var x: CGFloat = c.columnFirstX
 
         for (i, w) in c.widths.enumerated() {
             let cell = NSRect(x: x, y: 0, width: w, height: h)
@@ -965,7 +1021,12 @@ final class GridHeaderView: NSView {
             bounds.fill()
         }
         let grid = NSColor.gridColor
-        var x = -contentOffsetX
+        // `c.widths` is only the current horizontal column WINDOW
+        // (ARCH-column-windowing); position its first column at its exact
+        // prefix-sum offset (`columnFirstX`), translated into this fixed
+        // view's local space by the same horizontal-scroll offset the data
+        // columns are drawn under.
+        var x = c.columnFirstX - contentOffsetX
 
         for (i, w) in c.widths.enumerated() {
             let cell = NSRect(x: x, y: 0, width: w, height: h)

@@ -103,6 +103,43 @@ public final class CoreDocumentSession: DocumentSession, @unchecked Sendable {
         defer { lock.unlock() }
         let clamped = UInt32(clamping: max(rowCount, 0))
         let range = ls_window_set(doc, firstRow, clamped)
+        // The dense overload always asks for every column — no clamp needed,
+        // `0..<columnCount` is already exactly the valid domain.
+        return fetchWindow(range, columns: 0..<columnCount)
+    }
+
+    /// COLUMN-WINDOWED override (ARCH-column-windowing AC7 — the round-2
+    /// amendment): identical ROW handling to the dense overload above, but
+    /// reads cells/flags for ONLY `columns` (clamped to `0..<columnCount`)
+    /// instead of every column, so the fetch is O(rows x columns.count) FFI
+    /// calls, never O(rows x columnCount). `ViewerModel.materialize` routes
+    /// through this with the live horizontal column window as `columns`,
+    /// which is what carries a wide document's cold-open (and every
+    /// scroll-materialize) back under budget — the dense overload's own
+    /// `ls_cell`/`ls_cell_truncated` fetch of ALL columns, on EVERY
+    /// materialize, was measured (round-1 hand-off) at ~180 ms for
+    /// wide_100k_cols alone. Overriding the PROTOCOL REQUIREMENT (not just the
+    /// default extension) means this is what `any DocumentSession` dispatches
+    /// to — exactly what flips AC7 from the frozen RED seed (the dense
+    /// fallback) to GREEN.
+    public func setWindow(firstRow: UInt64, rowCount: Int, columns: Range<Int>) -> RowWindow {
+        lock.lock()
+        defer { lock.unlock() }
+        let clamped = UInt32(clamping: max(rowCount, 0))
+        let range = ls_window_set(doc, firstRow, clamped)
+        return fetchWindow(range, columns: columns.clamped(to: 0..<columnCount))
+    }
+
+    /// Shared row+column materialize (window lane; caller already holds
+    /// `lock`): copies cells/truncation/oversized flags for exactly `columns`
+    /// (already clamped to `0..<columnCount` by the caller) over the row
+    /// range `ls_window_set` just served, producing a `RowWindow` whose
+    /// `firstColumn` is `columns.lowerBound` and whose rows are exactly
+    /// `columns.count` wide — `columns == 0..<columnCount` (the dense
+    /// overload's call) yields `firstColumn == 0` and full-width rows,
+    /// byte-identical to what `setWindow(firstRow:rowCount:)` served before
+    /// this override existed.
+    private func fetchWindow(_ range: ls_row_range, columns: Range<Int>) -> RowWindow {
         var rows = [[String]]()
         var truncated = [[Bool]]()
         var oversized = [Bool]()
@@ -110,14 +147,14 @@ public final class CoreDocumentSession: DocumentSession, @unchecked Sendable {
         truncated.reserveCapacity(Int(range.row_count))
         oversized.reserveCapacity(Int(range.row_count))
         for row in range.first_row..<(range.first_row + range.row_count) {
-            rows.append((0..<columnCount).map { Self.copyCell(ls_cell(doc, row, UInt32($0))) })
-            truncated.append((0..<columnCount).map { ls_cell_truncated(doc, row, UInt32($0)) })
+            rows.append(columns.map { Self.copyCell(ls_cell(doc, row, UInt32($0))) })
+            truncated.append(columns.map { ls_cell_truncated(doc, row, UInt32($0)) })
             // Per-row OVERSIZED flag (ls_row_oversized): true iff the row's
             // source extent exceeded LS_WINDOW_ROW_SCAN_MAX_BYTES and it was
             // served as a bounded prefix. Window lane, so under the same lock.
             oversized.append(ls_row_oversized(doc, row))
         }
-        return RowWindow(firstRow: range.first_row, rows: rows, truncated: truncated, oversized: oversized)
+        return RowWindow(firstRow: range.first_row, firstColumn: columns.lowerBound, rows: rows, truncated: truncated, oversized: oversized)
     }
 
     public func startJump(to targetRow: UInt64) {

@@ -34,6 +34,30 @@ enum GridMetrics {
     /// a scroll-triggered geometry change is exactly the class of bug the
     /// column-width-growth fixes upstream had to correct.
     static let oversizedMarkerReserve: CGFloat = 14
+    /// Extra columns kept measured/materialized on EACH side of the horizontal
+    /// column window (ARCH-column-windowing) — the horizontal analog of
+    /// `scrollBufferRows`: a small scroll settles inside already-accurate
+    /// columns instead of immediately needing a fresh window + refine.
+    static let columnOverscan = 8
+    /// Extra columns FETCHED on each side of the current column window
+    /// whenever `materialize` (re-)issues `setWindow(columns:)` (ARCH-column-
+    /// windowing round-2, AC7) — the fetch analog of `scrollBufferRows`, sized
+    /// larger than `columnOverscan` (which only pads what gets MEASURED/DRAWN)
+    /// so a scroll that outgrows the drawn overscan by a handful of columns
+    /// still lands inside cells already fetched instead of needing another
+    /// core round-trip on the very next tick.
+    static let columnFetchBuffer = 32
+    /// Columns fetched for the very FIRST materialize of a session, before the
+    /// grid's first geometry callback establishes a real horizontal column
+    /// window (the column analog of `lastVisibleCount = 40` for rows). Every
+    /// column carries at least `minColumnWidth` (72 pt), so any document with
+    /// this many columns or fewer is already wider than any real viewport —
+    /// i.e. it can never be a viewport-FITTING file — so this bound never
+    /// shortchanges `measureColumnWidths`'s sample for a file AC4 actually
+    /// applies to, while still keeping an extremely wide document's cold-open
+    /// fetch O(hundreds) of columns, never O(columnCount) (the round-2 fix
+    /// that carries wide_100k_cols under the AC5 budget).
+    static let initialColumnFetchCount = 256
     /// End-of-file overscroll: rows of empty filler grid kept BELOW the last
     /// data row so the user can scroll a little past it and the bottom-right
     /// floating controls never cover the final rows. 5 rows (110 pt) clears the
@@ -74,6 +98,14 @@ final class DocumentModel {
         separatorForced: false, quoteForced: false, headerForced: false
     )
     private(set) var columnWidths: [CGFloat] = []      // per ORIGINAL column index
+    /// The current horizontal column window (ARCH-column-windowing) — the
+    /// column analog of `window` (`RowWindow`): the contiguous run of columns
+    /// the live grid's measure/fetch/draw stays bounded to, reported by the
+    /// grid from its horizontal scroll clip (see `horizontalViewportChanged`).
+    /// Indices are positions into `visibleColumns` (render order), matching
+    /// what `ColumnLayouting.window(widths:...)` was given. Empty until the
+    /// grid reports its first real viewport (fresh open, before any layout).
+    private(set) var columnWindow = ColumnWindow(first: 0, count: 0, firstX: 0)
 
     // Windowed data + progress knowledge.
     private(set) var window = RowWindow(firstRow: 0, rows: [])
@@ -125,6 +157,10 @@ final class DocumentModel {
 
     private let opener: any DocumentSessionOpening
     private let visibilityManager = ColumnVisibilityManager()
+    /// The pure horizontal column-window geometry + width-growth algebra
+    /// (ARCH-column-windowing); see `horizontalViewportChanged` /
+    /// `growColumnWidthsToFitWindow`.
+    private let columnLayout = ColumnLayout()
     private let jumpControl = JumpControl()
     private let composer = DialectComposer()
     private let findControl = FindControl()
@@ -137,6 +173,26 @@ final class DocumentModel {
     private var session: (any DocumentSession)?
     private var markedGeneration = -1
     private var firstVisibleRow = 0
+    /// `visibilityManager.visibleColumns(visibility)`, memoized: kept in
+    /// lockstep by `setVisibility` (the ONLY place `visibility` is assigned)
+    /// so every read is O(1) — this list is read many times per frame (every
+    /// visible row's cells/truncation/highlights, the header labels, the
+    /// widths) and a fresh `0..<columnCount` filter on each of those reads
+    /// would itself be the O(total-columns) cost this slice removes, on a
+    /// wide document with nothing hidden (ARCH-column-windowing).
+    private var cachedVisibleColumns: [Int] = []
+    /// `visibleColumns.map { Double(columnWidths[$0]) }`, plus its sum, both
+    /// memoized together and rebuilt ONLY when `markLayoutWidthsStale` is
+    /// called — after a width batch changes (open, or a monotone grow) or
+    /// `visibility` changes — never per scroll tick. ARCH-column-windowing
+    /// calls for exactly this ("rebuilt only when a width batch changes, off
+    /// the per-frame path"): converting/summing 100k `CGFloat`s is measurably
+    /// NOT free in a debug build (tens of ms, closure/array overhead), so
+    /// recomputing either on every call would silently reintroduce an
+    /// O(columnCount) per-frame cost this whole slice exists to remove.
+    private var cachedLayoutWidths: [Double] = []
+    private var cachedTotalVisibleWidth: CGFloat = 0
+    private var layoutWidthsStale = true
     /// Set on a header on/off re-open (consumed by the grid): how a data-row
     /// index shifts across the re-derivation so the viewport can re-anchor to the
     /// SAME file record. +1 when the header turns OFF (the former header record
@@ -178,9 +234,9 @@ final class DocumentModel {
             // Hidden-column state: carry across a re-open when the column count
             // is unchanged, else reset to all-visible (ARCH req. 10).
             if let previous {
-                self.visibility = visibilityManager.carriedOver(previous, toColumnCount: session.columnCount)
+                setVisibility(visibilityManager.carriedOver(previous, toColumnCount: session.columnCount))
             } else {
-                self.visibility = visibilityManager.allVisible(columnCount: session.columnCount)
+                setVisibility(visibilityManager.allVisible(columnCount: session.columnCount))
                 self.pendingHeaderShift = nil   // a fresh open never re-anchors to a prior toggle
             }
 
@@ -189,10 +245,14 @@ final class DocumentModel {
             if previous == nil, let raw = ProcessInfo.processInfo.environment["LESSSHEET_HIDE_COLS"] {
                 for token in raw.split(separator: ",") {
                     if let column = Int(token.trimmingCharacters(in: .whitespaces)) {
-                        self.visibility = visibilityManager.toggling(self.visibility, column: column)
+                        setVisibility(visibilityManager.toggling(self.visibility, column: column))
                     }
                 }
             }
+            // The horizontal window is a function of the widths this open is
+            // about to establish; it resets here and the grid re-derives it
+            // from its (possibly unchanged) viewport on the next layout pass.
+            self.columnWindow = ColumnWindow(first: 0, count: 0, firstX: 0)
 
             // First window from the top; frozen column widths from that head
             // sample (O(head), measured once for the session).
@@ -204,6 +264,7 @@ final class DocumentModel {
                 sample: window.rows,
                 columnCount: session.columnCount
             )
+            markLayoutWidthsStale()
             self.jumpFlow = .idle
             // New document identity: the core's search AND filter state died
             // with the old handle — clear results/highlights, retain the typed
@@ -286,28 +347,173 @@ final class DocumentModel {
         materialize(start: UInt64(newStart), count: newCount)
     }
 
+    /// The grid reports its horizontal scroll clip (x-offset + viewport
+    /// width) so the column window can be (re)derived, newly-revealed columns
+    /// RE-FETCHED once the comfort zone of the last `setWindow(columns:)` call
+    /// is exhausted (ARCH-column-windowing round-2, "Horizontal-scroll
+    /// re-materialize" — see the coversLeft/coversRight check below, which
+    /// mirrors `viewportChanged`'s row-window one), and accurately measured —
+    /// the horizontal analog of `viewportChanged`'s row window. The widths
+    /// array fed to `ColumnLayouting.window` is the MEMOIZED
+    /// `cachedLayoutWidths` (rebuilt only on a width-batch change, never
+    /// here), so a scroll tick is genuinely O(1) setup + `window`'s own
+    /// O(window position) scan, plus an O(window) `setWindow(columns:)`
+    /// re-fetch only when the comfort zone ran out — never O(columnCount)
+    /// either way. A no-op once the window settles (unchanged from the last
+    /// report), so neither the fetch nor `growColumnWidthsToFitWindow`
+    /// re-touches a stable window.
+    func horizontalViewportChanged(viewportX: CGFloat, viewportWidth: CGFloat) {
+        refreshLayoutWidthsIfNeeded()
+        guard !cachedLayoutWidths.isEmpty else { return }
+        let win = columnLayout.window(
+            widths: cachedLayoutWidths, viewportX: Double(viewportX), viewportWidth: Double(viewportWidth),
+            overscan: GridMetrics.columnOverscan
+        )
+        guard win != columnWindow else { return }
+        columnWindow = win
+
+        // Re-materialize ONLY when the new window would spill past the LAST
+        // fetch (`window.firstColumn` .. its rows' width) beyond a
+        // `columnOverscan` comfort margin — a small scroll settles inside an
+        // already-fetched range with no extra core call; the moment it does
+        // not, re-issuing setWindow(columns:) over the SAME row range (via
+        // `materialize`) fetches the newly-revealed columns' real cells
+        // before they are drawn, and `materialize` itself re-runs
+        // `growColumnWidthsToFitWindow` against the refreshed cells — so this
+        // branch does not also call it directly.
+        let target = absoluteColumnWindow()
+        let guardCols = GridMetrics.columnOverscan
+        let fetchedEnd = window.firstColumn + (window.rows.first?.count ?? 0)
+        let coversLeft = target.isEmpty || window.firstColumn == 0 || target.lowerBound >= window.firstColumn + guardCols
+        let coversRight = target.isEmpty || target.upperBound <= fetchedEnd - guardCols || fetchedEnd >= columnCount
+        if !window.rows.isEmpty, coversLeft, coversRight {
+            growColumnWidthsToFitWindow()
+        } else {
+            materialize(start: desiredStart, count: desiredCount)
+        }
+    }
+
+    /// The ABSOLUTE column range the CURRENT `columnWindow` spans — the
+    /// enclosing span of its in-window visible columns
+    /// (`windowColumns().first ..< .last + 1`). Identical to `columnWindow.
+    /// range` whenever no column is hidden (every existing fixture, and
+    /// wide_100k_cols); a hidden column strictly BETWEEN two in-window visible
+    /// ones is folded in too — `setWindow(columns:)` needs one contiguous
+    /// absolute range, and this is a cheap superset, never a fresh
+    /// `0..<columnCount` scan. Empty (`0..<0`) before any column window is
+    /// established (a fresh open) or when nothing is in view.
+    private func absoluteColumnWindow() -> Range<Int> {
+        let cols = windowColumns()
+        guard let first = cols.first, let last = cols.last else { return 0..<0 }
+        return first..<(last + 1)
+    }
+
+    /// The ABSOLUTE column range `materialize` asks the core to fetch: the
+    /// current column window (`absoluteColumnWindow`) padded by
+    /// `columnFetchBuffer` on each side and clamped to `0..<columnCount` — the
+    /// horizontal analog of `viewportChanged`'s buffered `newStart`/`newCount`
+    /// row request, so a horizontal scroll settles inside an already-fetched
+    /// range instead of re-materializing on every tick. Before the grid's
+    /// first geometry callback (`columnWindow` still empty — a fresh open)
+    /// falls back to the leftmost `initialColumnFetchCount` columns (see its
+    /// doc) rather than the whole document: `measureColumnWidths`'s head
+    /// sample reads exactly this fetch, which is what makes the session's
+    /// FIRST materialize — and every one after it — O(hundreds) of columns,
+    /// never O(columnCount) (ARCH-column-windowing round-2, AC7).
+    private func columnFetchRange() -> Range<Int> {
+        guard columnCount > 0 else { return 0..<0 }
+        guard !columnWindow.isEmpty else {
+            return 0..<min(columnCount, GridMetrics.initialColumnFetchCount)
+        }
+        let target = absoluteColumnWindow()
+        let buffer = GridMetrics.columnFetchBuffer
+        return max(0, target.lowerBound - buffer) ..< min(columnCount, target.upperBound + buffer)
+    }
+
+    /// Rebuilds `cachedLayoutWidths` (render-order `Double` widths) and
+    /// `cachedTotalVisibleWidth` (their sum) TOGETHER, in one O(visible
+    /// columns) pass — but only when `layoutWidthsStale` is set (see
+    /// `markLayoutWidthsStale`); a no-op otherwise. The single shared pass
+    /// means a structural refresh (`totalVisibleWidth`) and a scroll-driven
+    /// window query (`horizontalViewportChanged`) never each pay their own
+    /// separate O(columnCount) traversal for the same underlying data.
+    private func refreshLayoutWidthsIfNeeded() {
+        guard layoutWidthsStale else { return }
+        let cols = visibleColumns
+        // Hoisted to a LOCAL once: `columnWidths` is an `@Observable`-tracked
+        // property, and re-reading it from inside a 100k-iteration loop pays
+        // that tracking overhead 100k times over — measurably significant in
+        // a debug build, not merely theoretical (this loop's whole reason for
+        // existing is to pay that cost exactly ONCE per width batch).
+        let source = columnWidths
+        var widths = [Double](repeating: 0, count: cols.count)
+        var total: CGFloat = 0
+        for i in 0..<cols.count {
+            let c = cols[i]
+            let w = c < source.count ? source[c] : GridMetrics.minColumnWidth
+            widths[i] = Double(w)
+            total += w
+        }
+        cachedLayoutWidths = widths
+        cachedTotalVisibleWidth = total
+        layoutWidthsStale = false
+    }
+
+    /// Invalidates `cachedLayoutWidths` / `cachedTotalVisibleWidth` — call
+    /// after every `columnWidths` or `visibility` change (a width batch: a
+    /// fresh open's `measureColumnWidths`, or `growColumnWidthsToFitWindow`'s
+    /// monotone grow) so the next read rebuilds from the NEW values instead
+    /// of serving a stale cache.
+    private func markLayoutWidthsStale() {
+        layoutWidthsStale = true
+    }
+
+    /// Materializes the row window AND the current horizontal column window
+    /// together (ARCH-column-windowing round-2, AC7): `columnFetchRange`
+    /// derives the ABSOLUTE column range from `columnWindow` (or the
+    /// open-time default before one exists), so this fetches O(visible
+    /// columns), never O(columnCount) — see `CoreDocumentSession.setWindow
+    /// (firstRow:rowCount:columns:)`. `window.firstColumn`/each row's width
+    /// then reflect that range; every consumer below indexes it
+    /// column-relative (absolute column `c` at slot `c - window.firstColumn`).
     private func materialize(start: UInt64, count: Int) {
         guard let session else { return }
         desiredStart = start
         desiredCount = count
-        window = session.setWindow(firstRow: start, rowCount: count)
+        window = session.setWindow(firstRow: start, rowCount: count, columns: columnFetchRange())
         growColumnWidthsToFitWindow()
     }
 
-    /// Interim "column width scales with content, up to a point" (full column
-    /// ergonomics is slice 5): grow — never shrink — each visible column to fit
-    /// the just-materialized window's cells, capped at maxColumnWidth. Runs only
-    /// on materialization (scroll-settle / jump), not the per-frame scroll path;
-    /// monotone so it converges and never jitters; only reassigns `columnWidths`
-    /// (triggering a reflow) when a width actually grows. A cell the core already
-    /// clipped — display-TRUNCATED (`RowWindow.truncated`), or any cell of an
-    /// OVERSIZED row (`RowWindow.oversized`, ARCH-huge-row-budget) — is excluded
-    /// from the measurement: it isn't the cell's real content, just a cut prefix,
-    /// so growing a column to fit it shows no more of the cell (the truncation
-    /// mark still shows) while it CAN force a spurious horizontal scroller on an
-    /// otherwise normal-width landing (the giant-row case). Such a cell simply
-    /// leaves its column at its current width; normal cells still grow it as
-    /// before.
+    /// The DECIDED width behaviour (ARCH-column-windowing "Column-width
+    /// behaviour" / AC5b): grow — never shrink — each column CURRENTLY IN THE
+    /// HORIZONTAL WINDOW to fit its OWN content over the just-materialized
+    /// vertical row window, capped at maxColumnWidth, and merged through
+    /// `ColumnLayouting.grown` so the merge is provably independent (one
+    /// column's candidate never moves another's width) and monotone (a
+    /// horizontal scroll that re-measures an already-established column over
+    /// the SAME vertical window always yields the SAME candidate, so it never
+    /// churns). Bounded to `columnWindow` — a few tens to a few hundred
+    /// columns, NEVER `columnCount` — so this stays cheap however wide the
+    /// document is; called on every materialize (vertical scroll/jump) AND
+    /// every horizontal-window change (`horizontalViewportChanged`), so a
+    /// column gets its first accurate refine the moment it is revealed either
+    /// way (a viewport-fitting file's columns are ALL in the window from the
+    /// first layout, so they refine immediately — identical to an unwindowed
+    /// measurement; ARCH AC4). The header label is measured here too — the
+    /// cheap open-time estimate (`measureColumnWidths`) never touches it —
+    /// so a revealed column's header gets the same accurate treatment its
+    /// body cells do. A cell the core already clipped — display-TRUNCATED
+    /// (`RowWindow.truncated`), or any cell of an OVERSIZED row
+    /// (`RowWindow.oversized`, ARCH-huge-row-budget) — is excluded from the
+    /// measurement: it isn't the cell's real content, just a cut prefix, so
+    /// growing a column to fit it shows no more of the cell (the truncation
+    /// mark still shows) while it CAN force a spurious horizontal scroller on
+    /// an otherwise normal-width landing (the giant-row case). `window.rows`
+    /// is column-RELATIVE to `window.firstColumn` (ARCH-column-windowing
+    /// round-2): an in-window absolute column `c` reads slot `c -
+    /// window.firstColumn`, guarded — `materialize`'s `columnFetchRange`
+    /// always fetches (at least) `columnWindow` first, so that slot is normally
+    /// in range; the guard only degrades gracefully mid-transition.
     private func growColumnWidthsToFitWindow() {
         guard columnCount > 0, !window.rows.isEmpty, columnWidths.count == columnCount else { return }
         // Measure only the VISIBLE slice (~a viewport), not the whole buffered
@@ -317,32 +523,61 @@ final class DocumentModel {
         let lo = max(start, firstVisibleRow)
         let hi = min(start + window.rows.count, firstVisibleRow + max(lastVisibleCount, 1))
         guard lo < hi else { return }
+
+        refreshLayoutWidthsIfNeeded()
+        let cols = visibleColumns
+        guard !cols.isEmpty else { return }
+        let inWindow = columnWindow.range.clamped(to: 0..<cols.count)
+        guard !inWindow.isEmpty else { return }
+
         let bodyFont = NSFont.monospacedSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
-        var widths = columnWidths
-        var grew = false
-        for c in visibleColumns where c < widths.count && widths[c] < GridMetrics.maxColumnWidth {
-            var w = widths[c]
+        let headFont = NSFont.systemFont(ofSize: NSFont.systemFontSize, weight: .semibold)
+        // Keyed by VISIBLE POSITION (an index into `cachedLayoutWidths`, the
+        // SAME array `horizontalViewportChanged` feeds `ColumnLayouting.
+        // window`) rather than absolute column index — `grown` doesn't care
+        // which an index means, and this lets the merge below reuse the
+        // already-memoized `[Double]` array directly instead of re-converting
+        // all of `columnWidths` (O(columnCount), and — measured — genuinely
+        // costly in a debug build) just to touch a handful of entries.
+        let base = window.firstColumn   // column-relative base, see the doc above
+        var candidates: [Int: Double] = [:]
+        for pos in inWindow {
+            let c = cols[pos]
+            guard c < columnWidths.count else { continue }
+            let rel = c - base
+            var w = Self.textWidth(columnLabel(c), headFont)
             for r in lo..<hi {
                 let idx = r - start
                 if idx < window.oversized.count, window.oversized[idx] { continue }
                 let row = window.rows[idx]
-                guard c < row.count else { continue }
-                if idx < window.truncated.count, c < window.truncated[idx].count, window.truncated[idx][c] { continue }
-                let cellW = Self.textWidth(row[c], bodyFont) + GridMetrics.cellHPadding * 2
-                if cellW > w {
-                    w = cellW
-                    if w >= GridMetrics.maxColumnWidth { break }
-                }
+                guard rel >= 0, rel < row.count else { continue }
+                if idx < window.truncated.count, rel < window.truncated[idx].count, window.truncated[idx][rel] { continue }
+                w = max(w, Self.textWidth(row[rel], bodyFont))
             }
-            let capped = min(w, GridMetrics.maxColumnWidth)
-            if capped > widths[c] + 0.5 { widths[c] = capped; grew = true }
+            let capped = min(w + GridMetrics.cellHPadding * 2, GridMetrics.maxColumnWidth)
+            if capped > columnWidths[c] + 0.5 { candidates[pos] = Double(capped) }
         }
-        if grew { columnWidths = widths }
+        guard !candidates.isEmpty else { return }
+
+        let grownWidths = columnLayout.grown(cachedLayoutWidths, mergingCandidates: candidates)
+        var widths = columnWidths
+        for pos in candidates.keys {
+            let c = cols[pos]
+            let newWidth = CGFloat(grownWidths[pos])
+            cachedTotalVisibleWidth += newWidth - widths[c]
+            widths[c] = newWidth
+        }
+        columnWidths = widths
+        cachedLayoutWidths = grownWidths   // stays in lockstep; no need to mark stale
     }
 
-    /// Cells for a data row, read from the currently materialized window.
-    /// Rows outside the window return `nil` (the grid renders empty cells that
-    /// fill in once the frontier advances and the window re-materializes).
+    /// Cells for a data row, read from the currently materialized window —
+    /// COLUMN-RELATIVE to `window.firstColumn` (ARCH-column-windowing
+    /// round-2): slot `j` is absolute column `window.firstColumn + j`, NOT
+    /// absolute column `j` itself, whenever the window is narrower than
+    /// `columnCount`. Rows outside the window return `nil` (the grid renders
+    /// empty cells that fill in once the frontier advances and the window
+    /// re-materializes). Absolute-column callers go through `cellsAt`, below.
     func cells(forRow row: Int) -> [String]? {
         let start = Int(window.firstRow)
         let idx = row - start
@@ -351,13 +586,42 @@ final class DocumentModel {
     }
 
     /// Per-cell display-truncation flags for a data row, PARALLEL to
-    /// `cells(forRow:)` (mirrors `RowWindow.truncated`, ARCH req. 13/20). Rows
-    /// outside the window return `nil`, same rule as `cells(forRow:)`.
+    /// `cells(forRow:)` (mirrors `RowWindow.truncated`, ARCH req. 13/20) —
+    /// same column-RELATIVE shape as `cells(forRow:)`. Rows outside the
+    /// window return `nil`, same rule as `cells(forRow:)`.
     func truncated(forRow row: Int) -> [Bool]? {
         let start = Int(window.firstRow)
         let idx = row - start
         guard idx >= 0, idx < window.truncated.count else { return nil }
         return window.truncated[idx]
+    }
+
+    /// Cells at ABSOLUTE `columns` of data row `row`, mapped through the
+    /// CURRENTLY FETCHED column window (`window.firstColumn`): absolute
+    /// column `c` reads slot `c - window.firstColumn` of `cells(forRow:)`,
+    /// empty-padded for a column outside the fetched range — not yet
+    /// materialized, or past the row's width — exactly like a not-yet-loaded
+    /// row (ARCH-column-windowing round-2). Shared by the eager, all-visible-
+    /// columns dump-grid helpers and the live grid's window-bound helpers
+    /// below; they differ only in which absolute columns they ask for.
+    private func cellsAt(_ columns: [Int], forRow row: Int) -> [String] {
+        guard let full = cells(forRow: row) else { return Array(repeating: "", count: columns.count) }
+        let base = window.firstColumn
+        return columns.map { c in
+            let rel = c - base
+            return rel >= 0 && rel < full.count ? full[rel] : ""
+        }
+    }
+
+    /// Truncation flags at ABSOLUTE `columns` of data row `row` — the
+    /// `truncated(forRow:)` analog of `cellsAt`.
+    private func truncatedAt(_ columns: [Int], forRow row: Int) -> [Bool] {
+        guard let full = truncated(forRow: row) else { return Array(repeating: false, count: columns.count) }
+        let base = window.firstColumn
+        return columns.map { c in
+            let rel = c - base
+            return rel >= 0 && rel < full.count ? full[rel] : false
+        }
     }
 
     /// Whether a data row is OVERSIZED (ARCH-huge-row-budget req. 3/7): its
@@ -439,7 +703,11 @@ final class DocumentModel {
             + GridMetrics.oversizedMarkerReserve
     }
 
-    // MARK: - Grid view helpers (shared by the live grid and the dump grid)
+    // MARK: - Grid view helpers (the EAGER, all-visible-columns dump grid;
+    // ARCH-headless-dump / FrameDump. The dump renders small, already-loaded
+    // fixtures off the cold-open path, so an O(visible columns) pass here is
+    // fine — it is NOT what the live grid draws; see the window-bound
+    // counterparts below for that (ARCH-column-windowing).
 
     /// Frozen widths of the visible columns, in render order.
     func visibleWidths() -> [CGFloat] {
@@ -451,32 +719,96 @@ final class DocumentModel {
         visibleColumns.map { columnLabel($0) }
     }
 
-    /// Visible-column cells for a data row, empty-padded while not yet loaded.
+    /// Visible-column cells for a data row, empty-padded while not yet loaded
+    /// (or, on a wide document, not yet in the fetched column range — see
+    /// `cellsAt`).
     func visibleBodyCells(forRow row: Int) -> [String] {
-        guard let full = cells(forRow: row) else {
-            return Array(repeating: "", count: visibleColumns.count)
-        }
-        return visibleColumns.map { $0 < full.count ? full[$0] : "" }
+        cellsAt(visibleColumns, forRow: row)
     }
 
     /// Visible-column truncation flags for a data row (ARCH req. 13/20),
     /// false-padded while not yet loaded — same shape as `visibleBodyCells`.
     /// Driven entirely by the core's per-cell flag; never re-measures cells.
     func visibleBodyTruncated(forRow row: Int) -> [Bool] {
-        guard let full = truncated(forRow: row) else {
-            return Array(repeating: false, count: visibleColumns.count)
-        }
-        return visibleColumns.map { $0 < full.count ? full[$0] : false }
+        truncatedAt(visibleColumns, forRow: row)
+    }
+
+    // MARK: - Horizontal column window (the LIVE grid; ARCH-column-windowing)
+    //
+    // The window-bound counterparts of the helpers above: every one is O(the
+    // horizontal column window), NEVER O(columnCount), so `NativeGridController`
+    // can call them on every scroll/materialize tick even on a 100k-column
+    // document (the wide_100k_cols cold-open budget, csv-corpus AC5). Each
+    // slices `windowColumns()` — itself an O(window) slice of the memoized
+    // `visibleColumns` — so none of these ever re-filters `0..<columnCount`.
+
+    /// The current column window's ABSOLUTE column indices, in render order.
+    private func windowColumns() -> [Int] {
+        let cols = visibleColumns
+        guard !cols.isEmpty else { return [] }
+        let clamped = columnWindow.range.clamped(to: 0..<cols.count)
+        guard !clamped.isEmpty else { return [] }
+        return Array(cols[clamped])
+    }
+
+    /// Widths of the current column window, in render order — what the live
+    /// grid draws (`NativeGridController.widths`).
+    func windowWidths() -> [CGFloat] {
+        windowColumns().map { $0 < columnWidths.count ? columnWidths[$0] : GridMetrics.minColumnWidth }
+    }
+
+    /// Header labels of the current column window, in render order.
+    func windowHeaderLabels() -> [String] {
+        windowColumns().map { columnLabel($0) }
+    }
+
+    /// Column-window cells for a data row, empty-padded while not yet loaded
+    /// — the window-bound analog of `visibleBodyCells`.
+    func windowBodyCells(forRow row: Int) -> [String] {
+        cellsAt(windowColumns(), forRow: row)
+    }
+
+    /// Column-window truncation flags for a data row — the window-bound
+    /// analog of `visibleBodyTruncated`.
+    func windowBodyTruncated(forRow row: Int) -> [Bool] {
+        truncatedAt(windowColumns(), forRow: row)
+    }
+
+    /// Sum of every VISIBLE column's width — the document's total horizontal
+    /// content extent, independent of the window (drives the live grid's
+    /// scrollable table-column width / filler-column count —
+    /// `NativeGridController.refreshColumnWidth`). Memoized alongside
+    /// `cachedLayoutWidths` (see `refreshLayoutWidthsIfNeeded`); meant to be
+    /// read only on a structural change (open, hidden-column toggle, a
+    /// width-batch change) via `refreshLayoutMetrics`, never per scroll tick
+    /// — though it costs nothing extra even then, once the shared cache is
+    /// warm.
+    var totalVisibleWidth: CGFloat {
+        refreshLayoutWidthsIfNeeded()
+        return cachedTotalVisibleWidth
     }
 
     // MARK: - Column visibility (pure model; grid reflows)
 
-    var visibleColumns: [Int] { visibilityManager.visibleColumns(visibility) }
+    /// The ascending indices of the non-hidden columns, in render order —
+    /// `visibilityManager.visibleColumns(visibility)`, memoized (see
+    /// `cachedVisibleColumns`). Semantics UNCHANGED (find/filter column
+    /// scoping keeps reading exactly this); only the cost of a read changed.
+    var visibleColumns: [Int] { cachedVisibleColumns }
 
     func canHide(_ column: Int) -> Bool { visibilityManager.canHide(visibility, column: column) }
 
     func toggleColumn(_ column: Int) {
-        visibility = visibilityManager.toggling(visibility, column: column)
+        setVisibility(visibilityManager.toggling(visibility, column: column))
+    }
+
+    /// Assigns `visibility` and its memoized `visibleColumns` in lockstep —
+    /// the ONLY place `visibility` is set, so the cache can never drift from
+    /// it (ARCH-column-windowing).
+    private func setVisibility(_ newValue: ColumnVisibility) {
+        visibility = newValue
+        cachedVisibleColumns = visibilityManager.visibleColumns(newValue)
+        markLayoutWidthsStale()   // the render-order widths depend on visibleColumns too
     }
 
     /// The label for a column (effective header name, else generic A/B/C…),
@@ -747,12 +1079,25 @@ final class DocumentModel {
     /// current match is strong; every other matching visible cell is subtle;
     /// header cells are never passed here (never matched).
     func cellHighlights(forRow row: Int) -> [SheetCellHighlight] {
+        highlights(forRow: row, over: visibleColumns, cells: visibleBodyCells(forRow: row))
+    }
+
+    /// The window-bound analog of `cellHighlights` — the live grid's path
+    /// (ARCH-column-windowing): O(column window), never O(visible columns).
+    func windowCellHighlights(forRow row: Int) -> [SheetCellHighlight] {
+        let cols = windowColumns()
+        return highlights(forRow: row, over: cols, cells: windowBodyCells(forRow: row))
+    }
+
+    /// Shared highlight derivation over an explicit (absolute-indexed) column
+    /// list + its already-fetched cell text, so `cellHighlights` /
+    /// `windowCellHighlights` differ only in which columns they cover.
+    private func highlights(forRow row: Int, over columns: [Int], cells: [String]) -> [SheetCellHighlight] {
         guard let request = findSession.display.request else {
-            return Array(repeating: .none, count: visibleColumns.count)
+            return Array(repeating: .none, count: columns.count)
         }
-        let cells = visibleBodyCells(forRow: row)
         let current = findSession.display.current
-        return visibleColumns.enumerated().map { index, column in
+        return columns.enumerated().map { index, column in
             let text = index < cells.count ? cells[index] : ""
             if let current, current.row == UInt64(row), current.column == column {
                 return .strong
@@ -974,7 +1319,7 @@ final class DocumentModel {
         snapshot.window = live.window
         snapshot.rowCountInfo = live.rowCountInfo
         snapshot.indexProgress = live.indexProgress
-        snapshot.visibility = live.visibility
+        snapshot.setVisibility(live.visibility)
         snapshot.phase = .document
         snapshot.overlayRevealed = revealed
         snapshot.expandedPill = expandedPill
@@ -1063,21 +1408,66 @@ final class DocumentModel {
         pollTask = nil
     }
 
-    // MARK: - Column width measurement (head sample; frozen for the session)
+    // MARK: - Column width measurement (head sample; O(head) arithmetic, no
+    // per-cell text layout — ARCH-column-windowing)
 
+    /// Establishes EVERY column's width from the head sample in O(head) —
+    /// cheap character-count arithmetic, NEVER a `.size(withAttributes:)` call
+    /// per cell (100k text-layout calls across 100k columns is exactly what
+    /// made a wide document's cold-open take 3+ s; ARCH-column-windowing). The
+    /// data font is monospaced (`SheetRowView.font`, `== bodyFont` here), so
+    /// for ordinary text a column's pixel width is (its widest display-cell
+    /// count over the head sample, header included) times the font's own
+    /// advance width — arithmetic, not layout — plus padding, capped exactly
+    /// as before. This gives every column a REAL, independent width up front
+    /// (never a placeholder that pops in later) but is an ESTIMATE for exotic
+    /// glyphs (emoji/CJK/combining, whose rendered advance can differ from a
+    /// plain scalar's): `growColumnWidthsToFitWindow` gives every column an
+    /// ACCURATE `.size()` correction (its header included) the moment it
+    /// first enters the horizontal column window, monotone, so a
+    /// viewport-fitting file — every column in the window from the very first
+    /// layout — refines immediately to the exact widths an unwindowed
+    /// measurement would have given it (ARCH AC4); only a wide document's
+    /// off-screen columns keep the estimate until scrolled into view.
     static func measureColumnWidths(header: [String]?, sample: [[String]], columnCount: Int) -> [CGFloat] {
         guard columnCount > 0 else { return [] }
         let bodyFont = NSFont.monospacedSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
-        let headFont = NSFont.systemFont(ofSize: NSFont.systemFontSize, weight: .semibold)
-        var widths = [CGFloat](repeating: GridMetrics.minColumnWidth, count: columnCount)
-        for c in 0..<columnCount {
-            let label = (header != nil && c < header!.count && !header![c].isEmpty)
-                ? header![c] : GenericColumnName.name(at: c)
-            var w = textWidth(label, headFont)
-            for row in sample where c < row.count {
-                w = max(w, textWidth(row[c], bodyFont))
+        // One O(1) measurement (not per-column, not per-cell) gives the exact
+        // per-character advance of the monospaced data font.
+        let advance = max(textWidth("0", bodyFont), 1)
+        let minW = GridMetrics.minColumnWidth
+        let maxW = GridMetrics.maxColumnWidth
+        let padding = GridMetrics.cellHPadding * 2
+        // Hoisted out of the loop: `header` is unwrapped ONCE (not per
+        // column), and `sample`'s row count is read once — this loop runs
+        // `columnCount` times (up to 100k on a wide document) so anything
+        // paid per-iteration, however small, is worth hoisting.
+        let headerCells = header ?? []
+        let headerCount = headerCells.count
+        let sampleCount = sample.count
+
+        var widths = [CGFloat](repeating: minW, count: columnCount)
+        // `.utf8.count` (a stored length on a native Swift String, O(1)) is a
+        // cheaper display-cell proxy than `.count` (grapheme-cluster
+        // segmentation) for this cheap pass; both are estimates for the SAME
+        // exotic-glyph cases (ARCH), and both are superseded by the accurate
+        // `.size()` refine the moment a column enters the horizontal window.
+        widths.withUnsafeMutableBufferPointer { buf in
+            for c in 0..<columnCount {
+                let label = (c < headerCount && !headerCells[c].isEmpty) ? headerCells[c] : GenericColumnName.name(at: c)
+                var cells = label.utf8.count
+                var r = 0
+                while r < sampleCount {
+                    let row = sample[r]
+                    if c < row.count {
+                        let n = row[c].utf8.count
+                        if n > cells { cells = n }
+                    }
+                    r += 1
+                }
+                let estimate = CGFloat(cells) * advance + padding
+                buf[c] = min(max(estimate, minW), maxW)
             }
-            widths[c] = min(max(w + GridMetrics.cellHPadding * 2, GridMetrics.minColumnWidth), GridMetrics.maxColumnWidth)
         }
         return widths
     }
