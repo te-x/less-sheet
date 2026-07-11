@@ -1,14 +1,28 @@
 //! Shared document state: the `Document` aggregate, the small value types its
 //! fields embed (`CellRef`, `Checkpoint`, `OversizedMatch`, `MatchCtx`,
 //! `Decimal`), the api.Doc<->Document casts, and the cross-module tunables.
-//! Every other sibling module builds on this one; this module imports no
-//! siblings (see src/root.zig's module-boundary note).
+//! Every sibling module that touches parsing builds on this one PLUS the
+//! Reader/Source seam (src/reader.zig, src/source.zig — see docs/
+//! architecture/ARCH-reader-interface.md): `Document` holds a `Reader` (+ a
+//! `Source`) instead of raw content/dialect fields, so window/index/nav/
+//! search/filter never import `lexer.zig` directly (see src/root.zig's
+//! module-boundary note).
 
 const std = @import("std");
 const api = @import("api");
+const reader_mod = @import("reader.zig");
+const source_mod = @import("source.zig");
 
 const posix = std.posix;
 const c = std.c;
+
+/// Re-exported so sibling modules can keep writing `base.Pos` (matching how
+/// they already reference `base.CellRef`/`base.Checkpoint`) without a
+/// separate import of reader.zig. See reader.zig's module doc for what
+/// "opaque" means here.
+pub const Pos = reader_mod.Pos;
+const Source = source_mod.Source;
+const Reader = reader_mod.Reader;
 
 // --- Tunables shared across modules (implementation detail; not ABI) -------
 
@@ -26,8 +40,8 @@ pub const head_budget: u64 = api.open_head_max_bytes;
 /// when a bounded record-1 decode stopped mid-field (see `lexInto`).
 pub const CellRef = struct { start: usize, len: usize, truncated: bool = false };
 
-/// A sparse row-index entry: data row `row` begins at content offset `offset`.
-pub const Checkpoint = struct { row: u64, offset: u64 };
+/// A sparse row-index entry: data row `row` begins at (opaque) position `pos`.
+pub const Checkpoint = struct { row: u64, pos: Pos };
 
 /// ARCH-huge-row-filtered: the FULL-cell filter-match result the background
 /// filter-scan already decided for OVERSIZED row `row` (source extent >
@@ -87,22 +101,26 @@ pub const Document = struct {
 
     // File mapping (immutable after open). `mapping` is null for an empty file.
     mapping: ?[]align(std.heap.page_size_min) const u8,
-    content: []const u8, // mapping[bom_len..] (post-BOM SOURCE bytes; NOT UTF-8
-    // unless `encoding` is UTF-8 -- every scan decodes it through `decodeUnit`)
-    content_len: u64,
+    content_len: u64, // == source.len(); cached (see api/lesssheet.h byte-progress fields)
     file_size: u64,
     bom_len: u64,
-    // The resolved source encoding (see TEXT AND ENCODING). Constant for the
-    // document's lifetime; drives every `decodeUnit` call site (head scan,
-    // background index, jump/search scans, window materialization).
-    encoding: u8,
 
-    // Dialect + shape (immutable after open).
-    sep: u8,
-    quote: ?u8, // null == quoting disabled (NONE)
+    // The Reader (+ its Source) this document was opened with -- see
+    // docs/architecture/ARCH-reader-interface.md. `source` wraps the mmap'd,
+    // post-BOM SOURCE bytes (identity, zero-copy); `reader` is the CSV Reader
+    // today, holding the resolved dialect (sep/quote/encoding — see TEXT AND
+    // ENCODING) that drove every `decodeUnit` call site (head scan,
+    // background index, jump/search scans, window materialization) BEHIND
+    // the Reader interface. window/index/nav/search/filter never touch
+    // either field's payload directly -- they pass both opaquely into
+    // `reader.<op>(source, pos, ...)` calls.
+    source: Source,
+    reader: Reader,
+
+    // Shape (immutable after open).
     dialect: api.Dialect,
     column_count: u32,
-    data_start: u64, // content offset of data row 0
+    data_start: Pos, // position of data row 0
     auto: bool,
 
     // Header cells (immutable after open; never evicted).
@@ -147,7 +165,7 @@ pub const Document = struct {
     // `search_scratch`-style worker-scratch pattern already used below.
     oversized_stage: std.ArrayList(Checkpoint),
     frontier_rows: u64,
-    frontier_offset: u64,
+    frontier_pos: Pos,
     complete: bool,
     total_rows: u64,
     jump_state: api.JumpState,
@@ -167,8 +185,8 @@ pub const Document = struct {
     search_total: u64,
     search_total_exact: bool,
     // Match-scan cursor: rows [0, search_rows) are counted (contiguous from 0);
-    // search_offset is the content offset of the next data row to evaluate.
-    search_offset: u64,
+    // search_pos is the position of the next data row to evaluate.
+    search_pos: Pos,
     search_rows: u64,
     search_to_eof: bool, // scan goal: full sweep to EOF (vs nav-limited resume)
     // Generation: bumped by every ls_search_start so an in-flight worker chunk
@@ -212,8 +230,8 @@ pub const Document = struct {
     filter_total: u64,
     filter_total_exact: bool,
     // Filter-scan cursor: rows [0, filter_rows) are counted (contiguous from
-    // row 0); filter_offset is the content offset of the next row to evaluate.
-    filter_offset: u64,
+    // row 0); filter_pos is the position of the next row to evaluate.
+    filter_pos: Pos,
     filter_rows: u64,
     // Generation: bumped by every ls_filter_set so a stale in-flight worker
     // chunk of a replaced filter is discarded on commit.
@@ -340,13 +358,18 @@ pub fn freeDoc(doc: *Document) void {
     doc.gpa.destroy(doc);
 }
 
-/// Fraction of the data region covered by content offset `off`, clamped to
-/// 1.0. Shared progress calculation for the search match-scan and the filter
-/// scan (both report progress over the same [data_start, content_len) span).
-pub fn searchProgress(doc: *Document, off: u64) f64 {
-    if (doc.content_len <= doc.data_start) return 1.0;
-    const span = doc.content_len - doc.data_start;
-    const covered = off - doc.data_start;
+/// Fraction of the data region covered by position `pos`, clamped to 1.0.
+/// Shared progress calculation for the search match-scan and the filter scan
+/// (both report progress over the same [data_start, content_len) span).
+/// `bytesConsumed` is the ONLY place a position is turned back into a byte
+/// count here (see reader.zig's module doc) -- the ABI's progress fields are
+/// byte-denominated regardless of Reader.
+pub fn searchProgress(doc: *Document, pos: Pos) f64 {
+    const start_bytes = doc.reader.bytesConsumed(doc.source, doc.data_start);
+    if (doc.content_len <= start_bytes) return 1.0;
+    const span = doc.content_len - start_bytes;
+    const at_bytes = doc.reader.bytesConsumed(doc.source, pos);
+    const covered = at_bytes -| start_bytes;
     const p = @as(f64, @floatFromInt(covered)) / @as(f64, @floatFromInt(span));
     return if (p > 1.0) 1.0 else p;
 }
@@ -374,17 +397,20 @@ pub fn beginOversizedChunk(doc: *Document) void {
     doc.oversized_stage.clearRetainingCapacity();
 }
 
-/// If the record spanning SOURCE bytes [start, end) exceeded the per-row
+/// If the record spanning positions [start, end) exceeded the per-row
 /// window-scan cap (LS_WINDOW_ROW_SCAN_MAX_BYTES), stage a checkpoint
-/// immediately AFTER it (row `row + 1` at offset `end`) — see ARCH-huge-row-
+/// immediately AFTER it (row `row + 1` at position `end`) — see ARCH-huge-row-
 /// budget decision 2. Lock-free: exclusive to whichever single chunk is
 /// currently executing (never two concurrently for the same document — one
 /// worker thread, or a degraded caller holding the document mutex throughout;
 /// see `oversized_stage`'s doc comment on Document). A normal-sized row
-/// returns before touching anything.
-pub fn stageOversized(doc: *Document, row: u64, start: u64, end: u64) void {
-    if (end - start <= api.window_row_scan_max_bytes) return;
-    doc.oversized_stage.append(doc.gpa, .{ .row = row + 1, .offset = end }) catch {};
+/// returns before touching anything. `bytesConsumed` is the size test's only
+/// look at a position's byte meaning (see reader.zig's module doc); the cap
+/// itself is a plain, format-agnostic byte budget pinned by the ABI.
+pub fn stageOversized(doc: *Document, row: u64, start: Pos, end: Pos) void {
+    const size = doc.reader.bytesConsumed(doc.source, end) - doc.reader.bytesConsumed(doc.source, start);
+    if (size <= api.window_row_scan_max_bytes) return;
+    doc.oversized_stage.append(doc.gpa, .{ .row = row + 1, .pos = end }) catch {};
 }
 
 /// Fold this chunk's staged oversized-row checkpoints into the persistent

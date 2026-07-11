@@ -3,11 +3,12 @@
 //! scan-slot state machine (jump / search / filter priority is arbitrated by
 //! the worker in src/index.zig). See api/lesssheet.h SEARCH for the pinned
 //! model; api/lesssheet.h FILTERED VIEWS FIND for how a concurrent filter
-//! composes into the same scan.
+//! composes into the same scan. Parsing goes through `Document.reader` (see
+//! docs/architecture/ARCH-reader-interface.md) — this module never imports
+//! `lexer.zig`.
 
 const api = @import("api");
 const base = @import("base.zig");
-const lexer = @import("lexer.zig");
 const matcher = @import("matcher.zig");
 const nav = @import("nav.zig");
 const filter = @import("filter.zig");
@@ -15,6 +16,7 @@ const filter = @import("filter.zig");
 const Document = base.Document;
 const Checkpoint = base.Checkpoint;
 const MatchCtx = base.MatchCtx;
+const Pos = base.Pos;
 const Match = nav.Match;
 const checkpoint_interval = base.checkpoint_interval;
 const searchProgress = base.searchProgress;
@@ -24,7 +26,7 @@ const searchProgress = base.searchProgress;
 // ---------------------------------------------------------------------------
 
 const SearchChunk = struct {
-    end_offset: u64,
+    end_pos: Pos,
     end_row: u64,
     eof: bool,
     checkpoint: ?Checkpoint,
@@ -70,38 +72,38 @@ pub fn refreshWorkerCtx(doc: *Document) bool {
 }
 
 /// Lex + match one block of data rows (up to the next checkpoint boundary, EOF,
-/// or a stop request) from `start_off`/`start_row`, counting matches. Reads only
-/// immutable mmap bytes + the worker snapshot; reuses the scan scratch per row.
-/// `filtered` composes `doc.wf_ctx` (the worker's lock-free filter snapshot,
-/// refreshed alongside `doc.w_ctx` — see filter.refreshFilterWorkerCtx) with
-/// the find predicate: a row counts toward `matches` only if it ALSO
-/// satisfies the filter (see api/lesssheet.h FILTERED VIEWS FIND);
-/// `filter_matches` tallies the filter alone, letting the caller re-drive the
-/// filter's own counted region as a side effect (maybeAdvanceFilterFromSearch).
-pub fn searchScanChunk(doc: *Document, start_off: u64, start_row: u64, filtered: bool) SearchChunk {
-    const content = doc.content;
-    var i: usize = @intCast(start_off);
+/// or a stop request) from `start_pos`/`start_row`, counting matches. Reads only
+/// via the Reader (immutable mmap bytes, for CSV) + the worker snapshot;
+/// reuses the scan scratch per row. `filtered` composes `doc.wf_ctx` (the
+/// worker's lock-free filter snapshot, refreshed alongside `doc.w_ctx` — see
+/// filter.refreshFilterWorkerCtx) with the find predicate: a row counts
+/// toward `matches` only if it ALSO satisfies the filter (see api/
+/// lesssheet.h FILTERED VIEWS FIND); `filter_matches` tallies the filter
+/// alone, letting the caller re-drive the filter's own counted region as a
+/// side effect (maybeAdvanceFilterFromSearch).
+pub fn searchScanChunk(doc: *Document, start_pos: Pos, start_row: u64, filtered: bool) SearchChunk {
+    var pos = start_pos;
     var row = start_row;
     var matches: u64 = 0;
     var filter_matches: u64 = 0;
     const target = ((start_row / checkpoint_interval) + 1) * checkpoint_interval;
     base.beginOversizedChunk(doc);
     while (row < target) {
-        if (doc.stop_atomic.load(.monotonic)) return .{ .end_offset = i, .end_row = row, .eof = false, .checkpoint = null, .matches = matches, .filter_matches = filter_matches };
-        if (i >= content.len) return .{ .end_offset = i, .end_row = row, .eof = true, .checkpoint = null, .matches = matches, .filter_matches = filter_matches };
+        if (doc.stop_atomic.load(.monotonic)) return .{ .end_pos = pos, .end_row = row, .eof = false, .checkpoint = null, .matches = matches, .filter_matches = filter_matches };
+        if (doc.reader.atEnd(doc.source, pos)) return .{ .end_pos = pos, .end_row = row, .eof = true, .checkpoint = null, .matches = matches, .filter_matches = filter_matches };
         doc.search_scratch.clearRetainingCapacity();
         doc.search_refs.clearRetainingCapacity();
         // SEARCH matches the FULL cell, not the display-capped bytes (cap =
         // null; see requirement 10 / api/lesssheet.h SEARCH). Never bounded by
         // the WINDOW's per-row scan cap either -- ARCH-huge-row-budget only
         // byte-bounds ls_window_set, never find/filter.
-        const res = lexer.lexInto(content, i, doc.sep, doc.quote, doc.column_count, null, content.len, doc.encoding, &doc.search_scratch, &doc.search_refs, doc.gpa) catch {
+        const res = doc.reader.materialize(doc.source, pos, doc.column_count, null, null, &doc.search_scratch, &doc.search_refs, doc.gpa) catch {
             // Decode allocation failure: count no match and advance the boundary.
-            const nb = lexer.recordBounds(content, i, doc.sep, doc.quote, content.len, doc.encoding);
-            base.stageOversized(doc, row, @intCast(i), @intCast(nb.next));
-            i = nb.next;
+            const nb = doc.reader.boundsAfter(doc.source, pos, null);
+            base.stageOversized(doc, row, pos, nb.next);
+            pos = nb.next;
             row += 1;
-            if (nb.next >= content.len) return .{ .end_offset = i, .end_row = row, .eof = true, .checkpoint = null, .matches = matches, .filter_matches = filter_matches };
+            if (doc.reader.atEnd(doc.source, pos)) return .{ .end_pos = pos, .end_row = row, .eof = true, .checkpoint = null, .matches = matches, .filter_matches = filter_matches };
             continue;
         };
         var filt_ok = true;
@@ -114,12 +116,12 @@ pub fn searchScanChunk(doc: *Document, start_off: u64, start_row: u64, filtered:
         // a post-row checkpoint if this row's source extent exceeds the
         // WINDOW's per-row scan cap, so a later ls_window_set reaching a row
         // this search's own frontier advance passed can skip it.
-        base.stageOversized(doc, row, @intCast(i), @intCast(res.next));
-        i = res.next;
+        base.stageOversized(doc, row, pos, res.next);
+        pos = res.next;
         row += 1;
-        if (res.next >= content.len) return .{ .end_offset = i, .end_row = row, .eof = true, .checkpoint = null, .matches = matches, .filter_matches = filter_matches };
+        if (doc.reader.atEnd(doc.source, pos)) return .{ .end_pos = pos, .end_row = row, .eof = true, .checkpoint = null, .matches = matches, .filter_matches = filter_matches };
     }
-    return .{ .end_offset = i, .end_row = row, .eof = false, .checkpoint = .{ .row = row, .offset = i }, .matches = matches, .filter_matches = filter_matches };
+    return .{ .end_pos = pos, .end_row = row, .eof = false, .checkpoint = .{ .row = row, .pos = pos }, .matches = matches, .filter_matches = filter_matches };
 }
 
 /// Terminate the active search cleanly at its last consistent state (caller
@@ -143,7 +145,7 @@ pub fn failSearchLocked(doc: *Document) void {
 /// scan "advances the frontier" for the filter too (see FILTERED VIEWS).
 pub fn commitSearch(doc: *Document, res: SearchChunk, filtered: bool) void {
     const block = doc.search_rows / checkpoint_interval;
-    const advancing = res.end_offset > doc.frontier_offset;
+    const advancing = doc.reader.bytesConsumed(doc.source, res.end_pos) > doc.reader.bytesConsumed(doc.source, doc.frontier_pos);
     const need_cp = advancing and res.checkpoint != null;
     // Reserve counter (and any new nav checkpoint) storage BEFORE mutating the
     // cursor: OOM here fails the search cleanly rather than dropping a block
@@ -161,10 +163,10 @@ pub fn commitSearch(doc: *Document, res: SearchChunk, filtered: bool) void {
 
     doc.block_counts.appendAssumeCapacity(res.matches);
     doc.search_rows = res.end_row;
-    doc.search_offset = res.end_offset;
+    doc.search_pos = res.end_pos;
     doc.search_total +%= res.matches;
     if (advancing) {
-        doc.frontier_offset = res.end_offset;
+        doc.frontier_pos = res.end_pos;
         doc.frontier_rows = res.end_row;
         if (res.checkpoint) |cp| doc.checkpoints.appendAssumeCapacity(cp);
     }
@@ -180,7 +182,7 @@ pub fn commitSearch(doc: *Document, res: SearchChunk, filtered: bool) void {
         doc.search_progress = 1.0;
         doc.search_to_eof = true;
     } else {
-        doc.search_progress = searchProgress(doc, res.end_offset);
+        doc.search_progress = searchProgress(doc, res.end_pos);
     }
     if (filtered) maybeAdvanceFilterFromSearch(doc, block, res);
 }
@@ -198,14 +200,14 @@ fn maybeAdvanceFilterFromSearch(doc: *Document, block: u64, res: SearchChunk) vo
     doc.filter_block_counts.ensureUnusedCapacity(doc.gpa, 1) catch return;
     doc.filter_block_counts.appendAssumeCapacity(res.filter_matches);
     doc.filter_rows = res.end_row;
-    doc.filter_offset = res.end_offset;
+    doc.filter_pos = res.end_pos;
     doc.filter_total +%= res.filter_matches;
     if (res.eof) {
         doc.filter_total_exact = true;
         doc.filter_progress = 1.0;
         if (doc.filter_state == .cancelled) doc.filter_state = .done;
     } else {
-        doc.filter_progress = searchProgress(doc, res.end_offset);
+        doc.filter_progress = searchProgress(doc, res.end_pos);
     }
 }
 
@@ -388,7 +390,7 @@ pub fn startSearch(d: *Document, request: *const api.SearchRequest) bool {
     d.search_total = 0;
     d.search_total_exact = false;
     d.search_rows = 0;
-    d.search_offset = d.data_start;
+    d.search_pos = d.data_start;
     d.search_progress = 0.0;
     d.search_found_row = 0;
     d.search_found_col = 0;
@@ -397,7 +399,7 @@ pub fn startSearch(d: *Document, request: *const api.SearchRequest) bool {
     d.nav_pending = false;
     d.search_to_eof = true;
 
-    if (d.data_start >= d.content_len or d.column_count == 0) {
+    if (d.reader.atEnd(d.source, d.data_start) or d.column_count == 0) {
         // Nothing to scan: already DONE with total 0.
         d.search_state = .done;
         d.search_total_exact = true;
@@ -421,7 +423,7 @@ pub fn startSearch(d: *Document, request: *const api.SearchRequest) bool {
         if (filter.refreshFilterWorkerCtx(d)) d.wf_gen = d.filter_gen else failSearchLocked(d);
     }
     while (d.search_state == .scanning) {
-        const res = searchScanChunk(d, d.search_offset, d.search_rows, filtered);
+        const res = searchScanChunk(d, d.search_pos, d.search_rows, filtered);
         commitSearch(d, res, filtered);
         resolveNavLocked(d);
     }
@@ -472,7 +474,7 @@ pub fn navSearch(d: *Document, anchor_row: u64, dir: api.SearchDir) void {
                 if (filter.refreshFilterWorkerCtx(d)) d.wf_gen = d.filter_gen else failSearchLocked(d);
             }
             while (d.nav_pending and d.search_state == .scanning) {
-                const res = searchScanChunk(d, d.search_offset, d.search_rows, filtered);
+                const res = searchScanChunk(d, d.search_pos, d.search_rows, filtered);
                 commitSearch(d, res, filtered);
                 resolveNavLocked(d);
                 if (d.search_state == .scanning and !d.search_to_eof and !d.nav_pending) d.search_state = .cancelled;

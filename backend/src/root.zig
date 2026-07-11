@@ -27,10 +27,8 @@ const posix = std.posix;
 const c = std.c;
 
 const base = @import("base.zig");
-const enc = @import("encoding.zig");
-const lexer = @import("lexer.zig");
+const csv_reader = @import("csv_reader.zig");
 const matcher = @import("matcher.zig");
-const sniff = @import("sniff.zig");
 const filter = @import("filter.zig");
 const search = @import("search.zig");
 const index = @import("index.zig");
@@ -115,14 +113,15 @@ pub fn openWithAllocator(gpa: std.mem.Allocator, path: [*:0]const u8, options: ?
         mapping = m;
     }
 
-    // Resolve the source encoding from the raw head bytes (BEFORE dialect
-    // sniffing -- see TEXT AND ENCODING): BOM, else the NUL-ratio heuristic,
-    // else UTF-8 validation, else Latin-1; a forced encoding bypasses
-    // detection but still strips a matching BOM. The sample is a small,
-    // fixed prefix -- well within the O(head) budget regardless of file size.
-    const sample: []const u8 = if (mapping) |m| m[0..@min(m.len, encoding_sample_bytes)] else &.{};
-    const enc_res = enc.resolveEncoding(sample, opt.encoding);
-    const content: []const u8 = if (mapping) |m| m[enc_res.bom_len..file_size] else &.{};
+    // Resolve the source encoding then the dialect from the raw head bytes
+    // (see csv_reader.openHead: encoding BEFORE dialect sniffing -- TEXT AND
+    // ENCODING) and hand back the ready CSV Reader + the post-BOM content
+    // slice -- everything CSV-specific behind the Reader interface (see
+    // docs/architecture/ARCH-reader-interface.md). `raw` is the whole
+    // mapping (== file_size bytes) or empty for a 0-byte file; openHead runs
+    // unconditionally either way, exactly like the pre-reorg pipeline.
+    const raw: []const u8 = if (mapping) |m| m else &.{};
+    const oh = csv_reader.openHead(raw, opt, encoding_sample_bytes);
 
     const doc = gpa.create(Document) catch {
         if (mapping) |m| posix.munmap(m);
@@ -131,16 +130,14 @@ pub fn openWithAllocator(gpa: std.mem.Allocator, path: [*:0]const u8, options: ?
     doc.* = .{
         .gpa = gpa,
         .mapping = mapping,
-        .content = content,
-        .content_len = content.len,
+        .source = .{ .mmap = .{ .bytes = oh.content } },
+        .reader = .{ .csv = oh.reader },
+        .content_len = oh.content.len,
         .file_size = file_size,
-        .bom_len = enc_res.bom_len,
-        .encoding = enc_res.encoding,
-        .sep = api.default_separator,
-        .quote = api.default_quote,
+        .bom_len = oh.bom_len,
         .dialect = undefined,
         .column_count = 0,
-        .data_start = 0,
+        .data_start = undefined, // set unconditionally right after construction, below
         .auto = opt.index_mode == api.index_auto,
         .has_header = false,
         .header_buf = &.{},
@@ -154,7 +151,7 @@ pub fn openWithAllocator(gpa: std.mem.Allocator, path: [*:0]const u8, options: ?
         .oversized_checkpoints = .empty,
         .oversized_stage = .empty,
         .frontier_rows = 0,
-        .frontier_offset = 0,
+        .frontier_pos = undefined, // set unconditionally right after construction, below
         .complete = true, // an empty document is complete at open
         .total_rows = 0,
         .jump_state = .idle,
@@ -170,7 +167,7 @@ pub fn openWithAllocator(gpa: std.mem.Allocator, path: [*:0]const u8, options: ?
         .search_position = 0,
         .search_total = 0,
         .search_total_exact = false,
-        .search_offset = 0,
+        .search_pos = undefined, // set unconditionally right after construction, below
         .search_rows = 0,
         .search_to_eof = true,
         .search_gen = 0,
@@ -197,7 +194,7 @@ pub fn openWithAllocator(gpa: std.mem.Allocator, path: [*:0]const u8, options: ?
         .filter_progress = 0.0,
         .filter_total = 0,
         .filter_total_exact = false,
-        .filter_offset = 0,
+        .filter_pos = undefined, // set unconditionally right after construction, below
         .filter_rows = 0,
         .filter_gen = 0,
         .filter_kind = .text,
@@ -227,27 +224,28 @@ pub fn openWithAllocator(gpa: std.mem.Allocator, path: [*:0]const u8, options: ?
         .win_rows = 0,
     };
 
-    // Resolve the effective dialect (sniff the non-forced parameters) on the
-    // TRANSCODED structure of the head: sniffing/header/column-count logic is
-    // unchanged, but every byte comparison now flows through `decodeUnit` so
-    // it is correct for whichever encoding produced this UTF-8 (see
-    // api/lesssheet.h "Pipeline order at open").
-    const rd = sniff.sniffDialect(content, opt, doc.encoding);
-    doc.sep = rd.sep;
-    doc.quote = rd.quote;
+    // `data_start`/`frontier_pos`/`search_pos`/`filter_pos` all start at the
+    // Reader's own notion of "the very beginning" (0 for CSV) -- obtained
+    // opaquely (never a bare literal; see reader.zig's module doc) now that
+    // `doc.reader`/`doc.source` exist.
+    const start_pos = doc.reader.start(doc.source);
+    doc.data_start = start_pos;
+    doc.frontier_pos = start_pos;
+    doc.search_pos = start_pos;
+    doc.filter_pos = start_pos;
 
     // Record 1 -> column count, header decision, header cells.
-    if (content.len > 0) {
+    if (oh.content.len > 0) {
         if (!buildShape(doc, opt)) {
             freeDoc(doc);
             return .io;
         }
         // The base checkpoint must exist: findCheckpoint always reads [0].
-        doc.checkpoints.append(gpa, .{ .row = 0, .offset = doc.data_start }) catch {
+        doc.checkpoints.append(gpa, .{ .row = 0, .pos = doc.data_start }) catch {
             freeDoc(doc);
             return .io;
         };
-        doc.frontier_offset = doc.data_start;
+        doc.frontier_pos = doc.data_start;
         if (doc.has_header and doc.record1_capped) {
             // The header record itself never terminated within the head
             // budget (requirement 9): its true end -- and therefore where
@@ -265,11 +263,11 @@ pub fn openWithAllocator(gpa: std.mem.Allocator, path: [*:0]const u8, options: ?
     }
 
     doc.dialect = .{
-        .separator = doc.sep,
-        .quote = doc.quote orelse api.default_quote,
-        .has_quote = doc.quote != null,
+        .separator = oh.reader.sep,
+        .quote = oh.reader.quote orelse api.default_quote,
+        .has_quote = oh.reader.quote != null,
         .header = doc.has_header,
-        .encoding = doc.encoding,
+        .encoding = oh.reader.encoding,
         .separator_forced = opt.separator != api.sniff,
         .quote_forced = opt.quote != api.sniff,
         .header_forced = opt.header != api.sniff,
@@ -304,7 +302,7 @@ fn buildShape(doc: *Document, opt: api.OpenOptions) bool {
     var tmp_buf: std.ArrayList(u8) = .empty;
     var tmp_refs: std.ArrayList(CellRef) = .empty;
     const lim = index.headSourceLimit(doc);
-    const res = lexer.lexInto(doc.content, 0, doc.sep, doc.quote, null, api.cell_max_bytes, lim, doc.encoding, &tmp_buf, &tmp_refs, doc.gpa) catch {
+    const res = doc.reader.materialize(doc.source, doc.reader.start(doc.source), null, api.cell_max_bytes, lim, &tmp_buf, &tmp_refs, doc.gpa) catch {
         tmp_buf.deinit(doc.gpa);
         tmp_refs.deinit(doc.gpa);
         return false;
@@ -350,11 +348,11 @@ fn buildShape(doc: *Document, opt: api.OpenOptions) bool {
             tmp_refs.deinit(doc.gpa);
             return false;
         };
-        doc.data_start = 0; // record 1 is data row 0
+        doc.data_start = doc.reader.start(doc.source); // record 1 is data row 0
     } else {
         tmp_buf.deinit(doc.gpa);
         tmp_refs.deinit(doc.gpa);
-        doc.data_start = 0; // record 1 is data row 0
+        doc.data_start = doc.reader.start(doc.source); // record 1 is data row 0
     }
     return true;
 }

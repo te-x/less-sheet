@@ -11,11 +11,12 @@
 //! window.zig and this file's own `nthMatchInBlock`) and, for
 //! ARCH-huge-row-filtered, `nthMatchInBlock`'s per-row window-scan-cap bound
 //! + the `oversizedMatch` lookup into a filter's recorded oversized-row match
-//! results — see base.OversizedMatch.
+//! results — see base.OversizedMatch. Parsing goes through `Document.reader`
+//! (see docs/architecture/ARCH-reader-interface.md) — this module never
+//! imports `lexer.zig`.
 
 const api = @import("api");
 const base = @import("base.zig");
-const lexer = @import("lexer.zig");
 const matcher = @import("matcher.zig");
 
 const Document = base.Document;
@@ -23,13 +24,14 @@ const MatchCtx = base.MatchCtx;
 const CellRef = base.CellRef;
 const Checkpoint = base.Checkpoint;
 const OversizedMatch = base.OversizedMatch;
+const Pos = base.Pos;
 const checkpoint_interval = base.checkpoint_interval;
 
 /// A found match: `row` is an ORIGINAL data-row number; `col` the matched
 /// column (see matcher.matchRecord).
 pub const Match = struct { row: u64, col: u32 };
 
-pub const SourceLoc = struct { row: u64, offset: u64 };
+pub const SourceLoc = struct { row: u64, pos: Pos };
 
 /// True iff `filter_ctx` is absent or satisfied — the composed per-row test
 /// shared by search-nav (unfiltered: filter_ctx null) and search-nav-under-a-
@@ -48,22 +50,22 @@ fn rowMatch(filter_ctx: ?MatchCtx, primary_ctx: MatchCtx, buf: []const u8, refs:
 fn relexBlock(doc: *Document, filter_ctx: ?MatchCtx, primary_ctx: MatchCtx, b: u64, lo: u64, hi: u64, dir: api.SearchDir) ?Match {
     if (b >= doc.checkpoints.items.len) return null;
     const cp = doc.checkpoints.items[@intCast(b)];
-    var off: usize = @intCast(cp.offset);
+    var pos = cp.pos;
     var row = cp.row;
-    while (row < lo and off < doc.content.len) : (row += 1) {
-        off = lexer.recordBounds(doc.content, off, doc.sep, doc.quote, doc.content.len, doc.encoding).next;
+    while (row < lo and !doc.reader.atEnd(doc.source, pos)) : (row += 1) {
+        pos = doc.reader.boundsAfter(doc.source, pos, null).next;
     }
     var result: ?Match = null;
-    while (row < hi and off < doc.content.len) : (row += 1) {
+    while (row < hi and !doc.reader.atEnd(doc.source, pos)) : (row += 1) {
         doc.nav_scratch.clearRetainingCapacity();
         doc.nav_refs.clearRetainingCapacity();
         // NAVIGATION also matches the FULL cell (cap = null), same as the scan.
-        const res = lexer.lexInto(doc.content, off, doc.sep, doc.quote, doc.column_count, null, doc.content.len, doc.encoding, &doc.nav_scratch, &doc.nav_refs, doc.gpa) catch break;
+        const res = doc.reader.materialize(doc.source, pos, doc.column_count, null, null, &doc.nav_scratch, &doc.nav_refs, doc.gpa) catch break;
         if (rowMatch(filter_ctx, primary_ctx, doc.nav_scratch.items, doc.nav_refs.items)) |col| {
             result = .{ .row = row, .col = col };
             if (dir == .forward) return result;
         }
-        off = res.next;
+        pos = res.next;
     }
     return result;
 }
@@ -108,15 +110,15 @@ pub fn findBackwardMatch(doc: *Document, block_counts: []const u64, filter_ctx: 
 fn countInBlockUpTo(doc: *Document, filter_ctx: ?MatchCtx, primary_ctx: MatchCtx, b: u64, row: u64) u64 {
     if (b >= doc.checkpoints.items.len) return 0;
     const cp = doc.checkpoints.items[@intCast(b)];
-    var off: usize = @intCast(cp.offset);
+    var pos = cp.pos;
     var r = cp.row;
     var count: u64 = 0;
-    while (r <= row and off < doc.content.len) : (r += 1) {
+    while (r <= row and !doc.reader.atEnd(doc.source, pos)) : (r += 1) {
         doc.nav_scratch.clearRetainingCapacity();
         doc.nav_refs.clearRetainingCapacity();
-        const res = lexer.lexInto(doc.content, off, doc.sep, doc.quote, doc.column_count, null, doc.content.len, doc.encoding, &doc.nav_scratch, &doc.nav_refs, doc.gpa) catch break;
+        const res = doc.reader.materialize(doc.source, pos, doc.column_count, null, null, &doc.nav_scratch, &doc.nav_refs, doc.gpa) catch break;
         if (rowMatch(filter_ctx, primary_ctx, doc.nav_scratch.items, doc.nav_refs.items)) |_| count += 1;
-        off = res.next;
+        pos = res.next;
     }
     return count;
 }
@@ -186,7 +188,7 @@ pub fn oversizedMatch(list: []const OversizedMatch, row: u64) ?bool {
     return null;
 }
 
-/// Locate the ORIGINAL row/offset of the `need`-th (0-based) row satisfying
+/// Locate the ORIGINAL row/position of the `need`-th (0-based) row satisfying
 /// `ctx` within block `b` (rows [b*interval, min((b+1)*interval, hi_bound))),
 /// re-lexing from its checkpoint. ARCH-huge-row-filtered: `ctx` must be the
 /// ACTIVE FILTER's own predicate (filter.filterCtx) — true of both current
@@ -202,44 +204,43 @@ fn nthMatchInBlock(doc: *Document, ctx: MatchCtx, b: u64, hi_bound: u64, need: u
     if (b >= doc.checkpoints.items.len) return null;
     const cp = doc.checkpoints.items[@intCast(b)];
     const block_hi = @min((b + 1) * checkpoint_interval, hi_bound);
-    const scan_cap: usize = @intCast(api.window_row_scan_max_bytes);
-    var off: usize = @intCast(cp.offset);
+    var pos = cp.pos;
     var row = cp.row;
     var seen: u64 = 0;
-    while (row < block_hi and off < doc.content.len) {
-        const row_off = off;
-        const row_limit = @min(off +| scan_cap, doc.content.len);
+    while (row < block_hi and !doc.reader.atEnd(doc.source, pos)) {
+        const row_pos = pos;
+        const row_limit = doc.reader.posAtByteBudget(doc.source, pos, api.window_row_scan_max_bytes);
         doc.nav_scratch.clearRetainingCapacity();
         doc.nav_refs.clearRetainingCapacity();
-        const res = lexer.lexInto(doc.content, off, doc.sep, doc.quote, doc.column_count, null, row_limit, doc.encoding, &doc.nav_scratch, &doc.nav_refs, doc.gpa) catch return null;
+        const res = doc.reader.materialize(doc.source, pos, doc.column_count, null, row_limit, &doc.nav_scratch, &doc.nav_refs, doc.gpa) catch return null;
         if (res.capped) {
             // OVERSIZED: the match is decided from the filter-scan's already-
             // recorded FULL-cell result, never re-tested on this bounded
             // prefix and never by re-lexing to the row's true end.
             if (oversizedMatch(doc.filter_oversized_matches.items, row) orelse false) {
-                if (seen == need) return .{ .row = row, .offset = row_off };
+                if (seen == need) return .{ .row = row, .pos = row_pos };
                 seen += 1;
             }
             const target_row = row + 1;
             const skip_cp = bestCheckpoint(doc, target_row);
-            off = @intCast(skip_cp.offset);
+            pos = skip_cp.pos;
             row = skip_cp.row;
             while (row < target_row) : (row += 1) {
-                off = lexer.recordBounds(doc.content, off, doc.sep, doc.quote, doc.content.len, doc.encoding).next;
+                pos = doc.reader.boundsAfter(doc.source, pos, null).next;
             }
             continue;
         }
         if (matcher.matchRecord(ctx, doc.nav_scratch.items, doc.nav_refs.items) != null) {
-            if (seen == need) return .{ .row = row, .offset = row_off };
+            if (seen == need) return .{ .row = row, .pos = row_pos };
             seen += 1;
         }
-        off = res.next;
+        pos = res.next;
         row += 1;
     }
     return null;
 }
 
-/// Locate the ORIGINAL row/offset of the `idx`-th (0-based) row satisfying
+/// Locate the ORIGINAL row/position of the `idx`-th (0-based) row satisfying
 /// `ctx` within the counted region described by `block_counts` (bounded by
 /// `hi_bound`, its row cursor). O(checkpoints) to find the block + a bounded
 /// in-block re-lex — never O(idx)/O(matches) (see FILTERED VIEWS). Null when

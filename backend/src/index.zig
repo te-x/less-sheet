@@ -3,7 +3,9 @@
 //! api/lesssheet.h for the scan-frontier and threading-lanes model). The
 //! worker also arbitrates the single scan slot among a jump, a find
 //! (src/search.zig), and a filter-scan (src/filter.zig): jump > search >
-//! filter > the AUTO background indexer.
+//! filter > the AUTO background indexer. Parsing goes through
+//! `Document.reader` (see docs/architecture/ARCH-reader-interface.md) — this
+//! module never imports `lexer.zig`.
 
 const std = @import("std");
 const api = @import("api");
@@ -11,12 +13,12 @@ const posix = std.posix;
 const c = std.c;
 
 const base = @import("base.zig");
-const lexer = @import("lexer.zig");
 const filter = @import("filter.zig");
 const search = @import("search.zig");
 
 const Document = base.Document;
 const Checkpoint = base.Checkpoint;
+const Pos = base.Pos;
 const checkpoint_interval = base.checkpoint_interval;
 const head_budget = base.head_budget;
 
@@ -28,41 +30,42 @@ const madvise_keepback: u64 = 2 * 1024 * 1024;
 
 /// The O(head) SOURCE-byte scan bound shared by `root.buildShape`'s record-1
 /// decode and `headScan`: `LS_OPEN_HEAD_MAX_BYTES` minus the BOM, clamped to
-/// the file's true (post-BOM) content length.
-pub fn headSourceLimit(doc: *const Document) usize {
-    const budget: usize = if (head_budget > doc.bom_len) @intCast(head_budget - doc.bom_len) else 0;
-    return @min(budget, doc.content.len);
+/// the file's true (post-BOM) content length. Obtained from the Reader (see
+/// reader.zig's `posAtByteBudget`) rather than computed here, so this stays a
+/// plain byte-COUNT-to-position request, never arithmetic on a position.
+pub fn headSourceLimit(doc: *const Document) Pos {
+    const budget: u64 = if (head_budget > doc.bom_len) head_budget - doc.bom_len else 0;
+    return doc.reader.posAtByteBudget(doc.source, doc.reader.start(doc.source), budget);
 }
 
 /// Index the head region only: advance the frontier over data records while
 /// they fit within the O(head) byte budget. Files no larger than the budget
 /// are fully indexed here (complete + exact immediately, per the ABI pin).
 pub fn headScan(doc: *Document) void {
-    const content = doc.content;
-    const lim = headSourceLimit(doc); // == min(budget, content.len)
-    var i: usize = @intCast(doc.data_start);
+    const lim = headSourceLimit(doc); // == min(budget, source end)
+    var pos = doc.data_start;
     var row: u64 = 0;
     base.beginOversizedChunk(doc);
-    while (i < lim) {
-        const b = lexer.recordBounds(content, i, doc.sep, doc.quote, lim, doc.encoding);
+    while (!doc.reader.atEnd(doc.source, pos)) {
+        const b = doc.reader.boundsAfter(doc.source, pos, lim);
         if (b.capped) break; // record spills past the head budget: leave for later
-        if (doc.bom_len + b.next > head_budget) break; // keep bytes_scanned <= budget
+        if (doc.bom_len + doc.reader.bytesConsumed(doc.source, b.next) > head_budget) break; // keep bytes_scanned <= budget
         // ARCH-huge-row-budget: this row's source extent may exceed the
         // WINDOW's per-row scan cap (LS_WINDOW_ROW_SCAN_MAX_BYTES, much
         // smaller than the O(head) budget above) even though headScan itself
         // -- like every frontier scan -- always finds the row's true end.
-        base.stageOversized(doc, row, @intCast(i), @intCast(b.next));
-        i = b.next;
+        base.stageOversized(doc, row, pos, b.next);
+        pos = b.next;
         row += 1;
-        if (row % checkpoint_interval == 0) doc.checkpoints.append(doc.gpa, .{ .row = row, .offset = i }) catch {};
-        if (b.next >= content.len) break;
+        if (row % checkpoint_interval == 0) doc.checkpoints.append(doc.gpa, .{ .row = row, .pos = pos }) catch {};
+        if (doc.reader.atEnd(doc.source, pos)) break;
     }
     // headScan is the document's very first frontier advance (the worker has
     // not spawned yet): always the leading edge, so always drained.
     base.drainOversized(doc, true);
-    doc.frontier_offset = i;
+    doc.frontier_pos = pos;
     doc.frontier_rows = row;
-    if (i >= content.len) {
+    if (doc.reader.atEnd(doc.source, pos)) {
         doc.complete = true;
         doc.total_rows = row;
     }
@@ -73,7 +76,7 @@ pub fn headScan(doc: *Document) void {
 // ---------------------------------------------------------------------------
 
 pub fn workerMain(doc: *Document) void {
-    var released: u64 = 0; // content offset up to which pages were madvised away
+    var released: u64 = 0; // bytes up to which pages were madvised away
     doc.lock();
     while (true) {
         if (doc.stop) break;
@@ -105,18 +108,18 @@ pub fn workerMain(doc: *Document) void {
                 doc.wf_gen = doc.filter_gen;
             }
             const gen = doc.filter_gen;
-            const start_off = doc.filter_offset;
+            const start_pos = doc.filter_pos;
             const start_row = doc.filter_rows;
             doc.unlock();
 
-            const res = filter.filterScanChunk(doc, start_off, start_row);
+            const res = filter.filterScanChunk(doc, start_pos, start_row);
 
             doc.lock();
             if (doc.filter_gen == gen and doc.jump_state == .scanning) {
                 filter.commitFilter(doc, res);
                 filter.resolveFilterJumpLocked(doc);
             }
-            const advanced = doc.frontier_offset;
+            const advanced = doc.reader.bytesConsumed(doc.source, doc.frontier_pos);
             doc.unlock();
 
             if (doc.mapping != null and advanced > released + madvise_release_chunk and advanced > madvise_keepback) {
@@ -140,17 +143,17 @@ pub fn workerMain(doc: *Document) void {
                 doc.wf_gen = doc.filter_gen;
             }
             const gen = doc.filter_gen;
-            const start_off = doc.filter_offset;
+            const start_pos = doc.filter_pos;
             const start_row = doc.filter_rows;
             doc.unlock();
 
-            const res = filter.filterScanChunk(doc, start_off, start_row);
+            const res = filter.filterScanChunk(doc, start_pos, start_row);
 
             doc.lock();
             if (doc.filter_gen == gen and doc.filter_state == .scanning) {
                 filter.commitFilter(doc, res);
             }
-            const advanced = doc.frontier_offset;
+            const advanced = doc.reader.bytesConsumed(doc.source, doc.frontier_pos);
             doc.unlock();
 
             if (doc.mapping != null and advanced > released + madvise_release_chunk and advanced > madvise_keepback) {
@@ -186,12 +189,12 @@ pub fn workerMain(doc: *Document) void {
                 doc.wf_gen = doc.filter_gen;
             }
             const gen = doc.search_gen;
-            const start_off = doc.search_offset;
+            const start_pos = doc.search_pos;
             const start_row = doc.search_rows;
             doc.unlock();
 
             // Lex + match a chunk of rows lock-free (worker snapshot only).
-            const res = search.searchScanChunk(doc, start_off, start_row, filtered);
+            const res = search.searchScanChunk(doc, start_pos, start_row, filtered);
 
             doc.lock();
             // Commit only if this is still the same, still-scanning search;
@@ -205,7 +208,7 @@ pub fn workerMain(doc: *Document) void {
                     doc.search_state = .cancelled;
                 }
             }
-            const advanced = doc.frontier_offset;
+            const advanced = doc.reader.bytesConsumed(doc.source, doc.frontier_pos);
             doc.unlock();
 
             if (doc.mapping != null and advanced > released + madvise_release_chunk and advanced > madvise_keepback) {
@@ -219,14 +222,14 @@ pub fn workerMain(doc: *Document) void {
 
         // Jump or plain-index chunk: advance the frontier only (unchanged from
         // the viewer-ui worker; the sole frontier writer, so lock-free).
-        const start_off = doc.frontier_offset;
+        const start_pos = doc.frontier_pos;
         const start_row = doc.frontier_rows;
         doc.unlock();
 
-        const res = scanChunk(doc, start_off, start_row);
+        const res = scanChunk(doc, start_pos, start_row);
 
         doc.lock();
-        doc.frontier_offset = res.end_offset;
+        doc.frontier_pos = res.end_pos;
         doc.frontier_rows = res.end_row;
         if (res.checkpoint) |cp| doc.checkpoints.append(doc.gpa, cp) catch {};
         // scanChunk always starts exactly at the frontier: always the leading
@@ -237,7 +240,7 @@ pub fn workerMain(doc: *Document) void {
             doc.total_rows = doc.frontier_rows;
         }
         if (doc.jump_state == .scanning) updateJump(doc);
-        const advanced = doc.frontier_offset;
+        const advanced = doc.reader.bytesConsumed(doc.source, doc.frontier_pos);
         doc.unlock();
 
         // Release pages far behind the frontier (bounded resident memory).
@@ -253,32 +256,32 @@ pub fn workerMain(doc: *Document) void {
 }
 
 const ChunkResult = struct {
-    end_offset: u64,
+    end_pos: Pos,
     end_row: u64,
     eof: bool,
     checkpoint: ?Checkpoint,
 };
 
-/// Lex records from `start_off`/`start_row` up to the next `checkpoint_interval`
-/// multiple, or EOF, or a stop request. Reads only immutable mmap bytes; also
-/// stages any oversized row it crosses (base.stageOversized) for the caller
-/// to drain at commit time (base.drainOversized) -- ARCH-huge-row-budget.
-fn scanChunk(doc: *Document, start_off: u64, start_row: u64) ChunkResult {
-    const content = doc.content;
-    var i: usize = @intCast(start_off);
+/// Lex records from `start_pos`/`start_row` up to the next `checkpoint_interval`
+/// multiple, or EOF, or a stop request. Reads only via the Reader (immutable
+/// mmap bytes, for CSV); also stages any oversized row it crosses
+/// (base.stageOversized) for the caller to drain at commit time
+/// (base.drainOversized) -- ARCH-huge-row-budget.
+fn scanChunk(doc: *Document, start_pos: Pos, start_row: u64) ChunkResult {
+    var pos = start_pos;
     var row = start_row;
     const target = ((start_row / checkpoint_interval) + 1) * checkpoint_interval;
     base.beginOversizedChunk(doc);
     while (row < target) {
-        if (doc.stop_atomic.load(.monotonic)) return .{ .end_offset = i, .end_row = row, .eof = false, .checkpoint = null };
-        if (i >= content.len) return .{ .end_offset = i, .end_row = row, .eof = true, .checkpoint = null };
-        const b = lexer.recordBounds(content, i, doc.sep, doc.quote, content.len, doc.encoding);
-        base.stageOversized(doc, row, @intCast(i), @intCast(b.next));
-        i = b.next;
+        if (doc.stop_atomic.load(.monotonic)) return .{ .end_pos = pos, .end_row = row, .eof = false, .checkpoint = null };
+        if (doc.reader.atEnd(doc.source, pos)) return .{ .end_pos = pos, .end_row = row, .eof = true, .checkpoint = null };
+        const b = doc.reader.boundsAfter(doc.source, pos, null);
+        base.stageOversized(doc, row, pos, b.next);
+        pos = b.next;
         row += 1;
-        if (b.next >= content.len) return .{ .end_offset = i, .end_row = row, .eof = true, .checkpoint = null };
+        if (doc.reader.atEnd(doc.source, pos)) return .{ .end_pos = pos, .end_row = row, .eof = true, .checkpoint = null };
     }
-    return .{ .end_offset = i, .end_row = row, .eof = false, .checkpoint = .{ .row = row, .offset = i } };
+    return .{ .end_pos = pos, .end_row = row, .eof = false, .checkpoint = .{ .row = row, .pos = pos } };
 }
 
 /// Fold the current frontier into the active jump slot (mutex held).
@@ -322,9 +325,13 @@ pub fn rowCount(d: *Document) api.RowCount {
     // converging lower bound that becomes exact at LS_FILTER_DONE).
     if (d.filter_state != .idle) return .{ .count = d.filter_total, .exact = d.filter_total_exact };
     if (d.complete) return .{ .count = d.total_rows, .exact = true };
-    // Estimate = total data bytes / mean indexed row bytes.
-    const scanned_data = d.frontier_offset - d.data_start;
-    const total_data = d.content_len - d.data_start;
+    // Estimate = total data bytes / mean indexed row bytes. `bytesConsumed`
+    // is the only place a position is turned back into a byte count here
+    // (see reader.zig's module doc).
+    const start_bytes = d.reader.bytesConsumed(d.source, d.data_start);
+    const frontier_bytes = d.reader.bytesConsumed(d.source, d.frontier_pos);
+    const scanned_data = frontier_bytes - start_bytes;
+    const total_data = d.content_len - start_bytes;
     var count: u64 = 0;
     if (d.frontier_rows == 0 or scanned_data == 0) {
         count = if (total_data > 0) 1 else 0;
@@ -339,7 +346,7 @@ pub fn indexPoll(d: *Document) api.ScanProgress {
     d.lock();
     defer d.unlock();
     return .{
-        .bytes_scanned = d.bom_len + d.frontier_offset,
+        .bytes_scanned = d.bom_len + d.reader.bytesConsumed(d.source, d.frontier_pos),
         .bytes_total = d.file_size,
         .complete = d.complete,
     };

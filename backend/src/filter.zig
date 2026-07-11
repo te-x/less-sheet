@@ -4,17 +4,19 @@
 //! OWN predicate, cursor, and counters — never a materialized match-row
 //! list. `ls_filter_set` validates EXACTLY like `ls_search_start`
 //! (duplicated rather than shared, so neither call site risks drifting the
-//! other's already-frozen-green behavior — see src/search.zig).
+//! other's already-frozen-green behavior — see src/search.zig). Parsing
+//! goes through `Document.reader` (see docs/architecture/ARCH-reader-
+//! interface.md) — this module never imports `lexer.zig`.
 
 const api = @import("api");
 const base = @import("base.zig");
-const lexer = @import("lexer.zig");
 const matcher = @import("matcher.zig");
 const nav = @import("nav.zig");
 
 const Document = base.Document;
 const Checkpoint = base.Checkpoint;
 const MatchCtx = base.MatchCtx;
+const Pos = base.Pos;
 const checkpoint_interval = base.checkpoint_interval;
 const searchProgress = base.searchProgress;
 
@@ -71,7 +73,7 @@ pub fn refreshFilterWorkerCtx(doc: *Document) bool {
 // ---------------------------------------------------------------------------
 
 const FilterChunk = struct {
-    end_offset: u64,
+    end_pos: Pos,
     end_row: u64,
     eof: bool,
     checkpoint: ?Checkpoint,
@@ -79,15 +81,18 @@ const FilterChunk = struct {
 };
 
 /// ARCH-huge-row-filtered: stage row `row`'s FULL-cell filter-match decision
-/// (`matched`) IFF its SOURCE extent [start, end) exceeded the per-row window
-/// scan cap — mirrors base.stageOversized's size test, but records the match
-/// decision itself (never scan-relevant offsets) so the FILTERED window path
-/// can honor it later without re-scanning (see base.OversizedMatch / window.
-/// windowSetFiltered / nav.nthMatchInBlock). Lock-free: exclusive to the ONE
-/// filter-scan chunk currently executing (same guarantee as `oversized_stage`
-/// — see filterScanChunk's caller-serialization note on Document).
-fn stageOversizedMatch(doc: *Document, row: u64, start: u64, end: u64, matched: bool) void {
-    if (end - start <= api.window_row_scan_max_bytes) return;
+/// (`matched`) IFF its extent [start, end) exceeded the per-row window scan
+/// cap -- mirrors base.stageOversized's size test, but records the match
+/// decision itself (never scan-relevant positions) so the FILTERED window
+/// path can honor it later without re-scanning (see base.OversizedMatch /
+/// window.windowSetFiltered / nav.nthMatchInBlock). Lock-free: exclusive to
+/// the ONE filter-scan chunk currently executing (same guarantee as
+/// `oversized_stage` — see filterScanChunk's caller-serialization note on
+/// Document). `bytesConsumed` is the size test's only look at a position's
+/// byte meaning (see reader.zig's module doc).
+fn stageOversizedMatch(doc: *Document, row: u64, start: Pos, end: Pos, matched: bool) void {
+    const size = doc.reader.bytesConsumed(doc.source, end) - doc.reader.bytesConsumed(doc.source, start);
+    if (size <= api.window_row_scan_max_bytes) return;
     doc.filter_oversized_stage.append(doc.gpa, .{ .row = row, .matched = matched }) catch {};
 }
 
@@ -106,33 +111,32 @@ fn drainOversizedMatches(doc: *Document) void {
     }
 }
 
-/// Lex + test the filter predicate for one block of data rows. Reads only
-/// immutable mmap bytes + the worker's lock-free filter snapshot (doc.wf_ctx,
-/// refreshed by refreshFilterWorkerCtx). Matches the FULL cell (cap = null),
-/// same rule as SEARCH.
-pub fn filterScanChunk(doc: *Document, start_off: u64, start_row: u64) FilterChunk {
-    const content = doc.content;
-    var i: usize = @intCast(start_off);
+/// Lex + test the filter predicate for one block of data rows. Reads only via
+/// the Reader (immutable mmap bytes, for CSV) + the worker's lock-free filter
+/// snapshot (doc.wf_ctx, refreshed by refreshFilterWorkerCtx). Matches the
+/// FULL cell (cap = null), same rule as SEARCH.
+pub fn filterScanChunk(doc: *Document, start_pos: Pos, start_row: u64) FilterChunk {
+    var pos = start_pos;
     var row = start_row;
     var matches: u64 = 0;
     const target = ((start_row / checkpoint_interval) + 1) * checkpoint_interval;
     base.beginOversizedChunk(doc);
     doc.filter_oversized_stage.clearRetainingCapacity(); // ARCH-huge-row-filtered
     while (row < target) {
-        if (doc.stop_atomic.load(.monotonic)) return .{ .end_offset = i, .end_row = row, .eof = false, .checkpoint = null, .matches = matches };
-        if (i >= content.len) return .{ .end_offset = i, .end_row = row, .eof = true, .checkpoint = null, .matches = matches };
+        if (doc.stop_atomic.load(.monotonic)) return .{ .end_pos = pos, .end_row = row, .eof = false, .checkpoint = null, .matches = matches };
+        if (doc.reader.atEnd(doc.source, pos)) return .{ .end_pos = pos, .end_row = row, .eof = true, .checkpoint = null, .matches = matches };
         doc.filter_scratch.clearRetainingCapacity();
         doc.filter_refs.clearRetainingCapacity();
         // Matches the FULL cell (cap = null), same rule as SEARCH -- never
         // bounded by the WINDOW's per-row scan cap (ARCH-huge-row-budget only
         // byte-bounds ls_window_set).
-        const res = lexer.lexInto(content, i, doc.sep, doc.quote, doc.column_count, null, content.len, doc.encoding, &doc.filter_scratch, &doc.filter_refs, doc.gpa) catch {
-            const nb = lexer.recordBounds(content, i, doc.sep, doc.quote, content.len, doc.encoding);
-            base.stageOversized(doc, row, @intCast(i), @intCast(nb.next));
-            stageOversizedMatch(doc, row, @intCast(i), @intCast(nb.next), false);
-            i = nb.next;
+        const res = doc.reader.materialize(doc.source, pos, doc.column_count, null, null, &doc.filter_scratch, &doc.filter_refs, doc.gpa) catch {
+            const nb = doc.reader.boundsAfter(doc.source, pos, null);
+            base.stageOversized(doc, row, pos, nb.next);
+            stageOversizedMatch(doc, row, pos, nb.next, false);
+            pos = nb.next;
             row += 1;
-            if (nb.next >= content.len) return .{ .end_offset = i, .end_row = row, .eof = true, .checkpoint = null, .matches = matches };
+            if (doc.reader.atEnd(doc.source, pos)) return .{ .end_pos = pos, .end_row = row, .eof = true, .checkpoint = null, .matches = matches };
             continue;
         };
         // ARCH-huge-row-filtered: this is the ONLY place a giant row's match
@@ -143,13 +147,13 @@ pub fn filterScanChunk(doc: *Document, start_off: u64, start_row: u64) FilterChu
         if (matched) matches += 1;
         // This scan also feeds the base row index (ARCH-huge-row-budget): see
         // the matching comment in search.searchScanChunk.
-        base.stageOversized(doc, row, @intCast(i), @intCast(res.next));
-        stageOversizedMatch(doc, row, @intCast(i), @intCast(res.next), matched);
-        i = res.next;
+        base.stageOversized(doc, row, pos, res.next);
+        stageOversizedMatch(doc, row, pos, res.next, matched);
+        pos = res.next;
         row += 1;
-        if (res.next >= content.len) return .{ .end_offset = i, .end_row = row, .eof = true, .checkpoint = null, .matches = matches };
+        if (doc.reader.atEnd(doc.source, pos)) return .{ .end_pos = pos, .end_row = row, .eof = true, .checkpoint = null, .matches = matches };
     }
-    return .{ .end_offset = i, .end_row = row, .eof = false, .checkpoint = .{ .row = row, .offset = i }, .matches = matches };
+    return .{ .end_pos = pos, .end_row = row, .eof = false, .checkpoint = .{ .row = row, .pos = pos }, .matches = matches };
 }
 
 /// Terminate the active filter-scan cleanly at its last consistent state
@@ -167,7 +171,7 @@ pub fn failFilterLocked(doc: *Document) void {
 /// rules); only EOF unconditionally resolves to LS_FILTER_DONE (the total is
 /// final however it got there).
 pub fn commitFilter(doc: *Document, res: FilterChunk) void {
-    const advancing = res.end_offset > doc.frontier_offset;
+    const advancing = doc.reader.bytesConsumed(doc.source, res.end_pos) > doc.reader.bytesConsumed(doc.source, doc.frontier_pos);
     const need_cp = advancing and res.checkpoint != null;
     doc.filter_block_counts.ensureUnusedCapacity(doc.gpa, 1) catch {
         failFilterLocked(doc);
@@ -179,10 +183,10 @@ pub fn commitFilter(doc: *Document, res: FilterChunk) void {
     };
     doc.filter_block_counts.appendAssumeCapacity(res.matches);
     doc.filter_rows = res.end_row;
-    doc.filter_offset = res.end_offset;
+    doc.filter_pos = res.end_pos;
     doc.filter_total +%= res.matches;
     if (advancing) {
-        doc.frontier_offset = res.end_offset;
+        doc.frontier_pos = res.end_pos;
         doc.frontier_rows = res.end_row;
         if (res.checkpoint) |cp| doc.checkpoints.appendAssumeCapacity(cp);
     }
@@ -199,7 +203,7 @@ pub fn commitFilter(doc: *Document, res: FilterChunk) void {
         doc.filter_total_exact = true;
         doc.filter_progress = 1.0;
     } else {
-        doc.filter_progress = searchProgress(doc, res.end_offset);
+        doc.filter_progress = searchProgress(doc, res.end_pos);
     }
 }
 
@@ -368,10 +372,10 @@ pub fn setFilter(d: *Document, request: *const api.SearchRequest) bool {
     d.filter_total = 0;
     d.filter_total_exact = false;
     d.filter_rows = 0;
-    d.filter_offset = d.data_start;
+    d.filter_pos = d.data_start;
     d.filter_progress = 0.0;
 
-    if (d.data_start >= d.content_len or d.column_count == 0) {
+    if (d.reader.atEnd(d.source, d.data_start) or d.column_count == 0) {
         // Nothing to scan: already DONE with total 0.
         d.filter_state = .done;
         d.filter_total_exact = true;
@@ -390,7 +394,7 @@ pub fn setFilter(d: *Document, request: *const api.SearchRequest) bool {
     // other thread observes intermediate state.
     if (refreshFilterWorkerCtx(d)) d.wf_gen = d.filter_gen else failFilterLocked(d);
     while (d.filter_state == .scanning) {
-        const res = filterScanChunk(d, d.filter_offset, d.filter_rows);
+        const res = filterScanChunk(d, d.filter_pos, d.filter_rows);
         commitFilter(d, res);
     }
     d.unlock();
@@ -408,7 +412,7 @@ pub fn clearFilter(d: *Document) void {
     d.filter_total = 0;
     d.filter_total_exact = false;
     d.filter_rows = 0;
-    d.filter_offset = 0;
+    d.filter_pos = d.reader.start(d.source);
     d.filter_gen +%= 1; // discard any in-flight filter/jump-driven chunk
 
     // RESETS any active search to IDLE and returns the jump slot to IDLE
