@@ -238,6 +238,30 @@ final class DocumentModel {
     /// wherever a width is read for drawing/layout; `growColumnWidthsToFitWindow`
     /// skips an overridden column so auto-grow never fights it.
     private var manualColumnWidths: [Int: Double] = [:]
+    /// ARCH-stream-copy AC8/AC9: ONE shared gate + clock driving the "subtle
+    /// progress after ~500 ms" affordance for every long op this model tracks
+    /// (copy / jump-scan / filter-scan) — see `copyProgress` /
+    /// `jumpProgressIndication` / `filterProgressIndication` below, and
+    /// `DelayedProgressSpinner` for the rendered affordance. One instance
+    /// means one shared threshold band the whole app reads consistently.
+    private let progressGate = DelayedProgressGate()
+    private let progressClock = ContinuousClock()
+    private var copyStartedAt: ContinuousClock.Instant?
+    private var jumpScanStartedAt: ContinuousClock.Instant?
+    private var filterScanStartedAt: ContinuousClock.Instant?
+    /// Bumped on every `copySelection()` call — lets the delayed-reveal task
+    /// below (`copySelection`) tell "am I still THIS copy?" apart from the
+    /// shared `copyInFlight` flag, which is true for ANY in-flight copy: a
+    /// rapid supersede (⌘C again before the threshold) would otherwise let a
+    /// stale task, woken at the OLD copy's threshold, reveal progress for the
+    /// NEW copy using the old elapsed (round-2 review finding).
+    private var copyGeneration = 0
+    /// COPY's live delayed-progress indication (AC8): hidden until the
+    /// running copy passes the shared threshold, then visible with cancel;
+    /// cleared by `completeCopy`/`cancelCopy`. Recomputed once, at the
+    /// threshold tick in `copySelection` — copy needs no finer resolution
+    /// (accuracy is a non-goal; ARCH scope).
+    private(set) var copyProgress: ProgressIndication = .hidden
 
     init(opener: any DocumentSessionOpening = CoreSessionOpener()) {
         self.opener = opener
@@ -250,6 +274,13 @@ final class DocumentModel {
     /// override and carry the caller's prior column visibility.
     func open(path: String, forcing override: DialectOverride = .sniffAll, carrying previous: ColumnVisibility? = nil) async {
         await stopPolling()
+        // Cancel any in-flight copy against the OLD handle BEFORE closing it
+        // (round-4 UAF fix): an orphaned copy build keeps calling
+        // `session.copyCell` from a detached Task after `cancelCopy` merely
+        // asks it to stop, so the handle must still be open while that ask
+        // lands — closing first left a window where the orphaned build could
+        // call `ls_cell_copy` on an already-freed `doc`.
+        cancelCopy()
         session?.close()
         session = nil
 
@@ -297,7 +328,7 @@ final class DocumentModel {
                 columnCount: session.columnCount
             )
             markLayoutWidthsStale()
-            self.jumpFlow = .idle
+            self.setJumpFlow(.idle)
             // New document identity: the core's search AND filter state died
             // with the old handle — clear results/highlights, retain the typed
             // query so re-running is one Enter (ARCH req. 10;
@@ -308,15 +339,16 @@ final class DocumentModel {
             self.searchNavDirection = .forward
             self.filterSnapshot = nil
             self.filterDocumentRows = nil
+            self.filterScanStartedAt = nil
             self.pendingScrollRow = nil
             // Session-scoped select-copy state dies with the old handle too
             // (ARCH-select-copy): row/column indices from a prior document are
-            // meaningless here, and a pending copy has nothing left to copy —
-            // `cancelCopy` cancels any in-flight build against the OLD handle
-            // (about to be closed above) and clears its UI state in one call.
+            // meaningless here. `cancelCopy` already ran at the TOP of this
+            // method, BEFORE the old handle closed (round-4 UAF fix) — by now
+            // there is nothing left to cancel, only this leftover selection
+            // state to clear.
             self.selection = nil
             self.manualColumnWidths = [:]
-            self.cancelCopy()
             self.phase = .document
             startPolling()
         } catch {
@@ -357,7 +389,9 @@ final class DocumentModel {
     }
 
     func closeDocument() {
-        Task { await stopPolling(); session?.close(); session = nil }
+        // cancelCopy() BEFORE close() — same round-4 UAF fix as `open()`: an
+        // orphaned copy must stop touching the handle before it's freed.
+        Task { await stopPolling(); cancelCopy(); session?.close(); session = nil }
     }
 
     // MARK: - Windowed paging (O(viewport); UI-thread fast path)
@@ -1004,14 +1038,32 @@ final class DocumentModel {
         guard let session, let rect = selection?.rect else { return }
         cancelCopy()   // supersede any copy already running (see doc above)
         copyInFlight = true
-        // ARCH AC2 ("an instant result for small selections + a subtle
-        // 'Copying…'... notice for large ones"): shown only if the build is
-        // STILL running after a short readable-but-not-flashy delay, so a
-        // fast/small copy's result never flickers through an interstitial.
+        // ARCH-stream-copy AC8 ("subtle progress after ~500 ms ... with the
+        // existing cancel ... gone on completion/cancel; a sub-threshold copy
+        // shows nothing"): the SAME shared gate every long op in this model
+        // drives (see `progressGate`/`copyProgress`). A real `ContinuousClock`
+        // reading taken now is the copy's start; the driver feeds the real
+        // elapsed since then into the gate at the threshold tick, so the
+        // ~500 ms band is the ONE the whole app shares, not a private magic
+        // number (this replaces a prior local 300 ms constant).
+        let startedAt = progressClock.now
+        copyStartedAt = startedAt
+        copyGeneration += 1
+        let myGeneration = copyGeneration
         Task { [weak self] in
-            try? await Task.sleep(for: .milliseconds(300))
-            guard let self, !Task.isCancelled, self.copyInFlight else { return }
-            self.copyNotice = "Copying…"
+            guard let self else { return }
+            try? await Task.sleep(for: self.progressGate.threshold)
+            // `copyInFlight` alone is a SHARED flag (true for ANY in-flight
+            // copy); the generation check is what tells this stale task
+            // apart from a copy that superseded it in the meantime (a rapid
+            // ⌘C before this one crossed the threshold) — without it this
+            // task would reveal progress for the NEW copy, computed from
+            // THIS (older) copy's elapsed.
+            guard !Task.isCancelled, self.copyInFlight, self.copyGeneration == myGeneration else { return }
+            let elapsed = self.progressClock.now - startedAt
+            let indication = self.progressGate.indication(for: .running(elapsed: elapsed, cancellable: true))
+            self.copyProgress = indication
+            if indication.isVisible { self.copyNotice = "Copying…" }
         }
         let builder = copyBuilder
         let budget = CopyBudget.standard
@@ -1067,6 +1119,8 @@ final class DocumentModel {
         guard !Task.isCancelled else { return }
         copyTask = nil
         copyInFlight = false
+        copyProgress = .hidden   // ARCH-stream-copy AC8: gone on completion
+        copyStartedAt = nil
         Self.writeToPasteboard(report.text)
         copyNoticeTask?.cancel()
         copyNotice = Self.noticeText(for: report)
@@ -1098,6 +1152,8 @@ final class DocumentModel {
         copyNoticeTask?.cancel()
         copyNoticeTask = nil
         copyInFlight = false
+        copyProgress = .hidden   // ARCH-stream-copy AC8: gone on cancel
+        copyStartedAt = nil
         copyNotice = nil
     }
 
@@ -1289,7 +1345,7 @@ final class DocumentModel {
     /// rejection nonce so the overlay blinks/shakes the field. The core is left
     /// alone — its frontier gains (from any scan) are kept.
     private func rejectJump(restoreTo: UInt64?, scanned: Bool) {
-        jumpFlow = .idle
+        setJumpFlow(.idle)
         if let restoreTo { pendingScrollRow = restoreTo }
         jumpFieldActive = true
         jumpRejections += 1
@@ -1298,7 +1354,7 @@ final class DocumentModel {
 
     func beginJump(to target: UInt64) {
         guard let session else { return }
-        jumpFlow = jumpControl.begin(target: target, preJumpFirstRow: UInt64(firstVisibleRow))
+        setJumpFlow(jumpControl.begin(target: target, preJumpFirstRow: UInt64(firstVisibleRow)))
         session.startJump(to: target)
         // Behind-frontier targets complete before startJump returns; fold the
         // immediate status so a tiny/loaded jump lands without a poll tick.
@@ -1310,7 +1366,34 @@ final class DocumentModel {
         session?.cancelJump()
         let next = jumpControl.cancelled(jumpFlow)
         if case let .cancelled(restore) = next { pendingScrollRow = restore }
+        setJumpFlow(next)
+    }
+
+    /// The ONLY place `jumpFlow` is assigned (ARCH-stream-copy AC9 "just
+    /// wiring"): starts/clears `jumpScanStartedAt` — the real clock reading
+    /// `jumpProgressIndication` measures elapsed from — exactly on the
+    /// idle/landed/cancelled <-> scanning transition, so every call site
+    /// above gets this for free instead of repeating it.
+    private func setJumpFlow(_ next: JumpFlow) {
+        if case .scanning = next {
+            if case .scanning = jumpFlow {} else { jumpScanStartedAt = progressClock.now }
+        } else {
+            jumpScanStartedAt = nil
+        }
         jumpFlow = next
+    }
+
+    /// JUMP-scan's live delayed-progress indication (AC9 "just wiring"): the
+    /// SAME gate copy uses (`progressGate`), fed the real elapsed since
+    /// scanning began — hidden while idle/landed/cancelled, or still under
+    /// the shared threshold; visible WITH cancel once past it (a jump always
+    /// carries Task/Esc/Cancel — see `cancelJump`). `JumpControlView` reads
+    /// this to decide when its progress bar surfaces (OverlayView.swift).
+    var jumpProgressIndication: ProgressIndication {
+        guard case .scanning = jumpFlow, let startedAt = jumpScanStartedAt else {
+            return progressGate.indication(for: .settled)
+        }
+        return progressGate.indication(for: .running(elapsed: progressClock.now - startedAt, cancellable: true))
     }
 
     private func foldJump(_ status: JumpStatus) {
@@ -1334,11 +1417,11 @@ final class DocumentModel {
                 rejectJump(restoreTo: preJumpFirstRow, scanned: true)   // sets jumpFlow = .idle
                 return
             }
-            jumpFlow = next          // mark landed FIRST so a later poll doesn't re-fire
+            setJumpFlow(next)        // mark landed FIRST so a later poll doesn't re-fire
             landOn(row)
             return
         }
-        jumpFlow = next
+        setJumpFlow(next)
     }
 
     /// A completed jump lands here: page the core window to the target BEFORE
@@ -1553,6 +1636,21 @@ final class DocumentModel {
         filterControl.banner(filterSnapshot, documentRows: filterDocumentRows ?? rowCountInfo)
     }
 
+    /// FILTER-scan's live delayed-progress indication (ARCH-stream-copy AC9
+    /// "just wiring"): the SAME gate copy/jump use (`progressGate`), fed the
+    /// real elapsed since THIS filter began. Hidden whenever the banner
+    /// reports no progress (no filter active, or the scan is `.done`);
+    /// visible with NO cancel otherwise — a filter is a persistent view mode,
+    /// not a one-shot cancellable operation (ARCH: "Filter's indicator need
+    /// not offer cancel"). `FilterBannerView` reads this to decide when its
+    /// existing progress-bar + % surfaces (FilterBanner.swift).
+    var filterProgressIndication: ProgressIndication {
+        guard let banner = filterBanner, banner.progress != nil, let startedAt = filterScanStartedAt else {
+            return progressGate.indication(for: .settled)
+        }
+        return progressGate.indication(for: .running(elapsed: progressClock.now - startedAt, cancellable: false))
+    }
+
     /// The row-count knowledge the JUMP popup hints with: the captured base
     /// document count while filtered — the jump box interprets ORIGINAL row
     /// numbers (ARCH-filtered-views req. 7/12, criterion 17), so its hint must
@@ -1603,9 +1701,15 @@ final class DocumentModel {
             cancelWrapNav()
             findSession = findControl.invalidated(findSession)
             searchNavDirection = .forward
-            jumpFlow = .idle
+            setJumpFlow(.idle)
             selection = nil   // the coordinate space just changed (ARCH-select-copy)
             filterSnapshot = session.filterStatus()
+            // ARCH-stream-copy AC9 ("just wiring"): this filter's real start,
+            // fed to `filterProgressIndication` — set unconditionally (even a
+            // filter that resolves instantly on a tiny file is still "started
+            // now"; the indication itself stays hidden whenever the banner
+            // reports no progress, i.e. already `.done`).
+            filterScanStartedAt = progressClock.now
             rowCountInfo = session.rowCount()
             landViewport(on: 0)
             startPolling()
@@ -1627,11 +1731,12 @@ final class DocumentModel {
         session.clearFilter()
         filterSnapshot = nil
         filterDocumentRows = nil
+        filterScanStartedAt = nil
         rowCountInfo = session.rowCount()
         cancelWrapNav()
         findSession = findControl.invalidated(findSession)
         searchNavDirection = .forward
-        jumpFlow = .idle
+        setJumpFlow(.idle)
         selection = nil   // the coordinate space just changed (ARCH-select-copy)
         landViewport(on: anchor)
         startPolling()

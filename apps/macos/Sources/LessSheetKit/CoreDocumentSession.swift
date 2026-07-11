@@ -58,6 +58,17 @@ public final class CoreDocumentSession: DocumentSession, @unchecked Sendable {
     /// own `maxBytes` as the core's `buf_len`, so a smaller cap still
     /// truncates correctly even with a larger buffer sitting behind it)
     /// turns that into a one-time allocation per session.
+    ///
+    /// ROUND-4/5 UAF FIX: this lock ALSO now serializes every core call an
+    /// orphaned copy task can make — `copyCell`, and (round 5) `startJump`/
+    /// `jumpStatus` (the `advanceFrontier` pre-pass BEFORE the fetch loop) —
+    /// against `close()`'s {set `isClosed`; call `ls_close`}; see each
+    /// method's doc comment. `close()` takes this lock too (never the window
+    /// lane's `lock` alone), so an orphaned copy build (uncancellable
+    /// mid-loop) can no longer race a concurrent or prior `close()` onto a
+    /// freed `doc` through ANY of its three core calls. Window ops
+    /// (`setWindow`/`sourceRow`, guarded only by `lock`) are untouched by
+    /// this, so copy still runs fully concurrent with scrolling (AC4).
     private let copyBufferLock = NSLock()
     private var copyBuffer: [UInt8] = []
 
@@ -171,7 +182,16 @@ public final class CoreDocumentSession: DocumentSession, @unchecked Sendable {
         return RowWindow(firstRow: range.first_row, firstColumn: columns.lowerBound, rows: rows, truncated: truncated, oversized: oversized)
     }
 
+    /// RACE GUARD (round 5: closes the residual UAF round 4 left — the copy
+    /// task's `advanceFrontier` pre-pass calls THIS before ever reaching
+    /// `copyCell`). SAME `copyBufferLock` / reasoning as `copyCell`/`close()`
+    /// below: mutually exclusive with `close()`'s {set isClosed; ls_close},
+    /// so an orphaned copy waiting in `advanceFrontier` can no longer touch a
+    /// freed `doc` here either. A no-op once closed (nothing left to start).
     public func startJump(to targetRow: UInt64) {
+        copyBufferLock.lock()
+        defer { copyBufferLock.unlock() }
+        guard !isClosed else { return }
         ls_jump_start(doc, targetRow)
     }
 
@@ -179,7 +199,14 @@ public final class CoreDocumentSession: DocumentSession, @unchecked Sendable {
         ls_jump_cancel(doc)
     }
 
+    /// RACE GUARD (round 5), same lock/reasoning as `startJump` above: once
+    /// closed, reports `.done` — `advanceFrontier`'s `if case .done = ...
+    /// { return }` treats that as settled and stops polling promptly, rather
+    /// than looping (or touching a freed `doc` again) after a close.
     public func jumpStatus() -> JumpStatus {
+        copyBufferLock.lock()
+        defer { copyBufferLock.unlock() }
+        guard !isClosed else { return .done(landedRow: 0) }
         let s = ls_jump_poll(doc)
         switch s.state.rawValue {
         case ls_jump_state.RawValue(LS_JUMP_SCANNING.rawValue):
@@ -366,6 +393,19 @@ public final class CoreDocumentSession: DocumentSession, @unchecked Sendable {
         let capacity = max(maxBytes, 0)
         copyBufferLock.lock()
         defer { copyBufferLock.unlock() }
+        // RACE GUARD (round-4: fixes a confirmed use-after-free). `close()`
+        // takes this SAME lock around `isClosed = true; ls_close(doc)`, so
+        // this check and the `ls_cell_copy` call below can never interleave
+        // with a concurrent/prior close — an orphaned copy build (its
+        // synchronous loop has no cancellation checkpoint of its own; see
+        // `cancelCopy`'s doc in ViewerModel) can no longer touch a freed
+        // `doc`, satisfying the ABI rule "ls_cell_copy ... NOT concurrently
+        // with ls_open/ls_close". Deliberately NOT the window-lane `lock`:
+        // that would serialize copy against setWindow/sourceRow too, which
+        // would regress AC4 (copy runs concurrently with scrolling).
+        guard !isClosed else {
+            return CopiedCell(status: .noCell, text: "", truncated: false)
+        }
         // Grow-only reuse (see the property doc): a call with a SMALLER cap
         // than the buffer's current size must still pass ITS OWN `capacity`
         // as `buf_len` below (never the buffer's larger true size), so a
@@ -392,6 +432,13 @@ public final class CoreDocumentSession: DocumentSession, @unchecked Sendable {
     public func close() {
         lock.lock()
         defer { lock.unlock() }
+        // ROUND-4 UAF FIX: also take `copyBufferLock` — the SAME lock
+        // `copyCell` holds across its own {check isClosed; call
+        // ls_cell_copy} — so setting `isClosed` and calling `ls_close` here
+        // can never interleave with that. No other method takes both locks,
+        // so this fixed acquisition order can't deadlock.
+        copyBufferLock.lock()
+        defer { copyBufferLock.unlock() }
         guard !isClosed else { return }
         isClosed = true
         ls_close(doc)

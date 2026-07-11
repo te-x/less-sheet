@@ -129,6 +129,11 @@ struct CopyNoticeView: View {
 
     var body: some View {
         HStack(spacing: 8) {
+            // ARCH-stream-copy AC8: the SAME delayed-progress affordance
+            // every long op in this app drives, gated by `model.copyProgress`
+            // — a no-op once the copy is done/cancelled, or before it has
+            // run past the shared ~500 ms threshold.
+            DelayedProgressSpinner(indication: model.copyProgress)
             Text(text)
                 .font(.caption)
                 .foregroundStyle(.primary)
@@ -245,15 +250,30 @@ struct JumpControlView: View {
     private var popup: some View {
         Group {
             if case let .scanning(_, _, progress) = model.jumpFlow {
-                scanning(progress: progress)
+                // ARCH-stream-copy AC9 ("just wiring"): the scanning
+                // progress bar + Cancel only SURFACE once the shared gate
+                // says so (past ~500 ms) — a scan that lands sooner never
+                // flickers it. Esc still cancels the REAL scan either way
+                // (`field(onExit:)` below), so gating the VISUAL never
+                // weakens cancellability.
+                if model.jumpProgressIndication.isVisible {
+                    scanning(progress: progress)
+                } else {
+                    field(onExit: { model.cancelJump() })
+                }
             } else {
-                field
+                field(onExit: { model.dismissPopups() })
             }
         }
         .glassChrome(.regular, in: Capsule())
     }
 
-    private var field: some View {
+    /// The row/hint field. `onExit` differs by context (ARCH-stream-copy
+    /// AC9): plain Esc dismisses the popup when idle, but while a
+    /// sub-threshold scan is quietly running underneath (see `popup` above)
+    /// Esc must still CANCEL that real scan, not merely hide UI that was
+    /// never shown.
+    private func field(onExit: @escaping () -> Void) -> some View {
         HStack(spacing: 8) {
             Group {
                 if dumpChrome {
@@ -283,7 +303,7 @@ struct JumpControlView: View {
         .padding(.vertical, 8)
         // Red blink on rejection (item 4): a red ring over the capsule.
         .overlay { if rejected { Capsule().strokeBorder(Color.red, lineWidth: 2) } }
-        .onExitCommand { model.dismissPopups() }      // Esc closes the field
+        .onExitCommand(perform: onExit)               // Esc: dismiss (idle) or cancel (scanning)
         .accessibilityLabel("Jump to row, \(RowCountText.summary(model.jumpRowCountInfo))")
         .accessibilityValue(rejected ? "No such row. Enter a row from 1 to \(model.jumpRowCountInfo.count)." : "")
     }

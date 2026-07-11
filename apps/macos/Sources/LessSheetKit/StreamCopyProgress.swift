@@ -35,8 +35,15 @@ public struct DelayedProgressGate: DelayedProgressGating {
     }
 
     public func indication(for state: OperationState) -> ProgressIndication {
-        // SEED: never surfaces — RED for every "appears / surfaces" assertion.
-        _ = state
-        return .hidden
+        switch state {
+        case .settled:
+            // Rule 3: gone on completion or cancel, regardless of run time.
+            return .hidden
+        case let .running(elapsed, cancellable):
+            // Rule 2: visible iff elapsed >= threshold; rule 4: cancel only
+            // when visible AND the op is cancellable; rule 5: no fraction.
+            guard elapsed >= threshold else { return .hidden }
+            return ProgressIndication(isVisible: true, offersCancel: cancellable)
+        }
     }
 }

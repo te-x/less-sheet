@@ -285,6 +285,81 @@ pub fn rowOversized(d: *const Document, row: u64) bool {
     return d.win_oversized.items[idx];
 }
 
+/// ARCH-stream-copy FR3: a forward gap beyond this many rows is "implausibly
+/// large vs a checkpoint seek": a FRESH checkpoint lookup is bounded to ~one
+/// checkpoint interval, so beyond this gap re-anchoring there is guaranteed
+/// at least as cheap as stepping the cursor forward row-by-row — re-anchor
+/// instead (never slower than today, for any access pattern). Reuses the
+/// existing checkpoint spacing constant verbatim; NOT a new runtime tunable
+/// (the planner rejected a per-document interval knob — see the hand-off).
+const copy_reanchor_gap_max: u64 = base.checkpoint_interval;
+
+/// ARCH-stream-copy FR1/FR3 (identity): the intended monotonic access
+/// pattern (TSVCopyBuilder: row-major, so consecutive `cellCopy` calls have
+/// `row - copy_cursor_row` == 0 -- another column of the same row -- or 1 --
+/// the next row) is trusted to use the cursor UNCONDITIONALLY, without
+/// comparing it to a fresh checkpoint: a checkpoint can beat it by at most
+/// the single row it would otherwise step, so this keeps the well-known
+/// exact "N-1 advances for an N-row row-major sweep" cost (sc3) — no "free"
+/// checkpoint-aligned shortcuts. A LARGER gap is never produced by that
+/// pattern, so it is NOT trusted blindly (Claude review finding A) — see
+/// `cellCopy`, which compares it against a fresh `bestCheckpoint(row)` and
+/// uses whichever starts closer, for a PROVABLE never-slower-than-today
+/// guarantee on any gap, not just a small one.
+const copy_cursor_trust_gap_max: u64 = 1;
+
+/// TODAY'S locate-from-scratch skip: from (`from_row`,`from_pos`) — a
+/// checkpoint obtained fresh for the FINAL target `row` — up to `row`,
+/// counting one source-row-advance per step into `d.copy_advances` (via
+/// `advances`). Used both as the cursor-OFF reference/baseline (AC1/AC3/AC5)
+/// and as the cursor's own re-anchor fallback (FR3): SAFE by construction —
+/// an unbounded `boundsAfter` here never actually crosses an oversized row's
+/// bytes, because a FRESH `nav.bestCheckpoint(row)` never has an oversized
+/// row strictly between `from_row` and `row` (its maximality guarantees any
+/// oversized row in range would itself have produced a closer/bigger
+/// checkpoint) — identical reasoning to windowSet's own skip loop.
+fn skipFromCheckpoint(d: *Document, from_row: u64, from_pos: Pos, row: u64, advances: *u64) Pos {
+    var pos = from_pos;
+    var r = from_row;
+    while (r < row) : (r += 1) {
+        pos = d.reader.boundsAfter(d.source, pos, null).next;
+        advances.* += 1;
+    }
+    return pos;
+}
+
+/// ARCH-stream-copy FR1: resume the identity copy cursor forward from
+/// (`from_row`,`from_pos`) up to `row`, counting one source-row-advance per
+/// step. Unlike `skipFromCheckpoint`, `from_row` is a STALE position (not
+/// freshly anchored against `row`), so it may itself sit on an oversized row:
+/// each step is bounded to the per-row window-scan cap and, when capped
+/// (oversized), skips forward via the checkpoint the frontier already
+/// dropped immediately after it (ARCH-huge-row-budget decision 2) instead of
+/// re-scanning its remaining bytes — never crossing an oversized row's
+/// bytes, exactly like windowSet's own oversized recovery. `row == from_row`
+/// runs zero iterations: the "another column of the same row" case costs
+/// zero advances.
+fn advanceCursorForward(d: *Document, from_row: u64, from_pos: Pos, row: u64, advances: *u64) Pos {
+    var pos = from_pos;
+    var r = from_row;
+    while (r < row) {
+        const row_limit = d.reader.posAtByteBudget(d.source, pos, api.window_row_scan_max_bytes);
+        const b = d.reader.boundsAfter(d.source, pos, row_limit);
+        advances.* += 1;
+        if (!b.capped) {
+            pos = b.next;
+            r += 1;
+            continue;
+        }
+        d.lock();
+        const skip_cp = nav.bestCheckpoint(d, r + 1);
+        d.unlock();
+        pos = skip_cp.pos;
+        r = skip_cp.row;
+    }
+    return pos;
+}
+
 /// See api/lesssheet.h `ls_cell_copy`: the bounded, window-INDEPENDENT,
 /// LOSSLESS full-cell read. Poll/control lane: never touches or evicts the
 /// materialized window (win_buf/win_refs/win_first/win_rows are untouched
@@ -300,18 +375,23 @@ pub fn rowOversized(d: *const Document, row: u64) bool {
 ///   * Located WITHOUT scanning: the pinned bounded record-1 row 0
 ///     (`record1_capped && !has_header`, identity view only — see
 ///     `windowSet`'s identical special case) sits at position `data_start`
-///     directly, bypassing the frontier (which never claims a row whose
-///     extent past the O(head) budget is unknown — that row is
+///     directly, bypassing the frontier AND the cursor (which never claims a
+///     row whose extent past the O(head) budget is unknown — that row is
 ///     pathologically "oversized" from its very first byte, so
 ///     `decodeCellAt` below naturally bounds it exactly like any other
 ///     oversized row). A filtered view defers entirely to
-///     `cellCopyFiltered` (FILTERED coordinates, `nav.nthMatchLocation` —
-///     the same machinery `windowSetFiltered` uses). Otherwise a `row`
-///     behind the frontier is found via `nav.bestCheckpoint` (by value,
-///     under `d.lock()`) plus the SAME checkpoint-to-row skip loop
-///     `windowSet` uses — never crosses an oversized row's bytes, for the
-///     same reason: `row < avail_end` guarantees any oversized row before it
-///     was already scanned, so `bestCheckpoint` already lands past it. A
+///     `cellCopyFiltered`. Otherwise (ARCH-stream-copy): when the forward
+///     COPY CURSOR (`d.copy_cursor_*` on `Document`) is enabled, tagged for
+///     THIS view + filter generation, and `row` is at/ahead of it by a
+///     plausible gap, `advanceCursorForward` resumes from the cursor's last
+///     position — zero checkpoint lookups, zero advances for another column
+///     of the same row. Otherwise `nav.bestCheckpoint` (by value, under
+///     `d.lock()`) plus `skipFromCheckpoint` locate `row` exactly like
+///     today — never crosses an oversized row's bytes, for the same reason:
+///     `row < avail_end` guarantees any oversized row before it was already
+///     scanned, so `bestCheckpoint` already lands past it. This is both the
+///     cursor-OFF REFERENCE (AC1) and the cursor's own re-anchor fallback
+///     (FR3) — byte-identical either way, only the locate cost differs. A
 ///     `row` at/beyond the frontier (and not pinned) is PENDING: its
 ///     position isn't known yet.
 ///   * `decodeCellAt` (below) then decodes ONLY column `col` from that
@@ -333,7 +413,7 @@ pub fn cellCopy(d: *Document, row: u64, col: u32, buf: ?[*]u8, buf_len: usize, o
     // branch): row 0's true extent runs past the O(head) budget, and
     // therefore past the (far smaller) window scan cap too, so it is served
     // exactly like any other oversized row, from `data_start`, bypassing the
-    // frontier entirely.
+    // frontier AND the cursor entirely.
     if (row == 0 and d.record1_capped and !d.has_header and d.row0_pinned_refs.len > 0) {
         return decodeCellAt(d, d.data_start, col, buf, buf_len, out_len, out_truncated);
     }
@@ -345,37 +425,193 @@ pub fn cellCopy(d: *Document, row: u64, col: u32, buf: ?[*]u8, buf_len: usize, o
         d.unlock();
         return if (exact) .no_cell else .pending;
     }
-    const cp = nav.bestCheckpoint(d, row);
+
+    // ARCH-stream-copy FR1/FR3 (see copy_cursor_trust_gap_max's comment): the
+    // cursor applies when it's enabled, tagged for THIS view + filter
+    // generation, and forward of `row`. Within the intended monotonic gap
+    // (<=1) it is trusted unconditionally (no checkpoint lookup at all,
+    // preserving the exact row-major N-1 cost). Beyond that, a fresh
+    // `bestCheckpoint(row)` is compared: the cursor is used only if it
+    // starts at/after the checkpoint (`copy_cursor_row >= cp.row`), so
+    // `row - copy_cursor_row <= row - cp.row` — provably never costlier than
+    // today's from-scratch locate, for ANY forward gap (Claude review finding
+    // A: e.g. a cursor at row 100 asked for row 2048, where the checkpoint
+    // alone reaches row 2048 in zero steps).
+    const cursor_forward = d.copy_cursor_enabled and d.copy_cursor_valid and
+        d.copy_cursor_view == .identity and d.copy_cursor_gen == d.filter_gen and
+        row >= d.copy_cursor_row;
+    var use_cursor = cursor_forward and (row - d.copy_cursor_row) <= copy_cursor_trust_gap_max;
+    var from_row: u64 = undefined;
+    var from_pos: Pos = undefined;
+    if (use_cursor) {
+        from_row = d.copy_cursor_row;
+        from_pos = d.copy_cursor_pos;
+    } else {
+        const cp = nav.bestCheckpoint(d, row);
+        if (cursor_forward and d.copy_cursor_row >= cp.row) {
+            use_cursor = true;
+            from_row = d.copy_cursor_row;
+            from_pos = d.copy_cursor_pos;
+        } else {
+            from_row = cp.row;
+            from_pos = cp.pos;
+        }
+    }
     d.unlock();
 
-    // Skip from the checkpoint to `row` — identical to windowSet's skip loop,
-    // and safe for the same reason (see windowSet's comment on its own loop).
-    var pos = cp.pos;
-    var r = cp.row;
-    while (r < row) : (r += 1) {
-        pos = d.reader.boundsAfter(d.source, pos, null).next;
+    var advances: u64 = 0;
+    const pos = if (use_cursor)
+        advanceCursorForward(d, from_row, from_pos, row, &advances)
+    else
+        skipFromCheckpoint(d, from_row, from_pos, row, &advances);
+
+    d.lock();
+    d.copy_advances += advances;
+    if (d.copy_cursor_enabled) {
+        // Thread-safety (see base.Document's cursor field comment): the lock
+        // was dropped across the walk above, so if we EXTENDED an existing
+        // cursor (`use_cursor`), a concurrent identity copy could have
+        // already committed a further-along one in the meantime -- guard
+        // against regressing it (only relevant when `use_cursor`, since
+        // that's the only path that trusted/extended a value read before
+        // the drop). A fresh RE-ANCHOR (`!use_cursor`: cold start, backward,
+        // cross-view/generation, or an implausible gap) is never "extending"
+        // anything, so it always commits unconditionally -- including over a
+        // stale value left by a wholly separate, already-finished sweep
+        // (e.g. a brand-new sweep restarting at row 0 after a previous one
+        // ended at the last row). Either way this never changes the bytes
+        // THIS call returns (`pos` above is already fixed) -- only whether a
+        // LATER call gets to reuse it.
+        const stale = use_cursor and d.copy_cursor_valid and d.copy_cursor_view == .identity and
+            d.copy_cursor_gen == d.filter_gen and d.copy_cursor_row > row;
+        if (!stale) {
+            d.copy_cursor_valid = true;
+            d.copy_cursor_view = .identity;
+            d.copy_cursor_gen = d.filter_gen;
+            d.copy_cursor_row = row;
+            d.copy_cursor_pos = pos;
+        }
     }
+    d.unlock();
+
     return decodeCellAt(d, pos, col, buf, buf_len, out_len, out_truncated);
 }
 
 /// `ls_cell_copy` while a filter is active (FILTERED VIEWS): locate FILTERED
-/// index `row`'s ORIGINAL row/position via `nav.nthMatchLocation` — O(checkpoints)
-/// + a bounded in-block re-lex, the same machinery `windowSetFiltered` uses —
-/// then decode column `col` from there exactly like the identity path. Holds
-/// the mutex for the whole call (bounded: O(checkpoints) + one scan-capped
-/// row decode), mirroring `windowSetFiltered`.
+/// index `row`'s ORIGINAL row/position then decode column `col` from there,
+/// exactly like the identity path. ARCH-stream-copy FR2/FR3: when the
+/// forward copy cursor is enabled, tagged `.filtered` for the ACTIVE filter
+/// generation, `row` sits at/ahead of it by a plausible gap, AND a plain
+/// `filter_block_counts` lookup (O(1), no re-lex) proves the target still
+/// falls within the cursor's OWN block, `nav.nthMatchForwardFrom` resumes the
+/// match-walk from the cursor's last match — provably no costlier than a
+/// fresh locate for the same row (it starts further along, inside the SAME
+/// block a cold locate would relex from its start), so this is NEVER a
+/// forward-attempt-plus-cold-locate double pay, for ANY match distribution
+/// (Claude review finding 2: a clustered/sparse filter must not cost more
+/// than the baseline). Zero advances for another column of the same filtered
+/// row. Otherwise (no usable cursor, OR the target spills past the cursor's
+/// block — decided WITHOUT ever starting a doomed row-walk)
+/// `nav.nthMatchLocationCounted` — O(checkpoints) + a bounded in-block
+/// re-lex, the same machinery `windowSetFiltered` uses — is both the
+/// cursor-OFF reference (AC2) and the re-anchor fallback (FR3). Holds the
+/// mutex for the whole call (bounded either way), mirroring
+/// `windowSetFiltered`.
 fn cellCopyFiltered(d: *Document, row: u64, col: u32, buf: ?[*]u8, buf_len: usize, out_len: *usize, out_truncated: *bool) api.CopyResult {
     d.lock();
     defer d.unlock();
     if (row >= d.filter_total) return if (d.filter_state == .done) .no_cell else .pending;
     const fctx = filter.filterCtx(d);
-    const loc = nav.nthMatchLocation(d, d.filter_block_counts.items, fctx, d.filter_rows, row) orelse {
-        // Defensive only: `row < filter_total` guarantees the counted region
-        // has this many matches already, so this should be unreachable; if
-        // it ever triggers, retrying would not change the outcome.
-        return .no_cell;
-    };
-    return decodeCellAt(d, loc.pos, col, buf, buf_len, out_len, out_truncated);
+
+    const use_cursor = d.copy_cursor_enabled and d.copy_cursor_valid and
+        d.copy_cursor_view == .filtered and d.copy_cursor_gen == d.filter_gen and
+        row >= d.copy_cursor_row and (row - d.copy_cursor_row) <= copy_reanchor_gap_max;
+
+    var advances: u64 = 0;
+    var pos: Pos = undefined;
+    var source_row: u64 = undefined;
+    var block_consumed: u64 = undefined;
+    var resolved = false;
+
+    if (use_cursor and row == d.copy_cursor_row) {
+        // Another column of the same filtered row: zero advances.
+        pos = d.copy_cursor_pos;
+        source_row = d.copy_cursor_source_row;
+        block_consumed = d.copy_cursor_block_consumed;
+        resolved = true;
+    } else if (use_cursor) {
+        // Cheap (O(1), no re-lex) proof that the forward walk cannot run
+        // past the end of `copy_cursor_source_row`'s own block: only then is
+        // it guaranteed no costlier than a fresh locate (see
+        // nthMatchForwardFrom's doc comment). If the remaining match count in
+        // this block can't cover `gap`, the row-walk is skipped ENTIRELY —
+        // any partial attempt here would be pure waste.
+        const gap = row - d.copy_cursor_row;
+        const from_block = d.copy_cursor_source_row / base.checkpoint_interval;
+        const block_total = if (from_block < d.filter_block_counts.items.len) d.filter_block_counts.items[@intCast(from_block)] else 0;
+        const remaining = block_total -| d.copy_cursor_block_consumed;
+        if (gap <= remaining) {
+            const block_hi = @min(d.filter_rows, (from_block + 1) * base.checkpoint_interval);
+            if (nav.nthMatchForwardFrom(d, fctx, block_hi, d.copy_cursor_source_row, d.copy_cursor_pos, gap, &advances)) |loc| {
+                pos = loc.pos;
+                source_row = loc.row;
+                block_consumed = d.copy_cursor_block_consumed + gap;
+                resolved = true;
+            }
+            // else: the block-count proof said this should have been found;
+            // treat as defensive-unreachable and fall through to the cold
+            // locate below (never a wrong NO_CELL).
+        } else {
+            // Target spills past the cursor's block: RESUME the cross-block
+            // cumulative scan from `from_block` (Claude review finding B)
+            // instead of re-walking `filter_block_counts` from block 0 --
+            // otherwise a monotonic sparse-filter sweep (~1 match/block) pays
+            // O(blocks) EVERY step it crosses a block, O(blocks x matches)
+            // total. `cum_before` (matches counted in blocks [0, from_block))
+            // is derived in O(1) from already-known cursor state: the
+            // cursor's 1-based total position (`copy_cursor_row + 1`) minus
+            // its 1-based position WITHIN its own block
+            // (`copy_cursor_block_consumed`).
+            const cum_before = (d.copy_cursor_row + 1) -| d.copy_cursor_block_consumed;
+            if (nav.nthMatchLocationCounted(d, d.filter_block_counts.items, fctx, d.filter_rows, row, from_block, cum_before, &advances)) |loc| {
+                pos = loc.pos;
+                source_row = loc.row;
+                block_consumed = loc.block_consumed;
+                resolved = true;
+            }
+            // else: defensive-unreachable (see below) -- falls through to
+            // the true cold locate from block 0.
+        }
+    }
+
+    if (!resolved) {
+        const loc = nav.nthMatchLocationCounted(d, d.filter_block_counts.items, fctx, d.filter_rows, row, 0, 0, &advances) orelse {
+            // Defensive only: `row < filter_total` guarantees the counted
+            // region has this many matches already, so this should be
+            // unreachable; if it ever triggers, retrying would not change
+            // the outcome.
+            return .no_cell;
+        };
+        pos = loc.pos;
+        source_row = loc.row;
+        block_consumed = loc.block_consumed;
+    }
+
+    d.copy_advances += advances;
+    if (d.copy_cursor_enabled) {
+        // No forward-only guard needed here (contrast cellCopy): this whole
+        // function holds the lock throughout, so concurrent filtered copies
+        // are already fully serialized — never an interleaved stale commit.
+        d.copy_cursor_valid = true;
+        d.copy_cursor_view = .filtered;
+        d.copy_cursor_gen = d.filter_gen;
+        d.copy_cursor_row = row;
+        d.copy_cursor_pos = pos;
+        d.copy_cursor_source_row = source_row;
+        d.copy_cursor_block_consumed = block_consumed;
+    }
+
+    return decodeCellAt(d, pos, col, buf, buf_len, out_len, out_truncated);
 }
 
 /// Decode column `col` of the row starting at position `pos`, bounded to

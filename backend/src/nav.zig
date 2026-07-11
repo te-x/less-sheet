@@ -200,7 +200,7 @@ pub fn oversizedMatch(list: []const OversizedMatch, row: u64) ?bool {
 /// checkpoint the frontier drops immediately after it (ARCH-huge-row-budget
 /// decision 2) rather than by re-scanning its remaining bytes. Caller holds
 /// the mutex.
-fn nthMatchInBlock(doc: *Document, ctx: MatchCtx, b: u64, hi_bound: u64, need: u64) ?SourceLoc {
+fn nthMatchInBlock(doc: *Document, ctx: MatchCtx, b: u64, hi_bound: u64, need: u64, advances: ?*u64) ?SourceLoc {
     if (b >= doc.checkpoints.items.len) return null;
     const cp = doc.checkpoints.items[@intCast(b)];
     const block_hi = @min((b + 1) * checkpoint_interval, hi_bound);
@@ -213,6 +213,11 @@ fn nthMatchInBlock(doc: *Document, ctx: MatchCtx, b: u64, hi_bound: u64, need: u
         doc.nav_scratch.clearRetainingCapacity();
         doc.nav_refs.clearRetainingCapacity();
         const res = doc.reader.materialize(doc.source, pos, doc.column_count, null, row_limit, &doc.nav_scratch, &doc.nav_refs, doc.gpa) catch return null;
+        // ARCH-stream-copy: count this ROW TESTED (copy path's source-row-
+        // advance count) when the caller wants it (window.cellCopyFiltered's
+        // cold-locate, via nthMatchLocationCounted below); every other caller
+        // (nthMatchLocation, unchanged) passes null and pays nothing extra.
+        if (advances) |a| a.* += 1;
         if (res.capped) {
             // OVERSIZED: the match is decided from the filter-scan's already-
             // recorded FULL-cell result, never re-tested on this bounded
@@ -250,8 +255,133 @@ pub fn nthMatchLocation(doc: *Document, block_counts: []const u64, ctx: MatchCtx
     var b: u64 = 0;
     while (b < block_counts.len) : (b += 1) {
         const cnt = block_counts[b];
-        if (cum + cnt > idx) return nthMatchInBlock(doc, ctx, b, hi_bound, idx - cum);
+        if (cum + cnt > idx) return nthMatchInBlock(doc, ctx, b, hi_bound, idx - cum, null);
         cum += cnt;
+    }
+    return null;
+}
+
+/// ARCH-stream-copy: `nthMatchLocation`'s result, plus enough per-block
+/// bookkeeping (`block`, `block_consumed`) for window.cellCopyFiltered to
+/// decide — in O(1), no re-lex — whether a LATER forward-resume request can
+/// stay within the SAME block (see `nthMatchForwardFrom`'s doc comment).
+pub const FilteredCopyLoc = struct { row: u64, pos: Pos, block: u64, block_consumed: u64 };
+
+/// ARCH-stream-copy: identical to `nthMatchLocation` above, but also reports
+/// the number of rows TESTED reaching the match via `advances` (the copy
+/// path's source-row-advance count, see base.Document.copy_advances) and,
+/// via the returned `FilteredCopyLoc`, which BLOCK the match falls in and how
+/// many matches (1-based, counted from that block's own start) it consumes —
+/// used only by window.cellCopyFiltered's cold-locate / re-anchor path
+/// (cursor disabled, a backwards/cross-view/implausible-gap re-anchor, or a
+/// forward-resume whose target spills past the cursor's own block); every
+/// other caller (window.windowSetFiltered, search.zig's filtered nav) keeps
+/// calling the plain, uninstrumented `nthMatchLocation` above, at identical
+/// cost.
+///
+/// `start_block`/`start_cum` let the block-summation loop RESUME from a
+/// later block instead of always re-walking `block_counts` from block 0
+/// (Claude review finding B): a true cold locate passes `(0, 0)`; a
+/// forward-resume whose target spilled past the cursor's own block passes
+/// `(cursor's block, matches counted in blocks [0, that block))` — both
+/// already known to the caller in O(1) from `FilteredCopyLoc`/
+/// `copy_cursor_block_consumed`, no re-derivation. This is what keeps a
+/// monotonic forward filtered sweep at O(1) amortized block-counter work per
+/// step (O(blocks) total across the WHOLE sweep) instead of O(blocks) EVERY
+/// step it crosses into a new block (O(blocks x matches) for a sparse
+/// filter). Caller holds the mutex.
+pub fn nthMatchLocationCounted(doc: *Document, block_counts: []const u64, ctx: MatchCtx, hi_bound: u64, idx: u64, start_block: u64, start_cum: u64, advances: *u64) ?FilteredCopyLoc {
+    var cum: u64 = start_cum;
+    var b: u64 = start_block;
+    while (b < block_counts.len) : (b += 1) {
+        const cnt = block_counts[b];
+        if (cum + cnt > idx) {
+            const need = idx - cum; // 0-based position of `idx` WITHIN block `b`
+            const loc = nthMatchInBlock(doc, ctx, b, hi_bound, need, advances) orelse return null;
+            return .{ .row = loc.row, .pos = loc.pos, .block = b, .block_consumed = need + 1 };
+        }
+        cum += cnt;
+    }
+    return null;
+}
+
+/// ARCH-stream-copy FR2/FR3: resume the filtered match-walk FORWARD from a
+/// previously-served match at SOURCE coordinates (`from_row`,`from_pos`, both
+/// already known to satisfy `ctx`) to the `skip`-th (1-based) STRICTLY LATER
+/// match — `skip == 1` finds the very next match after `from_row`. Tests
+/// candidate rows one at a time from there (never re-touching `block_counts`/
+/// the block checkpoints), counting one source-row-advance per row it steps
+/// past or tests into `advances.*`. Mirrors window.windowSetFiltered's own
+/// forward walk, including the ARCH-huge-row-filtered oversized-candidate
+/// handling: an oversized candidate's match comes from
+/// `doc.filter_oversized_matches` (never a re-lex to its true end), and
+/// advancing past ANY oversized row (including `from_row` itself, if the
+/// last served match landed on one) uses the checkpoint the frontier drops
+/// immediately after it (ARCH-huge-row-budget decision 2) rather than
+/// re-scanning its remaining bytes — so a stale cursor sitting on a huge row
+/// is always safe to resume from.
+///
+/// PRECONDITION (never verified here — see window.cellCopyFiltered): the
+/// caller has ALREADY confirmed, via a plain `block_counts[from_row's block]`
+/// lookup (no re-lex), that the `skip`-th match lies at/before `hi_bound` —
+/// concretely, `hi_bound` is set to `from_row`'s own block's end, and the
+/// caller checked `skip` does not exceed that block's remaining match count.
+/// This is what makes the walk providably NO MORE EXPENSIVE than a fresh
+/// block-indexed locate for the same target: it starts from `from_row`
+/// (already inside the block, at/after the block's own checkpoint) rather
+/// than the block's checkpoint itself, so it tests a SUFFIX of the rows a
+/// cold `nthMatchLocationCounted` would — never a superset, so never slower
+/// (FR3). Unlike a cold locate (which can skip whole EMPTY blocks for free
+/// via `block_counts`), this walk has no such shortcut, so callers must NOT
+/// use it to search across an unknown/unbounded number of blocks — that is
+/// precisely the "forward + cold" double-pay the FR3 review flagged; the
+/// per-block precondition above is what rules it out. Returns null only if
+/// the precondition was somehow violated (defensive — should be
+/// unreachable); the caller falls back to `nthMatchLocationCounted`. Caller
+/// holds the mutex; `skip` must be >= 1.
+pub fn nthMatchForwardFrom(doc: *Document, ctx: MatchCtx, hi_bound: u64, from_row: u64, from_pos: Pos, skip: u64, advances: *u64) ?SourceLoc {
+    var pos = from_pos;
+    var row = from_row;
+    // Step off the known match at `from_row` (excluded — only STRICTLY later
+    // matches count), safely skipping an oversized row's remaining bytes.
+    {
+        const row_limit = doc.reader.posAtByteBudget(doc.source, pos, api.window_row_scan_max_bytes);
+        const b = doc.reader.boundsAfter(doc.source, pos, row_limit);
+        advances.* += 1;
+        if (!b.capped) {
+            pos = b.next;
+            row += 1;
+        } else {
+            const skip_cp = bestCheckpoint(doc, row + 1);
+            pos = skip_cp.pos;
+            row = skip_cp.row;
+        }
+    }
+    var seen: u64 = 0;
+    while (row < hi_bound and !doc.reader.atEnd(doc.source, pos)) {
+        const row_pos = pos;
+        const row_limit = doc.reader.posAtByteBudget(doc.source, pos, api.window_row_scan_max_bytes);
+        doc.nav_scratch.clearRetainingCapacity();
+        doc.nav_refs.clearRetainingCapacity();
+        const res = doc.reader.materialize(doc.source, pos, doc.column_count, null, row_limit, &doc.nav_scratch, &doc.nav_refs, doc.gpa) catch return null;
+        advances.* += 1;
+        if (res.capped) {
+            const matched = oversizedMatch(doc.filter_oversized_matches.items, row) orelse false;
+            if (matched) {
+                seen += 1;
+                if (seen == skip) return .{ .row = row, .pos = row_pos };
+            }
+            const skip_cp = bestCheckpoint(doc, row + 1);
+            pos = skip_cp.pos;
+            row = skip_cp.row;
+            continue;
+        }
+        if (matcher.matchRecord(ctx, doc.nav_scratch.items, doc.nav_refs.items) != null) {
+            seen += 1;
+            if (seen == skip) return .{ .row = row, .pos = row_pos };
+        }
+        pos = res.next;
+        row += 1;
     }
     return null;
 }

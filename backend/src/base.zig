@@ -96,6 +96,12 @@ pub const Decimal = struct {
 
 // --- The document -----------------------------------------------------------
 
+/// View discriminant for the copy cursor (ARCH-stream-copy FR4): identity
+/// (window.cellCopy) and filtered (window.cellCopyFiltered) occupy disjoint
+/// coordinate spaces, so a switch between them must never reuse the other
+/// view's cursor state.
+pub const CopyView = enum { identity, filtered };
+
 pub const Document = struct {
     gpa: std.mem.Allocator,
 
@@ -317,8 +323,60 @@ pub const Document = struct {
     //     Reset/read by the test seam; pure instrumentation, irrelevant to the
     //     copied bytes. SEED: never incremented (== 0) — see root.zig's seam
     //     comment for why that makes the AC3/AC4/AC5 counts RED until built.
+    //     TEST-ONLY and measured single-threaded (a sweep resets it, then
+    //     reads it back once the sweep is done) — the plain, un-guarded `+=`
+    //     below is fine as a simple additive aggregate; no reader ever
+    //     depends on it being linearizable across concurrent copies.
     copy_cursor_enabled: bool = true,
     copy_advances: u64 = 0,
+
+    // The REAL cursor state (FR1/FR2/FR4), all DEFAULTED so a freshly opened
+    // Document (openWithAllocator's literal, unedited) starts with an invalid
+    // cursor -- "reset on open" (FR4) falls out for free. `copy_cursor_valid`
+    // gates every field below: false means "absent", so window.cellCopy /
+    // cellCopyFiltered always re-anchor (FR3). Tagged with the VIEW it was
+    // captured under (`copy_cursor_view`) and the `filter_gen` in effect at
+    // capture (`copy_cursor_gen`) -- together, FR4's "view identity + filter
+    // generation" tag: a view switch (tag mismatch) OR any filter set/clear
+    // (filter_gen always bumps -- filter.setFilter/clearFilter -- so even a
+    // same-view round-trip back to identity sees a stale gen) invalidates the
+    // cursor without an explicit reset call. Positions themselves are never
+    // invalidated (stable once scanned, per FR4) -- only the tag is compared.
+    // `copy_cursor_row` is the coordinate the cursor last served, in ITS OWN
+    // space (identity: physical row; filtered: filtered index);
+    // `copy_cursor_pos` the SOURCE position where that row/match begins (a
+    // repeat column read costs zero advances: window.zig's forward-advance
+    // loops are `while (r < row)`, 0 iterations when `row` is unchanged).
+    // `copy_cursor_source_row` is filtered-only: the ORIGINAL/source data-row
+    // number of `copy_cursor_row`'s match; `copy_cursor_block_consumed` (also
+    // filtered-only) is the 1-based count of matches from THAT row's own
+    // per-block-index block start up to and including it -- together they let
+    // window.cellCopyFiltered decide in O(1) (one filter_block_counts lookup,
+    // no re-lex) whether the next `gap` matches still fit in the SAME block
+    // (nav.nthMatchForwardFrom safely resumes, provably no costlier than a
+    // fresh block-indexed locate for that row) or spill into a later block
+    // (skip the row-walk entirely and go straight to the fresh locate) --
+    // never both (ARCH-stream-copy FR3 "never slower than today", for ANY
+    // match distribution, not just a dense/monotonic one).
+    //
+    // Thread-safety: every FIELD READ/WRITE above happens under `d.lock()`,
+    // but window.cellCopy drops the lock across its (potentially long) walk
+    // between reading the cursor and committing it, so it is NOT a strict
+    // read-lock-walk-write-unlock critical section -- two concurrent identity
+    // copies are not linearizable against each other. This is memory-safe
+    // (no field is ever touched outside the lock) and never changes a
+    // returned byte (the commit only affects how fast a LATER call locates
+    // its row) -- cellCopy's commit additionally guards against a slower
+    // caller's stale commit regressing an already-further-along cursor
+    // backwards. window.cellCopyFiltered holds the lock for its entire call
+    // (no drop), so it has no such race to begin with.
+    copy_cursor_valid: bool = false,
+    copy_cursor_view: CopyView = .identity,
+    copy_cursor_gen: u64 = 0,
+    copy_cursor_row: u64 = 0,
+    copy_cursor_pos: Pos = @enumFromInt(0),
+    copy_cursor_source_row: u64 = 0,
+    copy_cursor_block_consumed: u64 = 0,
 
     pub fn lock(self: *Document) void {
         _ = c.pthread_mutex_lock(&self.mutex);

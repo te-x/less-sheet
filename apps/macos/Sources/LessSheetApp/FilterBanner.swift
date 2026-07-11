@@ -15,7 +15,14 @@ struct FilterBannerView: View {
     var body: some View {
         if let banner = model.filterBanner {
             HStack(spacing: 8) {
-                if let progress = banner.progress {
+                // ARCH-stream-copy AC9 ("just wiring"): the scan-progress bar
+                // + % SURFACE only once the shared delayed-progress gate says
+                // so (past ~500 ms) — a filter that resolves sooner never
+                // flickers it. The "Filtered — N of M rows" text + Clear
+                // below stay unconditional: a persistent VIEW-MODE indicator,
+                // not a transient long-op affordance (no cancel — ARCH:
+                // "Filter's indicator need not offer cancel").
+                if let progress = banner.progress, model.filterProgressIndication.isVisible {
                     let fraction = max(0, min(1, progress))
                     if dumpChrome {
                         ZStack(alignment: .leading) {
