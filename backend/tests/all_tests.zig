@@ -3875,3 +3875,305 @@ test "abi: the select-copy symbol links through extern linkage; ls_copy_result v
     const res = c_linked_copy.ls_cell_copy(od.doc, 0, 9, &buf, buf.len, &len, &truncated);
     try std.testing.expectEqual(api.CopyResult.no_cell, res);
 }
+
+
+// ===========================================================================
+// stream-copy slice (ARCH-stream-copy) — the BACKEND COPY CURSOR. Frozen;
+// planner-owned. ls_cell_copy is accelerated by an internal, forward, view-
+// scoped COPY CURSOR behind the UNCHANGED ABI (api/lesssheet.h + the
+// ls_cell_copy signature stay byte-identical): a row-major sweep advances O(1)
+// per row instead of re-locating each cell from a sparse checkpoint. Maps:
+//   sc1 (AC1) identity output byte-identical to locate-from-scratch, across the
+//              representative rects (single / within-window / spanning >=2
+//              checkpoints / first+last / col past fields / ragged+embedded-
+//              empty / cell past the display cap / oversized row / bounded
+//              record-1 row 0).
+//   sc2 (AC2) filtered output byte-identical to the per-cell nthMatchLocation
+//              path (all-match spanning checkpoints + zero-match).
+//   sc3 (AC3) identity locate cost is O(rows), interval-INVARIANT; extra
+//              columns add ZERO advances.
+//   sc4 (AC4) filtered locate cost is O(filtered rows read), interval-invariant.
+//   sc5 (AC5) NEVER-SLOWER: backwards / re-anchor access stays correct and its
+//              advance count never exceeds the from-scratch baseline.
+//
+// THE SEAM (contracts/api.zig, Zig-only — NOT new ABI): copyCursorSetEnabled
+// toggles the cursor (OFF == today's locate-from-scratch: the byte-identical
+// REFERENCE for AC1/AC2 and the interval-costly BASELINE for AC3/AC5);
+// copyAdvances / copyAdvancesReset read/zero the count of SOURCE ROW-ADVANCES
+// the copy path takes.
+//
+// HOW AC3/AC4 PROVE INTERVAL-INVARIANCE WITHOUT A RUNTIME INTERVAL KNOB: a
+// per-document runtime checkpoint interval would force a runtime divisor into
+// the index/search/filter/nav hot loops (today `% 2048` / `/ 2048` fold to a
+// mask/shift on a comptime power-of-two) — a real perf regression for TEST-only
+// code, and blast radius far beyond the ARCH's window.zig+base.zig cursor. So
+// instead: the cursor sweep's advance count is EXACTLY N-1 (identity) / linear
+// in M (filtered) — a value carrying NO checkpoint-interval term, hence
+// UNCHANGED whatever the interval (halved or otherwise) — while the from-scratch
+// BASELINE is >= 100*N (it re-skips ~interval/2 rows per cell), manifestly
+// interval-scaled. `count ~= N`  vs  `baseline >= 100*N` together prove the
+// cursor path is O(rows), NOT O(rows x interval). The linear CEILING (e.g.
+// `<= N+64`) independently rules out any interval factor (an O(N x interval)
+// count would be ~1000x larger). (Planner-decided seam shape — see hand-off.)
+//
+// RED SEED: the cursor is unbuilt, so cellCopy locates from scratch in BOTH
+// toggle states — the AC1/AC2 equivalence sweeps hold trivially (like the
+// frontend's structural greens; load-bearing the moment a real cursor could
+// diverge) and cc1..cc5 stay green — and NOTHING increments copy_advances
+// (copyAdvances == 0), which fails every AC3/AC4/AC5 count assertion (0 is
+// neither >= N-1 nor >= 100*N). GREEN needs the cursor + the counter wired to
+// increment once per source row the copy path steps forward, in BOTH the
+// identity (window.cellCopy) and filtered (window.cellCopyFiltered) paths.
+// Every fixture stays < LS_OPEN_HEAD_MAX_BYTES (except the deliberately >4 MiB
+// bounded-record-1 fixture) so it is fully indexed at open — exact count, every
+// row behind the frontier, deterministic advance counts, no scan.
+// ---------------------------------------------------------------------------
+
+fn prepNoop(_: *api.Doc) anyerror!void {}
+
+fn prepScanToEnd(doc: *api.Doc) anyerror!void {
+    try scanToEnd(doc);
+}
+
+/// ALL-MATCH filter: "0" occurs in every zero-padded genFixedRows cell, so the
+/// filtered view is EVERY data row (m == n; filtered row i == physical row i).
+/// AUTO index mode so the filter-scan converges to DONE (exact m) on its own —
+/// never a jump stealing the single scan slot (which would cancel it).
+fn prepFilterAll(doc: *api.Doc) anyerror!void {
+    try setFilter(doc, textReq("0"));
+    _ = try waitFilterDone(doc);
+}
+
+const sc_auto: api.OpenOptions = .{ .index_mode = api.index_auto };
+
+/// Open `bytes` TWICE (independent handles on identical content), run `prep` on
+/// each, disable the cursor on the REFERENCE and enable it on the SUBJECT, then
+/// sweep [top,bottom] x [left,right] ROW-MAJOR in lockstep — the exact monotone,
+/// non-decreasing access TSVCopyBuilder produces, so the subject's forward
+/// cursor engages across the whole sweep while the reference locates every cell
+/// from scratch. Asserts byte-identical (result, out_len, out_truncated, and the
+/// written buf bytes) per cell (ARCH AC1/AC2).
+fn expectCopyEquivalent(
+    bytes: []const u8,
+    options: api.OpenOptions,
+    top: u64,
+    bottom: u64,
+    left: u32,
+    right: u32,
+    buf_len: usize,
+    comptime prep: fn (*api.Doc) anyerror!void,
+) !void {
+    const gpa = std.testing.allocator;
+    var ref = try openWith(bytes, options);
+    defer ref.deinit();
+    var sub = try openWith(bytes, options);
+    defer sub.deinit();
+    try prep(ref.doc);
+    try prep(sub.doc);
+    api.copyCursorSetEnabled(ref.doc, false); // locate-from-scratch REFERENCE
+    api.copyCursorSetEnabled(sub.doc, true); // cursor-accelerated SUBJECT
+
+    const bref = try gpa.alloc(u8, buf_len);
+    defer gpa.free(bref);
+    const bsub = try gpa.alloc(u8, buf_len);
+    defer gpa.free(bsub);
+
+    var r = top;
+    while (r <= bottom) : (r += 1) {
+        var c = left;
+        while (c <= right) : (c += 1) {
+            errdefer std.debug.print("\n[stream-copy] divergence at row {d}, col {d}\n", .{ r, c });
+            const a = copyCell(ref.doc, r, c, bref);
+            const b = copyCell(sub.doc, r, c, bsub);
+            try std.testing.expectEqual(a.result, b.result);
+            try std.testing.expectEqual(a.len, b.len);
+            try std.testing.expectEqual(a.truncated, b.truncated);
+            try std.testing.expectEqualSlices(u8, bref[0..a.len], bsub[0..b.len]);
+        }
+    }
+}
+
+/// Row-major copy sweep of [0,rows) x [0,cols) with the cursor toggled to
+/// `enabled`; returns the copy-path SOURCE-ROW-ADVANCE count taken by the sweep.
+fn sweepAdvances(doc: *api.Doc, rows: u64, cols: u32, enabled: bool) u64 {
+    api.copyCursorSetEnabled(doc, enabled);
+    api.copyAdvancesReset(doc);
+    var buf: [64]u8 = undefined;
+    var r: u64 = 0;
+    while (r < rows) : (r += 1) {
+        var c: u32 = 0;
+        while (c < cols) : (c += 1) {
+            _ = copyCell(doc, r, c, &buf);
+        }
+    }
+    return api.copyAdvances(doc);
+}
+
+test "sc1: identity copy is byte-identical to locate-from-scratch across representative rects (ARCH AC1)" {
+    const gpa = std.testing.allocator;
+
+    // (a) Uniform fixture spanning >=2 checkpoints (n > checkpoint_interval): a
+    // full row-major sweep covers the single / within-first-window / checkpoint-
+    // spanning / first+last rects at once; col 2 == column_count is NO_CELL in
+    // BOTH paths (past-fields).
+    {
+        const n: u64 = 2_500;
+        const fixture = try genFixedRows(gpa, n);
+        defer gpa.free(fixture);
+        try expectCopyEquivalent(fixture, manual, 0, n - 1, 0, 2, 64, prepScanToEnd);
+    }
+    // (b) Ragged + embedded-empty cell + a cell PAST the 4 KiB display cap (the
+    // lossless full read). Header on (texty record 1).
+    {
+        var fx: std.ArrayList(u8) = .empty;
+        defer fx.deinit(gpa);
+        try fx.appendSlice(gpa, "h1,h2,h3\n");
+        try fx.appendSlice(gpa, "a,,c\n"); // embedded empty (col 1)
+        try fx.appendSlice(gpa, "short\n"); // ragged: cols 1,2 padded empty
+        var big: usize = 0;
+        while (big < 5000) : (big += 1) try fx.append(gpa, 'A'); // > the display cap
+        try fx.appendSlice(gpa, ",y,z\n");
+        const opts: api.OpenOptions = .{ .separator = ',', .header = api.header_on, .index_mode = api.index_manual };
+        try expectCopyEquivalent(fx.items, opts, 0, 2, 0, 3, 1 << 16, prepNoop); // col 3 == column_count
+    }
+    // (c) Oversized row (source extent > the per-row scan cap): served as a
+    // bounded prefix; the cursor must reach the rows AFTER it via the frontier's
+    // post-oversized checkpoint, byte-identically to from-scratch.
+    {
+        const doc = try genHugeRowDoc(gpa, 2, 2); // rows 0,1 small; 2 huge; 3,4 small
+        defer gpa.free(doc.bytes);
+        try expectCopyEquivalent(doc.bytes, manual, 0, 4, 0, 2, 4096, prepNoop); // col 2 == column_count
+    }
+    // (d) Bounded record-1 row 0 (header OFF; record 1 never terminates within
+    // the O(head) budget): served from data_start, BYPASSING the cursor — pinned
+    // here so the cursor addition never disturbs that special case.
+    {
+        var fx: std.ArrayList(u8) = .empty;
+        defer fx.deinit(gpa);
+        const over: usize = @intCast(api.open_head_max_bytes + 64 * 1024); // > head budget
+        const blob = try gpa.alloc(u8, over);
+        defer gpa.free(blob);
+        @memset(blob, 'A');
+        try fx.appendSlice(gpa, blob); // record 1 == data row 0, past the budget
+        try fx.appendSlice(gpa, ",tail\n");
+        const opts: api.OpenOptions = .{ .separator = ',', .header = api.header_off, .index_mode = api.index_manual };
+        try expectCopyEquivalent(fx.items, opts, 0, 0, 0, 1, 1 << 16, prepNoop);
+    }
+}
+
+test "sc2: filtered copy is byte-identical to the per-cell match-locate path (ARCH AC2)" {
+    const gpa = std.testing.allocator;
+    const n: u64 = 6_000; // all-match spans checkpoints 0,2048,4096
+    const fixture = try genFixedRows(gpa, n);
+    defer gpa.free(fixture);
+
+    // ALL-MATCH: filtered coords == identity coords; a filtered row-major sweep
+    // spanning >=2 checkpoints matches the from-scratch nthMatchLocation path
+    // cell-for-cell.
+    try expectCopyEquivalent(fixture, sc_auto, 0, n - 1, 0, 1, 64, prepFilterAll);
+
+    // ZERO-MATCH ("z" occurs nowhere): the filtered view has 0 rows, so row 0 is
+    // NO_CELL (m exact) in BOTH the cursor and reference paths.
+    {
+        var ref = try openWith(fixture, sc_auto);
+        defer ref.deinit();
+        var sub = try openWith(fixture, sc_auto);
+        defer sub.deinit();
+        try setFilter(ref.doc, textReq("z"));
+        _ = try waitFilterDone(ref.doc);
+        try setFilter(sub.doc, textReq("z"));
+        _ = try waitFilterDone(sub.doc);
+        api.copyCursorSetEnabled(ref.doc, false);
+        api.copyCursorSetEnabled(sub.doc, true);
+        var b1: [64]u8 = undefined;
+        var b2: [64]u8 = undefined;
+        try std.testing.expectEqual(api.CopyResult.no_cell, copyCell(ref.doc, 0, 0, &b1).result);
+        try std.testing.expectEqual(api.CopyResult.no_cell, copyCell(sub.doc, 0, 0, &b2).result);
+    }
+}
+
+test "sc3: identity copy is O(rows), interval-invariant; extra columns add zero advances (ARCH AC3)" {
+    const gpa = std.testing.allocator;
+    const n: u64 = 10_000; // spans ~5 checkpoints (interval 2048)
+    const fixture = try genFixedRows(gpa, n);
+    defer gpa.free(fixture);
+    var od = try openBytes(fixture);
+    defer od.deinit();
+    try scanToEnd(od.doc);
+    try expectDims(od.doc, n, 2);
+
+    // BASELINE (cursor OFF): from-scratch re-locates each cell from the nearest
+    // sparse checkpoint -> ~interval/2 advances PER ROW -> manifestly interval-
+    // scaled. (RED seed: copyAdvances == 0, so 0 >= 100*n fails.)
+    const baseline = sweepAdvances(od.doc, n, 1, false);
+    try std.testing.expect(baseline >= 100 * n);
+
+    // CURSOR (on): a row-major sweep advances exactly ONCE per row after
+    // anchoring at row 0 -> ~N-1. N-1 carries NO checkpoint-interval term, so it
+    // is UNCHANGED whatever the interval (halved or otherwise): O(rows), NOT
+    // O(rows x interval). (RED seed: 0 is not >= n-1.)
+    const cursor = sweepAdvances(od.doc, n, 1, true);
+    try std.testing.expect(cursor >= n - 1); // linear floor (>= one advance/row)
+    try std.testing.expect(cursor <= n + 64); // linear ceiling, + O(1) only (rules out any interval factor)
+    try std.testing.expect(baseline >= 20 * cursor); // from-scratch dwarfs the cursor
+
+    // EXTRA COLUMNS ADD ZERO advances: sweeping BOTH columns visits each row's
+    // cells without re-locating -> the SAME advance count as one column.
+    const cursor_wide = sweepAdvances(od.doc, n, 2, true);
+    try std.testing.expectEqual(cursor, cursor_wide);
+}
+
+test "sc4: filtered copy is O(filtered rows read), interval-invariant (ARCH AC4)" {
+    const gpa = std.testing.allocator;
+    const n: u64 = 6_000; // all rows match "0" -> m == n, spanning checkpoints
+    const fixture = try genFixedRows(gpa, n);
+    defer gpa.free(fixture);
+    var od = try openWith(fixture, sc_auto);
+    defer od.deinit();
+    try setFilter(od.doc, textReq("0"));
+    const fs = try waitFilterDone(od.doc);
+    try std.testing.expectEqual(n, fs.total); // all-match
+
+    // CURSOR (on): the filtered cursor resumes the match-walk FORWARD from the
+    // last filtered row -> LINEAR in filtered rows read, with NO interval term.
+    // An O(m x interval) count would be ~interval x larger (>> 4*n+8), so the
+    // linear ceiling rules out any interval factor. (RED seed: 0 is not >= 1.)
+    const cursor = sweepAdvances(od.doc, n, 1, true);
+    try std.testing.expect(cursor >= 1); // did real forward-walk work
+    try std.testing.expect(cursor <= 4 * n + 8); // linear in m, interval-INDEPENDENT
+}
+
+test "sc5: backwards / re-anchor access stays correct and never slower than from-scratch (ARCH AC5)" {
+    const gpa = std.testing.allocator;
+    const n: u64 = 8_000;
+    const fixture = try genFixedRows(gpa, n);
+    defer gpa.free(fixture);
+    var ref = try openBytes(fixture);
+    defer ref.deinit();
+    var sub = try openBytes(fixture);
+    defer sub.deinit();
+    try scanToEnd(ref.doc);
+    try scanToEnd(sub.doc);
+    api.copyCursorSetEnabled(ref.doc, false); // from-scratch reference
+    api.copyCursorSetEnabled(sub.doc, true); // cursor re-anchors on each backwards step
+    api.copyAdvancesReset(ref.doc);
+    api.copyAdvancesReset(sub.doc);
+
+    // DESCENDING sweep: every step has row < cursor.row, so the cursor must
+    // re-anchor (fall back to locate-from-scratch) -- still CORRECT, and never
+    // more advances than the from-scratch reference doing the same.
+    var bref: [64]u8 = undefined;
+    var bsub: [64]u8 = undefined;
+    var r: u64 = n;
+    while (r > 0) {
+        r -= 1;
+        const a = copyCell(ref.doc, r, 0, &bref);
+        const b = copyCell(sub.doc, r, 0, &bsub);
+        try std.testing.expectEqual(a.result, b.result);
+        try std.testing.expectEqualSlices(u8, bref[0..a.len], bsub[0..b.len]);
+    }
+    const baseline = api.copyAdvances(ref.doc);
+    const cursor = api.copyAdvances(sub.doc);
+    try std.testing.expect(baseline >= 100 * n); // from-scratch backwards is interval-costly (RED seed: 0)
+    try std.testing.expect(cursor <= baseline); // NEVER SLOWER than locate-from-scratch
+}

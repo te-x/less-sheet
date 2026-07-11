@@ -347,6 +347,26 @@ pub const ls_cell_copy = core.ls_cell_copy;
 /// measure search memory (O(checkpoints) count storage), and detect leaks.
 pub const openWithAllocator = core.openWithAllocator;
 
+// --- Test-only instrumentation seam (ARCH-stream-copy AC1-AC5) --------------
+// Zig-level seams (NOT C ABI — like `openWithAllocator`), so api/lesssheet.h and
+// the `ls_cell_copy` ABI stay BYTE-IDENTICAL: ARCH-stream-copy accelerates the
+// copy path (window.cellCopy / cellCopyFiltered) behind the UNCHANGED ABI with
+// an internal forward COPY CURSOR, and these let the frozen tests prove it.
+//   * copyCursorSetEnabled — flip the cursor OFF to force today's locate-from-
+//     scratch on every ls_cell_copy: the byte-identical REFERENCE for the
+//     equivalence sweeps (AC1/AC2) and the interval-costly BASELINE for the
+//     advance-count sweeps (AC3/AC4/AC5). Defaults ON (what production ships).
+//   * copyAdvances / copyAdvancesReset — read/zero the count of SOURCE ROW-
+//     ADVANCES the copy path took (boundsAfter skips + cursor forward steps),
+//     so a row-major sweep's cost is measured directly: O(rows) with the cursor
+//     (≈ N, interval-INDEPENDENT), O(rows x checkpoint-distance) without it.
+/// Enable/disable the forward copy cursor for THIS document (default enabled).
+pub const copyCursorSetEnabled = core.copyCursorSetEnabled;
+/// Count of source row-advances taken on the copy path since the last reset.
+pub const copyAdvances = core.copyAdvances;
+/// Zero the copy-path source-row-advance counter.
+pub const copyAdvancesReset = core.copyAdvancesReset;
+
 // ---------------------------------------------------------------------------
 // Conformance pins — signature drift in src/ fails `zig build` right here.
 // ---------------------------------------------------------------------------
@@ -401,4 +421,11 @@ comptime {
         @compileError("signature drift: ls_row_oversized");
     if (@TypeOf(core.ls_cell_copy) != fn (*const Doc, u64, u32, ?[*]u8, usize, *usize, *bool) callconv(.c) CopyResult)
         @compileError("signature drift: ls_cell_copy");
+    // ARCH-stream-copy test seams (Zig-only, NOT C ABI — no callconv).
+    if (@TypeOf(core.copyCursorSetEnabled) != fn (*Doc, bool) void)
+        @compileError("signature drift: copyCursorSetEnabled");
+    if (@TypeOf(core.copyAdvances) != fn (*const Doc) u64)
+        @compileError("signature drift: copyAdvances");
+    if (@TypeOf(core.copyAdvancesReset) != fn (*Doc) void)
+        @compileError("signature drift: copyAdvancesReset");
 }

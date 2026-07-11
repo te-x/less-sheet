@@ -525,10 +525,46 @@ pub export fn ls_row_oversized(doc: *const api.Doc, row: u64) callconv(.c) bool 
 
 
 // ---------------------------------------------------------------------------
+// Test-only instrumentation seam (ARCH-stream-copy AC1-AC5). NOT the C ABI:
+// plain Zig fns re-exported by contracts/api.zig for the frozen backend tests
+// ONLY (like `openWithAllocator`), so api/lesssheet.h + the ls_cell_copy ABI
+// stay BYTE-IDENTICAL. They toggle the forward COPY CURSOR and read/reset the
+// copy-path SOURCE-ROW-ADVANCE counter (base.Document.copy_cursor_enabled /
+// copy_advances). Production always runs cursor-enabled; the tests flip it OFF
+// to obtain the byte-identical locate-from-scratch REFERENCE (AC1/AC2) and the
+// interval-costly BASELINE (AC3/AC4/AC5).
+//
+// SEED: the cursor is not built yet, so `cellCopy` locates from scratch in BOTH
+// toggle states (identical output — cc1..cc5 + the AC1/AC2 equivalence sweeps
+// stay green) and NOTHING increments `copy_advances` (copyAdvances == 0). That
+// zero is exactly what makes the AC3/AC4/AC5 count assertions RED until the
+// implementer builds the cursor AND increments `copy_advances` once per source
+// row the copy path steps forward (a boundsAfter skip in cursor-OFF mode; a
+// single cursor forward-advance in cursor-ON mode) — in BOTH the identity
+// (window.cellCopy) and filtered (window.cellCopyFiltered) paths.
+// ---------------------------------------------------------------------------
+
+/// See contracts/api.zig `copyCursorSetEnabled`.
+pub fn copyCursorSetEnabled(doc: *api.Doc, enabled: bool) void {
+    asDocMut(doc).copy_cursor_enabled = enabled;
+}
+
+/// See contracts/api.zig `copyAdvances`.
+pub fn copyAdvances(doc: *const api.Doc) u64 {
+    return asDoc(doc).copy_advances;
+}
+
+/// See contracts/api.zig `copyAdvancesReset`.
+pub fn copyAdvancesReset(doc: *api.Doc) void {
+    asDocMut(doc).copy_advances = 0;
+}
+
+// ---------------------------------------------------------------------------
 // Full-cell read (select-copy slice) — the bounded, window-INDEPENDENT LOSSLESS
 // cell read. Poll/control lane (asDocMut takes the frontier mutex); copies into
 // the caller buffer (no borrow); ZERO alloc; never fails. See api/lesssheet.h
-// FULL-CELL READ. RED SEED — see window.cellCopy for the stub + RED->GREEN path.
+// FULL-CELL READ. ARCH-stream-copy makes window.cellCopy cursor-accelerated
+// behind this UNCHANGED ABI (byte-identical output).
 // ---------------------------------------------------------------------------
 
 /// See api/lesssheet.h `ls_cell_copy`.

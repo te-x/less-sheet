@@ -294,6 +294,32 @@ pub const Document = struct {
     win_first: u64,
     win_rows: u64,
 
+    // --- Copy cursor + test instrumentation (ARCH-stream-copy) --------------
+    // The forward, view-scoped COPY CURSOR that accelerates consecutive,
+    // monotonically-non-decreasing ls_cell_copy calls (window.cellCopy /
+    // window.cellCopyFiltered) to O(1) per row-major step: the implementer adds
+    // the cursor state itself here ({ row, pos, view-generation, filtered
+    // match-walk state }, reset on open / filter set-clear per FR4). The two
+    // fields below are the TEST-ONLY instrumentation seam behind that work
+    // (ARCH-stream-copy AC1-AC5), reached ONLY through the Zig-level seams in
+    // contracts/api.zig (copyCursorSetEnabled / copyAdvances / copyAdvancesReset,
+    // via root.zig) — NEVER across the C ABI. Both are DEFAULTED so the
+    // openWithAllocator construction literal need not mention them.
+    //
+    //   * copy_cursor_enabled — when false the copy path bypasses the cursor and
+    //     locates every cell from scratch (today's behavior): the byte-identical
+    //     REFERENCE for the AC1/AC2 equivalence sweeps and the interval-costly
+    //     BASELINE for the AC3/AC4/AC5 advance counts. Defaults TRUE (production
+    //     copies THROUGH the cursor once it lands).
+    //   * copy_advances — a monotone count of SOURCE ROW-ADVANCES taken on the
+    //     copy path (a boundsAfter skip in cursor-OFF mode; one cursor forward
+    //     step in cursor-ON mode), in BOTH the identity and filtered paths.
+    //     Reset/read by the test seam; pure instrumentation, irrelevant to the
+    //     copied bytes. SEED: never incremented (== 0) — see root.zig's seam
+    //     comment for why that makes the AC3/AC4/AC5 counts RED until built.
+    copy_cursor_enabled: bool = true,
+    copy_advances: u64 = 0,
+
     pub fn lock(self: *Document) void {
         _ = c.pthread_mutex_lock(&self.mutex);
     }
