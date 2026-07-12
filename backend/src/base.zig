@@ -63,6 +63,7 @@ pub const MatchCtx = struct {
     value_dec: Decimal = .{}, // pre-parsed value (ordering predicates)
     scope_mask: []const bool = &.{}, // empty == all columns; else len == column_count
     column_count: u32 = 0,
+    failure: []const usize = &.{}, // TEXT KMP prefix table, one entry/query byte
 };
 
 // ---------------------------------------------------------------------------
@@ -210,6 +211,7 @@ pub const Document = struct {
     search_value: []u8, // owned query / comparison bytes
     search_value_dec: Decimal, // pre-parsed value (ordering predicates)
     search_fold: bool, // TEXT smart-case: fold ASCII case (all-lowercase query)
+    search_failure: []usize,
     scope_mask: []bool, // owned; empty == all columns (NULL scope); else len == column_count
     // Per-index-block match counters (owned): block b == rows
     // [b*checkpoint_interval, (b+1)*checkpoint_interval); O(checkpoints) always.
@@ -220,6 +222,7 @@ pub const Document = struct {
     search_refs: std.ArrayList(CellRef),
     w_value: std.ArrayList(u8),
     w_mask: std.ArrayList(bool),
+    w_failure: std.ArrayList(usize),
     w_ctx: MatchCtx,
     w_gen: u64,
     // Nav-resolution scratch (only touched while holding the mutex).
@@ -249,6 +252,7 @@ pub const Document = struct {
     filter_value: []u8,
     filter_value_dec: Decimal,
     filter_fold: bool,
+    filter_failure: []usize,
     filter_scope_mask: []bool,
     // Per-index-block filter-match counters (owned): O(checkpoints) always,
     // aligned 1:1 with `checkpoints`, exactly like the search job's block_counts.
@@ -278,6 +282,7 @@ pub const Document = struct {
     filter_refs: std.ArrayList(CellRef),
     wf_value: std.ArrayList(u8),
     wf_mask: std.ArrayList(bool),
+    wf_failure: std.ArrayList(usize),
     wf_ctx: MatchCtx,
     wf_gen: u64,
 
@@ -374,7 +379,7 @@ pub const Document = struct {
     copy_cursor_view: CopyView = .identity,
     copy_cursor_gen: u64 = 0,
     copy_cursor_row: u64 = 0,
-    copy_cursor_pos: Pos = @enumFromInt(0),
+    copy_cursor_pos: Pos = .{ .logical = 0, .physical = 0 },
     copy_cursor_source_row: u64 = 0,
     copy_cursor_block_consumed: u64 = 0,
 
@@ -432,6 +437,7 @@ pub fn asDocMut(doc: *const api.Doc) *Document {
 /// was never spawned (open failure), so the sync primitives are quiescent and
 /// safe to destroy.
 pub fn freeDoc(doc: *Document) void {
+    source_mod.sourceShutdown(&doc.source);
     doc.checkpoints.deinit(doc.gpa);
     doc.oversized_checkpoints.deinit(doc.gpa);
     doc.oversized_stage.deinit(doc.gpa);
@@ -444,6 +450,7 @@ pub fn freeDoc(doc: *Document) void {
     doc.search_refs.deinit(doc.gpa);
     doc.w_value.deinit(doc.gpa);
     doc.w_mask.deinit(doc.gpa);
+    doc.w_failure.deinit(doc.gpa);
     doc.nav_scratch.deinit(doc.gpa);
     doc.nav_refs.deinit(doc.gpa);
     doc.filter_block_counts.deinit(doc.gpa);
@@ -453,14 +460,18 @@ pub fn freeDoc(doc: *Document) void {
     doc.filter_refs.deinit(doc.gpa);
     doc.wf_value.deinit(doc.gpa);
     doc.wf_mask.deinit(doc.gpa);
+    doc.wf_failure.deinit(doc.gpa);
     if (doc.search_value.len > 0) doc.gpa.free(doc.search_value);
     if (doc.scope_mask.len > 0) doc.gpa.free(doc.scope_mask);
+    if (doc.search_failure.len > 0) doc.gpa.free(doc.search_failure);
     if (doc.filter_value.len > 0) doc.gpa.free(doc.filter_value);
     if (doc.filter_scope_mask.len > 0) doc.gpa.free(doc.filter_scope_mask);
+    if (doc.filter_failure.len > 0) doc.gpa.free(doc.filter_failure);
     if (doc.header_buf.len > 0) doc.gpa.free(doc.header_buf);
     if (doc.header_refs.len > 0) doc.gpa.free(doc.header_refs);
     if (doc.row0_pinned_buf.len > 0) doc.gpa.free(doc.row0_pinned_buf);
     if (doc.row0_pinned_refs.len > 0) doc.gpa.free(doc.row0_pinned_refs);
+    source_mod.sourceDeinit(&doc.source);
     if (doc.mapping) |m| posix.munmap(m);
     _ = c.pthread_cond_destroy(&doc.cond);
     _ = c.pthread_mutex_destroy(&doc.mutex);
@@ -474,10 +485,10 @@ pub fn freeDoc(doc: *Document) void {
 /// count here (see reader.zig's module doc) -- the ABI's progress fields are
 /// byte-denominated regardless of Reader.
 pub fn searchProgress(doc: *Document, pos: Pos) f64 {
-    const start_bytes = doc.reader.bytesConsumed(doc.source, doc.data_start);
-    if (doc.content_len <= start_bytes) return 1.0;
-    const span = doc.content_len - start_bytes;
-    const at_bytes = doc.reader.bytesConsumed(doc.source, pos);
+    const start_bytes = doc.reader.physicalBytes(doc.source, doc.data_start);
+    if (doc.file_size <= start_bytes) return 1.0;
+    const span = doc.file_size - start_bytes;
+    const at_bytes = doc.reader.physicalBytes(doc.source, pos);
     const covered = at_bytes -| start_bytes;
     const p = @as(f64, @floatFromInt(covered)) / @as(f64, @floatFromInt(span));
     return if (p > 1.0) 1.0 else p;

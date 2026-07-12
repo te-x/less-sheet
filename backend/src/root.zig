@@ -28,6 +28,7 @@ const c = std.c;
 
 const base = @import("base.zig");
 const csv_reader = @import("csv_reader.zig");
+const source_mod = @import("source.zig");
 const matcher = @import("matcher.zig");
 const filter = @import("filter.zig");
 const search = @import("search.zig");
@@ -121,7 +122,20 @@ pub fn openWithAllocator(gpa: std.mem.Allocator, path: [*:0]const u8, options: ?
     // mapping (== file_size bytes) or empty for a 0-byte file; openHead runs
     // unconditionally either way, exactly like the pre-reorg pipeline.
     const raw: []const u8 = if (mapping) |m| m else &.{};
-    const oh = csv_reader.openHead(raw, opt, encoding_sample_bytes);
+    const kind: source_mod.SourceKind = if (raw.len >= 2 and raw[0] == 0x1f and raw[1] == 0x8b) .gzip else .mmap;
+    var source = source_mod.sourceFromMappingAlloc(gpa, raw, kind) catch {
+        if (mapping) |m| posix.munmap(m);
+        return .io;
+    };
+    var source_owned = true;
+    defer if (source_owned) source_mod.sourceDeinit(&source);
+    if (!source.gzipUsable()) {
+        if (mapping) |m| posix.munmap(m);
+        return .io;
+    }
+    const head_bytes = if (kind == .gzip) source.openHead() else raw;
+    const oh = csv_reader.openHead(head_bytes, opt, encoding_sample_bytes);
+    source_mod.rebaseBom(&source, oh.bom_len);
 
     const doc = gpa.create(Document) catch {
         if (mapping) |m| posix.munmap(m);
@@ -130,9 +144,9 @@ pub fn openWithAllocator(gpa: std.mem.Allocator, path: [*:0]const u8, options: ?
     doc.* = .{
         .gpa = gpa,
         .mapping = mapping,
-        .source = .{ .mmap = .{ .bytes = oh.content } },
+        .source = source,
         .reader = .{ .csv = oh.reader },
-        .content_len = oh.content.len,
+        .content_len = if (kind == .mmap) oh.content.len else file_size,
         .file_size = file_size,
         .bom_len = oh.bom_len,
         .dialect = undefined,
@@ -180,12 +194,14 @@ pub fn openWithAllocator(gpa: std.mem.Allocator, path: [*:0]const u8, options: ?
         .search_value = &.{},
         .search_value_dec = .{},
         .search_fold = false,
+        .search_failure = &.{},
         .scope_mask = &.{},
         .block_counts = .empty,
         .search_scratch = .empty,
         .search_refs = .empty,
         .w_value = .empty,
         .w_mask = .empty,
+        .w_failure = .empty,
         .w_ctx = .{},
         .w_gen = 0,
         .nav_scratch = .empty,
@@ -203,6 +219,7 @@ pub fn openWithAllocator(gpa: std.mem.Allocator, path: [*:0]const u8, options: ?
         .filter_value = &.{},
         .filter_value_dec = .{},
         .filter_fold = false,
+        .filter_failure = &.{},
         .filter_scope_mask = &.{},
         .filter_block_counts = .empty,
         .filter_oversized_stage = .empty,
@@ -211,6 +228,7 @@ pub fn openWithAllocator(gpa: std.mem.Allocator, path: [*:0]const u8, options: ?
         .filter_refs = .empty,
         .wf_value = .empty,
         .wf_mask = .empty,
+        .wf_failure = .empty,
         .wf_ctx = .{},
         .wf_gen = 0,
         .worker = null,
@@ -222,6 +240,16 @@ pub fn openWithAllocator(gpa: std.mem.Allocator, path: [*:0]const u8, options: ?
         .win_oversized = .empty,
         .win_first = 0,
         .win_rows = 0,
+    };
+    source_owned = false;
+
+    if (kind == .gzip) switch (doc.source) {
+        .gzip => |g| {
+            doc.gz_physical_in = g.open_physical;
+            doc.gz_inflated_out = g.open_inflated;
+            doc.gz_resident_bytes = g.residentBytes();
+        },
+        .mmap => unreachable,
     };
 
     // `data_start`/`frontier_pos`/`search_pos`/`filter_pos` all start at the
@@ -273,6 +301,10 @@ pub fn openWithAllocator(gpa: std.mem.Allocator, path: [*:0]const u8, options: ?
         .header_forced = opt.header != api.sniff,
         .encoding_forced = opt.encoding != api.encoding_auto,
     };
+
+    // Only after encoding/shape/header and the complete bounded head scan may
+    // subsequent worker/cursor work consume compressed input past 4 MiB.
+    source_mod.sourceFinishOpen(&doc.source);
 
     // One worker for the document's lifetime: advances the frontier (AUTO) or
     // parks until a jump (MANUAL). Failure to spawn only forfeits background
@@ -363,6 +395,7 @@ pub export fn ls_close(doc: *api.Doc) callconv(.c) void {
     d.lock();
     d.stop = true;
     d.stop_atomic.store(true, .monotonic);
+    source_mod.sourceShutdown(&d.source);
     d.wakeWorker();
     d.unlock();
     if (d.worker) |w| w.join();
@@ -523,7 +556,6 @@ pub export fn ls_row_oversized(doc: *const api.Doc, row: u64) callconv(.c) bool 
     return window.rowOversized(asDoc(doc), row);
 }
 
-
 // ---------------------------------------------------------------------------
 // Test-only instrumentation seam (ARCH-stream-copy AC1-AC5). NOT the C ABI:
 // plain Zig fns re-exported by contracts/api.zig for the frozen backend tests
@@ -572,7 +604,6 @@ pub export fn ls_cell_copy(doc: *const api.Doc, row: u64, col: u32, buf: ?[*]u8,
     return window.cellCopy(asDocMut(doc), row, col, buf, buf_len, out_len, out_truncated);
 }
 
-
 // ===========================================================================
 // csv-gz internal-seam re-exports + instrumentation seams (ARCH-csv-gz).
 // The re-exports below let contracts/api.zig pin the enumerated Source/Reader
@@ -610,6 +641,12 @@ pub fn gzOpenBudget(doc: *const api.Doc) api.OpenBudget {
 /// See contracts/api.zig `gzReplayStats` (AC15).
 pub fn gzReplayStats(doc: *const api.Doc) api.ReplayStats {
     const d = asDoc(doc);
+    if (d.source == .gzip) {
+        const g = d.source.gzip;
+        g.lock();
+        defer g.unlock();
+        return .{ .landed = g.replay_landed, .restored_checkpoint_logical = g.replay_restored, .inflated_replay = g.replay_inflated };
+    }
     return .{
         .landed = d.gz_replay_landed,
         .restored_checkpoint_logical = d.gz_replay_restored_logical,
@@ -619,17 +656,38 @@ pub fn gzReplayStats(doc: *const api.Doc) api.ReplayStats {
 /// See contracts/api.zig `gzReplayStatsReset`.
 pub fn gzReplayStatsReset(doc: *api.Doc) void {
     const d = asDocMut(doc);
+    if (d.source == .gzip) {
+        const g = d.source.gzip;
+        g.lock();
+        defer g.unlock();
+        g.replay_landed = false;
+        g.replay_restored = 0;
+        g.replay_inflated = 0;
+    }
     d.gz_replay_landed = false;
     d.gz_replay_restored_logical = 0;
     d.gz_replay_inflated = 0;
 }
 /// See contracts/api.zig `gzResidentBytes` (AC17).
 pub fn gzResidentBytes(doc: *const api.Doc) u64 {
-    return asDoc(doc).gz_resident_bytes;
+    const d = asDoc(doc);
+    if (d.source == .gzip) {
+        const g = d.source.gzip;
+        g.lock();
+        defer g.unlock();
+        return g.residentBytes();
+    }
+    return 0;
 }
 /// See contracts/api.zig `gzCheckpointStore` (AC17/AC21).
 pub fn gzCheckpointStore(doc: *const api.Doc) api.CheckpointStore {
     const d = asDoc(doc);
+    if (d.source == .gzip) {
+        const g = d.source.gzip;
+        g.lock();
+        defer g.unlock();
+        return .{ .present = g.spill_fd != null, .bytes = g.spill_bytes, .mode = if (g.spill_fd != null) 0o600 else 0, .unlinked = g.spill_fd != null };
+    }
     return .{
         .present = d.gz_ckpt_present,
         .bytes = d.gz_ckpt_bytes,
@@ -639,11 +697,15 @@ pub fn gzCheckpointStore(doc: *const api.Doc) api.CheckpointStore {
 }
 /// See contracts/api.zig `gzCheckpointStoreFailAfter` (AC18).
 pub fn gzCheckpointStoreFailAfter(doc: *api.Doc, ops: u64) void {
-    asDocMut(doc).gz_ckpt_fail_after = ops;
+    const d = asDocMut(doc);
+    d.gz_ckpt_fail_after = ops;
+    if (d.source == .gzip) d.source.gzip.spill_fail_after.store(ops, .release);
 }
 /// See contracts/api.zig `gzForceChunkBytes` (AC12).
 pub fn gzForceChunkBytes(doc: *api.Doc, n: u64) void {
-    asDocMut(doc).gz_force_chunk_bytes = n;
+    const d = asDocMut(doc);
+    d.gz_force_chunk_bytes = n;
+    if (d.source == .gzip) d.source.gzip.force_chunk.store(n, .release);
 }
 /// See contracts/api.zig `gzStreamMatcherResidentBytes` (AC13).
 pub fn gzStreamMatcherResidentBytes(doc: *const api.Doc) u64 {
@@ -663,8 +725,6 @@ pub fn gzCacheCopyBytes(doc: *const api.Doc) u64 {
 /// already proves the adapter is FEASIBLE against the installed std; this seam
 /// proves it WORKS byte-for-byte once built.
 pub fn gzSnapshotProbe(gpa: std.mem.Allocator, gzip_bytes: []const u8, probe_logical: u64) api.SnapshotProbe {
-    _ = gpa;
-    _ = gzip_bytes;
-    _ = probe_logical;
-    return .{ .restored = false, .identical = false };
+    const identical = source_seam.snapshotProbe(gpa, gzip_bytes, probe_logical);
+    return .{ .restored = identical, .identical = identical };
 }

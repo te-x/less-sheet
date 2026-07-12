@@ -30,15 +30,15 @@ const csv_reader = @import("csv_reader.zig");
 pub const Source = source_mod.Source;
 pub const CellRef = base.CellRef;
 
-/// Opaque row position — see the module doc. Backed by a `u64` so a Reader
-/// implementation can cast it to/from a byte offset (or whatever else)
-/// internally, but the type itself supports only equality outside
-/// `csv_reader.zig` — no arithmetic, no ordering.
-pub const Pos = enum(u64) { _ };
+/// Opaque row position. CSV records the immutable logical inflated offset and
+/// the compressed-file high-water mark that produced it. Core callers only
+/// store/pass this value; coordinate access remains behind Reader methods.
+pub const Pos = struct { logical: u64, physical: u64 };
 
 pub const BoundsResult = struct { next: Pos, capped: bool };
 pub const MaterializeResult = struct { next: Pos, capped: bool };
 pub const CellResult = struct { len: usize, truncated: bool };
+pub const ScanRowsResult = struct { next: Pos, rows: u64, eof: bool };
 
 /// A pluggable format Reader. One tagged-union variant per format — CSV is
 /// the only member in this slice (see csv_reader.CsvReader). Every op takes
@@ -91,6 +91,16 @@ pub const Reader = union(enum) {
         };
     }
 
+    pub fn logicalBytes(self: Reader, source: Source, pos: Pos) u64 {
+        _ = self;
+        return posLogicalBytes(source, pos);
+    }
+
+    pub fn physicalBytes(self: Reader, source: Source, pos: Pos) u64 {
+        _ = self;
+        return posPhysicalBytes(source, pos);
+    }
+
     /// The position right after the row starting at `pos` (CSV:
     /// `lexer.recordBounds`), never examining past `limit` (`null` == the
     /// true end of `source`). `capped` reports whether `limit` was reached
@@ -141,8 +151,15 @@ pub const Reader = union(enum) {
             .csv => |r| r.cell(source, pos, col, limit, buf, buf_len),
         };
     }
-};
 
+    /// Advance several records with one Source lease.  This is the frontier
+    /// hot path for streaming sources; mmap retains its direct lexer loop.
+    pub fn scanRows(self: Reader, source: Source, pos: Pos, max_rows: u64) ScanRowsResult {
+        return switch (self) {
+            .csv => |r| r.scanRows(source, pos, max_rows),
+        };
+    }
+};
 
 // ---------------------------------------------------------------------------
 // csv-gz SEED seam stubs (ARCH-csv-gz "Internal Source/Reader contract",
@@ -158,19 +175,19 @@ const source_mod2 = @import("source.zig");
 /// ARCH capability (2): unknown-end query in the frozen SourceEnd vocabulary --
 /// never conflate current availability with EOF. SEED STUB.
 pub fn sourceEndAt(source: Source, pos: Pos) api.SourceEnd {
-    _ = source;
-    _ = pos;
-    return .clean_eof;
+    if (source.knownEnd()) |end| return if (pos.logical >= end) switch (source) {
+        .mmap => .clean_eof,
+        .gzip => |g| if (g.terminal_kind.load(.acquire) == 1) .clean_eof else .damaged_eof,
+    } else .inflating;
+    return .inflating;
 }
 
 /// ARCH capability (3): bounded cursor acquisition by opaque logical position +
 /// DUAL limits (logical inflated-output + optional physical compressed-input).
 /// SEED STUB.
 pub fn sourceCursorAt(source: Source, pos: Pos, limit: api.DualLimit) source_mod2.Cursor {
-    _ = source;
-    _ = pos;
-    _ = limit;
-    return .{};
+    const logical_limit = if (limit.logical) |n| pos.logical +| n else null;
+    return source_mod2.cursorAt(source, pos.logical, logical_limit, limit.physical);
 }
 
 /// ARCH capability (4): logical inflated-byte measurement of an actual position
@@ -178,7 +195,7 @@ pub fn sourceCursorAt(source: Source, pos: Pos, limit: api.DualLimit) source_mod
 /// Pos IS a logical byte offset (identity), matching bytesConsumed today.
 pub fn posLogicalBytes(source: Source, pos: Pos) u64 {
     _ = source;
-    return @intFromEnum(pos);
+    return pos.logical;
 }
 
 /// ARCH capability (4): physical compressed-file-byte measurement of an actual
@@ -186,15 +203,14 @@ pub fn posLogicalBytes(source: Source, pos: Pos) u64 {
 /// mmap this equals the logical offset (identity apart from the BOM base).
 pub fn posPhysicalBytes(source: Source, pos: Pos) u64 {
     _ = source;
-    return @intFromEnum(pos);
+    return pos.physical;
 }
 
 /// ARCH capability (5): rebase the Source after the ONE leading BOM (only a BOM
 /// at inflated offset zero of the whole concatenated stream is stripped). SEED
 /// STUB (root.zig still rebases via the mmap content slice today).
 pub fn sourceRebaseBom(source: *Source, bom_len: u64) void {
-    _ = source;
-    _ = bom_len;
+    source_mod2.rebaseBom(source, bom_len);
 }
 
 /// ARCH capability (6) / req4: the streaming ROW-MATCH the Reader gains -- next
@@ -209,6 +225,7 @@ pub fn sourceRebaseBom(source: *Source, bom_len: u64) void {
 pub const MatchRowResult = struct {
     next: Pos,
     matched_col: ?u32,
+    filter_matched: bool,
     capped: bool,
     end: api.SourceEnd,
 };
@@ -221,10 +238,7 @@ pub fn readerMatchRow(
     filter_ctx: ?base.MatchCtx,
     limit: api.DualLimit,
 ) MatchRowResult {
-    _ = self;
-    _ = source;
-    _ = primary;
-    _ = filter_ctx;
-    _ = limit;
-    return .{ .next = pos, .matched_col = null, .capped = false, .end = .inflating };
+    return switch (self) {
+        .csv => |r| r.matchRow(source, pos, primary, filter_ctx, limit),
+    };
 }

@@ -21,7 +21,6 @@ const matcher = @import("matcher.zig");
 
 const Document = base.Document;
 const MatchCtx = base.MatchCtx;
-const CellRef = base.CellRef;
 const Checkpoint = base.Checkpoint;
 const OversizedMatch = base.OversizedMatch;
 const Pos = base.Pos;
@@ -38,13 +37,6 @@ pub const SourceLoc = struct { row: u64, pos: Pos };
 /// filter (filter_ctx = the active filter, so find evaluates only rows that
 /// satisfy it too — see api/lesssheet.h FILTERED VIEWS FIND) and by the
 /// filter-scan's own counting (primary_ctx = the filter, filter_ctx = null).
-fn rowMatch(filter_ctx: ?MatchCtx, primary_ctx: MatchCtx, buf: []const u8, refs: []const CellRef) ?u32 {
-    if (filter_ctx) |fc| {
-        if (matcher.matchRecord(fc, buf, refs) == null) return null;
-    }
-    return matcher.matchRecord(primary_ctx, buf, refs);
-}
-
 /// Re-lex block `b` and evaluate rows [lo, hi); return the first (FORWARD) or
 /// last (BACKWARD) matching row+col, or null. Caller holds the mutex.
 fn relexBlock(doc: *Document, filter_ctx: ?MatchCtx, primary_ctx: MatchCtx, b: u64, lo: u64, hi: u64, dir: api.SearchDir) ?Match {
@@ -57,11 +49,8 @@ fn relexBlock(doc: *Document, filter_ctx: ?MatchCtx, primary_ctx: MatchCtx, b: u
     }
     var result: ?Match = null;
     while (row < hi and !doc.reader.atEnd(doc.source, pos)) : (row += 1) {
-        doc.nav_scratch.clearRetainingCapacity();
-        doc.nav_refs.clearRetainingCapacity();
-        // NAVIGATION also matches the FULL cell (cap = null), same as the scan.
-        const res = doc.reader.materialize(doc.source, pos, doc.column_count, null, null, &doc.nav_scratch, &doc.nav_refs, doc.gpa) catch break;
-        if (rowMatch(filter_ctx, primary_ctx, doc.nav_scratch.items, doc.nav_refs.items)) |col| {
+        const res = @import("reader.zig").readerMatchRow(doc.reader, doc.source, pos, primary_ctx, filter_ctx, .{});
+        if (res.matched_col) |col| {
             result = .{ .row = row, .col = col };
             if (dir == .forward) return result;
         }
@@ -114,10 +103,8 @@ fn countInBlockUpTo(doc: *Document, filter_ctx: ?MatchCtx, primary_ctx: MatchCtx
     var r = cp.row;
     var count: u64 = 0;
     while (r <= row and !doc.reader.atEnd(doc.source, pos)) : (r += 1) {
-        doc.nav_scratch.clearRetainingCapacity();
-        doc.nav_refs.clearRetainingCapacity();
-        const res = doc.reader.materialize(doc.source, pos, doc.column_count, null, null, &doc.nav_scratch, &doc.nav_refs, doc.gpa) catch break;
-        if (rowMatch(filter_ctx, primary_ctx, doc.nav_scratch.items, doc.nav_refs.items)) |_| count += 1;
+        const res = @import("reader.zig").readerMatchRow(doc.reader, doc.source, pos, primary_ctx, filter_ctx, .{});
+        if (res.matched_col != null) count += 1;
         pos = res.next;
     }
     return count;

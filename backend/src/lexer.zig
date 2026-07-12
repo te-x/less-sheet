@@ -187,6 +187,24 @@ fn storeToStructural(
     buf: *std.ArrayList(u8),
     gpa: std.mem.Allocator,
 ) !Scan {
+    if (encoding == api.encoding_utf8) {
+        const tail = content[start_at..limit];
+        const rel = std.mem.findAny(u8, tail, &.{ sep, '\n', '\r' });
+        const end = start_at + (rel orelse tail.len);
+        if (store and !truncated.*) {
+            const bytes = content[start_at..end];
+            if (cap) |cap_bytes| {
+                const used = buf.items.len - start;
+                const room = cap_bytes -| used;
+                const take = @min(room, bytes.len);
+                try buf.appendSlice(gpa, bytes[0..take]);
+                if (take < bytes.len) truncated.* = true;
+            } else {
+                try buf.appendSlice(gpa, bytes);
+            }
+        }
+        return .{ .pos = end, .hit_limit = rel == null };
+    }
     var i = start_at;
     while (true) {
         const u = enc.decodeUnit(content, i, limit, encoding) orelse return .{ .pos = limit, .hit_limit = true };

@@ -32,6 +32,7 @@ pub fn filterCtx(doc: *Document) MatchCtx {
         .value_dec = doc.filter_value_dec,
         .scope_mask = doc.filter_scope_mask,
         .column_count = doc.column_count,
+        .failure = doc.filter_failure,
     };
 }
 
@@ -51,6 +52,8 @@ pub fn refreshFilterWorkerCtx(doc: *Document) bool {
     doc.wf_value.appendSlice(doc.gpa, doc.filter_value) catch return false;
     doc.wf_mask.clearRetainingCapacity();
     doc.wf_mask.appendSlice(doc.gpa, doc.filter_scope_mask) catch return false;
+    doc.wf_failure.clearRetainingCapacity();
+    doc.wf_failure.appendSlice(doc.gpa, doc.filter_failure) catch return false;
     doc.wf_ctx = .{
         .kind = doc.filter_kind,
         .op = doc.filter_op,
@@ -60,6 +63,7 @@ pub fn refreshFilterWorkerCtx(doc: *Document) bool {
         .value_dec = matcher.parseDecimal(doc.wf_value.items),
         .scope_mask = doc.wf_mask.items,
         .column_count = doc.column_count,
+        .failure = doc.wf_failure.items,
     };
     return true;
 }
@@ -125,25 +129,8 @@ pub fn filterScanChunk(doc: *Document, start_pos: Pos, start_row: u64) FilterChu
     while (row < target) {
         if (doc.stop_atomic.load(.monotonic)) return .{ .end_pos = pos, .end_row = row, .eof = false, .checkpoint = null, .matches = matches };
         if (doc.reader.atEnd(doc.source, pos)) return .{ .end_pos = pos, .end_row = row, .eof = true, .checkpoint = null, .matches = matches };
-        doc.filter_scratch.clearRetainingCapacity();
-        doc.filter_refs.clearRetainingCapacity();
-        // Matches the FULL cell (cap = null), same rule as SEARCH -- never
-        // bounded by the WINDOW's per-row scan cap (ARCH-huge-row-budget only
-        // byte-bounds ls_window_set).
-        const res = doc.reader.materialize(doc.source, pos, doc.column_count, null, null, &doc.filter_scratch, &doc.filter_refs, doc.gpa) catch {
-            const nb = doc.reader.boundsAfter(doc.source, pos, null);
-            base.stageOversized(doc, row, pos, nb.next);
-            stageOversizedMatch(doc, row, pos, nb.next, false);
-            pos = nb.next;
-            row += 1;
-            if (doc.reader.atEnd(doc.source, pos)) return .{ .end_pos = pos, .end_row = row, .eof = true, .checkpoint = null, .matches = matches };
-            continue;
-        };
-        // ARCH-huge-row-filtered: this is the ONLY place a giant row's match
-        // is ever decided (FULL-cell, cap = null) -- recorded via
-        // stageOversizedMatch so the FILTERED window path can honor it
-        // without re-scanning.
-        const matched = matcher.matchRecord(doc.wf_ctx, doc.filter_scratch.items, doc.filter_refs.items) != null;
+        const res = @import("reader.zig").readerMatchRow(doc.reader, doc.source, pos, doc.wf_ctx, null, .{});
+        const matched = res.matched_col != null;
         if (matched) matches += 1;
         // This scan also feeds the base row index (ARCH-huge-row-budget): see
         // the matching comment in search.searchScanChunk.
@@ -151,6 +138,7 @@ pub fn filterScanChunk(doc: *Document, start_pos: Pos, start_row: u64) FilterChu
         stageOversizedMatch(doc, row, pos, res.next, matched);
         pos = res.next;
         row += 1;
+        if (doc.source == .gzip) doc.gz_match_resident_bytes = @max(doc.gz_match_resident_bytes, @sizeOf(matcher.StreamCell));
         if (doc.reader.atEnd(doc.source, pos)) return .{ .end_pos = pos, .end_row = row, .eof = true, .checkpoint = null, .matches = matches };
     }
     return .{ .end_pos = pos, .end_row = row, .eof = false, .checkpoint = .{ .row = row, .pos = pos }, .matches = matches };
@@ -323,10 +311,16 @@ pub fn setFilter(d: *Document, request: *const api.SearchRequest) bool {
 
     // Allocate owned copies up front so an OOM rejects cleanly (no state change).
     const value_copy = d.gpa.dupe(u8, value) catch return false;
+    var failure: []usize = &.{};
+    if (kind_i == 0) failure = matcher.buildFailure(d.gpa, value_copy, fold) catch {
+        d.gpa.free(value_copy);
+        return false;
+    };
     var mask: []bool = &.{};
     if (kind_i == 0 and req.scope_ptr != null) {
         mask = d.gpa.alloc(bool, d.column_count) catch {
             d.gpa.free(value_copy);
+            if (failure.len > 0) d.gpa.free(failure);
             return false;
         };
         @memset(mask, false);
@@ -339,8 +333,10 @@ pub fn setFilter(d: *Document, request: *const api.SearchRequest) bool {
     // Replace any previous filter ENTIRELY.
     if (d.filter_value.len > 0) d.gpa.free(d.filter_value);
     if (d.filter_scope_mask.len > 0) d.gpa.free(d.filter_scope_mask);
+    if (d.filter_failure.len > 0) d.gpa.free(d.filter_failure);
     d.filter_value = value_copy;
     d.filter_scope_mask = mask;
+    d.filter_failure = failure;
     d.filter_kind = req.kind;
     d.filter_op = req.op;
     d.filter_column = req.column;

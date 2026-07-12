@@ -200,6 +200,166 @@ pub fn queryFolds(q: []const u8) bool {
     return true;
 }
 
+pub fn buildFailure(gpa: std.mem.Allocator, query: []const u8, fold: bool) std.mem.Allocator.Error![]usize {
+    if (query.len == 0) return gpa.alloc(usize, 0);
+    const table = try gpa.alloc(usize, query.len);
+    table[0] = 0;
+    var k: usize = 0;
+    var i: usize = 1;
+    while (i < query.len) : (i += 1) {
+        const b = if (fold) asciiLower(query[i]) else query[i];
+        while (k > 0 and b != (if (fold) asciiLower(query[k]) else query[k])) k = table[k - 1];
+        if (b == (if (fold) asciiLower(query[k]) else query[k])) k += 1;
+        table[i] = k;
+    }
+    return table;
+}
+
+/// Allocation-free streaming state for one decoded cell.  TEXT computes the
+/// KMP fallback from the query when needed, keeping resident state constant;
+/// EQ/NE track exact length/content without retaining cell bytes.
+pub const StreamCell = struct {
+    ctx: MatchCtx,
+    col: u32,
+    text_k: usize = 0,
+    text_found: bool = false,
+    equal: bool = true,
+    len: usize = 0,
+    num_phase: NumericPhase = .leading,
+    num_negative: bool = false,
+    num_int_digits: u64 = 0,
+    num_total_digits: u64 = 0,
+    num_first: ?u64 = null,
+    num_sig_seen: u64 = 0,
+    num_order: Order = .eq,
+    num_saw_digit: bool = false,
+    num_exp_negative: bool = false,
+    num_exp: i64 = 0,
+    num_exp_digits: u64 = 0,
+
+    const NumericPhase = enum { leading, mantissa, fraction, exp_start, exponent, trailing, invalid };
+
+    pub fn init(ctx: MatchCtx, col: u32) StreamCell {
+        return .{ .ctx = ctx, .col = col, .text_found = ctx.kind == .text and ctx.value.len == 0 };
+    }
+
+    fn eqByte(self: StreamCell, a: u8, b: u8) bool {
+        return if (self.ctx.fold) asciiLower(a) == asciiLower(b) else a == b;
+    }
+
+    fn feedDigit(self: *StreamCell, b: u8, integer: bool) void {
+        const at = self.num_total_digits;
+        self.num_total_digits +|= 1;
+        if (integer) self.num_int_digits +|= 1;
+        self.num_saw_digit = true;
+        if (self.num_first == null and b != '0') self.num_first = at;
+        if (self.num_first) |first| if (at >= first) {
+            const sig: usize = @intCast(@min(at - first, std.math.maxInt(usize)));
+            const qd = if (sig < self.ctx.value_dec.sig_len) self.ctx.value_dec.sigDigit(sig) else '0';
+            if (self.num_order == .eq and b != qd) self.num_order = if (b < qd) .lt else .gt;
+            self.num_sig_seen +|= 1;
+        };
+    }
+
+    fn feedNumeric(self: *StreamCell, b: u8) void {
+        var again = true;
+        while (again) {
+            again = false;
+            switch (self.num_phase) {
+                .leading => {
+                    if (isAsciiWs(b)) return;
+                    if (b == '+' or b == '-') {
+                        self.num_negative = b == '-';
+                        self.num_phase = .mantissa;
+                    } else {
+                        self.num_phase = .mantissa;
+                        again = true;
+                    }
+                },
+                .mantissa => {
+                    if (isDigit(b)) self.feedDigit(b, true) else if (b == '.') self.num_phase = .fraction else if ((b == 'e' or b == 'E') and self.num_saw_digit) self.num_phase = .exp_start else if (isAsciiWs(b) and self.num_saw_digit) self.num_phase = .trailing else self.num_phase = .invalid;
+                },
+                .fraction => {
+                    if (isDigit(b)) self.feedDigit(b, false) else if ((b == 'e' or b == 'E') and self.num_saw_digit) self.num_phase = .exp_start else if (isAsciiWs(b) and self.num_saw_digit) self.num_phase = .trailing else self.num_phase = .invalid;
+                },
+                .exp_start => {
+                    if (b == '+' or b == '-') {
+                        self.num_exp_negative = b == '-';
+                        self.num_phase = .exponent;
+                    } else if (isDigit(b)) {
+                        self.num_phase = .exponent;
+                        again = true;
+                    } else self.num_phase = .invalid;
+                },
+                .exponent => {
+                    if (isDigit(b)) {
+                        self.num_exp_digits +|= 1;
+                        self.num_exp = (self.num_exp *| 10) +| @as(i64, b - '0');
+                    } else if (isAsciiWs(b) and self.num_exp_digits > 0) self.num_phase = .trailing else self.num_phase = .invalid;
+                },
+                .trailing => {
+                    if (!isAsciiWs(b)) self.num_phase = .invalid;
+                },
+                .invalid => {},
+            }
+        }
+    }
+
+    pub fn feed(self: *StreamCell, bytes: []const u8) void {
+        switch (self.ctx.kind) {
+            .text => for (bytes) |b| {
+                if (self.text_found or self.ctx.value.len == 0) continue;
+                while (self.text_k > 0 and !self.eqByte(b, self.ctx.value[self.text_k])) self.text_k = self.ctx.failure[self.text_k - 1];
+                if (self.eqByte(b, self.ctx.value[self.text_k])) self.text_k += 1;
+                if (self.text_k == self.ctx.value.len) self.text_found = true;
+            },
+            .predicate => for (bytes) |b| if (self.ctx.op == .eq or self.ctx.op == .ne) {
+                    if (self.len >= self.ctx.value.len or b != self.ctx.value[self.len]) self.equal = false;
+                    self.len += 1;
+                } else self.feedNumeric(b),
+        }
+    }
+
+    pub fn matches(self: StreamCell) bool {
+        return switch (self.ctx.kind) {
+            .text => self.text_found,
+            .predicate => switch (self.ctx.op) {
+                .eq => self.equal and self.len == self.ctx.value.len,
+                .ne => !(self.equal and self.len == self.ctx.value.len),
+                .lt, .gt, .le, .ge => self.numericMatches(),
+            },
+        };
+    }
+
+    fn numericMatches(self: StreamCell) bool {
+        const valid = self.num_saw_digit and self.num_phase != .invalid and self.num_phase != .leading and self.num_phase != .exp_start and
+            (self.num_phase != .exponent or self.num_exp_digits > 0);
+        if (!valid) return false;
+        const q = self.ctx.value_dec;
+        const zero = self.num_first == null;
+        var ord: Order = .eq;
+        if (zero and q.zero) ord = .eq else if (zero) ord = if (q.negative) .gt else .lt else if (q.zero) ord = if (self.num_negative) .lt else .gt else if (self.num_negative != q.negative) ord = if (self.num_negative) .lt else .gt else {
+            const exp = if (self.num_exp_negative) -self.num_exp else self.num_exp;
+            const msd = exp +| @as(i64, @intCast(@min(self.num_int_digits, std.math.maxInt(i64)))) -| 1 -| @as(i64, @intCast(@min(self.num_first.?, std.math.maxInt(i64))));
+            var magnitude: Order = if (msd != q.msd_pos) (if (msd < q.msd_pos) .lt else .gt) else self.num_order;
+            if (msd == q.msd_pos and magnitude == .eq) {
+                    var i: usize = @intCast(@min(self.num_sig_seen, std.math.maxInt(usize)));
+                    while (i < q.sig_len) : (i += 1) if (q.sigDigit(i) != '0') {
+                        magnitude = .lt;
+                        break;
+                    };
+            }
+            ord = if (self.num_negative) magnitude.invert() else magnitude;
+        }
+        return switch (self.ctx.op) { .lt => ord == .lt, .gt => ord == .gt, .le => ord != .gt, .ge => ord != .lt, else => unreachable };
+    }
+};
+
+pub fn streamSupported(ctx: MatchCtx) bool {
+    _ = ctx;
+    return true;
+}
+
 /// Substring match with smart case: fold ASCII case iff `fold`, else byte-exact.
 /// Bytes >= 0x80 (all non-ASCII) always compare exactly.
 fn textMatch(cell: []const u8, query: []const u8, fold: bool) bool {

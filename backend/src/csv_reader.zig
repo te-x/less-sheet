@@ -12,6 +12,7 @@ const base = @import("base.zig");
 const enc = @import("encoding.zig");
 const lexer = @import("lexer.zig");
 const sniff = @import("sniff.zig");
+const matcher = @import("matcher.zig");
 const source_mod = @import("source.zig");
 const reader_mod = @import("reader.zig");
 
@@ -22,12 +23,49 @@ const BoundsResult = reader_mod.BoundsResult;
 const MaterializeResult = reader_mod.MaterializeResult;
 const CellResult = reader_mod.CellResult;
 
-fn toPos(off: usize) Pos {
-    return @enumFromInt(off);
+fn toPos(off: usize, physical: u64) Pos {
+    return .{ .logical = off, .physical = physical };
 }
 
 fn toOffset(pos: Pos) usize {
-    return @intCast(@intFromEnum(pos));
+    return @intCast(pos.logical);
+}
+
+fn cursorPos(cur: *source_mod.Cursor) Pos {
+    return toPos(@intCast(cur.logical), cur.physicalPosition());
+}
+
+const DirectCursor = struct {
+    bytes: []const u8,
+    logical: u64,
+    logical_limit: ?u64,
+    physical_base: u64,
+    physical_limit: ?u64,
+
+    fn end(self: *const DirectCursor) u64 {
+        const logical_end = self.logical_limit orelse self.bytes.len;
+        const physical_end = if (self.physical_limit) |p| p -| self.physical_base else self.bytes.len;
+        return @min(@as(u64, self.bytes.len), @min(logical_end, physical_end));
+    }
+
+    pub fn peek(self: *DirectCursor, n: usize) []const u8 {
+        const end_at = self.end();
+        if (self.logical >= end_at) return &.{};
+        return self.bytes[@intCast(self.logical)..@intCast(@min(end_at, self.logical +| n))];
+    }
+
+    pub fn advance(self: *DirectCursor, n: usize) void {
+        self.logical += n;
+    }
+    pub fn atLimit(self: *const DirectCursor) bool {
+        if (self.logical_limit) |lim| if (self.logical >= lim) return true;
+        return if (self.physical_limit) |lim| self.physical_base +| self.logical >= lim else false;
+    }
+};
+
+fn anyCursorPos(cur: anytype) Pos {
+    if (@TypeOf(cur.*) == DirectCursor) return toPos(@intCast(cur.logical), cur.physical_base +| cur.logical);
+    return cursorPos(cur);
 }
 
 /// The CSV Reader: the resolved dialect (sep/quote/encoding — see
@@ -41,13 +79,15 @@ pub const CsvReader = struct {
 
     pub fn start(self: CsvReader, source: Source) Pos {
         _ = self;
-        _ = source;
-        return toPos(0);
+        return toPos(0, switch (source) {
+            .mmap => |m| m.physical_base,
+            .gzip => 0,
+        });
     }
 
     pub fn atEnd(self: CsvReader, source: Source, pos: Pos) bool {
         _ = self;
-        return toOffset(pos) >= source.len();
+        return if (source.knownEnd()) |end| toOffset(pos) >= end else false;
     }
 
     /// See reader.Reader.posAtByteBudget. CSV: `min(from + budget, len)`,
@@ -58,21 +98,27 @@ pub const CsvReader = struct {
         const off = toOffset(from);
         const add: usize = @intCast(budget);
         const bounded = off +| add;
-        const len: usize = @intCast(source.len());
-        return toPos(@min(bounded, len));
+        const physical = from.physical;
+        const end = source.knownEnd() orelse return toPos(bounded, physical);
+        return toPos(@min(bounded, @as(usize, @intCast(end))), physical);
     }
 
     pub fn bytesConsumed(self: CsvReader, source: Source, pos: Pos) u64 {
         _ = self;
         _ = source;
-        return @intFromEnum(pos);
+        return pos.logical;
     }
 
     pub fn boundsAfter(self: CsvReader, source: Source, pos: Pos, limit: ?Pos) BoundsResult {
-        const content = source.slice(0, source.len());
-        const lim: usize = if (limit) |l| toOffset(l) else content.len;
-        const b = lexer.recordBounds(content, toOffset(pos), self.sep, self.quote, lim, self.encoding);
-        return .{ .next = toPos(b.next), .capped = b.capped };
+        return switch (source) {
+            .mmap => {
+                const content = source.slice(0, source.len());
+                const lim: usize = if (limit) |l| toOffset(l) else content.len;
+                const b = lexer.recordBounds(content, toOffset(pos), self.sep, self.quote, lim, self.encoding);
+                return .{ .next = toPos(b.next, source.mmap.physical_base +| b.next), .capped = b.capped };
+            },
+            .gzip => boundsStream(source, pos, limit, self.sep, self.quote, self.encoding),
+        };
     }
 
     pub fn materialize(
@@ -86,10 +132,15 @@ pub const CsvReader = struct {
         refs: *std.ArrayList(CellRef),
         gpa: std.mem.Allocator,
     ) std.mem.Allocator.Error!MaterializeResult {
-        const content = source.slice(0, source.len());
-        const lim: usize = if (limit) |l| toOffset(l) else content.len;
-        const res = try lexer.lexInto(content, toOffset(pos), self.sep, self.quote, want, cap, lim, self.encoding, buf, refs, gpa);
-        return .{ .next = toPos(res.next), .capped = res.capped };
+        return switch (source) {
+            .mmap => {
+                const content = source.slice(0, source.len());
+                const lim: usize = if (limit) |l| toOffset(l) else content.len;
+                const res = try lexer.lexInto(content, toOffset(pos), self.sep, self.quote, want, cap, lim, self.encoding, buf, refs, gpa);
+                return .{ .next = toPos(res.next, source.mmap.physical_base +| res.next), .capped = res.capped };
+            },
+            .gzip => try lexStream(source, pos, want, cap, limit, self.sep, self.quote, self.encoding, buf, refs, gpa),
+        };
     }
 
     pub fn cell(
@@ -101,12 +152,444 @@ pub const CsvReader = struct {
         buf: ?[*]u8,
         buf_len: usize,
     ) CellResult {
-        const content = source.slice(0, source.len());
-        const lim: usize = if (limit) |l| toOffset(l) else content.len;
-        const res = decodeColumn(content, toOffset(pos), self.sep, self.quote, lim, self.encoding, col, buf, buf_len);
-        return .{ .len = res.len, .truncated = res.truncated };
+        return switch (source) {
+            .mmap => {
+                const content = source.slice(0, source.len());
+                const lim: usize = if (limit) |l| toOffset(l) else content.len;
+                const res = decodeColumn(content, toOffset(pos), self.sep, self.quote, lim, self.encoding, col, buf, buf_len);
+                return .{ .len = res.len, .truncated = res.truncated };
+            },
+            .gzip => cellStream(source, pos, col, limit, self.sep, self.quote, self.encoding, buf, buf_len),
+        };
+    }
+
+    pub fn scanRows(self: CsvReader, source: Source, pos: Pos, max_rows: u64) reader_mod.ScanRowsResult {
+        var cur = source_mod.cursorAt(source, toOffset(pos), null, null);
+        defer cur.deinit();
+        if (self.encoding == api.encoding_utf8) return scanUtf8Rows(&cur, self.sep, self.quote, max_rows);
+        var rows: u64 = 0;
+        while (rows < max_rows) {
+            if (streamUnit(&cur, self.encoding) == null) break;
+            _ = boundsFromCursor(&cur, self.sep, self.quote, self.encoding);
+            rows += 1;
+        }
+        const eof = streamUnit(&cur, self.encoding) == null and !streamAtLimit(&cur);
+        return .{ .next = cursorPos(&cur), .rows = rows, .eof = eof };
+    }
+
+    pub fn matchRow(self: CsvReader, source: Source, pos: Pos, primary: base.MatchCtx, filter_ctx: ?base.MatchCtx, limit: api.DualLimit) reader_mod.MatchRowResult {
+        return matchStream(source, pos, self.sep, self.quote, self.encoding, primary, filter_ctx, limit);
     }
 };
+
+fn wantsCell(ctx: base.MatchCtx, col: u32) bool {
+    return switch (ctx.kind) {
+        .text => col < ctx.column_count and (ctx.scope_mask.len == 0 or ctx.scope_mask[col]),
+        .predicate => col == ctx.column,
+    };
+}
+
+fn matchStream(source: Source, pos: Pos, sep: u8, quote: ?u8, encoding: u8, primary: base.MatchCtx, filter_ctx: ?base.MatchCtx, limit: api.DualLimit) reader_mod.MatchRowResult {
+    const logical_limit = if (limit.logical) |n| pos.logical +| n else null;
+    return switch (source) {
+        .mmap => |m| blk: {
+            if (encoding == api.encoding_utf8)
+                break :blk matchMmapUtf8(m, pos, sep, quote, primary, filter_ctx, limit);
+            var cur: DirectCursor = .{
+                .bytes = m.bytes,
+                .logical = pos.logical,
+                .logical_limit = logical_limit,
+                .physical_base = m.physical_base,
+                .physical_limit = if (limit.physical) |n| pos.physical +| n else null,
+            };
+            break :blk matchCursor(&cur, sep, quote, encoding, primary, filter_ctx);
+        },
+        .gzip => blk: {
+            var cur = source_mod.cursorAt(source, toOffset(pos), logical_limit, limit.physical);
+            defer cur.deinit();
+            break :blk matchCursor(&cur, sep, quote, encoding, primary, filter_ctx);
+        },
+    };
+}
+
+fn matchMmapUtf8(m: source_mod.Mmap, pos: Pos, sep: u8, quote: ?u8, primary: base.MatchCtx, filter_ctx: ?base.MatchCtx, limit: api.DualLimit) reader_mod.MatchRowResult {
+    const logical_end = if (limit.logical) |n| pos.logical +| n else m.bytes.len;
+    const physical_end = if (limit.physical) |n| pos.physical +| n -| m.physical_base else m.bytes.len;
+    const end: usize = @intCast(@min(@as(u64, m.bytes.len), @min(logical_end, physical_end)));
+    var i: usize = @intCast(pos.logical);
+    var col: u32 = 0;
+    var primary_col: ?u32 = null;
+    var filter_ok = filter_ctx == null;
+    while (true) : (col += 1) {
+        var ps = matcher.StreamCell.init(primary, col);
+        var fs = if (filter_ctx) |fc| matcher.StreamCell.init(fc, col) else null;
+        const pfeed = wantsCell(primary, col);
+        const ffeed = if (filter_ctx) |fc| wantsCell(fc, col) else false;
+
+        if (quote) |q| if (i < end and m.bytes[i] == q) {
+            i += 1;
+            while (i < end) {
+                const rel = std.mem.findScalar(u8, m.bytes[i..end], q) orelse {
+                    if (pfeed) ps.feed(m.bytes[i..end]);
+                    if (ffeed) fs.?.feed(m.bytes[i..end]);
+                    i = end;
+                    break;
+                };
+                const q_at = i + rel;
+                if (pfeed) ps.feed(m.bytes[i..q_at]);
+                if (ffeed) fs.?.feed(m.bytes[i..q_at]);
+                if (q_at + 1 < end and m.bytes[q_at + 1] == q) {
+                    if (pfeed) ps.feed(&.{q});
+                    if (ffeed) fs.?.feed(&.{q});
+                    i = q_at + 2;
+                    continue;
+                }
+                i = q_at + 1;
+                break;
+            }
+        };
+
+        if (i < end) {
+            const rel = std.mem.findAny(u8, m.bytes[i..end], &.{ sep, '\r', '\n' });
+            const structural = i + (rel orelse end - i);
+            if (pfeed) ps.feed(m.bytes[i..structural]);
+            if (ffeed) fs.?.feed(m.bytes[i..structural]);
+            i = structural;
+        }
+
+        if (pfeed and primary_col == null and ps.matches()) primary_col = col;
+        if (ffeed and fs.?.matches()) filter_ok = true;
+        if (i >= end) {
+            var missing = col + 1;
+            while (missing < primary.column_count) : (missing += 1) {
+                if (primary_col == null and wantsCell(primary, missing) and matcher.StreamCell.init(primary, missing).matches()) primary_col = missing;
+                if (filter_ctx) |fc| {
+                    if (wantsCell(fc, missing) and matcher.StreamCell.init(fc, missing).matches()) filter_ok = true;
+                }
+            }
+            const capped = end < m.bytes.len;
+            return .{ .next = toPos(i, m.physical_base +| i), .matched_col = if (filter_ok) primary_col else null, .filter_matched = filter_ok, .capped = capped, .end = if (capped) .budget_stop else .clean_eof };
+        }
+        if (m.bytes[i] == sep) {
+            i += 1;
+            continue;
+        }
+        if (m.bytes[i] == '\r') {
+            i += 1;
+            if (i < end and m.bytes[i] == '\n') i += 1;
+        } else i += 1;
+        var missing = col + 1;
+        while (missing < primary.column_count) : (missing += 1) {
+            if (primary_col == null and wantsCell(primary, missing) and matcher.StreamCell.init(primary, missing).matches()) primary_col = missing;
+            if (filter_ctx) |fc| {
+                if (wantsCell(fc, missing) and matcher.StreamCell.init(fc, missing).matches()) filter_ok = true;
+            }
+        }
+        return .{ .next = toPos(i, m.physical_base +| i), .matched_col = if (filter_ok) primary_col else null, .filter_matched = filter_ok, .capped = false, .end = .inflating };
+    }
+}
+
+fn matchCursor(cur: anytype, sep: u8, quote: ?u8, encoding: u8, primary: base.MatchCtx, filter_ctx: ?base.MatchCtx) reader_mod.MatchRowResult {
+    var col: u32 = 0;
+    var primary_col: ?u32 = null;
+    var filter_ok = filter_ctx == null;
+    while (true) : (col += 1) {
+        var ps = matcher.StreamCell.init(primary, col);
+        var fs = if (filter_ctx) |fc| matcher.StreamCell.init(fc, col) else null;
+        const pfeed = wantsCell(primary, col);
+        const ffeed = if (filter_ctx) |fc| wantsCell(fc, col) else false;
+        var ended = false;
+        if (quote) |q| if (streamUnit(cur, encoding)) |first| {
+            if (enc.unitIsByte(first, q)) {
+                cur.advance(first.src_len);
+                while (streamUnit(cur, encoding)) |u| {
+                    cur.advance(u.src_len);
+                    if (enc.unitIsByte(u, q)) {
+                        if (streamUnit(cur, encoding)) |peek| if (enc.unitIsByte(peek, q)) {
+                            if (pfeed) ps.feed(u.out[0..u.out_len]);
+                            if (ffeed) fs.?.feed(u.out[0..u.out_len]);
+                            cur.advance(peek.src_len);
+                            continue;
+                        };
+                        break;
+                    }
+                    if (pfeed) ps.feed(u.out[0..u.out_len]);
+                    if (ffeed) fs.?.feed(u.out[0..u.out_len]);
+                } else ended = true;
+            }
+        };
+        if (!ended) {
+            while (streamUnit(cur, encoding)) |u| {
+                if (enc.unitIsByte(u, sep) or enc.unitIsByte(u, '\r') or enc.unitIsByte(u, '\n')) break;
+                if (pfeed) ps.feed(u.out[0..u.out_len]);
+                if (ffeed) fs.?.feed(u.out[0..u.out_len]);
+                cur.advance(u.src_len);
+            } else ended = true;
+        }
+        if (pfeed and primary_col == null and ps.matches()) primary_col = col;
+        if (ffeed and fs.?.matches()) filter_ok = true;
+        if (ended) {
+            var missing = col + 1;
+            while (missing < primary.column_count) : (missing += 1) {
+                if (primary_col == null and wantsCell(primary, missing) and matcher.StreamCell.init(primary, missing).matches()) primary_col = missing;
+                if (filter_ctx) |fc| {
+                    if (wantsCell(fc, missing) and matcher.StreamCell.init(fc, missing).matches()) filter_ok = true;
+                }
+            }
+            const capped = streamAtLimit(cur);
+            return .{ .next = anyCursorPos(cur), .matched_col = if (filter_ok) primary_col else null, .filter_matched = filter_ok, .capped = capped, .end = if (capped) .budget_stop else .clean_eof };
+        }
+        const structural = streamUnit(cur, encoding).?;
+        if (enc.unitIsByte(structural, sep)) {
+            cur.advance(structural.src_len);
+            continue;
+        }
+        finishTerminator(cur, structural, encoding);
+        var missing = col + 1;
+        while (missing < primary.column_count) : (missing += 1) {
+            if (primary_col == null and wantsCell(primary, missing) and matcher.StreamCell.init(primary, missing).matches()) primary_col = missing;
+            if (filter_ctx) |fc| {
+                if (wantsCell(fc, missing) and matcher.StreamCell.init(fc, missing).matches()) filter_ok = true;
+            }
+        }
+        return .{ .next = anyCursorPos(cur), .matched_col = if (filter_ok) primary_col else null, .filter_matched = filter_ok, .capped = false, .end = .inflating };
+    }
+}
+
+fn scanUtf8Rows(cur: *source_mod.Cursor, sep: u8, quote: ?u8, max_rows: u64) reader_mod.ScanRowsResult {
+    var rows: u64 = 0;
+    var field_start = true;
+    var quoted = false;
+    var saw = false;
+    var skip_lf = false;
+    while (rows < max_rows) {
+        const bytes = cur.span();
+        if (bytes.len == 0) break;
+        var i: usize = 0;
+        while (i < bytes.len and rows < max_rows) {
+            const b = bytes[i];
+            if (skip_lf) {
+                skip_lf = false;
+                if (b == '\n') {
+                    i += 1;
+                    continue;
+                }
+            }
+            saw = true;
+            if (quoted) {
+                if (quote != null and b == quote.?) {
+                    if (i + 1 < bytes.len) {
+                        if (bytes[i + 1] == quote.?) {
+                            i += 2;
+                            continue;
+                        }
+                        quoted = false;
+                    } else {
+                        cur.advance(i + 1);
+                        const p = cur.peek(1);
+                        if (p.len > 0 and p[0] == quote.?) cur.advance(1) else quoted = false;
+                        i = 0;
+                        break;
+                    }
+                }
+                i += 1;
+                continue;
+            }
+            if (field_start and quote != null and b == quote.?) {
+                quoted = true;
+                field_start = false;
+                i += 1;
+            } else if (b == sep) {
+                field_start = true;
+                i += 1;
+            } else if (b == '\n' or b == '\r') {
+                if (b == '\r' and i + 1 < bytes.len and bytes[i + 1] == '\n') i += 1;
+                if (b == '\r' and i + 1 == bytes.len) skip_lf = true;
+                rows += 1;
+                field_start = true;
+                saw = false;
+                i += 1;
+            } else {
+                field_start = false;
+                i += 1;
+            }
+        }
+        cur.advance(i);
+    }
+    const eof = cur.span().len == 0;
+    if (eof and saw and rows < max_rows) rows += 1;
+    return .{ .next = cursorPos(cur), .rows = rows, .eof = eof };
+}
+
+fn streamUnit(cur: anytype, encoding: u8) ?enc.Unit {
+    const bytes = cur.peek(4);
+    return enc.decodeUnit(bytes, 0, bytes.len, encoding);
+}
+
+fn streamAtLimit(cur: anytype) bool {
+    return cur.atLimit();
+}
+
+fn finishTerminator(cur: anytype, u: enc.Unit, encoding: u8) void {
+    cur.advance(u.src_len);
+    if (enc.unitIsByte(u, '\r')) {
+        if (streamUnit(cur, encoding)) |nxt| if (enc.unitIsByte(nxt, '\n')) cur.advance(nxt.src_len);
+    }
+}
+
+fn boundsStream(source: Source, pos: Pos, limit: ?Pos, sep: u8, quote: ?u8, encoding: u8) BoundsResult {
+    var cur = source_mod.cursorAt(source, toOffset(pos), if (limit) |l| toOffset(l) else null, null);
+    defer cur.deinit();
+    return boundsFromCursor(&cur, sep, quote, encoding);
+}
+
+fn boundsFromCursor(cur: *source_mod.Cursor, sep: u8, quote: ?u8, encoding: u8) BoundsResult {
+    while (true) {
+        if (quote) |q| if (streamUnit(cur, encoding)) |first| {
+            if (enc.unitIsByte(first, q)) {
+                cur.advance(first.src_len);
+                while (streamUnit(cur, encoding)) |u| {
+                    cur.advance(u.src_len);
+                    if (!enc.unitIsByte(u, q)) continue;
+                    if (streamUnit(cur, encoding)) |peek| {
+                        if (enc.unitIsByte(peek, q)) {
+                            cur.advance(peek.src_len);
+                            continue;
+                        }
+                    }
+                    break;
+                }
+            }
+        };
+        while (streamUnit(cur, encoding)) |u| {
+            if (enc.unitIsByte(u, sep)) {
+                cur.advance(u.src_len);
+                break;
+            }
+            if (enc.unitIsByte(u, '\r') or enc.unitIsByte(u, '\n')) {
+                finishTerminator(cur, u, encoding);
+                return .{ .next = cursorPos(cur), .capped = false };
+            }
+            cur.advance(u.src_len);
+        } else return .{ .next = cursorPos(cur), .capped = streamAtLimit(cur) };
+    }
+}
+
+fn appendStreamUnit(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, start: usize, u: enc.Unit, cap: ?usize, truncated: *bool) !void {
+    if (truncated.*) return;
+    if (cap) |n| if (buf.items.len - start + u.out_len > n) {
+        truncated.* = true;
+        return;
+    };
+    try buf.appendSlice(gpa, u.out[0..u.out_len]);
+}
+
+fn lexStream(source: Source, pos: Pos, want: ?u32, cap: ?usize, limit: ?Pos, sep: u8, quote: ?u8, encoding: u8, buf: *std.ArrayList(u8), refs: *std.ArrayList(CellRef), gpa: std.mem.Allocator) !MaterializeResult {
+    var cur = source_mod.cursorAt(source, toOffset(pos), if (limit) |l| toOffset(l) else null, null);
+    defer cur.deinit();
+    var produced: u32 = 0;
+    while (true) {
+        const store = want == null or produced < want.?;
+        const start = buf.items.len;
+        var truncated = false;
+        var ended = false;
+        if (quote) |q| if (streamUnit(&cur, encoding)) |first| {
+            if (enc.unitIsByte(first, q)) {
+                cur.advance(first.src_len);
+                while (streamUnit(&cur, encoding)) |u| {
+                    cur.advance(u.src_len);
+                    if (enc.unitIsByte(u, q)) {
+                        if (streamUnit(&cur, encoding)) |peek| {
+                            if (enc.unitIsByte(peek, q)) {
+                                if (store) try appendStreamUnit(buf, gpa, start, u, cap, &truncated);
+                                cur.advance(peek.src_len);
+                                continue;
+                            }
+                        }
+                        break;
+                    }
+                    if (store) try appendStreamUnit(buf, gpa, start, u, cap, &truncated);
+                } else ended = true;
+            }
+        };
+        if (!ended) {
+            while (streamUnit(&cur, encoding)) |u| {
+                if (enc.unitIsByte(u, sep) or enc.unitIsByte(u, '\r') or enc.unitIsByte(u, '\n')) break;
+                if (store) try appendStreamUnit(buf, gpa, start, u, cap, &truncated);
+                cur.advance(u.src_len);
+            } else ended = true;
+        }
+
+        if (ended) truncated = truncated or streamAtLimit(&cur);
+        if (store) {
+            if (truncated and encoding == api.encoding_utf8) buf.shrinkRetainingCapacity(start + enc.utf8TrimToBoundary(buf.items[start..]));
+            try refs.append(gpa, .{ .start = start, .len = buf.items.len - start, .truncated = truncated });
+        }
+        produced += 1;
+        if (ended) {
+            if (want) |w| while (produced < w) : (produced += 1) try refs.append(gpa, .{ .start = 0, .len = 0 });
+            return .{ .next = cursorPos(&cur), .capped = streamAtLimit(&cur) };
+        }
+        const structural = streamUnit(&cur, encoding).?;
+        if (enc.unitIsByte(structural, sep)) {
+            cur.advance(structural.src_len);
+            continue;
+        }
+        finishTerminator(&cur, structural, encoding);
+        if (want) |w| while (produced < w) : (produced += 1) try refs.append(gpa, .{ .start = 0, .len = 0 });
+        return .{ .next = cursorPos(&cur), .capped = false };
+    }
+}
+
+fn cellStream(source: Source, pos: Pos, col: u32, limit: ?Pos, sep: u8, quote: ?u8, encoding: u8, buf: ?[*]u8, buf_len: usize) CellResult {
+    var cur = source_mod.cursorAt(source, toOffset(pos), if (limit) |l| toOffset(l) else null, null);
+    defer cur.deinit();
+    var produced: u32 = 0;
+    while (true) : (produced += 1) {
+        const store = produced == col;
+        var out_len: usize = 0;
+        var truncated = false;
+        var ended = false;
+        if (quote) |q| if (streamUnit(&cur, encoding)) |first| {
+            if (enc.unitIsByte(first, q)) {
+                cur.advance(first.src_len);
+                while (streamUnit(&cur, encoding)) |u| {
+                    cur.advance(u.src_len);
+                    if (enc.unitIsByte(u, q)) {
+                        if (streamUnit(&cur, encoding)) |peek| if (enc.unitIsByte(peek, q)) {
+                            if (store) storeUnit(buf, buf_len, &out_len, &truncated, u);
+                            cur.advance(peek.src_len);
+                            continue;
+                        };
+                        break;
+                    }
+                    if (store) storeUnit(buf, buf_len, &out_len, &truncated, u);
+                } else ended = true;
+            }
+        };
+        if (!ended) {
+            while (streamUnit(&cur, encoding)) |u| {
+                if (enc.unitIsByte(u, sep) or enc.unitIsByte(u, '\r') or enc.unitIsByte(u, '\n')) break;
+                if (store) storeUnit(buf, buf_len, &out_len, &truncated, u);
+                cur.advance(u.src_len);
+            } else ended = true;
+        }
+        if (store) {
+            truncated = truncated or (ended and streamAtLimit(&cur));
+            if (truncated and encoding == api.encoding_utf8) {
+                if (buf) |b| out_len = enc.utf8TrimToBoundary(b[0..out_len]);
+            }
+            return .{ .len = out_len, .truncated = truncated };
+        }
+        if (ended) return .{ .len = 0, .truncated = streamAtLimit(&cur) };
+        const structural = streamUnit(&cur, encoding).?;
+        if (enc.unitIsByte(structural, sep)) {
+            cur.advance(structural.src_len);
+            continue;
+        }
+        return .{ .len = 0, .truncated = false };
+    }
+}
 
 // ---------------------------------------------------------------------------
 // open/sniff (ARCH-reader-interface item 5): detect + set up. Called ONCE,

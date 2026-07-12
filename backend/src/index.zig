@@ -119,7 +119,7 @@ pub fn workerMain(doc: *Document) void {
                 filter.commitFilter(doc, res);
                 filter.resolveFilterJumpLocked(doc);
             }
-            const advanced = doc.reader.bytesConsumed(doc.source, doc.frontier_pos);
+            const advanced = doc.reader.physicalBytes(doc.source, doc.frontier_pos);
             doc.unlock();
 
             if (doc.mapping != null and advanced > released + madvise_release_chunk and advanced > madvise_keepback) {
@@ -153,7 +153,7 @@ pub fn workerMain(doc: *Document) void {
             if (doc.filter_gen == gen and doc.filter_state == .scanning) {
                 filter.commitFilter(doc, res);
             }
-            const advanced = doc.reader.bytesConsumed(doc.source, doc.frontier_pos);
+            const advanced = doc.reader.physicalBytes(doc.source, doc.frontier_pos);
             doc.unlock();
 
             if (doc.mapping != null and advanced > released + madvise_release_chunk and advanced > madvise_keepback) {
@@ -208,7 +208,7 @@ pub fn workerMain(doc: *Document) void {
                     doc.search_state = .cancelled;
                 }
             }
-            const advanced = doc.reader.bytesConsumed(doc.source, doc.frontier_pos);
+            const advanced = doc.reader.physicalBytes(doc.source, doc.frontier_pos);
             doc.unlock();
 
             if (doc.mapping != null and advanced > released + madvise_release_chunk and advanced > madvise_keepback) {
@@ -240,7 +240,7 @@ pub fn workerMain(doc: *Document) void {
             doc.total_rows = doc.frontier_rows;
         }
         if (doc.jump_state == .scanning) updateJump(doc);
-        const advanced = doc.reader.bytesConsumed(doc.source, doc.frontier_pos);
+        const advanced = doc.reader.physicalBytes(doc.source, doc.frontier_pos);
         doc.unlock();
 
         // Release pages far behind the frontier (bounded resident memory).
@@ -272,6 +272,14 @@ fn scanChunk(doc: *Document, start_pos: Pos, start_row: u64) ChunkResult {
     var row = start_row;
     const target = ((start_row / checkpoint_interval) + 1) * checkpoint_interval;
     base.beginOversizedChunk(doc);
+    if (doc.source == .gzip) {
+        if (doc.stop_atomic.load(.monotonic)) return .{ .end_pos = pos, .end_row = row, .eof = false, .checkpoint = null };
+        const batch = doc.reader.scanRows(doc.source, pos, target - row);
+        pos = batch.next;
+        row += batch.rows;
+        if (batch.eof) return .{ .end_pos = pos, .end_row = row, .eof = true, .checkpoint = null };
+        return .{ .end_pos = pos, .end_row = row, .eof = false, .checkpoint = .{ .row = row, .pos = pos } };
+    }
     while (row < target) {
         if (doc.stop_atomic.load(.monotonic)) return .{ .end_pos = pos, .end_row = row, .eof = false, .checkpoint = null };
         if (doc.reader.atEnd(doc.source, pos)) return .{ .end_pos = pos, .end_row = row, .eof = true, .checkpoint = null };
@@ -301,11 +309,11 @@ fn updateJump(doc: *Document) void {
     }
 }
 
-fn madviseDontNeed(doc: *Document, start_content: u64, end_content: u64) void {
+fn madviseDontNeed(doc: *Document, start_physical: u64, end_physical: u64) void {
     const m = doc.mapping orelse return;
     const psz: u64 = std.heap.page_size_min;
-    const a_start = std.mem.alignForward(u64, doc.bom_len + start_content, psz);
-    const a_end = std.mem.alignBackward(u64, doc.bom_len + end_content, psz);
+    const a_start = std.mem.alignForward(u64, start_physical, psz);
+    const a_end = std.mem.alignBackward(u64, end_physical, psz);
     if (a_end <= a_start or a_end > m.len) return;
     const ptr: [*]align(std.heap.page_size_min) u8 = @alignCast(@constCast(m.ptr + @as(usize, @intCast(a_start))));
     posix.madvise(ptr, @intCast(a_end - a_start), c.MADV.DONTNEED) catch {};
@@ -328,8 +336,8 @@ pub fn rowCount(d: *Document) api.RowCount {
     // Estimate = total data bytes / mean indexed row bytes. `bytesConsumed`
     // is the only place a position is turned back into a byte count here
     // (see reader.zig's module doc).
-    const start_bytes = d.reader.bytesConsumed(d.source, d.data_start);
-    const frontier_bytes = d.reader.bytesConsumed(d.source, d.frontier_pos);
+    const start_bytes = d.reader.physicalBytes(d.source, d.data_start);
+    const frontier_bytes = d.reader.physicalBytes(d.source, d.frontier_pos);
     const scanned_data = frontier_bytes - start_bytes;
     const total_data = d.content_len - start_bytes;
     var count: u64 = 0;
@@ -338,7 +346,7 @@ pub fn rowCount(d: *Document) api.RowCount {
     } else {
         count = @intCast(@as(u128, total_data) * @as(u128, d.frontier_rows) / @as(u128, scanned_data));
     }
-    return .{ .count = count, .exact = false };
+    return .{ .count = @max(count, d.frontier_rows), .exact = false };
 }
 
 /// See api/lesssheet.h `ls_index_poll`.
@@ -346,7 +354,7 @@ pub fn indexPoll(d: *Document) api.ScanProgress {
     d.lock();
     defer d.unlock();
     return .{
-        .bytes_scanned = d.bom_len + d.reader.bytesConsumed(d.source, d.frontier_pos),
+        .bytes_scanned = if (d.complete) d.file_size else @min(d.file_size, d.reader.physicalBytes(d.source, d.frontier_pos)),
         .bytes_total = d.file_size,
         .complete = d.complete,
     };

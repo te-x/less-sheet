@@ -45,6 +45,7 @@ pub fn docCtx(doc: *Document) MatchCtx {
         .value_dec = doc.search_value_dec,
         .scope_mask = doc.scope_mask,
         .column_count = doc.column_count,
+        .failure = doc.search_failure,
     };
 }
 
@@ -58,6 +59,8 @@ pub fn refreshWorkerCtx(doc: *Document) bool {
     doc.w_value.appendSlice(doc.gpa, doc.search_value) catch return false;
     doc.w_mask.clearRetainingCapacity();
     doc.w_mask.appendSlice(doc.gpa, doc.scope_mask) catch return false;
+    doc.w_failure.clearRetainingCapacity();
+    doc.w_failure.appendSlice(doc.gpa, doc.search_failure) catch return false;
     doc.w_ctx = .{
         .kind = doc.search_kind,
         .op = doc.search_op,
@@ -67,6 +70,7 @@ pub fn refreshWorkerCtx(doc: *Document) bool {
         .value_dec = matcher.parseDecimal(doc.w_value.items),
         .scope_mask = doc.w_mask.items,
         .column_count = doc.column_count,
+        .failure = doc.w_failure.items,
     };
     return true;
 }
@@ -91,34 +95,13 @@ pub fn searchScanChunk(doc: *Document, start_pos: Pos, start_row: u64, filtered:
     while (row < target) {
         if (doc.stop_atomic.load(.monotonic)) return .{ .end_pos = pos, .end_row = row, .eof = false, .checkpoint = null, .matches = matches, .filter_matches = filter_matches };
         if (doc.reader.atEnd(doc.source, pos)) return .{ .end_pos = pos, .end_row = row, .eof = true, .checkpoint = null, .matches = matches, .filter_matches = filter_matches };
-        doc.search_scratch.clearRetainingCapacity();
-        doc.search_refs.clearRetainingCapacity();
-        // SEARCH matches the FULL cell, not the display-capped bytes (cap =
-        // null; see requirement 10 / api/lesssheet.h SEARCH). Never bounded by
-        // the WINDOW's per-row scan cap either -- ARCH-huge-row-budget only
-        // byte-bounds ls_window_set, never find/filter.
-        const res = doc.reader.materialize(doc.source, pos, doc.column_count, null, null, &doc.search_scratch, &doc.search_refs, doc.gpa) catch {
-            // Decode allocation failure: count no match and advance the boundary.
-            const nb = doc.reader.boundsAfter(doc.source, pos, null);
-            base.stageOversized(doc, row, pos, nb.next);
-            pos = nb.next;
-            row += 1;
-            if (doc.reader.atEnd(doc.source, pos)) return .{ .end_pos = pos, .end_row = row, .eof = true, .checkpoint = null, .matches = matches, .filter_matches = filter_matches };
-            continue;
-        };
-        var filt_ok = true;
-        if (filtered) {
-            filt_ok = matcher.matchRecord(doc.wf_ctx, doc.search_scratch.items, doc.search_refs.items) != null;
-            if (filt_ok) filter_matches += 1;
-        }
-        if (filt_ok and matcher.matchRecord(doc.w_ctx, doc.search_scratch.items, doc.search_refs.items) != null) matches += 1;
-        // This scan also feeds the base row index (ARCH-huge-row-budget): stage
-        // a post-row checkpoint if this row's source extent exceeds the
-        // WINDOW's per-row scan cap, so a later ls_window_set reaching a row
-        // this search's own frontier advance passed can skip it.
+        const res = @import("reader.zig").readerMatchRow(doc.reader, doc.source, pos, doc.w_ctx, if (filtered) doc.wf_ctx else null, .{});
+        if (filtered and res.filter_matched) filter_matches += 1;
+        if (res.matched_col != null) matches += 1;
         base.stageOversized(doc, row, pos, res.next);
         pos = res.next;
         row += 1;
+        if (doc.source == .gzip) doc.gz_match_resident_bytes = @max(doc.gz_match_resident_bytes, 2 * @sizeOf(matcher.StreamCell));
         if (doc.reader.atEnd(doc.source, pos)) return .{ .end_pos = pos, .end_row = row, .eof = true, .checkpoint = null, .matches = matches, .filter_matches = filter_matches };
     }
     return .{ .end_pos = pos, .end_row = row, .eof = false, .checkpoint = .{ .row = row, .pos = pos }, .matches = matches, .filter_matches = filter_matches };
@@ -354,10 +337,16 @@ pub fn startSearch(d: *Document, request: *const api.SearchRequest) bool {
 
     // Allocate owned copies up front so an OOM rejects cleanly (no state change).
     const value_copy = d.gpa.dupe(u8, value) catch return false;
+    var failure: []usize = &.{};
+    if (kind_i == 0) failure = matcher.buildFailure(d.gpa, value_copy, fold) catch {
+        d.gpa.free(value_copy);
+        return false;
+    };
     var mask: []bool = &.{};
     if (kind_i == 0 and req.scope_ptr != null) {
         mask = d.gpa.alloc(bool, d.column_count) catch {
             d.gpa.free(value_copy);
+            if (failure.len > 0) d.gpa.free(failure);
             return false;
         };
         @memset(mask, false);
@@ -370,8 +359,10 @@ pub fn startSearch(d: *Document, request: *const api.SearchRequest) bool {
     // Replace any previous search ENTIRELY.
     if (d.search_value.len > 0) d.gpa.free(d.search_value);
     if (d.scope_mask.len > 0) d.gpa.free(d.scope_mask);
+    if (d.search_failure.len > 0) d.gpa.free(d.search_failure);
     d.search_value = value_copy;
     d.scope_mask = mask;
+    d.search_failure = failure;
     d.search_kind = req.kind;
     d.search_op = req.op;
     d.search_column = req.column;
