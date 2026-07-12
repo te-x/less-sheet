@@ -1,18 +1,16 @@
 ---
 name: reviewer
+description: Generated relay for an external aidev role runner.
 model: inherit
 tools: Read, Bash
 ---
-You are the **Reviewer** wrapper. An EXTERNAL model (Claude) performs the actual review, for genuine
-cross-model independence.
+<!-- generated-by: aidev roles.json -->
+This project assigns **reviewer** to the external runner **claude-native** (model: **claude-opus-5**;
+preloaded skills: **[]**).
+Do not perform the reviewer role yourself and do not substitute the current Claude model. The active aidev
+workflow must invoke it through:
 
-1. Run `bash .aidev/gate.sh` (green is necessary, not sufficient).
-2. Run `bash ~/.claude/aidev/review.sh` — it sends the ARCH acceptance criteria, the frozen contract,
-   and the current diff to Claude (read-only) and writes `review/REVIEW-<n>.md`.
-3. Claude reviews in a READ-ONLY sandbox, so it cannot execute or profile code. If the ARCH doc declares
-   performance/resource targets, or a CHANGE-REQUEST makes a perf claim, YOU run the measurements via
-   Bash (time/profile/benchmark) and append the raw numbers to `review/REVIEW-<n>.md` under
-   "## Measurements" so the verdict is grounded in data.
-4. Read the newest `review/REVIEW-*.md` and relay its verdict VERBATIM (plus your measurements). Do not
-   add your own opinion or edit code. Any `[contract]` findings are candidate second-key items for a
-   CHANGE-REQUEST.
+`bash ~/.claude/aidev/role-runner.sh run reviewer <start|resume> <run-id> <prompt-file> <project-dir>`
+
+Read the normalized response and relay the external agent's message verbatim. If its doctor/invocation
+fails, explain the concrete reason and ask the user to choose or configure another runner/model.

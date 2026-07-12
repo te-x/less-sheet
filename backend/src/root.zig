@@ -571,3 +571,100 @@ pub fn copyAdvancesReset(doc: *api.Doc) void {
 pub export fn ls_cell_copy(doc: *const api.Doc, row: u64, col: u32, buf: ?[*]u8, buf_len: usize, out_len: *usize, out_truncated: *bool) callconv(.c) api.CopyResult {
     return window.cellCopy(asDocMut(doc), row, col, buf, buf_len, out_len, out_truncated);
 }
+
+
+// ===========================================================================
+// csv-gz internal-seam re-exports + instrumentation seams (ARCH-csv-gz).
+// The re-exports below let contracts/api.zig pin the enumerated Source/Reader
+// SEAM capabilities as `core.*` (Decision 1-C) while their DEFINITIONS stay in
+// source.zig / reader.zig (implementer-owned; the af83db9 boundary). The gz*
+// seams are Zig-only test instrumentation (NOT the C ABI -- like copyAdvances),
+// reading DEFAULTED base.Document state, so api/lesssheet.h is byte-identical
+// and a plain-CSV document reports zeros. SEED: gzip is not wired, so these
+// report zero/false -> csv-gz quantitative ACs are RED; existing tests GREEN.
+// ===========================================================================
+
+const source_seam = @import("source.zig");
+const reader_seam = @import("reader.zig");
+
+// Seam CAPABILITY re-exports (pinned by contracts/api.zig comptime block).
+pub const Source = source_seam.Source;
+pub const Pos = reader_seam.Pos;
+pub const Cursor = source_seam.Cursor;
+pub const SourceKind = source_seam.SourceKind;
+pub const sourceFromMapping = source_seam.sourceFromMapping;
+pub const sourceShutdown = source_seam.sourceShutdown;
+pub const sourceDeinit = source_seam.sourceDeinit;
+pub const sourceEndAt = reader_seam.sourceEndAt;
+pub const sourceCursorAt = reader_seam.sourceCursorAt;
+pub const posLogicalBytes = reader_seam.posLogicalBytes;
+pub const posPhysicalBytes = reader_seam.posPhysicalBytes;
+pub const sourceRebaseBom = reader_seam.sourceRebaseBom;
+pub const readerMatchRow = reader_seam.readerMatchRow;
+
+/// See contracts/api.zig `gzOpenBudget` (AC5/AC6/AC7).
+pub fn gzOpenBudget(doc: *const api.Doc) api.OpenBudget {
+    const d = asDoc(doc);
+    return .{ .physical_in = d.gz_physical_in, .inflated_out = d.gz_inflated_out };
+}
+/// See contracts/api.zig `gzReplayStats` (AC15).
+pub fn gzReplayStats(doc: *const api.Doc) api.ReplayStats {
+    const d = asDoc(doc);
+    return .{
+        .landed = d.gz_replay_landed,
+        .restored_checkpoint_logical = d.gz_replay_restored_logical,
+        .inflated_replay = d.gz_replay_inflated,
+    };
+}
+/// See contracts/api.zig `gzReplayStatsReset`.
+pub fn gzReplayStatsReset(doc: *api.Doc) void {
+    const d = asDocMut(doc);
+    d.gz_replay_landed = false;
+    d.gz_replay_restored_logical = 0;
+    d.gz_replay_inflated = 0;
+}
+/// See contracts/api.zig `gzResidentBytes` (AC17).
+pub fn gzResidentBytes(doc: *const api.Doc) u64 {
+    return asDoc(doc).gz_resident_bytes;
+}
+/// See contracts/api.zig `gzCheckpointStore` (AC17/AC21).
+pub fn gzCheckpointStore(doc: *const api.Doc) api.CheckpointStore {
+    const d = asDoc(doc);
+    return .{
+        .present = d.gz_ckpt_present,
+        .bytes = d.gz_ckpt_bytes,
+        .mode = d.gz_ckpt_mode,
+        .unlinked = d.gz_ckpt_unlinked,
+    };
+}
+/// See contracts/api.zig `gzCheckpointStoreFailAfter` (AC18).
+pub fn gzCheckpointStoreFailAfter(doc: *api.Doc, ops: u64) void {
+    asDocMut(doc).gz_ckpt_fail_after = ops;
+}
+/// See contracts/api.zig `gzForceChunkBytes` (AC12).
+pub fn gzForceChunkBytes(doc: *api.Doc, n: u64) void {
+    asDocMut(doc).gz_force_chunk_bytes = n;
+}
+/// See contracts/api.zig `gzStreamMatcherResidentBytes` (AC13).
+pub fn gzStreamMatcherResidentBytes(doc: *const api.Doc) u64 {
+    return asDoc(doc).gz_match_resident_bytes;
+}
+/// See contracts/api.zig `gzStreamMatcherResidentReset`.
+pub fn gzStreamMatcherResidentReset(doc: *api.Doc) void {
+    asDocMut(doc).gz_match_resident_bytes = 0;
+}
+/// See contracts/api.zig `gzCacheCopyBytes` (AC20 regression proxy).
+pub fn gzCacheCopyBytes(doc: *const api.Doc) u64 {
+    return asDoc(doc).gz_cache_copy_bytes;
+}
+/// See contracts/api.zig `gzSnapshotProbe` (AC14). SEED: the inflate-checkpoint
+/// snapshot adapter is not built yet -> report "no snapshot taken, not
+/// identical" so AC14 is RED. The comptime shape-assertion in contracts/api.zig
+/// already proves the adapter is FEASIBLE against the installed std; this seam
+/// proves it WORKS byte-for-byte once built.
+pub fn gzSnapshotProbe(gpa: std.mem.Allocator, gzip_bytes: []const u8, probe_logical: u64) api.SnapshotProbe {
+    _ = gpa;
+    _ = gzip_bytes;
+    _ = probe_logical;
+    return .{ .restored = false, .identical = false };
+}

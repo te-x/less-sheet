@@ -378,6 +378,31 @@ pub const Document = struct {
     copy_cursor_source_row: u64 = 0,
     copy_cursor_block_consumed: u64 = 0,
 
+    // --- csv-gz instrumentation state (ARCH-csv-gz) -------------------------
+    // All DEFAULTED (like copy_cursor_* above), so openWithAllocator's literal
+    // need not mention them AND a plain-CSV document reports zeros -> the mmap
+    // fast path is unaffected (AC20). The implementer sets these as the gzip
+    // Source consumes the dual open budget, spills/reads checkpoints, replays a
+    // behind-frontier landing, and streaming-matches. In the SEED they stay
+    // zero, which is exactly what makes every csv-gz quantitative AC RED (each
+    // asserts the counter did REAL work, e.g. `> 0 and <= bound`) -- mirroring
+    // stream-copy's `copy_advances == 0` RED seed. Read/reset only via the
+    // Zig-level seams in contracts/api.zig (gz* -> root.zig), NEVER the C ABI.
+    gz_physical_in: u64 = 0, // AC5/6/7: compressed input consumed at open
+    gz_inflated_out: u64 = 0, // AC5/6/7: inflated output produced at open
+    gz_replay_landed: bool = false, // AC15: a behind-frontier landing occurred
+    gz_replay_restored_logical: u64 = 0, // AC15: restored checkpoint's logical offset
+    gz_replay_inflated: u64 = 0, // AC15: inflated bytes replayed for that landing
+    gz_resident_bytes: u64 = 0, // AC17: gzip-specific resident state (bound 16 MiB)
+    gz_ckpt_present: bool = false, // AC17/21: a checkpoint spill file exists
+    gz_ckpt_bytes: u64 = 0, // AC17: its size (bound 0.25% of inflated + overhead)
+    gz_ckpt_mode: u32 = 0, // AC17/21: its permission bits (must be 0o600)
+    gz_ckpt_unlinked: bool = false, // AC17/21: already unlinked while open
+    gz_ckpt_fail_after: u64 = std.math.maxInt(u64), // AC18: inject store failure after N ops
+    gz_force_chunk_bytes: u64 = 0, // AC12: force cursor spans to <=N bytes (0 == natural)
+    gz_match_resident_bytes: u64 = 0, // AC13: peak per-row matcher residency
+    gz_cache_copy_bytes: u64 = 0, // AC20: bytes copied THROUGH a cache (0 for mmap)
+
     pub fn lock(self: *Document) void {
         _ = c.pthread_mutex_lock(&self.mutex);
     }

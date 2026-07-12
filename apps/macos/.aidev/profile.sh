@@ -2,6 +2,9 @@
 LANG_NAME="Swift (SwiftPM)"
 # Package.swift is a FILE entry: frozen so the implementer can't drop test targets or add deps (planner owns it).
 FROZEN_PATHS=( "Sources/Contracts" "Tests" "Package.swift" )
+ARCHITECTURE_PATHS=( )                   # architecture owned at the workspace root (docs/architecture)
+DEPENDENCY_PATHS=( "Package.swift" )     # SwiftPM manifest (also frozen above — planner-owned)
+IMPLEMENTATION_PATHS=( "Sources/LessSheetApp" "Sources/LessSheetKit" "Sources/CLessSheet" )
 # The Kit links the Zig core statically (backend/zig-out/lib/liblesssheet.a),
 # so conformance builds the backend artifact first.
 # STALE-LINK GUARD (find-seek round 2 lesson): SwiftPM does NOT track the .a as a

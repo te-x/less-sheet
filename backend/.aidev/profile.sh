@@ -1,6 +1,9 @@
 # aidev language profile — Zig
 LANG_NAME="Zig"
 FROZEN_PATHS=( "contracts" "tests" )
+ARCHITECTURE_PATHS=( )                   # architecture is owned at the workspace root (docs/architecture)
+DEPENDENCY_PATHS=( "build.zig" )         # Zig build graph (stdlib-only; no build.zig.zon)
+IMPLEMENTATION_PATHS=( "src" )
 # Zig analyzes lazily; build + test compilation fires the comptime signature assertions.
 CONFORMANCE_CMD='[ "$(zig version)" = "0.16.0" ] || { echo "zig 0.16.0 required, found $(zig version)"; false; } && zig build'
 BEHAVIOR_CMD="zig build test"

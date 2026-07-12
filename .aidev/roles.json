@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "roles": {
+    "architect":   {"runner": "claude-native",  "model": "claude-opus-5",   "transport": "resume", "settings": {"reasoning_effort": "max"},   "skills": [],      "skill_sources": {}},
+    "planner":     {"runner": "claude-native",    "model": "opus",          "transport": "native", "settings": {"effort": "max"},            "skills": ["tdd"], "skill_sources": {"tdd": "$HOME/.claude/skills/tdd/SKILL.md"}},
+    "implementer": {"runner": "claude-native",    "model": "sonnet",        "transport": "native", "settings": {"effort": "max"},            "skills": [],      "skill_sources": {}},
+    "reviewer":    {"runner": "claude-native",        "model": "claude-opus-5", "transport": "resume", "settings": {"reasoning_effort": "xhigh"}, "skills": [],      "skill_sources": {}}
+  }
+}

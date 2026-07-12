@@ -4177,3 +4177,819 @@ test "sc5: backwards / re-anchor access stays correct and never slower than from
     try std.testing.expect(baseline >= 100 * n); // from-scratch backwards is interval-costly (RED seed: 0)
     try std.testing.expect(cursor <= baseline); // NEVER SLOWER than locate-from-scratch
 }
+
+
+// ===========================================================================
+// csv-gz slice (ARCH-csv-gz) — transparent, checkpointed `.csv.gz`. Frozen;
+// planner-owned. Tests exercise the PUBLIC C ABI through @import("api") only,
+// PLUS the Zig-only instrumentation seams (gz* / snapshot probe — NOT the C
+// ABI, like copyAdvances), so api/lesssheet.h is BYTE-IDENTICAL (AC1). gzip
+// fixtures are generated DETERMINISTICALLY IN-TEST via the pinned Zig-0.16 std
+// (std.compress.flate.Compress .gzip/.raw + a hand-built RFC-1952 header/footer
+// for the optional-field / recovery / false-ISIZE / BGZF matrices), so the
+// frozen suite is self-contained and never depends on build.zig wiring.
+//
+// AC -> test map  (FU = deterministic frozen unit · TL = generous CI timing
+// lane · RM = REVIEWER-MEASURED build-time, NOT gate-blocking — Decision 2-A):
+//   AC1  frozen boundary ....... gz_ac1  (GUARD: root gate + abi tests)
+//   AC2  magic not name ........ gz_ac2  (FU RED)
+//   AC3  plain/gzip equivalence  gz_ac3  (FU RED)
+//   AC4  member transparency ... gz_ac4  (FU RED)
+//   AC5  dual open bound ....... gz_ac5  (FU RED)
+//   AC6  5KB..500GB flatness ... gz_ac6  (FU RED + TL cold-open<500ms)
+//   AC7  small determinism ..... gz_ac7  (FU RED)
+//   AC8  RFC/member coverage ... gz_ac8  (FU RED)
+//   AC9  recovery matrix ....... gz_ac9  (FU RED)
+//   AC10 terminal prefix ....... gz_ac10 (FU RED)
+//   AC11 no ISIZE dependency ... gz_ac11 (FU RED)
+//   AC12 chunk-boundary ........ gz_ac12 (FU RED)
+//   AC13 no unbounded materlz. . gz_ac13 (FU RED)
+//   AC14 checkpoint restore .... gz_ac14 (FU RED + comptime shape pin)
+//   AC15 bounded replay ........ gz_ac15 (FU RED, heavy 132 MiB-inflate fixture)
+//   AC16 landing performance ... gz_ac16 (FU RED correctness + TL <100ms)
+//   AC17 resident/temp bounds .. gz_ac17 (FU RED; 120 MiB 10GB-class RSS = RM)
+//   AC18 checkpoint-store fail . gz_ac18 (FU RED)
+//   AC19 concurrency+cleanup ... gz_ac19 (FU RED)
+//   AC20 plain-CSV regression .. gz_ac20 (GUARD FU; 5%-median & 5MB-RSS = RM)
+//   AC21 read-only source ...... gz_ac21 (GUARD FU)
+//   AC22 build/distribution .... gz_ac22 (GUARD FU; single-digit-MB size = RM)
+//
+// RED SEED: gzip is NOT wired (root.zig detects no magic; source.sourceFromMapping
+// always builds the mmap specialization). So a `.csv` file whose bytes are gzip
+// is opened as mmap-as-plain garbage -> every EQUIVALENCE/behaviour AC diverges
+// from its plain reference (RED). The gz* counters read DEFAULTED base.Document
+// state == 0/false -> every QUANTITATIVE AC's "did real work" clause (`> 0 and
+// <= bound`) fails at 0 (RED) — exactly stream-copy's `copyAdvances == 0` seed.
+// The four GUARD ACs (AC1/20/21/22) are invariants: GREEN by construction and
+// must STAY green. GREEN needs the implementer to build+wire the bounded,
+// checkpointed gzip Source + streaming matcher and set the counters.
+// ===========================================================================
+
+const flate = std.compress.flate;
+
+/// gzip `plain` into ONE standard member (stdlib header/footer, mtime 0).
+fn gz(gpa: std.mem.Allocator, plain: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = try .initCapacity(gpa, @max(64, plain.len));
+    defer out.deinit();
+    var win: [flate.max_window_len]u8 = undefined;
+    var cmp = try flate.Compress.init(&out.writer, &win, .gzip, .default);
+    try cmp.writer.writeAll(plain);
+    try cmp.finish();
+    return gpa.dupe(u8, out.written());
+}
+
+/// Raw (headerless) DEFLATE of `plain` — the payload for hand-built members.
+fn deflateRaw(gpa: std.mem.Allocator, plain: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = try .initCapacity(gpa, @max(64, plain.len));
+    defer out.deinit();
+    var win: [flate.max_window_len]u8 = undefined;
+    var cmp = try flate.Compress.init(&out.writer, &win, .raw, .default);
+    try cmp.writer.writeAll(plain);
+    try cmp.finish();
+    return gpa.dupe(u8, out.written());
+}
+
+fn appendU32Le(gpa: std.mem.Allocator, m: *std.ArrayList(u8), v: u32) !void {
+    try m.append(gpa, @intCast(v & 0xff));
+    try m.append(gpa, @intCast((v >> 8) & 0xff));
+    try m.append(gpa, @intCast((v >> 16) & 0xff));
+    try m.append(gpa, @intCast((v >> 24) & 0xff));
+}
+
+/// Full-control single gzip member (RFC 1952) for the optional-field (AC8),
+/// recovery (AC9), and false-ISIZE (AC11) matrices.
+const GzFlags = struct {
+    cm: u8 = 8, // compression method (8 = deflate; !=8 tests rejection)
+    ftext: bool = false,
+    fname: ?[]const u8 = null,
+    fcomment: ?[]const u8 = null,
+    extra: ?[]const u8 = null, // FEXTRA payload (subfields; e.g. BGZF "BC")
+    fhcrc: bool = false,
+    bad_fhcrc: bool = false, // corrupt the header CRC16 (AC9)
+    bad_crc: bool = false, // corrupt the footer CRC32 (AC9)
+    isize_override: ?u32 = null, // false/wrapped ISIZE (AC11)
+    truncate_payload: ?usize = null, // keep only N deflate bytes (AC9 truncation)
+    omit_footer: bool = false, // drop CRC32+ISIZE (AC9 truncation)
+};
+
+fn gzMember(gpa: std.mem.Allocator, plain: []const u8, f: GzFlags) ![]u8 {
+    var m: std.ArrayList(u8) = .empty;
+    errdefer m.deinit(gpa);
+    var flg: u8 = 0;
+    if (f.ftext) flg |= 0x01;
+    if (f.fhcrc or f.bad_fhcrc) flg |= 0x02;
+    if (f.extra != null) flg |= 0x04;
+    if (f.fname != null) flg |= 0x08;
+    if (f.fcomment != null) flg |= 0x10;
+    try m.appendSlice(gpa, &.{ 0x1f, 0x8b, f.cm, flg, 0, 0, 0, 0, 0, 0xff }); // magic..OS
+    if (f.extra) |x| {
+        try m.append(gpa, @intCast(x.len & 0xff));
+        try m.append(gpa, @intCast((x.len >> 8) & 0xff));
+        try m.appendSlice(gpa, x);
+    }
+    if (f.fname) |n| {
+        try m.appendSlice(gpa, n);
+        try m.append(gpa, 0);
+    }
+    if (f.fcomment) |cm| {
+        try m.appendSlice(gpa, cm);
+        try m.append(gpa, 0);
+    }
+    if (f.fhcrc or f.bad_fhcrc) {
+        var h16: u16 = @truncate(std.hash.Crc32.hash(m.items));
+        if (f.bad_fhcrc) h16 +%= 1;
+        try m.append(gpa, @intCast(h16 & 0xff));
+        try m.append(gpa, @intCast((h16 >> 8) & 0xff));
+    }
+    const raw = try deflateRaw(gpa, plain);
+    defer gpa.free(raw);
+    const payload = if (f.truncate_payload) |n| raw[0..@min(n, raw.len)] else raw;
+    try m.appendSlice(gpa, payload);
+    if (!f.omit_footer) {
+        var crc = std.hash.Crc32.hash(plain);
+        if (f.bad_crc) crc +%= 1;
+        try appendU32Le(gpa, &m, crc);
+        try appendU32Le(gpa, &m, f.isize_override orelse @truncate(plain.len));
+    }
+    return m.toOwnedSlice(gpa);
+}
+
+/// A multi-member gzip whose CONCATENATED payload == `plain`, split at byte
+/// `at` (adversarial member boundary — AC3/AC4).
+fn gzSplit(gpa: std.mem.Allocator, plain: []const u8, at: usize) ![]u8 {
+    const cut = @min(at, plain.len);
+    const a = try gzMember(gpa, plain[0..cut], .{});
+    defer gpa.free(a);
+    const b = try gzMember(gpa, plain[cut..], .{});
+    defer gpa.free(b);
+    var m: std.ArrayList(u8) = .empty;
+    errdefer m.deinit(gpa);
+    try m.appendSlice(gpa, a);
+    try m.appendSlice(gpa, b);
+    return m.toOwnedSlice(gpa);
+}
+
+/// A BGZF-STYLE stream: `plain` split into `block`-byte members, each carrying a
+/// gzip FEXTRA "BC" subfield (AC3/AC8). BSIZE is a placeholder — a generic gzip
+/// reader skips XLEN bytes and decodes the payload regardless.
+fn gzBgzf(gpa: std.mem.Allocator, plain: []const u8, block: usize) ![]u8 {
+    var m: std.ArrayList(u8) = .empty;
+    errdefer m.deinit(gpa);
+    const bc = [_]u8{ 'B', 'C', 2, 0, 0, 0 }; // SI1 SI2 SLEN(=2 LE) BSIZE(LE placeholder)
+    var i: usize = 0;
+    if (plain.len == 0) {
+        const only = try gzMember(gpa, plain, .{ .extra = &bc });
+        defer gpa.free(only);
+        try m.appendSlice(gpa, only);
+        return m.toOwnedSlice(gpa);
+    }
+    while (i < plain.len) : (i += block) {
+        const end = @min(i + block, plain.len);
+        const mem = try gzMember(gpa, plain[i..end], .{ .extra = &bc });
+        defer gpa.free(mem);
+        try m.appendSlice(gpa, mem);
+    }
+    return m.toOwnedSlice(gpa);
+}
+
+/// A HIGH-EXPANSION gzip: `unit` repeated `repeat` times, streamed through the
+/// (fastest) compressor so a few-KB gz inflates to `unit.len * repeat` bytes
+/// WITHOUT materializing the whole logical stream (AC6/AC15).
+fn gzHighExpansion(gpa: std.mem.Allocator, unit: []const u8, repeat: usize) ![]u8 {
+    var out: std.Io.Writer.Allocating = try .initCapacity(gpa, 64 * 1024);
+    defer out.deinit();
+    var win: [flate.max_window_len]u8 = undefined;
+    var cmp = try flate.Compress.init(&out.writer, &win, .gzip, .level_1);
+    var i: usize = 0;
+    while (i < repeat) : (i += 1) try cmp.writer.writeAll(unit);
+    try cmp.finish();
+    return gpa.dupe(u8, out.written());
+}
+
+fn makeFixtureNamed(bytes: []const u8, sub: []const u8, mode: u9) !Fixture {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    errdefer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = sub, .data = bytes, .flags = .{ .permissions = .fromMode(mode) } });
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &buf);
+    const path = try std.fs.path.joinZ(std.testing.allocator, &.{ buf[0..n], sub });
+    return .{ .tmp = tmp, .path = path };
+}
+
+fn openNamed(bytes: []const u8, sub: []const u8, options: api.OpenOptions) !OpenedDoc {
+    var fx = try makeFixtureNamed(bytes, sub, 0o644);
+    errdefer fx.deinit();
+    var doc: ?*api.Doc = null;
+    try std.testing.expectEqual(api.Status.ok, api.ls_open(fx.path.ptr, &options, &doc));
+    try std.testing.expect(doc != null);
+    return .{ .fx = fx, .doc = doc.? };
+}
+
+/// The AC3 workhorse: a gzip of `plain` opened with `opts` is byte-identical in
+/// EVERY observable dimension to the plain file opened the same way. RED in the
+/// seed (gzip decodes to mmap-as-plain garbage -> dims/dialect/cells diverge).
+fn expectGzEquiv(plain: []const u8, opts: api.OpenOptions, gz_bytes: []const u8) !void {
+    var pod = try openWith(plain, opts);
+    defer pod.deinit();
+    var god = try openWith(gz_bytes, opts);
+    defer god.deinit();
+    try scanToEnd(pod.doc);
+    try scanToEnd(god.doc);
+
+    const pd = api.ls_dialect_get(pod.doc);
+    const gd = api.ls_dialect_get(god.doc);
+    try std.testing.expectEqual(pd.separator, gd.separator);
+    try std.testing.expectEqual(pd.quote, gd.quote);
+    try std.testing.expectEqual(pd.has_quote, gd.has_quote);
+    try std.testing.expectEqual(pd.header, gd.header);
+    try std.testing.expectEqual(pd.encoding, gd.encoding);
+
+    const cols = api.ls_column_count(pod.doc);
+    try std.testing.expectEqual(cols, api.ls_column_count(god.doc));
+    const prc = api.ls_row_count_get(pod.doc);
+    const grc = api.ls_row_count_get(god.doc);
+    try std.testing.expectEqual(prc.count, grc.count);
+    try std.testing.expectEqual(prc.exact, grc.exact);
+
+    _ = api.ls_window_set(pod.doc, 0, api.window_max_rows);
+    _ = api.ls_window_set(god.doc, 0, api.window_max_rows);
+    var c: u32 = 0;
+    while (c < cols) : (c += 1) {
+        try std.testing.expectEqualStrings(api.ls_header_cell(pod.doc, c).slice(), api.ls_header_cell(god.doc, c).slice());
+        try std.testing.expectEqual(api.ls_header_cell_truncated(pod.doc, c), api.ls_header_cell_truncated(god.doc, c));
+    }
+    var r: u64 = 0;
+    while (r < prc.count and r < api.window_max_rows) : (r += 1) {
+        c = 0;
+        while (c < cols) : (c += 1) {
+            errdefer std.debug.print("\n[csv-gz] cell divergence at row {d} col {d}\n", .{ r, c });
+            try std.testing.expectEqualStrings(api.ls_cell(pod.doc, r, c).slice(), api.ls_cell(god.doc, r, c).slice());
+            try std.testing.expectEqual(api.ls_cell_truncated(pod.doc, r, c), api.ls_cell_truncated(god.doc, r, c));
+        }
+        try std.testing.expectEqual(api.ls_row_oversized(pod.doc, r), api.ls_row_oversized(god.doc, r));
+        try std.testing.expectEqual(api.ls_source_row(pod.doc, r), api.ls_source_row(god.doc, r));
+    }
+}
+
+test "gz_ac1: frozen C-ABI boundary (root gate + abi extern-linkage tests)" {
+    // AC1 (GUARD): api/lesssheet.h byte-identity is enforced by the ROOT gate's
+    // frozen `api/` integrity + the `abi:` extern-linkage tests above; csv-gz
+    // touches NO api/ symbol. Here we assert the gz feature is entirely behind
+    // the unchanged ABI: the instrumentation is Zig-only (never a C export).
+    var od = try openBytes("a,b\n1,2\n");
+    defer od.deinit();
+    // A plain document reports zero gzip state through the Zig-only seams — the
+    // ABI surface it exposes is unchanged (no gzip-specific C symbol exists).
+    try std.testing.expectEqual(@as(u64, 0), api.gzResidentBytes(od.doc));
+    const st = api.gzCheckpointStore(od.doc);
+    try std.testing.expectEqual(false, st.present);
+}
+
+test "gz_ac2: gzip opens by MAGIC not name; plain named .csv.gz stays plain" {
+    const gpa = std.testing.allocator;
+    const plain = "name,age\nAlice,30\nBob,25\n";
+    const g = try gz(gpa, plain);
+    defer gpa.free(g);
+
+    // gzip content under `.csv`, `.gz`, and an unrelated extension all open AS
+    // the decompressed CSV (magic 1f8b, not filename). RED: seed = garbage.
+    for ([_][]const u8{ "data.csv", "data.gz", "export.bin" }) |sub| {
+        var od = try openNamed(g, sub, manual);
+        defer od.deinit();
+        try std.testing.expectEqual(@as(u32, 2), api.ls_column_count(od.doc));
+        winAll(od.doc);
+        try expectCell(od.doc, 0, 0, "Alice");
+        try expectCell(od.doc, 1, 1, "25");
+    }
+    // A PLAIN CSV named `.csv.gz` lacks gzip magic -> stays plain (GUARD).
+    {
+        var od = try openNamed(plain, "data.csv.gz", manual);
+        defer od.deinit();
+        try std.testing.expectEqual(@as(u32, 2), api.ls_column_count(od.doc));
+        winAll(od.doc);
+        try expectCell(od.doc, 0, 0, "Alice");
+    }
+    // Zero- and one-byte files retain existing plain behavior (GUARD).
+    {
+        var e = try openBytes("");
+        defer e.deinit();
+        try std.testing.expectEqual(@as(u32, 0), api.ls_column_count(e.doc));
+        var one = try openBytes("x");
+        defer one.deinit();
+        try std.testing.expectEqual(@as(u32, 1), api.ls_column_count(one.doc));
+    }
+}
+
+test "gz_ac3: plain/gzip equivalence across the encoding/dialect/quote matrix (single, multi-member, BGZF)" {
+    const gpa = std.testing.allocator;
+    // A representative logical CSV: header, quotes + doubled quotes, embedded
+    // newline, CRLF + LF, ragged rows, empty cells, invalid-UTF8 pass-through.
+    const plain = "id,name,note\r\n" ++
+        "1,\"a,b\",\"line\nbreak\"\r\n" ++
+        "2,\"he said \"\"hi\"\"\",\r\n" ++
+        "3,short\n" ++
+        "4,\xff\xfe-raw,ok\n";
+    const opts: api.OpenOptions = .{ .separator = ',', .index_mode = api.index_manual };
+
+    const single = try gz(gpa, plain);
+    defer gpa.free(single);
+    try expectGzEquiv(plain, opts, single);
+
+    // Adversarial member splits at several byte positions (inside a quote, a
+    // CRLF, a field, a record) — all invisible to the CSV layer.
+    for ([_]usize{ 1, 15, 18, 30, plain.len - 2 }) |at| {
+        const ms = try gzSplit(gpa, plain, at);
+        defer gpa.free(ms);
+        try expectGzEquiv(plain, opts, ms);
+    }
+    // BGZF-style: 16-byte blocks, each a member with a "BC" extra field.
+    const bg = try gzBgzf(gpa, plain, 16);
+    defer gpa.free(bg);
+    try expectGzEquiv(plain, opts, bg);
+}
+
+test "gz_ac4: member transparency — splits/BOM/repeated-header/missing-newline/trailing-garbage" {
+    const gpa = std.testing.allocator;
+    // Missing newline BETWEEN members concatenates their bytes within a field.
+    {
+        const a = try gzMember(gpa, "h1,h2\nval", .{}); // no trailing newline
+        defer gpa.free(a);
+        const b = try gzMember(gpa, "ue,x\n", .{}); // continues the field: "value"
+        defer gpa.free(b);
+        var ms: std.ArrayList(u8) = .empty;
+        defer ms.deinit(gpa);
+        try ms.appendSlice(gpa, a);
+        try ms.appendSlice(gpa, b);
+        try expectGzEquiv("h1,h2\nvalue,x\n", .{ .separator = ',', .index_mode = api.index_manual }, ms.items);
+    }
+    // A later member starting with a UTF-8 BOM: only the FIRST overall BOM is
+    // stripped; a later BOM + a repeated header line are ORDINARY data.
+    {
+        const plain = "\xEF\xBB\xBFa,b\n1,2\n\xEF\xBB\xBFa,b\n3,4\n";
+        const ms = try gzSplit(gpa, plain, 8); // split so member 2 begins at the later BOM
+        defer gpa.free(ms);
+        try expectGzEquiv(plain, .{ .separator = ',', .index_mode = api.index_manual }, ms);
+    }
+    // Trailing non-gzip bytes after a completed member are NOT appended as CSV.
+    {
+        const m = try gzMember(gpa, "a,b\n1,2\n", .{});
+        defer gpa.free(m);
+        var withjunk: std.ArrayList(u8) = .empty;
+        defer withjunk.deinit(gpa);
+        try withjunk.appendSlice(gpa, m);
+        try withjunk.appendSlice(gpa, "TRAILING GARBAGE NOT CSV");
+        try expectGzEquiv("a,b\n1,2\n", .{ .separator = ',', .index_mode = api.index_manual }, withjunk.items);
+    }
+}
+
+test "gz_ac5: every gzip open consumes <= 4 MiB physical in AND <= 4 MiB inflated out" {
+    const gpa = std.testing.allocator;
+    // A high-expansion gzip: ~5 KB compressed, ~64 MiB logical. Open must stop
+    // at 4 MiB inflated WITHOUT touching a trailer/tail page for ISIZE.
+    const big = try gzHighExpansion(gpa, "aaaa,bbbb,cccc\n", (64 * 1024 * 1024) / 15);
+    defer gpa.free(big);
+    try std.testing.expect(big.len < 4 * 1024 * 1024); // compressed prefix is small
+    var od = try openWith(big, .{ .separator = ',', .index_mode = api.index_manual });
+    defer od.deinit();
+    const b = api.gzOpenBudget(od.doc);
+    // RED SEED: budget == {0,0}, so `> 0` fails. GREEN: bounded by BOTH ceilings.
+    try std.testing.expect(b.physical_in > 0);
+    try std.testing.expect(b.inflated_out > 0);
+    try std.testing.expect(b.physical_in <= api.open_head_max_bytes);
+    try std.testing.expect(b.inflated_out <= api.open_head_max_bytes);
+    // High expansion < 4 MiB compressed is NOT fully inflated at open.
+    try std.testing.expect(b.inflated_out < 64 * 1024 * 1024);
+}
+
+test "gz_ac6: 5 KB..500 GB flatness — open work is bounded, independent of size (FU + TL cold-open)" {
+    const gpa = std.testing.allocator;
+    const small = try gz(gpa, "a,b,c\n1,2,3\n4,5,6\n");
+    defer gpa.free(small);
+    const t0: std.Io.Clock.Timestamp = .now(std.testing.io, .awake);
+    var sm = try openWith(small, .{ .separator = ',', .index_mode = api.index_manual });
+    defer sm.deinit();
+    try std.testing.expect(elapsedMs(t0) < 500); // TL cold-open ceiling (generous)
+    const sb = api.gzOpenBudget(sm.doc);
+
+    // A sparse apparent-500 GB file: a small valid gzip head, then a hole.
+    const head = try gz(gpa, "a,b,c\n1,2,3\n4,5,6\n");
+    defer gpa.free(head);
+    var fx = try makeSparseFixture(head, 500 * 1024 * 1024 * 1024);
+    defer fx.deinit();
+    var big_doc: ?*api.Doc = null;
+    const t1: std.Io.Clock.Timestamp = .now(std.testing.io, .awake);
+    try std.testing.expectEqual(api.Status.ok, api.ls_open(fx.path.ptr, &manual, &big_doc));
+    defer api.ls_close(big_doc.?);
+    try std.testing.expect(elapsedMs(t1) < 500); // TL: the 500 GB apparent size adds no open work
+    const bb = api.gzOpenBudget(big_doc.?);
+    // FU RED: both opens did real work bounded to the head — the apparent size
+    // caused NO extra physical consumption (seed budgets are 0 -> `> 0` fails).
+    try std.testing.expect(sb.physical_in > 0 and sb.physical_in <= api.open_head_max_bytes);
+    try std.testing.expect(bb.physical_in > 0 and bb.physical_in <= api.open_head_max_bytes);
+}
+
+test "gz_ac7: a fully-fitting gzip is exact+complete at open; an over-4-MiB output is a usable head, inexact" {
+    const gpa = std.testing.allocator;
+    // Whole physical AND inflated streams fit both 4 MiB limits -> exact.
+    const smallp = "a,b\n1,2\n3,4\n5,6\n";
+    const smallg = try gz(gpa, smallp);
+    defer gpa.free(smallg);
+    var sd = try openWith(smallg, .{ .separator = ',', .index_mode = api.index_manual });
+    defer sd.deinit();
+    const rc = api.ls_row_count_get(sd.doc);
+    try std.testing.expectEqual(true, rc.exact); // RED seed: garbage count != 3 (and content check below)
+    try std.testing.expectEqual(@as(u64, 3), rc.count);
+    const poll = api.ls_index_poll(sd.doc);
+    try std.testing.expectEqual(true, poll.complete);
+
+    // Output crosses 4 MiB -> usable head, INEXACT (not blocked for full inflate).
+    const bigg = try gzHighExpansion(gpa, "aaaa,bbbb\n", (16 * 1024 * 1024) / 10);
+    defer gpa.free(bigg);
+    var bd = try openWith(bigg, .{ .separator = ',', .index_mode = api.index_manual });
+    defer bd.deinit();
+    try std.testing.expectEqual(false, api.ls_row_count_get(bd.doc).exact); // RED seed: small-as-plain -> exact==true
+}
+
+test "gz_ac8: RFC/member coverage — optional fields + empty/multi member; non-gzip is not misparsed" {
+    const gpa = std.testing.allocator;
+    const plain = "a,b\n1,2\n3,4\n";
+    const opts: api.OpenOptions = .{ .separator = ',', .index_mode = api.index_manual };
+    // Every supported optional header field decodes to the same logical CSV.
+    const with_fields = try gzMember(gpa, plain, .{ .ftext = true, .fname = "orig.csv", .fcomment = "note", .extra = &[_]u8{ 'X', 'Y', 1, 0, 7 }, .fhcrc = true });
+    defer gpa.free(with_fields);
+    try expectGzEquiv(plain, opts, with_fields);
+    // An EMPTY member followed by a real member (concatenated).
+    {
+        const empty = try gzMember(gpa, "", .{});
+        defer gpa.free(empty);
+        const real = try gzMember(gpa, plain, .{});
+        defer gpa.free(real);
+        var ms: std.ArrayList(u8) = .empty;
+        defer ms.deinit(gpa);
+        try ms.appendSlice(gpa, empty);
+        try ms.appendSlice(gpa, real);
+        try expectGzEquiv(plain, opts, ms.items);
+    }
+    // A non-method-8 "gzip" (CM=9) has no usable payload -> LS_ERROR_IO.
+    {
+        const badcm = try gzMember(gpa, plain, .{ .cm = 9 });
+        defer gpa.free(badcm);
+        var fx = try makeFixture(badcm, 0o644);
+        defer fx.deinit();
+        var doc: ?*api.Doc = null;
+        // RED SEED: opened as mmap-as-plain -> .ok; GREEN: rejected .io.
+        try std.testing.expectEqual(api.Status.io, api.ls_open(fx.path.ptr, &opts, &doc));
+    }
+}
+
+test "gz_ac9: recovery matrix — empty/invalid/truncated/footer-mismatch/structural/budget-header" {
+    const gpa = std.testing.allocator;
+    const opts: api.OpenOptions = .{ .separator = ',', .index_mode = api.index_manual };
+    // (a) valid EMPTY gzip -> empty document (0 columns, like an empty file).
+    {
+        const empty = try gzMember(gpa, "", .{});
+        defer gpa.free(empty);
+        var od = try openWith(empty, opts);
+        defer od.deinit();
+        try std.testing.expectEqual(@as(u32, 0), api.ls_column_count(od.doc)); // RED seed: ~20 garbage bytes -> >=1 col
+    }
+    // (b) INVALID gzip (magic, then garbage) with no payload -> LS_ERROR_IO.
+    {
+        const bad = [_]u8{ 0x1f, 0x8b, 0x08, 0, 0, 0, 0, 0, 0, 0xff, 0xde, 0xad, 0xbe, 0xef };
+        var fx = try makeFixture(&bad, 0o644);
+        defer fx.deinit();
+        var doc: ?*api.Doc = null;
+        try std.testing.expectEqual(api.Status.io, api.ls_open(fx.path.ptr, &opts, &doc)); // RED seed: .ok
+    }
+    // (c) TRUNCATION after emitted payload (footer missing) -> the FULL emitted
+    //     prefix is salvaged exactly (deterministic: all deflate bytes present,
+    //     only the CRC/ISIZE footer dropped -> damaged EOF after every row).
+    {
+        const full = "a,b\n1,2\n3,4\n5,6\n";
+        const trunc = try gzMember(gpa, full, .{ .omit_footer = true });
+        defer gpa.free(trunc);
+        try expectGzEquiv(full, opts, trunc); // RED seed: garbage; GREEN: salvaged == full
+    }
+    // (d) footer CRC mismatch keeps payload AND permits a following valid member.
+    {
+        const bad = try gzMember(gpa, "a,b\n1,2\n", .{ .bad_crc = true });
+        defer gpa.free(bad);
+        const good = try gzMember(gpa, "3,4\n", .{});
+        defer gpa.free(good);
+        var ms: std.ArrayList(u8) = .empty;
+        defer ms.deinit(gpa);
+        try ms.appendSlice(gpa, bad);
+        try ms.appendSlice(gpa, good);
+        try expectGzEquiv("a,b\n1,2\n3,4\n", opts, ms.items);
+    }
+    // (e) an optional FILENAME that consumes the whole physical head budget
+    //     before any payload -> LS_ERROR_IO within the budget.
+    {
+        const huge = try gpa.alloc(u8, api.open_head_max_bytes + 64 * 1024);
+        defer gpa.free(huge);
+        @memset(huge, 'N');
+        const m = try gzMember(gpa, "a,b\n1,2\n", .{ .fname = huge });
+        defer gpa.free(m);
+        var fx = try makeFixture(m, 0o644);
+        defer fx.deinit();
+        var doc: ?*api.Doc = null;
+        try std.testing.expectEqual(api.Status.io, api.ls_open(fx.path.ptr, &opts, &doc)); // RED seed: .ok
+    }
+}
+
+test "gz_ac10: a salvaged prefix has a deterministic immutable end (exact count, terminal poll, stable)" {
+    const gpa = std.testing.allocator;
+    const opts: api.OpenOptions = .{ .separator = ',', .index_mode = api.index_manual };
+    const full = "a,b\n1,2\n3,4\n5,6\n";
+    const trunc = try gzMember(gpa, full, .{ .truncate_payload = 6, .omit_footer = true });
+    defer gpa.free(trunc);
+    var od = try openWith(trunc, opts);
+    defer od.deinit();
+    try scanToEnd(od.doc);
+    const rc = api.ls_row_count_get(od.doc);
+    try std.testing.expectEqual(true, rc.exact); // salvaged prefix is EXACT for the rows it has
+    const poll = api.ls_index_poll(od.doc);
+    // Terminal normalization: bytes_scanned == bytes_total, complete == true.
+    try std.testing.expectEqual(poll.bytes_total, poll.bytes_scanned); // RED seed: garbage/partial
+    try std.testing.expectEqual(true, poll.complete);
+    // Repeated access exposes no additional rows after the terminal decision.
+    const rc2 = api.ls_row_count_get(od.doc);
+    try std.testing.expectEqual(rc.count, rc2.count);
+    try std.testing.expect(rc.count >= 1); // at least the emitted prefix
+}
+
+test "gz_ac11: row estimate/progress never use ISIZE (false/wrapped ISIZE + concatenated members)" {
+    const gpa = std.testing.allocator;
+    const plain = "a,b\n1,2\n3,4\n5,6\n7,8\n";
+    // Deliberately FALSE / wrapped ISIZE in each member's footer.
+    const m1 = try gzMember(gpa, "a,b\n1,2\n3,4\n", .{ .isize_override = 0xFFFFFFFF });
+    defer gpa.free(m1);
+    const m2 = try gzMember(gpa, "5,6\n7,8\n", .{ .isize_override = 7 });
+    defer gpa.free(m2);
+    var ms: std.ArrayList(u8) = .empty;
+    defer ms.deinit(gpa);
+    try ms.appendSlice(gpa, m1);
+    try ms.appendSlice(gpa, m2);
+    // The decoded CSV (ISIZE ignored) is byte-identical to plain; the estimate
+    // collapses to the exact count at terminal EOF. RED seed: garbage.
+    try expectGzEquiv(plain, .{ .separator = ',', .index_mode = api.index_manual }, ms.items);
+}
+
+test "gz_ac12: forced 1-byte/irregular chunks split every token boundary; results == mmap reference" {
+    const gpa = std.testing.allocator;
+    const plain = "n,v\r\n" ++
+        "\"a,b\",\"x\ny\"\r\n" ++ // quote + embedded sep + embedded newline
+        "alpha,3.14159e2\n" ++ // decimal token
+        "beta,-0.0000000000000000000000000000000000000042\n"; // >40-digit magnitude
+    const g = try gz(gpa, plain);
+    defer gpa.free(g);
+    var pod = try openWith(plain, .{ .separator = ',', .index_mode = api.index_manual });
+    defer pod.deinit();
+    var god = try openWith(g, .{ .separator = ',', .index_mode = api.index_manual });
+    defer god.deinit();
+    api.gzForceChunkBytes(god.doc, 1); // one inflated byte per span
+    try scanToEnd(pod.doc);
+    try scanToEnd(god.doc);
+    try std.testing.expectEqual(api.ls_column_count(pod.doc), api.ls_column_count(god.doc));
+    _ = api.ls_window_set(pod.doc, 0, api.window_max_rows);
+    _ = api.ls_window_set(god.doc, 0, api.window_max_rows);
+    const cols = api.ls_column_count(pod.doc);
+    var r: u64 = 0;
+    const n = api.ls_row_count_get(pod.doc).count;
+    while (r < n) : (r += 1) {
+        var c: u32 = 0;
+        while (c < cols) : (c += 1) {
+            try std.testing.expectEqualStrings(api.ls_cell(pod.doc, r, c).slice(), api.ls_cell(god.doc, r, c).slice());
+        }
+    }
+    // Numeric predicate + text search resolve identically under 1-byte chunking.
+    try startSearch(god.doc, predReq(1, .lt, "0")); // the negative decimal row
+    const gs = try waitSearchDone(god.doc);
+    try std.testing.expectEqual(@as(u64, 1), gs.total);
+}
+
+test "gz_ac13: streaming match is O(query+fixed) on a giant cell; the tail match is found (no unbounded materialize)" {
+    const gpa = std.testing.allocator;
+    // A giant first cell (> the display cap AND > any small budget), with the
+    // search needle only in its TAIL, plus a normal following row.
+    var plain: std.ArrayList(u8) = .empty;
+    defer plain.deinit(gpa);
+    try plain.appendSlice(gpa, "h1,h2\n");
+    var i: usize = 0;
+    while (i < 2 * 1024 * 1024) : (i += 1) try plain.append(gpa, 'a');
+    try plain.appendSlice(gpa, "NEEDLE,x\n");
+    try plain.appendSlice(gpa, "b,y\n");
+    const g = try gz(gpa, plain.items);
+    defer gpa.free(g);
+    var od = try openWith(g, .{ .separator = ',', .index_mode = api.index_auto });
+    defer od.deinit();
+    try scanToEnd(od.doc);
+    api.gzStreamMatcherResidentReset(od.doc);
+    try startSearch(od.doc, textReq("NEEDLE"));
+    const s = try waitSearchDone(od.doc);
+    try std.testing.expectEqual(@as(u64, 1), s.total); // RED seed: garbage -> not found as expected
+    const resident = api.gzStreamMatcherResidentBytes(od.doc);
+    // O(query + fixed state), never O(cell): RED seed reads 0 (`> 0` fails);
+    // GREEN stays far below the 2 MiB cell.
+    try std.testing.expect(resident > 0);
+    try std.testing.expect(resident < 64 * 1024);
+}
+
+test "gz_ac14: forced inflate-checkpoint snapshot+restore is byte-identical (stored/fixed/dynamic/pending/member)" {
+    const gpa = std.testing.allocator;
+    // Fixtures biased toward different DEFLATE block kinds + a member boundary.
+    const dynamic = try gzHighExpansion(gpa, "the quick brown fox,42,lorem ipsum dolor\n", 40000);
+    defer gpa.free(dynamic);
+    const twomember = try gzSplit(gpa, "col\n" ++ "aaaaaaaa\n" ** 200, 900);
+    defer gpa.free(twomember);
+    for ([_][]const u8{ dynamic, twomember }) |fixture| {
+        for ([_]u64{ 0, 100, 40000, 250000 }) |probe| {
+            const pr = api.gzSnapshotProbe(gpa, fixture, probe);
+            // RED SEED: {restored=false, identical=false}. GREEN: a checkpoint
+            // was taken/restored AND the restart matched uninterrupted decoding.
+            try std.testing.expectEqual(true, pr.restored);
+            try std.testing.expectEqual(true, pr.identical);
+        }
+    }
+}
+
+test "gz_ac15: behind-frontier landing restores a nonzero checkpoint and replays <= 32 MiB (heavy)" {
+    const gpa = std.testing.allocator;
+    // ~135 MiB logical from a tiny gzip: crosses >4 durable 32-MiB checkpoints.
+    const unit = "aaaa,bbbb\n"; // 10 bytes/row
+    const repeat: usize = (135 * 1024 * 1024) / 10;
+    const g = try gzHighExpansion(gpa, unit, repeat);
+    defer gpa.free(g);
+    var od = try openWith(g, .{ .separator = ',', .index_mode = api.index_manual });
+    defer od.deinit();
+    try scanToEnd(od.doc); // scan past >=4 intervals, evicting hot inflated state
+    // Land backward deep in an early interval (far behind the frontier).
+    const target: u64 = (40 * 1024 * 1024) / 10; // ~40 MiB in -> 2nd interval
+    api.gzReplayStatsReset(od.doc);
+    _ = api.ls_window_set(od.doc, target, 4);
+    var buf: [64]u8 = undefined;
+    const cc = copyCell(od.doc, target, 0, &buf); // forces the behind-frontier decode
+    try std.testing.expectEqual(api.CopyResult.ok, cc.result);
+    try std.testing.expectEqualStrings("aaaa", buf[0..cc.len]); // RED seed: row out of range
+    const rp = api.gzReplayStats(od.doc);
+    // RED SEED: {landed=false, restored=0, replay=0}. GREEN: resumed from a
+    // NONZERO nearest checkpoint, replaying at most one 32-MiB interval.
+    try std.testing.expectEqual(true, rp.landed);
+    try std.testing.expect(rp.restored_checkpoint_logical > 0);
+    try std.testing.expect(rp.inflated_replay <= 32 * 1024 * 1024);
+}
+
+test "gz_ac16: a behind-frontier landing meets the synchronous budget (TL <100 ms) and returns correct cells" {
+    const gpa = std.testing.allocator;
+    const g = try gzHighExpansion(gpa, "aaaa,bbbb\n", (48 * 1024 * 1024) / 10);
+    defer gpa.free(g);
+    var od = try openWith(g, .{ .separator = ',', .index_mode = api.index_manual });
+    defer od.deinit();
+    try scanToEnd(od.doc);
+    const target: u64 = (8 * 1024 * 1024) / 10;
+    const t0: std.Io.Clock.Timestamp = .now(std.testing.io, .awake);
+    _ = api.ls_window_set(od.doc, target, 8);
+    try std.testing.expect(elapsedMs(t0) < 100); // TL: landing budget (generous)
+    var buf: [64]u8 = undefined;
+    const cc = copyCell(od.doc, target, 1, &buf);
+    try std.testing.expectEqual(api.CopyResult.ok, cc.result);
+    try std.testing.expectEqualStrings("bbbb", buf[0..cc.len]); // RED seed: row out of range
+}
+
+test "gz_ac17: gzip resident state <= 16 MiB; checkpoint file is 0600, unlinked, bounded (120 MiB RSS = RM)" {
+    // NOTE: the 120 MiB steady RSS on a 10 GB-class document (ARCH NFR) is
+    // REVIEWER-MEASURED at build time (RM) — not a hermetic frozen unit test.
+    const gpa = std.testing.allocator;
+    const g = try gzHighExpansion(gpa, "aaaa,bbbb,cccc\n", (80 * 1024 * 1024) / 15);
+    defer gpa.free(g);
+    var od = try openWith(g, .{ .separator = ',', .index_mode = api.index_manual });
+    defer od.deinit();
+    try scanToEnd(od.doc); // spills checkpoints as the frontier advances
+    const resident = api.gzResidentBytes(od.doc);
+    try std.testing.expect(resident > 0); // RED seed: 0
+    try std.testing.expect(resident <= 16 * 1024 * 1024);
+    const st = api.gzCheckpointStore(od.doc);
+    try std.testing.expectEqual(true, st.present); // RED seed: false
+    try std.testing.expectEqual(@as(u32, 0o600), st.mode);
+    try std.testing.expectEqual(true, st.unlinked); // already unlinked while open
+    // <= 0.25% of inflated bytes + fixed overhead (inflated ~80 MiB here).
+    try std.testing.expect(st.bytes <= (80 * 1024 * 1024) / 400 + 1024 * 1024);
+}
+
+test "gz_ac18: injected checkpoint-store failure keeps usable content, stays <=16 MiB, terminates cleanly" {
+    const gpa = std.testing.allocator;
+    const g = try gzHighExpansion(gpa, "aaaa,bbbb\n", (40 * 1024 * 1024) / 10);
+    defer gpa.free(g);
+    var od = try openWith(g, .{ .separator = ',', .index_mode = api.index_manual });
+    defer od.deinit();
+    api.gzCheckpointStoreFailAfter(od.doc, 0); // fail the very first store op
+    try scanToEnd(od.doc);
+    // Memory-only mode within the SAME 16 MiB ceiling; terminates at the last
+    // replay-safe prefix with the AC10 terminal completion behavior.
+    try std.testing.expect(api.gzResidentBytes(od.doc) <= 16 * 1024 * 1024);
+    const poll = api.ls_index_poll(od.doc);
+    try std.testing.expectEqual(true, poll.complete); // terminal
+    try std.testing.expectEqual(poll.bytes_total, poll.bytes_scanned);
+    // Content already produced stays usable + correct.
+    _ = api.ls_window_set(od.doc, 0, 4);
+    var buf: [64]u8 = undefined;
+    const cc = copyCell(od.doc, 0, 0, &buf);
+    try std.testing.expectEqual(api.CopyResult.ok, cc.result);
+    try std.testing.expectEqualStrings("aaaa", buf[0..cc.len]); // RED seed: garbage cell
+}
+
+test "gz_ac19: concurrent AUTO scan + window + background copy over a gzip yields reference-equal data" {
+    const gpa = std.testing.allocator;
+    const plain = try genFixedRows(gpa, 8_000); // deterministic "{i:0>8},{2i:0>8}"
+    defer gpa.free(plain);
+    const g = try gz(gpa, plain);
+    defer gpa.free(g);
+    var pod = try openWith(plain, manual);
+    defer pod.deinit();
+    try scanToEnd(pod.doc);
+    var god = try openWith(g, .{ .index_mode = api.index_auto }); // background worker scans
+    defer god.deinit();
+    // Interleave window changes + full-cell copies WHILE the worker inflates —
+    // exercising the lease/borrow rules without a deadlock or torn read.
+    var it: u64 = 0;
+    var pbuf: [32]u8 = undefined;
+    var gbuf: [32]u8 = undefined;
+    while (it < 200) : (it += 1) {
+        const row = (it * 37) % 8_000;
+        _ = api.ls_window_set(god.doc, row, 8);
+        const a = copyCell(pod.doc, row, 1, &pbuf);
+        const b = copyCell(god.doc, row, 1, &gbuf);
+        if (b.result == .pending) continue; // frontier not there yet; retry later
+        try std.testing.expectEqual(a.result, b.result);
+        try std.testing.expectEqualSlices(u8, pbuf[0..a.len], gbuf[0..b.len]); // RED seed: garbage
+    }
+    // Close during active inflation is safe (no hang / no double-unmap).
+    var closing = try openWith(g, .{ .index_mode = api.index_auto });
+    api.ls_close(closing.doc);
+    closing.fx.deinit();
+}
+
+test "gz_ac20: plain-CSV mmap fast path is unaffected — zero gzip state, direct spans (GUARD; throughput/RSS = RM)" {
+    // NOTE: the "median window/search/filter throughput <= 5% slower than the
+    // pre-csv-gz commit" and "steady RSS grows <= 5 MB" NFRs are REVIEWER-
+    // MEASURED at build time across >=5 release runs (RM) — not frozen units.
+    // Here we GUARD the structural invariant: a plain document allocates ZERO
+    // gzip-specific state and copies ZERO bytes through any cache (direct
+    // spans). This stays GREEN through the build (it must never regress).
+    const gpa = std.testing.allocator;
+    const plain = try genFixedRows(gpa, 5_000);
+    defer gpa.free(plain);
+    var od = try openBytes(plain);
+    defer od.deinit();
+    try scanToEnd(od.doc);
+    _ = api.ls_window_set(od.doc, 100, 64);
+    var buf: [32]u8 = undefined;
+    _ = copyCell(od.doc, 100, 0, &buf);
+    try startSearch(od.doc, predReq(0, .ge, "00000000"));
+    _ = try waitSearchDone(od.doc);
+    try setFilter(od.doc, textReq("0"));
+    _ = try waitFilterDone(od.doc);
+    try std.testing.expectEqual(@as(u64, 0), api.gzResidentBytes(od.doc)); // no gzip state on the mmap path
+    try std.testing.expectEqual(@as(u64, 0), api.gzCacheCopyBytes(od.doc)); // direct spans, never via a cache
+}
+
+test "gz_ac21: the physical gzip source is never modified, locked, renamed, or copied wholesale (GUARD)" {
+    const gpa = std.testing.allocator;
+    const g = try gz(gpa, "a,b,c\n1,2,3\n4,5,6\n7,8,9\n");
+    defer gpa.free(g);
+    const before = std.hash.Crc32.hash(g);
+    var fx = try makeFixture(g, 0o644);
+    defer fx.deinit();
+    var doc: ?*api.Doc = null;
+    try std.testing.expectEqual(api.Status.ok, api.ls_open(fx.path.ptr, &manual, &doc));
+    {
+        defer api.ls_close(doc.?);
+        try scanToEnd(doc.?);
+        _ = api.ls_window_set(doc.?, 0, 8);
+        var buf: [32]u8 = undefined;
+        _ = copyCell(doc.?, 0, 0, &buf);
+    }
+    // Re-read the source file and confirm byte-identical (never written).
+    const reread = try fx.tmp.dir.readFileAlloc(std.testing.io, "fixture.csv", gpa, std.Io.Limit.limited(1 << 20));
+    defer gpa.free(reread);
+    try std.testing.expectEqual(before, std.hash.Crc32.hash(reread));
+    try std.testing.expectEqualSlices(u8, g, reread);
+}
+
+test "gz_ac22: uses ONLY the pinned Zig-0.16 std gzip decoder — no runtime dependency (GUARD; size = RM)" {
+    // NOTE: single-digit-MB assembled binary size is REVIEWER-MEASURED (RM).
+    // GUARD (comptime): the std gzip decoder/encoder the feature builds on are
+    // present in the pinned toolchain — no vendored compression dependency.
+    comptime {
+        if (!@hasDecl(std.compress.flate, "Decompress")) @compileError("std.compress.flate.Decompress missing");
+        if (!@hasDecl(std.compress.flate, "Compress")) @compileError("std.compress.flate.Compress missing");
+    }
+    // The value-copy snapshot adapter the checkpoint feature relies on compiles
+    // against the installed std (mirrors the frozen contract's shape pin).
+    var in: std.Io.Reader = .fixed(&[_]u8{ 0x1f, 0x8b, 0x08, 0, 0, 0, 0, 0, 0, 0xff });
+    var hist: [flate.max_window_len]u8 = undefined;
+    const dec_a = flate.Decompress.init(&in, .gzip, &hist);
+    const dec_b = dec_a; // value copy => snapshottable
+    try std.testing.expect(@TypeOf(dec_b) == flate.Decompress);
+}

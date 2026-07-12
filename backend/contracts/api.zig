@@ -307,6 +307,91 @@ pub const CopyResult = enum(c_int) {
 };
 
 // ---------------------------------------------------------------------------
+// csv-gz internal Source/Reader SEAM value types (ARCH-csv-gz "Internal
+// Source/Reader contract"). Planner-owned + FROZEN: the OBSERVABLE vocabulary
+// the repaired, bounded-streaming Source/Reader seam speaks + the result shapes
+// the Zig-only test seams below hand back. The seam's OWN types (source.Source,
+// reader.Reader, reader.Pos, source.Cursor) and the checkpoint/cache/lexer/
+// matcher MECHANISM stay implementer-owned in src/ (the af83db9 reader-
+// interface ownership boundary is preserved -- Decision 1-C); the comptime
+// block at the bottom pins that `core` PROVIDES the enumerated capabilities in
+// THIS vocabulary. NONE of these cross the C ABI -- api/lesssheet.h is unchanged.
+// ---------------------------------------------------------------------------
+
+/// The Source's END-KNOWLEDGE (ARCH req2/req8/AC9): a bounded logical-byte
+/// provider must never conflate "the currently inflated prefix ends here" with
+/// EOF. `inflating` is NOT an end (the decoder can still advance); the other
+/// four are the terminal/stop outcomes the recovery matrix (AC9/AC10) and the
+/// dual-bounded open (AC5) depend on. Zig-only (never crosses the C ABI).
+pub const SourceEnd = enum(u8) {
+    /// More output may follow; NOT end (the Reader must keep going).
+    inflating = 0,
+    /// The stream ended cleanly (all members validated / mmap true end).
+    clean_eof = 1,
+    /// A salvaged terminal prefix (footer/structural damage after >=1 payload
+    /// byte); the logical end is IMMUTABLE from here (ARCH req8/AC10).
+    damaged_eof = 2,
+    /// Stopped at a caller DualLimit ceiling; more data may exist and must
+    /// never be mistaken for EOF (ARCH req2/AC5).
+    budget_stop = 3,
+    /// Bounded backward access can no longer be guaranteed (checkpoint store
+    /// unavailable within the resident ceiling) -> becomes damaged_eof for the
+    /// presented stream (ARCH req7/AC18).
+    unavailable = 4,
+};
+
+/// A cursor request's DUAL ceilings (ARCH req2): an independent logical
+/// inflated-output limit and an optional physical compressed-input limit.
+/// `null` == unbounded on that axis. Window/copy pass only `logical`; open
+/// passes BOTH (AC5); unbounded worker scans pass neither. Zig-only, so `?u64`
+/// is fine. This replaces `Source.len()` / `Source.slice(0, len())` -- no
+/// operation may require a total logical length or a slice from byte zero.
+pub const DualLimit = struct {
+    logical: ?u64 = null,
+    physical: ?u64 = null,
+};
+
+/// AC5/AC6/AC7 test-seam result: the two open-budget axes actually CONSUMED by
+/// the last `ls_open` -- physical compressed input read + inflated output
+/// produced -- so a test proves open stopped within BOTH 4 MiB ceilings AND did
+/// real work (see `gzOpenBudget`).
+pub const OpenBudget = struct {
+    physical_in: u64,
+    inflated_out: u64,
+};
+
+/// AC15 test-seam result: the last behind-frontier landing's restored inflate
+/// checkpoint (logical offset) + inflated bytes replayed to reach the target,
+/// so a test proves replay resumed from a NONZERO nearest checkpoint and stayed
+/// <= 32 MiB (see `gzReplayStats`).
+pub const ReplayStats = struct {
+    landed: bool,
+    restored_checkpoint_logical: u64,
+    inflated_replay: u64,
+};
+
+/// AC17/AC21 test-seam result: the private checkpoint spill file's state, so a
+/// test proves it is mode-0600, already unlinked while open, bounded, and
+/// absent after close (see `gzCheckpointStore`). `present == false` == no spill
+/// file exists (memory-only mode / plain CSV).
+pub const CheckpointStore = struct {
+    present: bool,
+    bytes: u64,
+    mode: u32,
+    unlinked: bool,
+};
+
+/// AC14 test-seam result: round-tripping a gzip stream through a FORCED inflate-
+/// checkpoint snapshot+restore at a probe offset. `restored` proves a snapshot
+/// was actually taken AND restored (not a no-op); `identical` proves the
+/// restored decoder produced byte-identical output+integrity to uninterrupted
+/// Zig-0.16 `.gzip` decoding (see `gzSnapshotProbe`).
+pub const SnapshotProbe = struct {
+    restored: bool,
+    identical: bool,
+};
+
+// ---------------------------------------------------------------------------
 // Public surface (re-exported from the implementation; tests use only these).
 // ---------------------------------------------------------------------------
 
@@ -366,6 +451,46 @@ pub const copyCursorSetEnabled = core.copyCursorSetEnabled;
 pub const copyAdvances = core.copyAdvances;
 /// Zero the copy-path source-row-advance counter.
 pub const copyAdvancesReset = core.copyAdvancesReset;
+
+// --- Test-only instrumentation seams (ARCH-csv-gz) --------------------------
+// Zig-level seams (NOT C ABI -- like `openWithAllocator`/`copyAdvances`), so
+// api/lesssheet.h stays BYTE-IDENTICAL: csv-gz adds transparent, checkpointed
+// gzip BEHIND the unchanged ABI, and these let the frozen tests prove the
+// bounded/streaming/recovery/replay properties the C ABI cannot express
+// directly. Each reads implementer-owned base.Document state that is DEFAULTED
+// to zero, so a plain-CSV document reports zeros and the mmap fast path is
+// unaffected (AC20); the SEED leaves them zero, which is what makes every
+// csv-gz quantitative AC RED until the gzip Source is built + wired.
+//
+/// AC5/AC6/AC7: physical-in / inflated-out consumed by the last ls_open.
+pub const gzOpenBudget = core.gzOpenBudget;
+/// AC15: the last behind-frontier landing's restored-checkpoint + replay bytes.
+pub const gzReplayStats = core.gzReplayStats;
+/// Zero the replay-stats latch (before a measured landing).
+pub const gzReplayStatsReset = core.gzReplayStatsReset;
+/// AC17: gzip-specific resident state bytes for THIS document (bound: 16 MiB).
+pub const gzResidentBytes = core.gzResidentBytes;
+/// AC17/AC21: the private checkpoint spill file's size/mode/unlinked/present.
+pub const gzCheckpointStore = core.gzCheckpointStore;
+/// AC18: inject checkpoint-store create/write failure after `ops` successful
+/// store operations (0 == fail immediately; maxInt == never, the default).
+pub const gzCheckpointStoreFailAfter = core.gzCheckpointStoreFailAfter;
+/// AC12: force the gzip Source cursor to yield spans of at most `n` bytes
+/// (1 == one byte at a time; 0 == natural chunking, the default) so a test can
+/// split every CSV/encoding/query/decimal token boundary.
+pub const gzForceChunkBytes = core.gzForceChunkBytes;
+/// AC13: peak per-row matcher resident bytes since the last reset (must stay
+/// O(query + fixed state), never O(cell)/O(file)).
+pub const gzStreamMatcherResidentBytes = core.gzStreamMatcherResidentBytes;
+/// Zero the matcher-residency peak (before a measured match-scan).
+pub const gzStreamMatcherResidentReset = core.gzStreamMatcherResidentReset;
+/// AC20 regression proxy: bytes the parse path copied THROUGH a cache for this
+/// document (0 for the mmap fast path -> proves direct spans, never via the
+/// gzip cache).
+pub const gzCacheCopyBytes = core.gzCacheCopyBytes;
+/// AC14: snapshot+restore a gzip stream at `probe_logical` and report whether a
+/// checkpoint was taken/restored and the restart was byte-identical.
+pub const gzSnapshotProbe = core.gzSnapshotProbe;
 
 // ---------------------------------------------------------------------------
 // Conformance pins — signature drift in src/ fails `zig build` right here.
@@ -428,4 +553,77 @@ comptime {
         @compileError("signature drift: copyAdvances");
     if (@TypeOf(core.copyAdvancesReset) != fn (*Doc) void)
         @compileError("signature drift: copyAdvancesReset");
+
+    // === csv-gz: internal Source/Reader SEAM capabilities (ARCH "Internal
+    // Source/Reader contract"). Decision 1-C: pin the enumerated CAPABILITIES
+    // against `core.*` -- the frozen SourceEnd/DualLimit vocabulary via @TypeOf,
+    // the rest via @hasDecl existence (their BEHAVIOR is pinned by the 22-AC
+    // suite + the instrumentation seams below, and the seam TYPE INTERNALS stay
+    // implementer-owned). "No operation may require a total logical length or a
+    // slice from logical byte zero" is honored by the unknown-end query +
+    // dual-limit cursor REPLACING len()/slice(0,len()).
+    // (1) Source construction from a mapping + a selected mmap|gzip kind.
+    if (!@hasDecl(core, "SourceKind")) @compileError("csv-gz seam: core.SourceKind (mmap|gzip) missing");
+    if (!@hasDecl(core, "sourceFromMapping")) @compileError("csv-gz seam: core.sourceFromMapping missing");
+    // (2) Unknown-end query in the frozen SourceEnd vocabulary.
+    if (@TypeOf(core.sourceEndAt) != fn (core.Source, core.Pos) SourceEnd)
+        @compileError("csv-gz seam drift: sourceEndAt must be fn(Source, Pos) SourceEnd");
+    // (3) Bounded cursor acquisition by opaque logical position + DUAL limits.
+    if (@TypeOf(core.sourceCursorAt) != fn (core.Source, core.Pos, DualLimit) core.Cursor)
+        @compileError("csv-gz seam drift: sourceCursorAt must be fn(Source, Pos, DualLimit) Cursor");
+    // (4) Logical + physical measurement of an actual position.
+    if (@TypeOf(core.posLogicalBytes) != fn (core.Source, core.Pos) u64)
+        @compileError("csv-gz seam drift: posLogicalBytes must be fn(Source, Pos) u64");
+    if (@TypeOf(core.posPhysicalBytes) != fn (core.Source, core.Pos) u64)
+        @compileError("csv-gz seam drift: posPhysicalBytes must be fn(Source, Pos) u64");
+    // (5) Source rebase after the ONE leading BOM.
+    if (!@hasDecl(core, "sourceRebaseBom")) @compileError("csv-gz seam: core.sourceRebaseBom missing");
+    // (6) Reader bounds/materialize/cell/MATCH over cursors -- the streaming
+    //     row-match (req4/AC13) replacing unbounded materialize(cap=null).
+    if (!@hasDecl(core, "readerMatchRow")) @compileError("csv-gz seam: core.readerMatchRow (streaming match) missing");
+    // (7) Explicit Source shutdown + deinitialization.
+    if (!@hasDecl(core, "sourceShutdown")) @compileError("csv-gz seam: core.sourceShutdown missing");
+    if (!@hasDecl(core, "sourceDeinit")) @compileError("csv-gz seam: core.sourceDeinit missing");
+
+    // === csv-gz: instrumentation seam signatures (Zig-only test teeth). ======
+    if (@TypeOf(core.gzOpenBudget) != fn (*const Doc) OpenBudget)
+        @compileError("signature drift: gzOpenBudget");
+    if (@TypeOf(core.gzReplayStats) != fn (*const Doc) ReplayStats)
+        @compileError("signature drift: gzReplayStats");
+    if (@TypeOf(core.gzReplayStatsReset) != fn (*Doc) void)
+        @compileError("signature drift: gzReplayStatsReset");
+    if (@TypeOf(core.gzResidentBytes) != fn (*const Doc) u64)
+        @compileError("signature drift: gzResidentBytes");
+    if (@TypeOf(core.gzCheckpointStore) != fn (*const Doc) CheckpointStore)
+        @compileError("signature drift: gzCheckpointStore");
+    if (@TypeOf(core.gzCheckpointStoreFailAfter) != fn (*Doc, u64) void)
+        @compileError("signature drift: gzCheckpointStoreFailAfter");
+    if (@TypeOf(core.gzForceChunkBytes) != fn (*Doc, u64) void)
+        @compileError("signature drift: gzForceChunkBytes");
+    if (@TypeOf(core.gzStreamMatcherResidentBytes) != fn (*const Doc) u64)
+        @compileError("signature drift: gzStreamMatcherResidentBytes");
+    if (@TypeOf(core.gzStreamMatcherResidentReset) != fn (*Doc) void)
+        @compileError("signature drift: gzStreamMatcherResidentReset");
+    if (@TypeOf(core.gzCacheCopyBytes) != fn (*const Doc) u64)
+        @compileError("signature drift: gzCacheCopyBytes");
+    if (@TypeOf(core.gzSnapshotProbe) != fn (std.mem.Allocator, []const u8, u64) SnapshotProbe)
+        @compileError("signature drift: gzSnapshotProbe");
+
+    // === csv-gz AC14: compile-proven snapshot-adapter SHAPE assertion on the
+    // installed Zig-0.16 std gzip decoder. A future std layout change that would
+    // break the value-copy inflate-checkpoint adapter fails the build HERE,
+    // loudly (ARCH req6 "compile-proven snapshot adapter"). Frozen in the
+    // contract so the implementer cannot silently drop the guard. The fields
+    // below are exactly the checkpoint state (input pointer repaired on restore;
+    // consumed_bits sub-byte alignment; reader = the <=64 KiB history window;
+    // container_metadata = member CRC/ISIZE; state = DEFLATE block/pending) --
+    // all value-copyable (no allocator/slice-owning field), verified against the
+    // installed std on 0.16.0.
+    const Dz = std.compress.flate.Decompress;
+    if (!@hasField(Dz, "input")) @compileError("flate.Decompress: no `input` field (checkpoint repairs this pointer on restore)");
+    if (!@hasField(Dz, "consumed_bits")) @compileError("flate.Decompress: no `consumed_bits` field (sub-byte bit alignment)");
+    if (!@hasField(Dz, "reader")) @compileError("flate.Decompress: no `reader` field (output history window to snapshot)");
+    if (!@hasField(Dz, "container_metadata")) @compileError("flate.Decompress: no `container_metadata` field (member CRC/ISIZE state)");
+    if (!@hasField(Dz, "state")) @compileError("flate.Decompress: no `state` field (DEFLATE block/pending state)");
+    if (@TypeOf(@as(Dz, undefined).consumed_bits) != u3) @compileError("flate.Decompress.consumed_bits must be u3 (bit alignment)");
 }

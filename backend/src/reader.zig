@@ -22,6 +22,7 @@
 //! lesssheet.h `LS_OPEN_HEAD_MAX_BYTES` / `LS_WINDOW_ROW_SCAN_MAX_BYTES`).
 
 const std = @import("std");
+const api = @import("api");
 const base = @import("base.zig");
 const source_mod = @import("source.zig");
 const csv_reader = @import("csv_reader.zig");
@@ -141,3 +142,89 @@ pub const Reader = union(enum) {
         };
     }
 };
+
+
+// ---------------------------------------------------------------------------
+// csv-gz SEED seam stubs (ARCH-csv-gz "Internal Source/Reader contract",
+// Decision 1-C). Reader/Source capabilities the repaired seam must provide,
+// pinned in contracts/api.zig. NOT wired into the working path in the seed
+// (window/index/nav/search/filter still call the existing ops above), so
+// existing behavior is byte-identical; the implementer builds the real bounded,
+// resumable versions. Every param is discarded here -- these are shape stubs.
+// ---------------------------------------------------------------------------
+
+const source_mod2 = @import("source.zig");
+
+/// ARCH capability (2): unknown-end query in the frozen SourceEnd vocabulary --
+/// never conflate current availability with EOF. SEED STUB.
+pub fn sourceEndAt(source: Source, pos: Pos) api.SourceEnd {
+    _ = source;
+    _ = pos;
+    return .clean_eof;
+}
+
+/// ARCH capability (3): bounded cursor acquisition by opaque logical position +
+/// DUAL limits (logical inflated-output + optional physical compressed-input).
+/// SEED STUB.
+pub fn sourceCursorAt(source: Source, pos: Pos, limit: api.DualLimit) source_mod2.Cursor {
+    _ = source;
+    _ = pos;
+    _ = limit;
+    return .{};
+}
+
+/// ARCH capability (4): logical inflated-byte measurement of an actual position
+/// (row extents, per-row scan cap, oversized detection, CSV parsing). SEED: CSV
+/// Pos IS a logical byte offset (identity), matching bytesConsumed today.
+pub fn posLogicalBytes(source: Source, pos: Pos) u64 {
+    _ = source;
+    return @intFromEnum(pos);
+}
+
+/// ARCH capability (4): physical compressed-file-byte measurement of an actual
+/// position (index/search/filter progress + the row-count estimate). SEED: for
+/// mmap this equals the logical offset (identity apart from the BOM base).
+pub fn posPhysicalBytes(source: Source, pos: Pos) u64 {
+    _ = source;
+    return @intFromEnum(pos);
+}
+
+/// ARCH capability (5): rebase the Source after the ONE leading BOM (only a BOM
+/// at inflated offset zero of the whole concatenated stream is stripped). SEED
+/// STUB (root.zig still rebases via the mmap content slice today).
+pub fn sourceRebaseBom(source: *Source, bom_len: u64) void {
+    _ = source;
+    _ = bom_len;
+}
+
+/// ARCH capability (6) / req4: the streaming ROW-MATCH the Reader gains -- next
+/// opaque position + the lowest matching column/result matcher.matchRecord
+/// returns today, over ONE predicate or the composed filter+find pair, so a row
+/// is decompressed + lexed ONCE and the matcher stays O(query + fixed state)
+/// (AC13). Replaces the unbounded materialize(cap=null) in search/filter/nav.
+/// SEED STUB: returns "no match" and NOTHING calls it yet (search/filter/nav
+/// still use the existing materialize path), so AC13 stays RED until the
+/// implementer builds the streaming matcher, wires it, and increments
+/// gzStreamMatcherResidentBytes.
+pub const MatchRowResult = struct {
+    next: Pos,
+    matched_col: ?u32,
+    capped: bool,
+    end: api.SourceEnd,
+};
+
+pub fn readerMatchRow(
+    self: Reader,
+    source: Source,
+    pos: Pos,
+    primary: base.MatchCtx,
+    filter_ctx: ?base.MatchCtx,
+    limit: api.DualLimit,
+) MatchRowResult {
+    _ = self;
+    _ = source;
+    _ = primary;
+    _ = filter_ctx;
+    _ = limit;
+    return .{ .next = pos, .matched_col = null, .capped = false, .end = .inflating };
+}

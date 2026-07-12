@@ -2,6 +2,12 @@
 LANG_NAME="workspace (Zig core + Swift/macOS frontend)"
 # The language-NEUTRAL cross-component contract (C headers, .proto, OpenAPI): frozen for EVERYONE.
 FROZEN_PATHS=( "api" )
+# Architecture (ARCH docs + PROJECT.md) is owned here at the workspace root.
+ARCHITECTURE_PATHS=( "docs/architecture" )
+# Dependencies + implementation are DELEGATED to the nested component profiles
+# (backend/.aidev, apps/macos/.aidev); the root owns only api/ + architecture.
+DEPENDENCY_PATHS=( )
+IMPLEMENTATION_PATHS=( )
 CONFORMANCE_CMD=""
 # Full gate = integrity on api/ + every component's own gate, chained:
 BEHAVIOR_CMD="bash backend/.aidev/gate.sh backend && bash apps/macos/.aidev/gate.sh apps/macos"

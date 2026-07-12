@@ -43,3 +43,53 @@ pub const Source = union(enum) {
         };
     }
 };
+
+
+// ---------------------------------------------------------------------------
+// csv-gz SEED seam stubs (ARCH-csv-gz "Internal Source/Reader contract",
+// Decision 1-C). These satisfy the contract's capability pins and compile the
+// tree; they are NOT wired into the working mmap hot path (which still uses
+// `len`/`slice` above), so existing behavior is byte-identical (all existing
+// tests + cc/sc stay GREEN) while every csv-gz behavior test is RED. The
+// implementer replaces `Source`/`Cursor` internals + these bodies with the real
+// bounded, checkpointed gzip Source (mmap stays a zero-copy specialization).
+// ---------------------------------------------------------------------------
+
+/// The Source kind selected at construction (ARCH req2). `gzip` is inflated
+/// transparently behind the same Reader; `mmap` is the zero-copy specialization.
+pub const SourceKind = enum { mmap, gzip };
+
+/// SEED STUB cursor shape (ARCH req2 "starts at an opaque logical position and
+/// yields immutable contiguous spans", <=256 KiB, up to 4 bytes cross-span
+/// lookahead, reports SourceEnd). The REAL cursor (leased/pinned spans, gzip
+/// replay session, dual-coordinate reporting) is implementer-owned; this stub
+/// only exists so `core.Cursor` / `sourceCursorAt` type-check.
+pub const Cursor = struct {
+    logical: u64 = 0,
+    physical: u64 = 0,
+    span_len: usize = 0,
+};
+
+/// Construct a Source over the physical `mapping` for the selected `kind`
+/// (ARCH: construction from a physical mmap + mmap|gzip kind). SEED: always the
+/// mmap specialization -- gzip detection/inflation is NOT wired yet, so a gzip
+/// file falls through to the mmap-as-plain path and every gzip behavior test
+/// diverges from its plain reference (RED).
+pub fn sourceFromMapping(mapping: []const u8, kind: SourceKind) Source {
+    _ = kind;
+    return .{ .mmap = .{ .bytes = mapping } };
+}
+
+/// Explicit Source shutdown (ARCH req9): signal in-flight cursor sessions to
+/// stop at a bounded chunk boundary. SEED: no gzip state -> no-op.
+pub fn sourceShutdown(source: *Source) void {
+    _ = source;
+}
+
+/// Explicit Source deinitialization (ARCH req2/req9): release cursor sessions,
+/// cache blocks, close the already-unlinked checkpoint store, before the
+/// physical mapping is unmapped. SEED: no gzip state -> no-op (the mmap unmap
+/// still happens in base.freeDoc, unchanged).
+pub fn sourceDeinit(source: *Source) void {
+    _ = source;
+}
