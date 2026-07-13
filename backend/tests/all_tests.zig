@@ -4993,3 +4993,527 @@ test "gz_ac22: uses ONLY the pinned Zig-0.16 std gzip decoder — no runtime dep
     const dec_b = dec_a; // value copy => snapshottable
     try std.testing.expect(@TypeOf(dec_b) == flate.Decompress);
 }
+
+
+// ===========================================================================
+// window-budget slice (ARCH-window-budget). Frozen; planner-owned. Bounds the
+// SYNCHRONOUS work of ls_window_set to a fixed 8 MiB (8,388,608-byte) aggregate
+// charged-work ceiling and repairs the filtered ls_search_nav lane (backlog #6),
+// BOTH behind a BYTE-IDENTICAL api/lesssheet.h (AC1): a budget-truncated window
+// returns a shorter contiguous ls_row_range (completed prefix; suffix pending),
+// REUSING the existing short-range signal -- no new ABI flag -- and ls_row_oversized
+// keeps its narrower per-row (>1 MiB) meaning. Tests use the PUBLIC C ABI via
+// @import("api") PLUS the Zig-only charged-work seams (windowChargedBytes /
+// navChargedBytes -- NOT the C ABI, like copyAdvances / gz*).
+//
+// AC -> test map:
+//   AC1  frozen surface ......... wb_ac1  (GUARD: 8 MiB pin + seams link; root gate covers the header)
+//   AC2  exact 8 MiB accounting . wb_ac2  (mmap + gzip + filtered: charged>0 AND <=8 MiB)          [RED]
+//   AC3  short-prefix result .... wb_ac3  (contiguous prefix; first unreturned row ABSENT, unflagged) [RED]
+//   AC4  monotone retry .......... wb_ac4  (grows to full; no livelock; no completed-work re-scan)    [RED]
+//   AC5  eviction + borrows ...... wb_ac5  (identical reuse + changed request re-derive byte-identical) [RED]
+//   AC6  caps stay distinct ...... wb_ac6  (>1 MiB oversized vs aggregate-cut normal row absent+unflagged) [RED]
+//   AC7  frontend pending flow ... (macOS ViewerModel MODEL test -- NOT a backend unit; see apps/macos)
+//   AC8  window work bound ....... wb_ac8  (WORK proxy <=8 MiB, flat as rows grow; skip charged; wall-clock=RM) [RED]
+//   AC9  normal-window regression  wb_ac9  (a normal viewport fills in ONE call; order/cells unchanged) [RED]
+//   AC10 mmap fast path .......... wb_ac10 (byte-identical output; charged>0; zero cache-copy; dispatch=RM) [RED]
+//   AC11 committed #6 proof ...... wb_ac11 (giants crossed by filtered nav; fwd/back FOUND/EXHAUSTED, tail, position) [RED]
+//   AC12 #6 pass/fix branch ...... wb_ac12 (frozen OFF-MAIN branch: SEARCHING + worker resolves; replace/cancel/concurrent) [RED]
+//   AC13 no dependency/storage ... wb_ac13 (retries leak nothing; source read-only; deps frozen by the freeze) [GUARD]
+//
+// #6 FROZEN BRANCH (ARCH criterion 12 / Decision 5). The planner has DETERMINED
+// the synchronous filtered-nav lane is NOT provably bounded: nav.relexBlock /
+// countInBlockUpTo re-lex a whole checkpoint block (up to checkpoint_interval ==
+// 2048 rows) of possibly-giant rows synchronously under the document lock with an
+// UNBOUNDED DualLimit (contrast window.windowSetFiltered, which is per-row capped
+// -- yet even a per-row cap leaves a 2048-row block at up to ~2 GiB). So criterion
+// 11 is RED and the frozen behavior is the criterion-12 REPAIR: ls_search_nav
+// returns PROMPTLY with LS_SEARCH_NAV_SEARCHING (bounded synchronous work) and the
+// existing search worker resolves the exact FOUND/EXHAUSTED off-main, outside the
+// short commit lock (FR11: a background giant-row parse never makes a concurrent
+// ls_window_set / poll wait). Should the implementer instead PROVE a finite
+// synchronous bound, relaxing this contract is a two-key CHANGE-REQUEST, not a
+// free change.
+//
+// RED SEED: ls_window_set / filtered ls_search_nav keep TODAY's UNBOUNDED behavior
+// (return the full window / resolve nav synchronously) and the two charged-work
+// seams read DEFAULTED base.Document state == 0. So: short-prefix / grows-on-retry
+// / deferred-SEARCHING assertions FAIL (the seed returns everything at once /
+// resolves synchronously), and charged>0 clauses FAIL at 0. GREEN needs the
+// aggregate meter + request-local continuation (window.zig / base.zig) and the
+// bounded/off-main filtered nav (nav.zig / search.zig), wiring both counters.
+// Fixtures keep giant/near-cap rows just over/under the 1 MiB per-row cap so the
+// RED seed still completes each in ~ms (like the hr*/hrf* fixtures): the tests
+// pin the WORK model + its short-range consequences, never wall-clock.
+// ---------------------------------------------------------------------------
+
+/// A source row whose extent is JUST UNDER the per-row scan cap
+/// (LS_WINDOW_ROW_SCAN_MAX_BYTES == 1 MiB): a NORMAL row (fully materialized, NOT
+/// oversized) that still costs ~0.94 MiB of charged window work, so a handful blow
+/// past the 8 MiB aggregate ceiling while each stays cheap enough for the RED seed
+/// to materialize in ~ms.
+const wb_near_cap_bytes: usize = @intCast(api.window_row_scan_max_bytes - 64 * 1024);
+
+/// `n` two-column near-cap rows under header "k,v": col 0 is ~wb_near_cap_bytes of
+/// filler 'a' (display-capped when served, but < the 1 MiB per-row cap so col 1 is
+/// still reachable), col 1 is the decimal "{i}" (a small, deterministic checkable
+/// cell). Bigger than the O(head) budget, so a test scanToEnd()s to index every
+/// row behind the frontier before windowing. Caller frees.
+fn genNearCapRows(gpa: std.mem.Allocator, n: u64) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(gpa);
+    try buf.appendSlice(gpa, "k,v\n");
+    const blob = try gpa.alloc(u8, wb_near_cap_bytes);
+    defer gpa.free(blob);
+    @memset(blob, 'a');
+    var line: [24]u8 = undefined;
+    var i: u64 = 0;
+    while (i < n) : (i += 1) {
+        try buf.appendSlice(gpa, blob); // col 0: ~0.94 MiB filler -> NORMAL (< 1 MiB cap)
+        try buf.appendSlice(gpa, try std.fmt.bufPrint(&line, ",{d}\n", .{i})); // col 1: "{i}"
+    }
+    return buf.toOwnedSlice(gpa);
+}
+
+/// Approx source bytes of ONE genNearCapRows row (filler + ",{i}\n"; the decimal
+/// tail is 3-4 bytes -- close enough for the linear no-re-scan ceiling in wb_ac4).
+const wb_row_source: u64 = wb_near_cap_bytes + 4;
+
+test "wb_ac1: the 8 MiB ceiling is pinned and the charged-work seams link (GUARD)" {
+    // NOT the C ABI: the root gate proves api/lesssheet.h byte-identical; here we
+    // pin the frozen aggregate number + that the Zig-only seams are callable and
+    // total (they only rise once the meter fires). Green from the seed; must stay.
+    try std.testing.expectEqual(@as(u64, 8_388_608), api.window_budget_max_bytes);
+    var od = try openBytes("k,v\nx,y\n");
+    defer od.deinit();
+    winAll(od.doc);
+    _ = api.windowChargedBytes(od.doc); // links + total
+    try std.testing.expectEqual(@as(u64, 0), api.navChargedBytes(od.doc)); // no nav yet
+}
+
+test "wb_ac2: every ls_window_set charges >0 and <= 8 MiB across mmap, gzip, and filtered paths (ARCH AC2)" {
+    const gpa = std.testing.allocator;
+    // (a) mmap identity near-cap window (fits under one 8 MiB call).
+    {
+        const fixture = try genNearCapRows(gpa, 6); // ~5.6 MiB
+        defer gpa.free(fixture);
+        var od = try openBytes(fixture);
+        defer od.deinit();
+        try scanToEnd(od.doc);
+        _ = api.ls_window_set(od.doc, 0, 6);
+        const charged = api.windowChargedBytes(od.doc);
+        try std.testing.expect(charged > 0); // RED seed: 0
+        try std.testing.expect(charged <= api.window_budget_max_bytes);
+    }
+    // (b) gzip: charged is measured at the LOGICAL inflated-source layer, so the
+    // SAME ceiling and meaning hold for a .csv.gz window.
+    {
+        const plain = try genNearCapRows(gpa, 4);
+        defer gpa.free(plain);
+        const g = try gz(gpa, plain);
+        defer gpa.free(g);
+        var od = try openWith(g, .{ .separator = ',', .index_mode = api.index_manual });
+        defer od.deinit();
+        try scanToEnd(od.doc);
+        _ = api.ls_window_set(od.doc, 0, 4);
+        const charged = api.windowChargedBytes(od.doc);
+        try std.testing.expect(charged > 0); // RED seed: 0
+        try std.testing.expect(charged <= api.window_budget_max_bytes);
+    }
+    // (c) filtered near-cap window: the match-TEST plus the display re-materialize
+    // is a DOUBLE pass over each matched row, charged twice -- yet still bounded by
+    // the SAME ceiling (which is exactly what shortens the filtered prefix).
+    {
+        const fixture = try genNearCapRows(gpa, 4);
+        defer gpa.free(fixture);
+        var od = try openWith(fixture, .{ .index_mode = api.index_auto });
+        defer od.deinit();
+        try setFilter(od.doc, textReq("a")); // col-0 filler -> every row matches
+        try std.testing.expectEqual(@as(u64, 4), (try waitFilterDone(od.doc)).total);
+        _ = api.ls_window_set(od.doc, 0, 4);
+        const charged = api.windowChargedBytes(od.doc);
+        try std.testing.expect(charged > 0); // RED seed: 0
+        try std.testing.expect(charged <= api.window_budget_max_bytes);
+    }
+}
+
+test "wb_ac3: a window over > 8 MiB of rows returns a SHORT contiguous prefix; the suffix is absent, not blank (ARCH AC3)" {
+    const gpa = std.testing.allocator;
+    const n: u64 = 12; // ~11.3 MiB -> one 8 MiB call cannot hold all 12 near-cap rows
+    const fixture = try genNearCapRows(gpa, n);
+    defer gpa.free(fixture);
+    var od = try openBytes(fixture);
+    defer od.deinit();
+    try scanToEnd(od.doc);
+    try expectDims(od.doc, n, 2);
+
+    const r = api.ls_window_set(od.doc, 0, @intCast(n));
+    // A short contiguous prefix beginning at the requested row (RED seed: all n).
+    try std.testing.expectEqual(@as(u64, 0), r.first_row);
+    try std.testing.expect(r.row_count >= 1); // >=1 fits (per-row cap < aggregate cap)
+    try std.testing.expect(r.row_count < n); // ... but NOT the whole > 8 MiB window
+    try std.testing.expect(api.windowChargedBytes(od.doc) <= api.window_budget_max_bytes);
+    // Every RETURNED row is correct + NOT oversized (a near-cap row is normal;
+    // aggregate exhaustion ALONE never sets ls_row_oversized).
+    var buf: [24]u8 = undefined;
+    var i: u64 = 0;
+    while (i < r.row_count) : (i += 1) {
+        try expectCell(od.doc, i, 1, try std.fmt.bufPrint(&buf, "{d}", .{i}));
+        try std.testing.expectEqual(false, api.ls_row_oversized(od.doc, i));
+        try std.testing.expectEqual(i, api.ls_source_row(od.doc, i));
+    }
+    // The FIRST unreturned row is ABSENT -- not a row of empty cells: ls_cell is
+    // empty AND ls_source_row is the no-row sentinel (outside the served window).
+    try std.testing.expectEqual(@as(usize, 0), api.ls_cell(od.doc, r.row_count, 0).slice().len);
+    try std.testing.expectEqual(api.no_row, api.ls_source_row(od.doc, r.row_count));
+}
+
+test "wb_ac4: identical retries grow the prefix monotonically to the full range with no re-scan or livelock (ARCH AC4)" {
+    const gpa = std.testing.allocator;
+    const n: u64 = 20; // ~18.8 MiB -> at least 3 budget-bounded calls to fill
+    const fixture = try genNearCapRows(gpa, n);
+    defer gpa.free(fixture);
+    var od = try openBytes(fixture);
+    defer od.deinit();
+    try scanToEnd(od.doc);
+
+    const first = api.ls_window_set(od.doc, 0, @intCast(n));
+    try std.testing.expect(first.row_count < n); // RED seed: returns all n at once
+    var prev: u64 = first.row_count;
+    var total_charged: u64 = api.windowChargedBytes(od.doc);
+    var calls: u32 = 1;
+    // Repeating the IDENTICAL request grows the returned count monotonically and
+    // fills the whole range within a finite number of calls.
+    while (prev < n) {
+        const r = api.ls_window_set(od.doc, 0, @intCast(n));
+        try std.testing.expect(r.row_count >= prev); // monotone non-decreasing
+        try std.testing.expect(api.windowChargedBytes(od.doc) <= api.window_budget_max_bytes);
+        total_charged += api.windowChargedBytes(od.doc);
+        prev = r.row_count;
+        calls += 1;
+        try std.testing.expect(calls <= 64); // NO LIVELOCK: a finite call budget fills it
+    }
+    try std.testing.expectEqual(n, prev);
+    // The whole range is byte-identical to a single (uncapped) read.
+    var buf: [24]u8 = undefined;
+    var i: u64 = 0;
+    while (i < n) : (i += 1) try expectCell(od.doc, i, 1, try std.fmt.bufPrint(&buf, "{d}", .{i}));
+    // NO completed-work re-scan: total charged to fill stays near the range's ONE-
+    // pass source size plus at most one restarted per-row op per call (ARCH: "an
+    // unfinished boundary operation may be restarted"). Re-scanning the completed
+    // prefix each call would be quadratic (>> this bound) and would in fact
+    // livelock -- caught above.
+    const bound: u64 = n * wb_row_source + @as(u64, calls) * api.window_row_scan_max_bytes;
+    try std.testing.expect(total_charged <= bound);
+}
+
+test "wb_ac5: a changed request evicts and re-derives byte-identical; identical reuse refreshes borrows (ARCH AC5)" {
+    const gpa = std.testing.allocator;
+    const n: u64 = 12;
+    const fixture = try genNearCapRows(gpa, n);
+    defer gpa.free(fixture);
+    var od = try openBytes(fixture);
+    defer od.deinit();
+    try scanToEnd(od.doc);
+
+    // Identical retries: an earlier prefix row keeps serving byte-identical col-1
+    // text as the prefix grows (borrows re-derived each call; no stale bytes).
+    const first = api.ls_window_set(od.doc, 0, @intCast(n));
+    try std.testing.expect(first.row_count < n); // RED seed: full window
+    try expectCell(od.doc, 0, 1, "0");
+    _ = api.ls_window_set(od.doc, 0, @intCast(n)); // identical -> resume + grow
+    try expectCell(od.doc, 0, 1, "0"); // row 0 still correct after reuse
+
+    // A DIFFERENT request evicts the continuation; a return re-derives identical
+    // cells from the immutable source (existing eviction semantics preserved).
+    _ = api.ls_window_set(od.doc, 3, 2);
+    try expectCell(od.doc, 3, 1, "3");
+    _ = api.ls_window_set(od.doc, 0, @intCast(n)); // back to the original range
+    try expectCell(od.doc, 0, 1, "0");
+}
+
+test "wb_ac6: aggregate exhaustion and the per-row 1 MiB cap stay distinct (ARCH AC6)" {
+    const gpa = std.testing.allocator;
+    // 12 NORMAL near-cap rows (~11.3 MiB > 8 MiB), then ONE genuinely oversized
+    // (> 1 MiB) row.
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    try buf.appendSlice(gpa, "k,v\n");
+    const normal = try gpa.alloc(u8, wb_near_cap_bytes);
+    defer gpa.free(normal);
+    @memset(normal, 'a');
+    const big = try gpa.alloc(u8, hr_over_cap_bytes); // > the 1 MiB per-row cap
+    defer gpa.free(big);
+    @memset(big, 'X');
+    var line: [24]u8 = undefined;
+    var i: u64 = 0;
+    while (i < 12) : (i += 1) {
+        try buf.appendSlice(gpa, normal);
+        try buf.appendSlice(gpa, try std.fmt.bufPrint(&line, ",{d}\n", .{i}));
+    }
+    try buf.appendSlice(gpa, big); // row 12: genuinely oversized
+    try buf.appendSlice(gpa, ",TAIL\n");
+
+    var od = try openBytes(buf.items);
+    defer od.deinit();
+    try scanToEnd(od.doc);
+    try expectDims(od.doc, 13, 2);
+
+    // A whole-doc window: the aggregate cap cuts among the NORMAL rows BEFORE the
+    // oversized one, so it is absent and NO returned row is flagged oversized
+    // merely because the budget fired (RED seed: returns all 13, incl the flagged
+    // oversized row).
+    const r = api.ls_window_set(od.doc, 0, 13);
+    try std.testing.expect(r.row_count < 13);
+    var j: u64 = 0;
+    while (j < r.row_count) : (j += 1) try std.testing.expectEqual(false, api.ls_row_oversized(od.doc, j));
+
+    // Retrying the identical request eventually reaches the oversized row: it IS
+    // present as a bounded prefix and flagged -- the per-row cap, distinct from the
+    // aggregate budget. LS_CELL_MAX_BYTES truncation stays byte-identical.
+    var guard: u32 = 0;
+    while (api.ls_source_row(od.doc, 12) == api.no_row) {
+        _ = api.ls_window_set(od.doc, 0, 13);
+        guard += 1;
+        try std.testing.expect(guard <= 64);
+    }
+    try std.testing.expectEqual(true, api.ls_row_oversized(od.doc, 12));
+    try std.testing.expectEqual(true, api.ls_cell_truncated(od.doc, 12, 0));
+}
+
+test "wb_ac8: synchronous window work stays <= 8 MiB and flat as the fixture grows; skips are charged (ARCH AC8 work proxy)" {
+    // The wall-clock ceiling (release <500 ms, target <=100 ms on Apple Silicon) is
+    // a target-host reviewer probe; the DETERMINISTIC gate proxy is the 8 MiB
+    // charged-work bound -- verified here to NOT grow with row count.
+    const gpa = std.testing.allocator;
+    for ([_]u64{ 12, 24 }) |n| {
+        const fixture = try genNearCapRows(gpa, n);
+        defer gpa.free(fixture);
+        var od = try openBytes(fixture);
+        defer od.deinit();
+        try scanToEnd(od.doc);
+        const r = api.ls_window_set(od.doc, 0, @intCast(n));
+        try std.testing.expect(r.row_count < n); // RED seed: full
+        const charged = api.windowChargedBytes(od.doc);
+        try std.testing.expect(charged > 0); // RED seed: 0
+        try std.testing.expect(charged <= api.window_budget_max_bytes); // flat, independent of n
+    }
+    // A large checkpoint SKIP is charged and bounded too: a window whose first row
+    // sits ~11 MiB of source past its (row-0) checkpoint spends the budget skipping
+    // and returns ZERO new rows on the first call -- the continuation retains that
+    // forward progress (RED seed: skips unbounded, then returns rows 12..15).
+    {
+        const n: u64 = 16; // rows 0..15 all in checkpoint block 0 (< 2048)
+        const fixture = try genNearCapRows(gpa, n);
+        defer gpa.free(fixture);
+        var od = try openBytes(fixture);
+        defer od.deinit();
+        try scanToEnd(od.doc);
+        const r = api.ls_window_set(od.doc, 12, 4); // skip rows 0..12 (~11.3 MiB) > 8 MiB
+        try std.testing.expectEqual(@as(u64, 0), r.row_count);
+        try std.testing.expect(api.windowChargedBytes(od.doc) <= api.window_budget_max_bytes);
+    }
+}
+
+test "wb_ac9: a normal small-row viewport fills in ONE call; row order and cells unchanged (ARCH AC9)" {
+    const gpa = std.testing.allocator;
+    const n: u64 = 5_000; // small 18-byte rows; a 4096-row viewport is ~72 KiB of work
+    const fixture = try genFixedRows(gpa, n);
+    defer gpa.free(fixture);
+    var od = try openBytes(fixture);
+    defer od.deinit();
+    try scanToEnd(od.doc);
+    // A full scroll-buffer request fills in a SINGLE call -- the aggregate cap never
+    // fires for a normal viewport (guard: must stay GREEN through the build).
+    const r = api.ls_window_set(od.doc, 0, api.window_max_rows);
+    try std.testing.expectEqual(@as(u64, api.window_max_rows), r.row_count);
+    const charged = api.windowChargedBytes(od.doc);
+    try std.testing.expect(charged > 0); // RED seed: 0
+    try std.testing.expect(charged <= api.window_budget_max_bytes);
+    var b0: [8]u8 = undefined;
+    var b1: [8]u8 = undefined;
+    try expectCell(od.doc, 4095, 0, fixedCell(&b0, 4095));
+    try expectCell(od.doc, 4095, 1, fixedCell(&b1, 2 * 4095));
+}
+
+test "wb_ac10: the mmap fast path is preserved -- byte-identical output, zero cache-copy, metered (ARCH AC10)" {
+    // Throughput (<=5% regression) + no per-byte dynamic dispatch are REVIEWER-
+    // MEASURED (RM); here we GUARD the structural invariants + that the meter works
+    // on mmap.
+    const gpa = std.testing.allocator;
+    const n: u64 = 10;
+    const fixture = try genNearCapRows(gpa, n);
+    defer gpa.free(fixture);
+    var od = try openBytes(fixture);
+    defer od.deinit();
+    try scanToEnd(od.doc);
+    const r = api.ls_window_set(od.doc, 0, @intCast(n));
+    // The meter accounts on the mmap path (RED seed: 0) ...
+    try std.testing.expect(api.windowChargedBytes(od.doc) > 0);
+    // ... WITHOUT copying source bytes through any staging cache (direct spans):
+    // reuse the csv-gz proxies, which are 0 for the mmap specialization.
+    try std.testing.expectEqual(@as(u64, 0), api.gzCacheCopyBytes(od.doc));
+    try std.testing.expectEqual(@as(u64, 0), api.gzResidentBytes(od.doc));
+    // Returned-prefix output is byte-identical (col 1 is deterministic).
+    var buf: [24]u8 = undefined;
+    var i: u64 = 0;
+    while (i < r.row_count) : (i += 1) try expectCell(od.doc, i, 1, try std.fmt.bufPrint(&buf, "{d}", .{i}));
+}
+
+/// Append ONE giant data row: col 0 is `size` filler bytes (> the 1 MiB per-row
+/// cap when `size` is chosen so). `needle_in_prefix` puts "needle" in col 0 (a
+/// prefix match, visible in a bounded read); otherwise col 1 == "needle" -- a
+/// TAIL match past the cap that only the FULL-cell background scan can find.
+fn appendGiantRowSized(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), size: usize, needle_in_prefix: bool) !void {
+    const blob = try gpa.alloc(u8, size);
+    defer gpa.free(blob);
+    @memset(blob, 'X');
+    if (needle_in_prefix) try buf.appendSlice(gpa, "needle");
+    try buf.appendSlice(gpa, blob);
+    try buf.appendSlice(gpa, if (needle_in_prefix) ",TAIL\n" else ",needle\n");
+}
+
+/// A filtered-nav #6 fixture: tiny match "m0", then `ngiant` giant rows each
+/// matching "needle" (alternating prefix-match / tail-match-past-the-cap), then a
+/// tiny match "mZ". Under filter "needle" the filtered view is
+/// [m0, giant0..giant(ngiant-1), mZ] (filter_total == ngiant + 2). All rows sit in
+/// checkpoint block 0 (ngiant + 2 << 2048), so a filtered ls_search_nav whose
+/// answer lies past the giants must re-lex ACROSS them from the block-0 checkpoint
+/// -- the unbounded synchronous work #6 repairs. Caller frees.
+fn genGiantNavDoc(gpa: std.mem.Allocator, giant: usize, ngiant: usize) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(gpa);
+    try buf.appendSlice(gpa, "k,v\n");
+    try buf.appendSlice(gpa, "m0,needle\n"); // filtered 0 (tiny)
+    var j: usize = 0;
+    while (j < ngiant) : (j += 1) try appendGiantRowSized(gpa, &buf, giant, j % 2 == 0);
+    try buf.appendSlice(gpa, "mZ,needle\n"); // filtered ngiant+1 (tiny)
+    return buf.toOwnedSlice(gpa);
+}
+
+test "wb_ac11: filtered ls_search_nav crossing giant rows resolves the exact FOUND/EXHAUSTED result off-main (ARCH AC11, #6)" {
+    const gpa = std.testing.allocator;
+    const ngiant: usize = 8; // ~8.8 MiB of giants crossed (> the 8 MiB synchronous ceiling)
+    const g = try genGiantNavDoc(gpa, hr_over_cap_bytes, ngiant);
+    defer gpa.free(g);
+    var od = try openWith(g, .{ .index_mode = api.index_auto });
+    defer od.deinit();
+    const last: u64 = ngiant + 1; // filtered index of "mZ"
+    const total: u64 = ngiant + 2; // filter_total
+
+    try setFilter(od.doc, textReq("needle"));
+    try std.testing.expectEqual(total, (try waitFilterDone(od.doc)).total); // giants counted full-cell
+    try startSearch(od.doc, textReq("needle")); // every filtered row is a find match
+    try std.testing.expectEqual(total, (try waitSearchDone(od.doc)).total);
+
+    // FORWARD from an anchor PAST the giants: resolving must re-lex across all
+    // giants from the block-0 checkpoint. The GREEN repair returns PROMPTLY with
+    // SEARCHING (RED seed: it re-lexes synchronously and resolves in-call, so the
+    // immediate poll already reads FOUND), then the worker publishes the exact
+    // filtered row + 1-based position; the synchronous portion stays bounded.
+    api.ls_search_nav(od.doc, last, .forward);
+    try std.testing.expectEqual(api.SearchNavState.searching, api.ls_search_poll(od.doc).nav);
+    try std.testing.expect(api.navChargedBytes(od.doc) <= api.window_budget_max_bytes);
+    try expectFound(try waitNavTerminal(od.doc), last, 1, total);
+
+    // BACKWARD from past-the-end: the LAST match (filtered `last`) -- also crosses
+    // the giants; exact row + position.
+    api.ls_search_nav(od.doc, total, .backward);
+    try std.testing.expect(api.navChargedBytes(od.doc) <= api.window_budget_max_bytes);
+    try expectFound(try waitNavTerminal(od.doc), last, 1, total);
+
+    // A giant TAIL match (needle past the 1 MiB cap) is a real, navigable filtered
+    // row: forward from filtered 1 finds the next match, never decided on a prefix.
+    api.ls_search_nav(od.doc, 1, .forward);
+    const tail = try waitNavTerminal(od.doc);
+    try std.testing.expectEqual(api.SearchNavState.found, tail.nav);
+    try std.testing.expectEqual(@as(u64, 1), tail.found_row);
+
+    // EXHAUSTED that crosses giants: search "m0" (only filtered 0 matches), then
+    // forward from filtered 1 must re-lex [1, end) across the giants to confirm no
+    // later match, still bounded.
+    try startSearch(od.doc, textReq("m0"));
+    _ = try waitSearchDone(od.doc);
+    api.ls_search_nav(od.doc, 1, .forward);
+    try std.testing.expect(api.navChargedBytes(od.doc) <= api.window_budget_max_bytes);
+    try std.testing.expectEqual(api.SearchNavState.exhausted, (try waitNavTerminal(od.doc)).nav);
+
+    // Giant-row-length INDEPENDENCE (bound, NOT linear re-lex): DOUBLING every
+    // giant does not grow the synchronous nav work -- it stays <= the ceiling even
+    // though the crossing is now ~17.6 MiB (a linear re-lex would ~double it).
+    const g2 = try genGiantNavDoc(gpa, 2 * hr_over_cap_bytes, ngiant);
+    defer gpa.free(g2);
+    var od2 = try openWith(g2, .{ .index_mode = api.index_auto });
+    defer od2.deinit();
+    try setFilter(od2.doc, textReq("needle"));
+    _ = try waitFilterDone(od2.doc);
+    try startSearch(od2.doc, textReq("needle"));
+    _ = try waitSearchDone(od2.doc);
+    api.ls_search_nav(od2.doc, last, .forward);
+    try std.testing.expect(api.navChargedBytes(od2.doc) <= api.window_budget_max_bytes);
+    try expectFound(try waitNavTerminal(od2.doc), last, 1, total);
+}
+
+test "wb_ac12: the #6 off-main nav supersedes/cancels and never blocks a concurrent window/poll (ARCH AC12, #6)" {
+    const gpa = std.testing.allocator;
+    const ngiant: usize = 8;
+    const g = try genGiantNavDoc(gpa, hr_over_cap_bytes, ngiant);
+    defer gpa.free(g);
+    var od = try openWith(g, .{ .index_mode = api.index_auto });
+    defer od.deinit();
+    const last: u64 = ngiant + 1;
+    const total: u64 = ngiant + 2;
+    try setFilter(od.doc, textReq("needle"));
+    _ = try waitFilterDone(od.doc);
+    try startSearch(od.doc, textReq("needle"));
+    _ = try waitSearchDone(od.doc);
+
+    // A crossing nav defers OFF-MAIN (RED seed: resolves synchronously to FOUND).
+    api.ls_search_nav(od.doc, last, .forward);
+    try std.testing.expectEqual(api.SearchNavState.searching, api.ls_search_poll(od.doc).nav);
+
+    // While that nav is pending, a concurrent ls_window_set + ls_index_poll return
+    // promptly with correct data (FR11: a background giant-row parse never makes the
+    // window/poll lane wait behind it -- the source parse is outside the commit lock).
+    const w = api.ls_window_set(od.doc, 0, 4);
+    try std.testing.expect(w.row_count >= 1);
+    try std.testing.expectEqual(@as(u64, 0), api.ls_source_row(od.doc, 0)); // filtered 0 == source 0 ("m0")
+    _ = api.ls_index_poll(od.doc);
+    try expectFound(try waitNavTerminal(od.doc), last, 1, total);
+
+    // REPLACEMENT: a second nav supersedes a pending one; the final result is the
+    // REPLACEMENT's answer (both cross giants; here both resolve to the last match).
+    api.ls_search_nav(od.doc, last, .forward);
+    api.ls_search_nav(od.doc, total, .backward); // supersedes the pending forward
+    try expectFound(try waitNavTerminal(od.doc), last, 1, total);
+
+    // CANCEL resolves a pending nav to NONE (existing terminal rule; no stale
+    // worker result publishes afterward).
+    api.ls_search_nav(od.doc, last, .forward);
+    api.ls_search_cancel(od.doc);
+    try std.testing.expectEqual(api.SearchNavState.none, api.ls_search_poll(od.doc).nav);
+}
+
+test "wb_ac13: window retries add no leak and never touch the source file (ARCH AC13)" {
+    // The dependency manifest (build.zig) is unchanged -- enforced by the FREEZE,
+    // not a runtime check. Here: bounded retained continuation state is released on
+    // close (the testing allocator fails on any leak) and the source stays read-only.
+    const gpa = std.testing.allocator;
+    const fixture = try genNearCapRows(gpa, 16);
+    defer gpa.free(fixture);
+    const before = std.hash.Crc32.hash(fixture);
+    var fx = try makeFixture(fixture, 0o644);
+    defer fx.deinit();
+    var doc: ?*api.Doc = null;
+    try std.testing.expectEqual(api.Status.ok, api.ls_open(fx.path.ptr, &manual, &doc));
+    {
+        defer api.ls_close(doc.?);
+        try scanToEnd(doc.?);
+        var k: u32 = 0;
+        while (k < 8) : (k += 1) _ = api.ls_window_set(doc.?, 0, 16); // identical retries
+        _ = api.ls_window_set(doc.?, 4, 4); // a different request (evict)
+    }
+    const reread = try fx.tmp.dir.readFileAlloc(std.testing.io, "fixture.csv", gpa, std.Io.Limit.limited(64 * 1024 * 1024));
+    defer gpa.free(reread);
+    try std.testing.expectEqual(before, std.hash.Crc32.hash(reread)); // source never written
+}

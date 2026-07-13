@@ -492,6 +492,60 @@ pub const gzCacheCopyBytes = core.gzCacheCopyBytes;
 /// checkpoint was taken/restored and the restart was byte-identical.
 pub const gzSnapshotProbe = core.gzSnapshotProbe;
 
+// --- Test-only instrumentation seams (ARCH-window-budget) -------------------
+// Zig-level seams (NOT C ABI -- like openWithAllocator/copyAdvances/gz*), so
+// api/lesssheet.h AND every ls_* signature stay BYTE-IDENTICAL (AC1): window-
+// budget bounds the SYNCHRONOUS work of ls_window_set to a fixed 8 MiB aggregate
+// charged-work ceiling and repairs the filtered ls_search_nav lane (backlog #6),
+// BOTH behind the unchanged ABI. A budget-truncated window is signalled ONLY by
+// the EXISTING short ls_row_range (a shorter contiguous prefix; suffix pending) --
+// never a new flag, and ls_row_oversized keeps its narrower per-row (>1 MiB)
+// meaning. These seams let the frozen tests prove the byte/work model the C ABI
+// cannot express. Each reads implementer-owned base.Document state DEFAULTED to
+// zero, so the SEED reports zero -> every quantitative window-budget/#6 AC
+// (">0 and <=bound", plus the #6 deferred-nav behavioral flip) is RED until the
+// aggregate meter + the bounded/off-main nav are built + wired (mirroring
+// copyAdvances==0 / the gz* seeds). Neither crosses the C ABI.
+
+/// The fixed aggregate charged-work ceiling of ONE ls_window_set call:
+/// 8 MiB == 8,388,608 charged source-byte visits (ARCH-window-budget Decision 2 /
+/// FR1 / non-functional "Work"). NOT an ABI constant (ARCH non-goal: no
+/// aggregate-budget constant in api/lesssheet.h) -- a Zig-only contract pin so the
+/// tests AND the frozen number stay DRY and cannot silently drift. A hard MAXIMUM
+/// per call, never a per-call target; also the responsiveness proxy the #6 proof
+/// holds the SYNCHRONOUS ls_search_nav portion under (the wall-clock <500 ms /
+/// target <=100 ms half is a target-host reviewer probe -- see the wb_* notes).
+pub const window_budget_max_bytes: u64 = 8 * 1024 * 1024;
+
+/// AC2/AC3/AC4/AC8: charged SOURCE-byte visits performed by the LAST ls_window_set
+/// on this document -- a per-call latch (each call overwrites it at entry; no
+/// reset seam needed, so a test reads one call's cost directly and sums across a
+/// retry loop itself). One unit == one source byte VISITED by synchronous window
+/// work, charged EVERY visit (never deduplicated by offset): checkpoint-to-target
+/// skip bytes (charged even when the call returns no new row), filtered match-test
+/// bytes, the filtered display re-materialize (a matched row is charged twice),
+/// and any Reader/Source replay all count. Measured at the LOGICAL-source-byte
+/// layer, so it is identical in meaning across the mmap and gzip Source paths
+/// (ARCH "Exact byte/work model"). GREEN keeps it in (0, window_budget_max_bytes];
+/// SEED == 0 (RED).
+pub const windowChargedBytes = core.windowChargedBytes;
+
+/// AC11/AC12 (backlog #6): charged SYNCHRONOUS SOURCE-byte visits performed by the
+/// LAST ls_search_nav call BEFORE it returned -- the filtered-navigation work
+/// proof. A per-call latch, same charging rule as windowChargedBytes. The ARCH
+/// freezes this proof FIRST (Decision 5): today's filtered nav re-lexes a whole
+/// checkpoint block (up to checkpoint_interval == 2048 rows) of possibly-giant
+/// rows SYNCHRONOUSLY under the document lock (nav.relexBlock / countInBlockUpTo,
+/// with an unbounded DualLimit), so the lane has NO finite synchronous bound. The
+/// frozen branch is therefore the criterion-12 REPAIR: the synchronous portion
+/// stays bounded (this counter <= window_budget_max_bytes and INDEPENDENT of
+/// giant-row length) and the expensive counted-region resolution runs OFF-MAIN on
+/// the existing search worker, reporting LS_SEARCH_NAV_SEARCHING until it publishes
+/// the exact FOUND/EXHAUSTED result (FR11/FR12). SEED == 0, and the seed resolves
+/// nav SYNCHRONOUSLY -> the #6 tests are RED via that deferred-nav flip, with this
+/// counter supplying the bound/independence work evidence on GREEN.
+pub const navChargedBytes = core.navChargedBytes;
+
 // ---------------------------------------------------------------------------
 // Conformance pins — signature drift in src/ fails `zig build` right here.
 // ---------------------------------------------------------------------------
@@ -608,6 +662,14 @@ comptime {
         @compileError("signature drift: gzCacheCopyBytes");
     if (@TypeOf(core.gzSnapshotProbe) != fn (std.mem.Allocator, []const u8, u64) SnapshotProbe)
         @compileError("signature drift: gzSnapshotProbe");
+
+    // === window-budget: instrumentation seam signatures (Zig-only test teeth,
+    // NOT C ABI -- no callconv). Their BEHAVIOR is pinned by the wb_* suite +
+    // the seam doc comments; drift in src/ fails `zig build` right here. =======
+    if (@TypeOf(core.windowChargedBytes) != fn (*const Doc) u64)
+        @compileError("signature drift: windowChargedBytes");
+    if (@TypeOf(core.navChargedBytes) != fn (*const Doc) u64)
+        @compileError("signature drift: navChargedBytes");
 
     // === csv-gz AC14: compile-proven snapshot-adapter SHAPE assertion on the
     // installed Zig-0.16 std gzip decoder. A future std layout change that would

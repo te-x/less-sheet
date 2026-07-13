@@ -408,6 +408,21 @@ pub const Document = struct {
     gz_match_resident_bytes: u64 = 0, // AC13: peak per-row matcher residency
     gz_cache_copy_bytes: u64 = 0, // AC20: bytes copied THROUGH a cache (0 for mmap)
 
+    // --- window-budget instrumentation state (ARCH-window-budget) -----------
+    // DEFAULTED (like copy_cursor_* / gz_* above) so openWithAllocator's literal
+    // need not mention them AND the SEED reports zero -> every quantitative
+    // window-budget/#6 AC is RED until the aggregate window meter + the bounded/
+    // off-main filtered nav are built + wired. Read ONLY via contracts/api.zig's
+    // windowChargedBytes / navChargedBytes (Zig-only seams -> root.zig), NEVER the
+    // C ABI. Per-call latches: ls_window_set / ls_search_nav each reset their OWN
+    // field at entry and add every charged source-byte visit to it (checkpoint
+    // skips, the filtered test+display double pass, any replay -- see the seam doc
+    // comments). The plain additive accounting is single-lane and caller-
+    // serialized (the window / poll-control lanes), exactly like copy_advances --
+    // pure instrumentation, irrelevant to any returned byte.
+    window_charged_bytes: u64 = 0, // AC2/AC3/AC4/AC8: last ls_window_set charged work
+    nav_charged_bytes: u64 = 0, // AC11/AC12 (#6): last ls_search_nav SYNCHRONOUS charged work
+
     pub fn lock(self: *Document) void {
         _ = c.pthread_mutex_lock(&self.mutex);
     }
