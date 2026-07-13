@@ -50,6 +50,16 @@
 //      second click on an already-selected cell / whole row / whole column clears
 //      the selection (deselected=true for all three), through the shipping
 //      controller's event-free semantic seam (cc-macos defect-pass regression-lock).
+//   6. scrollWheelMovesViewportWhileFindPopupActive — LESSSHEET_FIND_SCROLL_ACTIVE
+//      (AC21 cc-macos round-2 defect-pass regression-LOCK): after a known-match Find
+//      completes with its popup STILL open, ONE real pixel wheel event driven through
+//      the shipping PopupDismissScrimView must SCROLL the live NSClipView while both
+//      the search and the popup stay active. The single lesssheet.find.scroll_while_active
+//      line must report probe_ready=true moved=true search_active=true popup_active=true.
+//      GREEN today (the scrim now forwards scroll-wheel events to the grid); the earlier
+//      transparent scrim swallowed them. Event-free of TCC (a synthesized NSEvent handed
+//      straight to the scrim's handler, never posted). LESSSHEET_FIND (a known match)
+//      arms FindProbe; LESSSHEET_DUMP_EXIT quits after the probe's terminal line.
 //
 // REVIEWER-MEASURED (deliberately not gated — flaky gates are worse than reviewer
 // enforcement):
@@ -76,7 +86,9 @@
 // (34_888_925 bytes) — header "id,tag,val" + 3_000_000 data rows "<i>,r,<i%10>",
 // with tag "ZQZmark" (the stall probe's default query; smart-case = byte-exact) on
 // 0-based data rows 200000 / 1400000 / 2000000 / 2800000. Generation ~2 s, one-time.
-// Gate cost: 4 headless app launches, ~15-20 s green (red adds nothing: fail-fast).
+// Gate cost: 6 headless app launches (one per probe test on the happy path; some
+// relaunch once on a malformed run), ~20-30 s green (red adds nothing: fail-fast).
+// The scroll-while-active test reuses the byte-size-cached big fixture (no regen).
 //
 // HAZARD (pinned knowledge): a LANDING_STALL run must NOT set LESSSHEET_FIND — that
 // arms FindProbe, whose terminal check under LESSSHEET_DUMP_EXIT quits the app the
@@ -427,6 +439,48 @@ struct NativeGridProbeTests {
         let countFinal = probeLines(log, prefix: "lesssheet.find.count_final ").first
         #expect(countFinal.flatMap { intField($0, "total") } == NativeGridFixture.markerRows.count,
                 "final match count must be exactly \(NativeGridFixture.markerRows.count):\n\(logTail(log))")
+    }
+
+    // Scroll-while-Find-active lock (AC21, cc-macos round-2 defect pass): after a
+    // known-match Find completes with its popup STILL open, a real wheel event over
+    // the grid must SCROLL the viewport while both the search and the popup stay
+    // active — the earlier transparent click-away scrim swallowed scroll-wheel events.
+    // Regression-LOCK, not a red seed: the shipping scrim now forwards the wheel to
+    // the grid (PopupDismissScrimView.scrollWheel -> NativeGridController.forwardScrollWheel),
+    // so this passes GREEN today. LESSSHEET_FIND (a known match) arms FindProbe;
+    // LESSSHEET_FIND_SCROLL_ACTIVE diverts its terminal path — once the scan is final
+    // and the first match landed — into runActiveSearchScrollProbe, which drives ONE
+    // pixel wheel event straight into the shipping PopupDismissScrimView (a synthesized
+    // NSEvent handed to the handler, never posted — no TCC) and reports whether the
+    // LIVE NSClipView moved with the search + popup still active. The big fixture makes
+    // the content far taller than the viewport, so a real scroll has ample headroom
+    // (moved is high-margin). Exactly one terminal line; all four booleans must hold.
+    @Test func scrollWheelMovesViewportWhileFindPopupActive() throws {
+        let fixture = try NativeGridFixture.path()
+        let env = [
+            "LESSSHEET_FIND": NativeGridFixture.markerTag, // known match -> a landing
+            "LESSSHEET_FIND_SCROLL_ACTIVE": "1",
+            "LESSSHEET_DUMP_EXIT": "1",
+        ]
+
+        var log = ""
+        for _ in 1...2 { // relaunch only when the probe never reached its terminal line
+            log = try AppProbe.launchOnce(fixture: fixture, env: env, timeout: 90)
+            if !probeLines(log, prefix: "lesssheet.find.scroll_while_active ").isEmpty { break }
+        }
+
+        let lines = probeLines(log, prefix: "lesssheet.find.scroll_while_active ")
+        #expect(lines.count == 1,
+                "scroll-while-active probe must emit exactly one terminal line:\n\(logTail(log))")
+        let line = lines.first
+        #expect(line.flatMap { boolField($0, "probe_ready") } == true,
+                "scroll-while-active probe must set up headless (live grid + scrim + wheel event):\n\(logTail(log))")
+        #expect(line.flatMap { boolField($0, "moved") } == true,
+                "a wheel event over the grid while the Find popup is open must MOVE the viewport:\n\(logTail(log))")
+        #expect(line.flatMap { boolField($0, "search_active") } == true,
+                "scrolling with the Find popup open must NOT clear the active search:\n\(logTail(log))")
+        #expect(line.flatMap { boolField($0, "popup_active") } == true,
+                "scrolling with the Find popup open must NOT dismiss the popup:\n\(logTail(log))")
     }
 
     // Selection-toggle lock (cc-macos defect pass): a second click on an already-

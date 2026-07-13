@@ -738,6 +738,13 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
         scroll.reflectScrolledClipView(clip)
     }
 
+    /// The click-away overlay is above this AppKit subtree while a popup is
+    /// open, so it receives wheel events first. Forward the untouched event to
+    /// NSScrollView to retain native momentum, direction, and elasticity.
+    func forwardScrollWheel(_ event: NSEvent) {
+        scroll.scrollWheel(with: event)
+    }
+
     /// The data row currently at the TOP of the unobscured data area (just below
     /// the glass band), recovered exactly from the clip origin: a landing sets
     /// clip.y = row*rowHeight − contentInsetTop, so this inverts it. Used to

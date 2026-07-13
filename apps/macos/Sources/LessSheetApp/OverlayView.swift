@@ -65,12 +65,12 @@ struct OverlayView: View {
 
     var body: some View {
         ZStack(alignment: .bottomTrailing) {
-            // Click-away scrim — present ONLY while a popup is open, so ordinary
-            // scrolling is never intercepted. Invisible; a tap dismisses.
+            // Click-away scrim — clicks dismiss, while wheel events pass to the
+            // native grid. An active search is navigation chrome, not a modal
+            // interaction that replaces normal viewport scrolling.
             if model.anyPopupOpen {
-                Color.clear
-                    .contentShape(Rectangle())
-                    .onTapGesture { model.dismissPopups() }
+                PopupDismissScrim(model: model)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .accessibilityHidden(true)
             }
 
@@ -109,6 +109,57 @@ struct OverlayView: View {
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Viewer controls")
         .animation(.easeInOut(duration: 0.2), value: model.copyNotice)
+    }
+}
+
+/// Full-window click-away surface for floating controls. The former SwiftUI
+/// `Color.clear.contentShape` swallowed wheel events because it was the view
+/// hit-tested above the grid for the whole lifetime of an idle Find popup.
+/// This native surface preserves click-away and forwards the original wheel
+/// event to the document's real NSScrollView.
+private struct PopupDismissScrim: NSViewRepresentable {
+    let model: DocumentModel
+
+    func makeNSView(context: Context) -> PopupDismissScrimView {
+        let view = PopupDismissScrimView()
+        view.model = model
+        return view
+    }
+
+    func updateNSView(_ view: PopupDismissScrimView, context: Context) {
+        view.model = model
+    }
+}
+
+@MainActor
+final class PopupDismissScrimView: NSView {
+    static weak var live: PopupDismissScrimView?
+    weak var model: DocumentModel?
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        Self.live = self
+        setAccessibilityElement(false)
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        Self.live = self
+        setAccessibilityElement(false)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        model?.dismissPopups()
+    }
+
+    override func scrollWheel(with event: NSEvent) {
+        guard let model, let controller = NativeGridController.live,
+              controller.model === model
+        else {
+            super.scrollWheel(with: event)
+            return
+        }
+        controller.forwardScrollWheel(event)
     }
 }
 

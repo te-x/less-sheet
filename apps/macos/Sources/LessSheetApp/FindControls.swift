@@ -434,6 +434,11 @@ enum FindProbe {
     /// every fold so each landing can be checked against the true match rows.
     static let stepSeqMode: Bool = env["LESSSHEET_FIND_STEP_SEQ"] != nil
 
+    /// Opt-in AC21 regression: once a completed search leaves its popup open,
+    /// drive a wheel event through the shipping click-away scrim and verify
+    /// that the viewport moves without closing or clearing the search.
+    static let scrollWhileActiveMode: Bool = env["LESSSHEET_FIND_SCROLL_ACTIVE"] != nil
+
     private static var model: DocumentModel?
     private static var t0 = DispatchTime.now()
     private static var lastTick = DispatchTime.now()
@@ -451,6 +456,7 @@ enum FindProbe {
     private static var landings = 0
     private static var wantDoneStep = false
     private static var doneStepIssued = false
+    private static var scrollProbeStarted = false
 
     private static func noticeName(_ notice: FindNotice?) -> String {
         switch notice {
@@ -496,6 +502,7 @@ enum FindProbe {
         landedLogged = false
         finalLogged = false
         lastPct = -1
+        scrollProbeStarted = false
         startHeartbeat()
         log("lesssheet.find.submit query=\(query) at_ms=\(elapsedMs())"
             + " known_total=\(model.rowCountInfo.count) exact=\(model.rowCountInfo.isExact)")
@@ -654,7 +661,48 @@ enum FindProbe {
         if display.totalIsFinal, landed || noMatches {
             log("lesssheet.find.terminal total=\(display.total) final=\(display.totalIsFinal)"
                 + " landed=\(landed) no_matches=\(noMatches) at_ms=\(elapsedMs()) max_gap_ms=\(maxGapMs)")
+            if scrollWhileActiveMode, landed {
+                if !scrollProbeStarted {
+                    scrollProbeStarted = true
+                    runActiveSearchScrollProbe(model)
+                }
+                return
+            }
             finish()
+        }
+    }
+
+    /// Wait one render turn for `findScanning` to become false and install the
+    /// click-away scrim, then directly invoke that exact view with a pixel-wheel
+    /// event (never posted, so no input-monitoring permission is involved). The
+    /// frozen native-grid suite can assert the three booleans in this signal.
+    private static func runActiveSearchScrollProbe(_ model: DocumentModel) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+            guard let controller = NativeGridController.live,
+                  let scrim = PopupDismissScrimView.live,
+                  let cgEvent = CGEvent(
+                    scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 1,
+                    wheel1: -160, wheel2: 0, wheel3: 0
+                  ),
+                  let event = NSEvent(cgEvent: cgEvent)
+            else {
+                log("lesssheet.find.scroll_while_active probe_ready=false")
+                finish()
+                return
+            }
+            let before = controller.scroll.contentView.bounds.origin.y
+            scrim.scrollWheel(with: event)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                let after = controller.scroll.contentView.bounds.origin.y
+                let moved = abs(after - before) > 0.5
+                let searchActive = model.findSession.display.request != nil
+                log(String(format:
+                    "lesssheet.find.scroll_while_active probe_ready=true before_y=%.1f after_y=%.1f"
+                        + " moved=\(moved) search_active=\(searchActive) popup_active=\(model.findFieldActive)",
+                    before, after
+                ))
+                finish()
+            }
         }
     }
 
