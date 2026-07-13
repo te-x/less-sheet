@@ -3,9 +3,16 @@
 **Feature:** compact, session-scoped column type, visibility, and display-format control for the macOS
 viewer.
 
-**Status:** design complete; technology decisions and acceptance criteria await final sign-off.
+**Status:** original column-config design shipped; inline-Settings amendment drafted and awaiting explicit
+human sign-off.
 
-**Decision date:** 2026-07-13.
+**Decision dates:** 2026-07-13 (original design); 2026-07-14 (inline-Settings amendment draft).
+
+The 2026-07-14 amendment supersedes the original decision to put column configuration behind a “Configure
+Columns…” entry in a separate chromeless panel. Settings is now the sole column-configuration surface. The
+underlying type, null, formatting, visibility, width, inference, raw-value, session, and performance semantics
+remain unchanged. Existing Swift types and implementation state containing `ColumnPanel` / `panel` keep those
+names as internal legacy terminology; they do not imply a second user-visible panel.
 
 This design is a delta on the frozen C ABI in `api/lesssheet.h`, the bounded open/worker pipeline in
 `backend/src/{root,base,sniff,encoding}.zig`, the horizontal window in `ARCH-column-windowing.md`, and the
@@ -14,11 +21,17 @@ or column-width guarantees.
 
 ## Problem & scope
 
-The existing Settings “Columns” section constructs one SwiftUI checkbox for every column. It is useful on a
-small document but violates the established wide-document contract: `wide_100k_cols` must not create 100,000
-controls, copy 100,000 Swift header strings, or infer 100,000 column types before first paint. The viewer also
-has no stable type metadata or display-format layer, so values cannot be aligned or formatted consistently and
-users cannot correct a guess.
+Before column-config shipped, the Settings “Columns” section constructed one SwiftUI checkbox for every column.
+It was useful on a small document but violated the established wide-document contract: `wide_100k_cols` must
+not create 100,000 controls, copy 100,000 Swift header strings, or infer 100,000 column types before first
+paint. The shipped design removed that eager list and placed a bounded, virtualized list plus inspector behind
+one “Configure Columns…” entry in a separate sheet. That solved the resource hazard, but it also hid the main
+column options behind a second surface. This amendment moves the already-bounded controls directly into the
+normal Settings window without restoring an all-column UI for wide documents.
+
+The viewer also needs the shipped stable type metadata and display-format layer so values align and format
+consistently and users can correct a guess; this amendment changes where those controls live, not their value
+semantics.
 
 This feature adds one compact column-control surface and the format-neutral metadata needed to support it:
 
@@ -27,7 +40,7 @@ This feature adds one compact column-control surface and the format-neutral meta
 - explicit, per-session type and null-sentinel overrides;
 - stable conflict and proposed-revision states;
 - display-only number/date formatting and type-based alignment in the macOS frontend;
-- the existing visibility and width controls in the same column panel; and
+- the existing visibility and width controls in the same embedded Settings surface; and
 - bounded, caller-owned access to metadata and header labels through an additive C ABI.
 
 The following are explicitly out of scope:
@@ -38,8 +51,15 @@ The following are explicitly out of scope:
   binary display, or arbitrary-precision numeric formatting;
 - manual alignment;
 - changing copy, Find, filter, search, or predicate semantics to operate on formatted or typed display text;
-- moving Parsing into the column panel; and
+- merging Parsing into Columns (Parsing remains its own compact Settings section); and
 - replacing the current Reader/Source, row-window, scan-frontier, or column-window architecture.
+
+The inline-Settings amendment additionally does not:
+
+- change the frozen C ABI or the public Swift contracts in `apps/macos/Sources/Contracts/ColumnPanel.swift`;
+- add typo-tolerant or relevance-ranked search, a search dependency, persistence, or a header index;
+- rename legacy `ColumnPanel` / `panel` implementation symbols merely because the surface moved; or
+- expose an unfiltered browsing list when a document has more than ten columns.
 
 ## Inputs / Outputs
 
@@ -145,6 +165,48 @@ Invalid UTF-8, an over-limit sentinel, an invalid type/parameter combination, or
 rejected atomically. Allocation failure leaves the previous configuration untouched. The UI explains the
 validation error and never partially applies a setting.
 
+### Settings surface input and output
+
+The normal titled Settings window is resizable and is the only column-configuration surface. Its compact,
+full-width Parsing section remains above a Columns section. Within Columns, the column discovery area and the
+selected-column inspector are side by side and remain simultaneously present; there is no tab, navigation
+stack, “Configure Columns…” entry, sheet, or second panel. The window's initial and minimum usable layout must
+show Parsing, at least one discovery/result row when one exists, and the selected column's immediate controls
+without a disclosure expansion or a transition to another surface.
+
+The inspector exposes these controls immediately:
+
+- Visible;
+- Type, including Auto, guessed/effective state, explicit override, and Reset to Auto; and
+- only the Number or Date format controls relevant to the selected effective type.
+
+Null values and Width/Auto-fit are two independent advanced disclosures in the same inspector. Both are
+collapsed whenever Settings opens; expanding either remains in effect while the user changes selected columns
+during that opening. Neither disclosure state is persisted.
+
+Column discovery is determined by the document's logical column count:
+
+- zero columns: Columns shows an empty state and creates no column row, metadata request, or search;
+- one through ten columns: the discovery area shows the complete unfiltered list in source-column order and
+  does not show a search field;
+- more than ten columns: no unfiltered list exists. The inspector still shows the restored/current selection,
+  while the discovery area shows a search field and no result rows for an empty query.
+
+A non-empty ordinary search query uses the existing localized, case-insensitive substring match against the
+existing searchable label text and returns the first at most ten matches in source-column order. Finding an
+eleventh match sets an overflow result and stops the scan; the UI shows “More matches—refine your search” but
+neither renders nor retains the eleventh ID after the fixed batch completes. Between batches, search therefore
+retains at most ten result IDs plus one Boolean, never all matching labels or IDs; one transient candidate/match
+batch remains bounded by the existing 1024-item contract.
+
+An input beginning with `#` is reserved for direct addressing, not ordinary label search. Its entire value must
+be `#N`, where `N` matches `[1-9][0-9]*`. A value in `1...columnCount` resolves directly to that one column and
+shows it as the sole result row and selection without a label scan; `#0`, a sign, whitespace, non-ASCII digits,
+arithmetic overflow, or a value greater than `columnCount` is invalid, leaves the current selection unchanged,
+and produces an inline “No such column” result. This direct address keeps every column reachable even when
+labels are duplicated and ordinary results are capped at ten. It is frontend routing layered before
+`ColumnLabelSearching`, so the approved Swift search contract is unchanged.
+
 ### Display output
 
 The core continues to serve raw cells and type metadata; it never serves formatted strings. The macOS frontend
@@ -182,8 +244,9 @@ full-cell copy and search behavior is therefore unchanged.
 ## Functional requirements
 
 1. Opening a CSV creates no type-inference job and performs no type-metadata allocation. After the first grid
-   column window is known, the frontend requests inference for the union of grid-visible and panel-visible
-   column IDs plus fixed overscan.
+   column window is known, the frontend requests inference for the union of grid-visible and Settings-visible
+   column IDs plus fixed overscan; the latter includes the selected inspector column and only live discovery or
+   result rows.
 2. The core coalesces duplicate IDs, samples only requested columns, and publishes metadata asynchronously on
    the existing document worker. Untouched CSV columns synthesize an unrequested/unknown snapshot without a
    stored per-column object.
@@ -212,50 +275,76 @@ full-cell copy and search behavior is therefore unchanged.
 10. Work that is still active at 500 ms presents “Guessing…” with determinate progress when a finite queued
     sample is known and an indeterminate state otherwise. Cancellation, document close, and replacement
     requests terminate stale work without publishing into a new session.
-11. The current Settings “Columns” `ForEach(0..<columnCount)` is replaced by one “Configure Columns…” entry.
-    Parsing remains its own Settings section. The entry opens one compact, chromeless Liquid-Glass panel; a
-    column-header context action may deep-link to the same panel and selection.
-12. The panel contains a reusable, virtualized, searchable column list and a selected-column inspector. A row
-    shows visibility, effective label/type, and compact warning/format state. The inspector shows Auto · guessed
-    or the override, Reset to Auto, null sentinel, and only relevant v1 format controls. Show All and reset
-    actions reuse the existing visibility/width rules, including the invariant that at least one column remains
-    visible.
-13. Opening or scrolling the unsearched panel requests labels and metadata only for its viewport plus a fixed
-    one-viewport overscan on each side. A search enumerates labels off-main in batches, is cancellable on query
-    replacement/panel close, streams results, and does not fetch type metadata until a result enters the panel
-    viewport.
-14. Headerless/empty-header columns use the existing generic column name plus their 1-based index for panel
-    search. Headered search uses decoded source header labels, with localized case-insensitive substring matching
-    under the captured session locale. Truncated header labels preserve and expose their existing truncation
-    state.
+11. Settings is the sole column-configuration surface. Parsing remains a compact, full-width section above
+    Columns. Columns embeds the discovery list/results and selected-column inspector side by side, with both
+    visible at once in a wider, resizable normal Settings window. The old “Configure Columns…” entry, separate
+    sheet, chromeless shell, Done action, and any tab/navigation transition are removed. A column-header action
+    raises this same Settings window and targets its column.
+12. The selected-column inspector immediately shows Visible, Type with Auto/guessed/override state and reset,
+    and only the relevant v1 Number or Date format controls. Null values and Width/Auto-fit are independent
+    advanced disclosures in the same inspector. A discovery/result row shows visibility, effective label/type,
+    and compact warning/format state. Show All and reset actions reuse the existing visibility/width rules,
+    including the invariant that at least one column remains visible.
+13. Discovery is adaptive. At zero columns it shows an empty state. At one through ten columns it shows every
+    column in source order and no search field. Above ten it shows no unfiltered list: an empty query leaves the
+    current selection in the inspector and displays zero result rows; a non-empty label query exposes at most
+    the first ten localized case-insensitive substring matches in source order and reports when an eleventh
+    match requires refinement. An exact `#N` query addresses one valid 1-based column directly and never scans
+    labels; malformed, overflowing, zero, or out-of-range addresses leave selection unchanged and explain the
+    error.
+14. The reusable list/result control continues to use `ColumnPanelLayouting`. It requests labels and metadata
+    only for live rows plus its fixed one-viewport overscan on each side, capped by the adaptive source's at
+    most ten logical rows, plus the independently selected inspector column. Label search uses unchanged
+    `ColumnLabelSearching` decisions off-main in batches of at most 1024, stops after finding an eleventh match
+    or exhausting the labels, is cancellable on query replacement, Settings close, or document replacement,
+    and does not fetch type metadata until a retained result enters the live list viewport. Headerless or
+    empty-header columns retain the generic name plus 1-based index searchable text; headered search retains
+    decoded source-label matching under the captured session locale. Truncated labels preserve and expose their
+    existing truncation state.
 15. Type/format/null changes invalidate and redraw only the affected visible column. An automatic-width column
     may be remeasured once for that direct user change and grow monotonically to fit the new display; it never
     shrinks implicitly. Apart from such a direct configuration change, content-driven growth remains triggered
     only by newly materialized vertical evidence. Manual width wins. Horizontal scrolling never changes an
     already-established width, and one column's content never affects another's width.
-16. The panel is keyboard navigable and exposes labels, selected/effective type, Auto/override source, warning,
-    format-unavailable, null, progress, and reset actions to VoiceOver. Warning state is not color-only, and
-    Reduce Motion/Increase Contrast behavior follows the existing glass UI.
+16. The embedded Settings surface is keyboard navigable and exposes labels, selected/effective type,
+    Auto/override source, warning, format-unavailable, null, progress, overflow/refinement, direct-address
+    errors, disclosure state, and reset actions to VoiceOver. Warning and search-overflow state are not
+    color-only, and Reduce Motion/Increase Contrast behavior follows the existing macOS UI.
+17. Opening Settings clears search/results, collapses both advanced disclosures, and restores the last selected
+    column in the logical session, falling back to zero-based column 0 when that selection is absent or invalid
+    and a column exists; an empty document has no selection.
+    Closing Settings cancels search and clears search/results but preserves that selection. Disclosure expansion
+    survives column changes only until Settings closes. A header action raises Settings and, when current
+    discovery/result rows already contain the target, preserves the query (if any), selects the target, and
+    scrolls it into view. Above ten columns, when current results exclude it, the action clears the old label
+    query, resolves the target as direct `#N`, and selects and scrolls that sole result. Explicitly opening a new
+    document resets selection and search; a safe internal Parsing re-open preserves the selected ordinal while
+    clearing search, and an unsafe mapping falls back to column 0 when one exists.
 
 ## Non-functional constraints
 
 - **Cold start:** existing launch-to-first-visible-rows remains below 500 ms on every frozen corpus fixture,
   including `wide_100k_cols`. Type inference is entirely outside `ls_open`; the feature adds no all-column
   strings, controls, metadata snapshots, or per-column FFI calls to first paint.
-- **Interactive latency:** normal panel open, selection, scroll, type change, and redraw target at most 100 ms
-  and must remain below 500 ms. Any operation capable of crossing 500 ms runs off-main, reports loading/progress
-  by that threshold, and remains cancellable.
-- **Panel complexity:** unsearched list construction, row reuse, label copies, and metadata retrieval are
-  `O(panel viewport + overscan)`, independent of total column count. Grid inference follows the established
-  horizontal column window, not the non-hidden-column set.
+- **Interactive latency:** normal Settings open/raise, selection, result scroll, disclosure, type change, and
+  redraw target at most 100 ms and must remain below 500 ms. Any search capable of crossing 500 ms runs off-main,
+  reports loading/progress by that threshold, and remains cancellable. A broad search may take time proportional
+  to labels examined before its eleventh match or exhaustion, but it never blocks the main thread.
+- **Embedded-list complexity:** live row construction, reuse, label copies, and metadata retrieval are
+  `O(Settings list viewport + overscan)` and are additionally capped by ten logical discovery/result rows,
+  independent of total column count. Empty-query Settings on a document above ten columns requests only the
+  selected inspector column, not all columns. Grid inference follows the established horizontal column window,
+  not the non-hidden-column set.
 - **Inference complexity:** work is `O(bounded head + requested materialized windows)`, never `O(file)`,
   `O(all rows)`, or `O(all columns)`. Per-event and per-chunk byte bounds are fixed above.
 - **Memory:** new core type state is `O(columns requested/configured)`, plus bounded job/evidence state. It is
-  sparse and not `O(total columns)` on an untouched wide document. The panel owns `O(viewport)` live row views
-  and strings; an active label search may retain only matching column IDs, not all labels or controls. Existing
-  `O(columns)` visibility, width, and x-offset scalar arrays remain the sole accepted wide-column indexes.
+  sparse and not `O(total columns)` on an untouched wide document. The embedded Settings surface owns
+  `O(viewport)` live row views and strings; between fixed-size search batches it retains at most ten matching IDs
+  plus an overflow Boolean, never all matching labels, IDs, or controls. One transient candidate/match batch is
+  bounded by 1024. Existing `O(columns)` visibility, width, and x-offset scalar arrays remain the sole accepted
+  wide-column indexes.
 - **Header strings:** the macOS session no longer owns `[String]` for every header. Actual header bytes are
-  caller-copied only for the grid/panel window or an off-main label search. The existing width/offset setup may
+  caller-copied only for the grid/Settings window or an off-main label search. The existing width/offset setup may
   perform a batched length-only preflight over columns because `ARCH-column-windowing` already requires compact
   per-column scalars; it may not allocate a Swift String or request type inference/metadata for every column.
 - **Stability:** a published effective type and active format do not silently flip because the user scrolls,
@@ -281,10 +370,12 @@ full-cell copy and search behavior is therefore unchanged.
 | `backend/src/sniff.zig` | Reuse the pinned exact numeric grammar. Type inference does not alter delimiter/header sniffing and is not called from sniff/open. |
 | `backend/src/encoding.zig` and Reader seam | Reuse bounded source/decode behavior and source-row identity. CSV has no declared type; a future Reader may fill the declared slot without changing precedence or frontend snapshots. |
 | `LessSheetKit/CoreDocumentSession` | Bridge batch snapshots/copy operations and stop eagerly constructing `[String]` for every header. Serialize live-handle access with existing close safety and expose caller-owned Swift values. |
-| `LessSheetKit/ColumnVisibility` | Remain the single visibility model. No second hide/show state is introduced by the panel. |
-| `ViewerModel` and grid rendering/sizing | Coordinate requested grid/panel IDs, poll one global generation, cache metadata/labels only around visible windows, validate/format visible raw cells, apply automatic alignment, and preserve monotone/manual width rules. Raw copy/Find/filter paths bypass this cache. |
-| `SettingsWindow` | Keep Parsing intact; replace the eager per-column `ForEach` with one entry into the shared compact panel. |
-| New macOS panel/controller | SwiftUI macOS-26 glass shell and inspector around an AppKit reusable table; owns selection, label search, session-only formatting, progress, and accessibility presentation. |
+| `LessSheetKit/ColumnVisibility` | Remain the single visibility model. No second hide/show state is introduced by Settings. |
+| `ViewerModel` and grid rendering/sizing | Coordinate requested grid/Settings IDs, poll one global generation, cache metadata/labels only around visible windows, validate/format visible raw cells, apply automatic alignment, and preserve monotone/manual width rules. Raw copy/Find/filter paths bypass this cache. Existing `columnPanel*` state names may remain internal. |
+| `apps/macos/Sources/Contracts/ColumnPanel.swift` | **No change.** Reuse `ColumnPanelViewport`, `ColumnPanelLayouting`, and `ColumnLabelSearching` with their frozen geometry, batch, localized-substring, and source-order semantics. Exact `#N`, the ten-result cap, and the adaptive threshold are frontend composition/routing around those contracts. |
+| `SettingsWindow` | Keep Parsing intact as the compact full-width section; make the normal titled Settings window wider and resizable; embed the adaptive list/search and inspector side by side beneath Parsing; own disclosure/open-close presentation state. |
+| `ColumnPanelView` reusable components | Reuse the AppKit `NSTableView` row views, viewport planning, inspector controls, off-main search batching, progress, and accessibility presentation inside Settings. Remove the user-visible sheet shell, glass container, Done action, and sheet dismissal ownership. Internal legacy names need not change. |
+| `AppUI` / `AppDelegate` | Remove the document-window column sheet route. The Settings command and column-header actions raise the one retained Settings window; a header action carries its target column into the embedded surface. |
 
 ### Data flow
 
@@ -296,7 +387,7 @@ ls_open (unchanged bounded raw document)
     │                                              └── Swift visible-cell validator
     │                                                   └── FormatStyle / raw fallback
     │
-    └── requested grid ∪ panel column IDs ──► existing worker, bounded chunks
+    └── requested grid ∪ Settings column IDs ──► existing worker, bounded chunks
                                                    │
                                                    ├── sparse evidence/state
                                                    └── atomic metadata commit
@@ -308,9 +399,11 @@ ls_open (unchanged bounded raw document)
                          redraw affected visible columns
 ```
 
-The UI has one column-ID coordinator. Each grid/panel viewport change computes the union of requested IDs and
-issues one replacement inference request. This prevents two surfaces from racing by independently replacing the
-worker's desired set.
+The UI has one column-ID coordinator. Each grid/Settings viewport, result, or selected-inspector change computes
+the union of requested IDs and issues one replacement inference request. This prevents UI consumers from racing
+by independently replacing the worker's desired set. For a document above ten columns with an empty query, the
+Settings contribution is exactly the selected inspector ID; during label search, IDs do not join the union
+until one of the at most ten retained results enters the live result viewport.
 
 The worker re-lexes the deterministic bounded head only after the first request. Later `ls_window_set` success
 publishes source-row identities and eligible requested-column IDs into a bounded event queue; it does not pass
@@ -320,13 +413,15 @@ boundary. Cancelled or superseded work retains already committed evidence but ca
 
 ### Logical-session internal re-open
 
-An explicit close/open is always a new logical session and resets every column type, inference, null, format,
-visibility, automatic/manual width, and panel state. Nothing is persisted.
+An explicit document close/open is always a new logical session and resets every column type, inference, null,
+format, visibility, automatic/manual width, and column-Settings selection/search state. Nothing is persisted.
 
 Changing Parsing settings inside an open document is an **internal re-open** in the same logical session. Swift
 owns a snapshot of user-authored column settings only: override, null sentinel, format, visibility, and manual
 width. Inference, conflicts, proposals, automatic widths, active jobs, and metadata generations are never
-replayed.
+replayed. Search text/results and advanced-disclosure expansion are presentation state and are never replayed.
+An internal re-open clears search. A safe identity map preserves the selected column ordinal; an unsafe map
+resets selection to column 0, matching the fresh column state.
 
 The frontend opens the candidate handle while retaining the old live handle, then determines whether mapping is
 safe:
@@ -346,6 +441,26 @@ old handle and settings without a partial apply. On an unsafe map, the candidate
 and the UI explains that column settings were reset rather than applying them to the wrong identities.
 
 ## External interfaces
+
+### Inline-Settings amendment boundary
+
+The amendment changes UI composition and routing only. It adds, removes, or changes no symbol, numeric value,
+layout, function, or behavior in the frozen C ABI described below. It also makes no change to the public Swift
+declarations or pinned semantics in `apps/macos/Sources/Contracts/ColumnPanel.swift`:
+`ColumnPanelViewport`, `ColumnPanelPlan`, `ColumnPanelLayouting`, `ColumnLabelCandidate`,
+`columnLabelSearchBatchMax`, and `ColumnLabelSearching` remain byte/source compatible and keep their existing
+meaning. Existing conformance tests must pass unchanged.
+
+The user-visible macOS routing contract becomes:
+
+- the Settings command raises the one normal titled Settings window;
+- there is no “Configure Columns…” command, document-window sheet, second panel, or separate Done action; and
+- a column-header configuration action raises that same Settings window with the target selected, using an
+  existing matching result when possible or replacing an excluding label query with direct `#N` resolution.
+
+The exact `#N` recognizer, adaptive ten-column threshold, result cap, overflow indicator, Settings open/close
+state, and disclosure state are feature-local frontend behavior outside the frozen Swift search/layout
+contracts. No production, runtime, build, or network dependency is added.
 
 ### Additive C ABI rules
 
@@ -515,7 +630,7 @@ frontend conservatively re-queries visible IDs on every poll.
 `request_generation` changes only when a normalized desired inference set changes or is cancelled; it identifies
 progress, not metadata. A worker result carries its request generation and is discarded if superseded before
 commit. A global-generation change tells Swift only that some column changed. Swift compares cached per-column
-generations after one `get_many` for the grid/panel viewport and redraws only changed visible columns. It never
+generations after one `get_many` for the grid/Settings viewport and redraws only changed visible columns. It never
 uses the global value as a reason to query all column IDs.
 
 Confidence/state publication is pinned:
@@ -537,7 +652,8 @@ Confidence/state publication is pinned:
 | Publication/conflicts | Eight-value or exhaustive-small publication; freeze published type; contradictory values become a user-accepted proposal. | Confidence-driven silent flipping makes alignment/format depend on scroll order. “First value wins” is too brittle; waiting for EOF defeats laziness. Eight is a bounded, deterministic evidence floor while exhaustive small documents still resolve. | Project-wide behavior for inferred metadata. |
 | Exact decimal display | Foundation `Decimal.FormatStyle` only after a string-exact Decimal round-trip guard; raw fallback plus non-conflict indication outside Foundation's exact range; half-even rounding. | `Double` violates exactness; an in-house/third-party arbitrary-precision formatter adds production maintenance, licensing, size, and locale burden for v1. Raw fallback is reversible and never lies. Foundation documents the native Decimal format style and decimal-number limits. | macOS feature-local; no dependency. |
 | Date/datetime display | Strict project grammar followed by Foundation ISO/date-components parsing and native localized presets; preserve naive wall time or each source offset. | `DateFormatter` with arbitrary user patterns is locale-ambiguous and mutable; permissive ISO parsing accepts forms outside the contract; custom calendrical code is high-risk. A lexical gate plus native calendar validation is deterministic and locale-capable. | macOS feature-local; grammar is project-wide metadata behavior. |
-| Virtualized panel | SwiftUI/macOS-26 Liquid-Glass shell and inspector with an embedded chromeless `NSTableView` reusable list. | The current eager `ForEach` is unsafe. SwiftUI `List` is less explicit about row creation/cache bounds at 100k columns; a custom canvas loses standard selection/accessibility; a third-party grid adds cost. `NSTableView` gives deterministic view reuse while SwiftUI owns the product styling. | macOS feature-local. |
+| Embedded Settings composition | The existing normal titled Settings window becomes the sole, resizable column surface: compact Parsing above, reusable `NSTableView` discovery/results beside the SwiftUI inspector below. Main controls are immediate; Null and Width/Auto-fit use collapsed disclosures. | Retaining the separate sheet leaves the unwanted second transition; a tab or navigation destination fails the requirement that Parsing and main column controls remain visible together; restoring eager SwiftUI controls revives the wide-document hazard. Reusing the shipped native list/inspector preserves deterministic reuse, selection, and accessibility without a new package. | macOS feature-local amendment; no dependency or project-wide change. |
+| Adaptive column discovery | Show the complete source-order list only for 1–10 columns. Above ten, use search-only discovery with at most ten existing localized-substring matches, an overflow/refine state, and direct exact `#N` addressing. No empty-query wide list exists. | A fully virtualized 100k list is memory-safe but poor to browse; a standard picker may eagerly materialize labels and controls; retaining every search match makes broad queries `O(total columns)` in frontend memory. True fuzzy ranking requires new scoring semantics, full-corpus ranking work, and likely a new contract or dependency. Existing substring batches plus a ten-ID cap are deterministic, bounded, reversible, and keep every column reachable through `#N`. | macOS feature-local amendment around unchanged Swift contracts. |
 | Header labels | New zero-allocation batched caller-copy API; viewport/overscan String cache, off-main batch search, and length-only cold width preflight. | Eager `[String]` copies regress wide open; returning borrowed labels preserves the old invalidation hazard; storing all search labels duplicates memory. The chosen split preserves header truncation and strict re-open identity while keeping live strings bounded. | Cross-component feature-local. |
 | Internal re-open ownership | Swift logical-session snapshot of user-authored settings, strict identity mapping, candidate-handle replay, then atomic swap. | Core persistence/sidecars violate no-persistence and format neutrality; replay by count alone can configure the wrong column; resetting every internal parse tweak discards useful user work. Candidate swap preserves the old session on failure. | macOS session architecture. |
 | Platform/dependencies | macOS 26, Swift/Foundation/AppKit/SwiftUI plus Zig standard library only; no new package/runtime. | Supporting older macOS weakens the approved glass/format surface and adds branches; external formatting/table packages add deployment, licensing, and maintenance cost without solving an unmet requirement. `Package.swift` already declares 26. | **Project-wide macOS minimum**, approved; `PROJECT.md` updated by root freeze. |
@@ -601,20 +717,36 @@ bounded.
     exactly as `override > published inferred > declared > unknown`; provisional inference never wins. Clearing
     override reveals the prior inferred/declared value without re-open. Changing null policy starts a fresh
     evidence/conflict epoch. Unknown/unsupported always render the original value.
-11. **The 100k-column panel is O(viewport).** Opening and scrolling the unsearched panel on `wide_100k_cols`
-    instantiates at most the visible table rows plus one viewport of reusable overscan on each side (bounded by
-    `3 × visibleRowCount + 8`), and requests no more label/metadata IDs than that union plus the grid column
-    window. Instrumentation shows no `0..<columnCount` control construction, no per-column FFI loop, target
-    panel-open/scroll under 100 ms, and hard maximum below 500 ms.
-12. **Panel search is bounded and cancellable.** A header search scans label batches of at most 1024 off-main,
-    retains IDs rather than all label Strings/controls, streams matching IDs in source-column order, and requests
-    type metadata only for visible result rows. A search crossing 500 ms reports progress; query replacement or
-    panel close cancels within one batch/under 100 ms and stale results never publish.
+11. **The embedded Settings surface stays O(viewport) at 100k columns.** Opening Settings on
+    `wide_100k_cols` with an empty query creates no unfiltered logical list and requests only the restored/fallback
+    inspector column in addition to the grid column window. Any discovery/result list instantiates at most its
+    visible rows plus one viewport of reusable overscan on each side (bounded by
+    `3 × visibleRowCount + 8`) and can contain at most ten logical rows. Instrumentation shows no
+    `0..<columnCount` control construction, no per-column metadata/FFI loop, no all-label Swift array, Settings
+    open/raise and result scroll target at most 100 ms, and each remains below 500 ms. The unchanged
+    `wide_100k_cols` cold-open path remains below 500 ms to first visible rows whether or not Settings was open in
+    the previous document session.
+12. **The 6/10/100k discovery boundary and `#N` route are exact.** A six-column fixture shows exactly six
+    unfiltered source-order rows and no search field; a ten-column fixture shows exactly ten and no search field.
+    Eleven-column and `wide_100k_cols` fixtures show a search field, zero unfiltered/empty-query result rows, and
+    the restored selection (or column 1 fallback) in the inspector. A non-empty ordinary query uses the frozen
+    localized case-insensitive substring decision, retains/renders the first at most ten matches in source order,
+    and, upon an eleventh, retains the ten IDs plus only an overflow Boolean and exposes “More matches—refine
+    your search.” Exact
+    `#1`, `#10`, and `#100000` on the 100k fixture resolve directly to those 1-based columns without a label
+    scan; `#0`, `#100001`, signs, surrounding whitespace, non-ASCII digits, and numeric
+    overflow leave selection unchanged and expose “No such column.” Duplicate labels beyond the ten-result cap
+    remain reachable by valid `#N`. An ordinary query scans label batches of at most 1024 off-main, retains at
+    most ten matching IDs plus the overflow Boolean between batches rather than all label Strings/controls,
+    discards the transient fixed-size batch after detecting the eleventh match or exhaustion, and requests type
+    metadata only for live result rows. A search crossing 500 ms reports progress; query replacement, Settings
+    close, or document replacement cancels within one batch/under 100 ms and stale results never publish. Empty
+    queries and every `#`-prefixed valid/invalid direct-address input perform no label scan.
 13. **Eager header Strings are removed without width regression.** `CoreDocumentSession` does not construct or
-    retain `[String]` across all columns. First paint copies actual labels only for the grid/panel window; the
+    retain `[String]` across all columns. First paint copies actual labels only for the grid/Settings window; the
     allowed all-column width setup uses batched length-only spans and compact existing width/offset arrays. A
     100k distinct-header fixture stays below 500 ms, retains no all-header Swift Strings, renders the right label
-    and truncation state at arbitrary horizontal/panel positions, and preserves `ARCH-column-windowing`'s
+    and truncation state at arbitrary horizontal/Settings-list positions, and preserves `ARCH-column-windowing`'s
     per-column, horizontally stable, vertical-evidence-only monotone growth and viewport-fitting layout results;
     a direct user type/format change may remeasure only its affected visible column as requirement 15 specifies.
 14. **Exact decimal formatting never lies.** Under fixed test locales, auto preserves `2.00`, `+1e5`, a 38-digit
@@ -641,21 +773,42 @@ bounded.
     header, or any headerless dialect change resets all column settings. In every safe replay, inference,
     conflicts/proposals, generations, and automatic widths restart. Candidate open/replay failure leaves the old
     handle and every setting unchanged; no partial candidate state becomes visible.
-19. **Session reset and no persistence are complete.** Explicit close/open clears inference, override, null
-    sentinel, formats, visibility, manual/automatic widths, panel selection/search, conflicts, and proposals.
-    Closing during inference cancels/joins safely and a new handle begins at generation zero. No sidecar,
-    preference/database record, extended attribute, recent-file profile, source write, or unexpected filesystem
-    artifact is produced.
-20. **Composition and accessibility are one coherent surface.** Settings still shows Parsing separately and no
-    eager per-column checkbox list. Settings and header context action open the same selected-column panel/state.
-    Keyboard-only and VoiceOver verification can search/select a column, distinguish Auto/inferred/override,
-    hear conflicts and format-unavailable separately, edit/reset relevant controls, toggle visibility without
-    hiding the final visible column, and observe progress/cancellation under normal, Increase Contrast, and
-    Reduce Motion settings.
+19. **Session reset and no persistence are complete.** Explicit document close/open clears inference, override,
+    null sentinel, formats, visibility, manual/automatic widths, Settings selection/search, conflicts, and
+    proposals. Closing during inference cancels/joins safely and a new handle begins at generation zero. No
+    sidecar, preference/database record, extended attribute, recent-file profile, source write, or unexpected
+    filesystem artifact is produced.
+20. **Composition and accessibility are one coherent Settings surface.** The normal Settings window is resizable
+    and is the sole column-configuration surface: compact Parsing is full-width above Columns; discovery/results
+    and the inspector are side by side below; both sections remain present without tabs or navigation. There is
+    no “Configure Columns…” entry, document-window sheet, chromeless second panel, separate Done action, or eager
+    per-column checkbox list. At the declared minimum usable size, Visible, Type with source/reset, and every
+    control in the applicable Number or Date format group are available without expanding an advanced disclosure
+    or moving to another surface. Keyboard-only and VoiceOver verification can use the adaptive list/search,
+    exact address, overflow/refine state, selection, both disclosures, conflicts and format-unavailable, reset,
+    final-visible-column guard, progress, and cancellation under normal, Increase Contrast, and Reduce Motion
+    settings.
 21. **All gates and resource bounds hold.** Backend, macOS, root ABI, existing corpus, column-windowing,
     window-budget, search/filter, and copy gates pass unchanged. New retained core metadata is proportional only
-    to requested/configured columns; the panel has bounded live views/strings; no new dependency is linked; and
-    main-thread instrumentation records no operation at or above 500 ms.
+    to requested/configured columns; embedded Settings has bounded live views/strings and at most ten search IDs;
+    no new dependency is linked; and main-thread instrumentation records no operation at or above 500 ms.
+22. **Settings lifecycle and header deep links are deterministic.** First opening in a logical session clears
+    search/results, collapses Null and Width/Auto-fit, and selects the prior valid session selection or column 1
+    when a column exists; a zero-column document has no selection.
+    Expanding either disclosure and changing columns leaves expansion unchanged until Settings closes. Closing
+    and reopening Settings preserves selection but clears search/results and collapses both disclosures. A header
+    action raises the same Settings window; if the target is already in current discovery/result rows it
+    preserves the query (if any), selects the target, and scrolls that row into view. Above ten columns, when
+    current results exclude the target, it clears the excluding label query, resolves the target through direct
+    `#N`, and selects/scrolls its sole result. A safe internal Parsing re-open clears search but preserves the
+    selected ordinal; an unsafe mapping and an explicit new document both fall back to column 1 when one exists,
+    with no search/results.
+23. **The amendment changes no contract or project stack.** Relative to the shipped column-config baseline,
+    `api/lesssheet.h` and `apps/macos/Sources/Contracts/ColumnPanel.swift` have an empty diff; all existing ABI and
+    Swift contract conformance checks pass unchanged. The application links no new runtime/build package and
+    introduces no persistent setting, header index, helper process, or network service. Legacy `ColumnPanel` /
+    `panel` implementation names may remain, but only the one Settings surface is user-visible. `PROJECT.md`
+    requires no amendment.
 
 ## Open Questions
 
