@@ -239,17 +239,20 @@ pub const Gzip = struct {
         if (s == self.forward) {
             self.forward_logical.store(s.logical, .release);
             self.forward_physical.store(s.input.seek, .release);
-            switch (s.terminal) {
-                .clean => {
-                    self.terminal_kind.store(1, .release);
-                    self.terminal_end.store(s.logical, .release);
-                },
-                .damaged => {
-                    self.terminal_kind.store(2, .release);
-                    self.terminal_end.store(s.logical, .release);
-                },
-                else => {},
-            }
+        }
+        // A retained trailing-scan session may reach the real end before the
+        // shared forward session.  Real EOF is source-global knowledge; only
+        // an artificial physical budget stop remains lane-local.
+        switch (s.terminal) {
+            .clean => {
+                self.terminal_kind.store(1, .release);
+                self.terminal_end.store(s.logical, .release);
+            },
+            .damaged => {
+                self.terminal_kind.store(2, .release);
+                self.terminal_end.store(s.logical, .release);
+            },
+            else => {},
         }
         _ = self.inflated_total.fetchAdd(@intCast(written), .monotonic); // gz-filter-stream: inflated output bytes
         return written;
@@ -533,13 +536,14 @@ pub const Cursor = struct {
     source: ?Source = null,
     logical: u64 = 0,
     physical: u64 = 0,
-    span_len: usize = 0,
     limit: ?u64 = null,
     physical_limit: ?u64 = null,
     saved_input_end: usize = 0,
     locked: bool = false,
     lane: u8 = 0,
     look: [4]u8 = undefined,
+    look_start: u64 = 0,
+    look_len: usize = 0,
 
     pub fn deinit(self: *Cursor) void {
         if (self.locked) switch (self.source.?) {
@@ -570,27 +574,40 @@ pub const Cursor = struct {
     pub fn peek(self: *Cursor, n: usize) []const u8 {
         const max_n = @min(n, self.look.len);
         if (self.limit) |lim| if (self.logical >= lim) return self.look[0..0];
+        var got: usize = 0;
+        // A previous peek may have crossed a lane-buffer boundary. Preserve
+        // its unconsumed suffix: advancing the inflater replaced lane_buf,
+        // but advancing the Cursor by one byte did not consume all lookahead.
+        if (self.look_len > 0 and self.logical >= self.look_start and self.logical < self.look_start + self.look_len) {
+            const offset: usize = @intCast(self.logical - self.look_start);
+            got = @min(max_n, self.look_len - offset);
+            std.mem.copyForwards(u8, self.look[0..got], self.look[offset..][0..got]);
+            self.look_start = self.logical;
+            self.look_len = got;
+            if (got == max_n) return self.look[0..got];
+        } else {
+            self.look_start = self.logical;
+            self.look_len = 0;
+        }
         switch (self.source.?) {
             .mmap => |m| {
                 const physical_end = if (self.physical_limit) |p| p -| m.physical_base else m.bytes.len;
                 const end = @min(m.bytes.len, @as(usize, @intCast(@min(self.limit orelse m.bytes.len, physical_end))));
                 const at: usize = @intCast(self.logical);
-                if (at < end) return m.bytes[at..@min(end, at + max_n)];
+                if (got == 0 and at < end and end - at >= max_n) return m.bytes[at .. at + max_n];
             },
             .gzip => |g| {
                 const internal = self.logical + g.bom_len;
                 const logical_end = if (self.limit) |lim| lim + g.bom_len else std.math.maxInt(u64);
-                if (internal < g.head.items.len) {
+                if (got == 0 and internal < g.head.items.len) {
                     const end = @min(@as(u64, g.head.items.len), logical_end);
                     if (end - internal >= max_n) return g.head.items[@intCast(internal)..@intCast(internal + max_n)];
                 }
                 const lane: usize = self.lane;
-                _ = g.byteAtLane(lane, internal) orelse return self.look[0..0];
-                if (internal >= g.op_start[lane] and internal + max_n <= g.op_start[lane] + g.op_len[lane] and internal + max_n <= logical_end)
+                if (got == 0 and internal >= g.op_start[lane] and internal + max_n <= g.op_start[lane] + g.op_len[lane] and internal + max_n <= logical_end)
                     return g.lane_buf[lane][@intCast(internal - g.op_start[lane])..@intCast(internal - g.op_start[lane] + max_n)];
             },
         }
-        var got: usize = 0;
         while (got < max_n) : (got += 1) {
             if (self.limit) |lim| if (self.logical + got >= lim) break;
             if (self.physical_limit) |lim| switch (self.source.?) {
@@ -603,7 +620,8 @@ pub const Cursor = struct {
             };
             self.look[got] = b;
         }
-        self.span_len = got;
+        self.look_start = self.logical;
+        self.look_len = got;
         return self.look[0..got];
     }
 
@@ -769,6 +787,46 @@ pub fn cursorAt(source: Source, logical: u64, logical_limit: ?u64, physical_budg
                 cur.physical_limit = @min(@as(u64, session.input.end), session.input.seek +| budget);
                 session.input.end = @intCast(cur.physical_limit.?);
             }
+            g.unlock();
+            cur.locked = true;
+        },
+    }
+    return cur;
+}
+
+/// Acquire one lane for a sequential FILTER/SEARCH chunk.  Unlike cursorAt's
+/// short-operation resume fast path, a scan which starts behind the forward
+/// inflater must use an independent replay session: the shared forward
+/// session can never serve a byte behind its over-produced logical position.
+/// The returned Cursor retains that lane until the whole chunk is finished.
+pub fn scanCursorAt(source: Source, logical: u64) Cursor {
+    var cur: Cursor = .{ .source = source, .logical = logical };
+    switch (source) {
+        .mmap => {},
+        .gzip => |g| {
+            g.lock();
+            const internal = logical +| g.bom_len;
+            while (true) {
+                const trailing = internal < g.forward_logical.load(.acquire);
+                if (!trailing and !g.lane_busy[0]) {
+                    cur.lane = 0;
+                    break;
+                }
+                if (trailing) {
+                    if (!g.lane_busy[1]) {
+                        cur.lane = 1;
+                        break;
+                    }
+                    if (!g.lane_busy[2]) {
+                        cur.lane = 2;
+                        break;
+                    }
+                }
+                _ = c.pthread_cond_wait(&g.cond, &g.mutex);
+            }
+            g.lane_busy[cur.lane] = true;
+            const session = if (cur.lane == 0) g.forward else if (cur.lane == 1) g.replay else g.replay2;
+            cur.physical = session.input.seek;
             g.unlock();
             cur.locked = true;
         },

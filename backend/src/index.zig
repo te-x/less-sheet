@@ -79,7 +79,20 @@ pub fn workerMain(doc: *Document) void {
     var released: u64 = 0; // bytes up to which pages were madvised away
     doc.lock();
     while (true) {
-        if (doc.stop) break;
+        if (doc.stop) {
+            doc.endMatchScan();
+            break;
+        }
+        // TEST-ONLY (base.Document.scan_park; DEFAULT false => byte-identical
+        // behavior): while parked, a test owns the gzip FILTER/SEARCH match-scan
+        // and drives it one 2048-row block at a time on its OWN thread. The
+        // worker must touch NOTHING here -- not even the match_scan_owner
+        // reconciliation below -- or it would tear the test's leased scan cursor
+        // down mid-chunk. It re-checks on every wake, so unpark resumes normally.
+        if (doc.scan_park.load(.acquire)) {
+            doc.waitWork();
+            continue;
+        }
         // Slot priority: a scanning jump owns the frontier; else a scanning
         // search (find — which runs even after the index is complete; it must
         // re-lex behind the frontier to COUNT); else exact filtered navigation;
@@ -94,6 +107,15 @@ pub fn workerMain(doc: *Document) void {
         const do_filter = !do_jump and !do_search and !do_nav and
             (doc.filter_state == .scanning or (doc.filter_state == .cancelled and doc.auto));
         const do_index = !do_jump and !do_search and !do_nav and !do_filter and doc.auto and !doc.complete;
+        const wanted_scan: base.MatchScanOwner = if (do_jump and doc.filter_state != .idle)
+            .filter
+        else if (do_search)
+            .search
+        else if (do_filter)
+            .filter
+        else
+            .none;
+        if (doc.match_scan_owner != wanted_scan) doc.endMatchScan();
         if (!(do_jump or do_search or do_nav or do_filter or do_index)) {
             doc.waitWork();
             continue;
@@ -162,7 +184,7 @@ pub fn workerMain(doc: *Document) void {
             const start_row = doc.filter_rows;
             doc.unlock();
 
-            const res = filter.filterScanChunk(doc, start_pos, start_row);
+            const res = filter.filterScanChunk(doc, start_pos, start_row, gen);
 
             doc.lock();
             if (doc.filter_gen == gen and doc.jump_state == .scanning) {
@@ -197,7 +219,7 @@ pub fn workerMain(doc: *Document) void {
             const start_row = doc.filter_rows;
             doc.unlock();
 
-            const res = filter.filterScanChunk(doc, start_pos, start_row);
+            const res = filter.filterScanChunk(doc, start_pos, start_row, gen);
 
             doc.lock();
             if (doc.filter_gen == gen and doc.filter_state == .scanning) {
@@ -244,7 +266,7 @@ pub fn workerMain(doc: *Document) void {
             doc.unlock();
 
             // Lex + match a chunk of rows lock-free (worker snapshot only).
-            const res = search.searchScanChunk(doc, start_pos, start_row, filtered);
+            const res = search.searchScanChunk(doc, start_pos, start_row, filtered, gen);
 
             doc.lock();
             // Commit only if this is still the same, still-scanning search;

@@ -230,6 +230,50 @@ pub const MatchRowResult = struct {
     end: api.SourceEnd,
 };
 
+/// A FILTER/SEARCH chunk's retained source lease.  mmap continues through its
+/// direct matcher; gzip holds one sequential Cursor so row boundaries do not
+/// release and accidentally reacquire the shared forward inflater.
+pub const MatchScan = struct {
+    reader: Reader,
+    source: Source,
+    cursor: ?source_mod.Cursor = null,
+
+    pub fn init(reader: Reader, source: Source, pos: Pos) MatchScan {
+        var scan: MatchScan = .{ .reader = reader, .source = source };
+        if (source == .gzip) scan.cursor = source_mod.scanCursorAt(source, pos.logical);
+        return scan;
+    }
+
+    pub fn deinit(self: *MatchScan) void {
+        if (self.cursor) |*cur| cur.deinit();
+        self.cursor = null;
+    }
+
+    pub fn matchRow(self: *MatchScan, pos: Pos, primary: base.MatchCtx, filter_ctx: ?base.MatchCtx) MatchRowResult {
+        if (self.cursor) |*cur| {
+            std.debug.assert(cur.logical == pos.logical);
+            return switch (self.reader) {
+                .csv => |r| r.matchRowAtScanCursor(cur, primary, filter_ctx),
+            };
+        }
+        return readerMatchRow(self.reader, self.source, pos, primary, filter_ctx, .{});
+    }
+};
+
+/// Match one row through a document-owned whole-job scan Cursor.  Unlike
+/// MatchScan above, ownership and deinit stay with base.Document so the lane
+/// remains leased across worker block commits.
+pub fn readerMatchRowAtScanCursor(
+    self: Reader,
+    cursor: *source_mod.Cursor,
+    primary: base.MatchCtx,
+    filter_ctx: ?base.MatchCtx,
+) MatchRowResult {
+    return switch (self) {
+        .csv => |r| r.matchRowAtScanCursor(cursor, primary, filter_ctx),
+    };
+}
+
 pub fn readerMatchRow(
     self: Reader,
     source: Source,

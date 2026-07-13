@@ -5657,3 +5657,154 @@ test "gzfs_search: a gzip FIND-scan trailing the frontier streams forward, does 
     try std.testing.expectEqual(api.SearchState.done, st.state);
     try std.testing.expectEqual(gzfs_rows, st.total);
 }
+
+// ===========================================================================
+// gz-filter-stream — GENERAL multi-block regression (planner-owned, frozen).
+// gzfs_filter/gzfs_search above use a 48-row, single-block, no-contention
+// fixture; the shipped fix passed them yet an earlier round still re-inflated a
+// ~32 MiB checkpoint interval PER 2048-row block when a behind-frontier replay
+// read perturbed the scan's replay lane BETWEEN blocks. These tests lock the
+// GENERAL case: a gzip FILTER/SEARCH scan that trails the frontier across MANY
+// 2048-row blocks and >= 2 durable 32 MiB inflate-checkpoints, with a
+// behind-frontier replay-lane read interleaved between every block.
+//
+// The committed fix retains ONE scan replay lane for the WHOLE job
+// (base.Document.match_scan_cursor, keyed by owner+generation+position;
+// lane_busy stays held across block commits), so an interleaved read is forced
+// onto the OTHER replay lane and the scan keeps streaming: ~1x logical inflated
+// bytes in ~logical/chunk inflate ops, no matter how many reads perturb the
+// other lane. Two impls this MUST reject, both witnessed by the bounds below:
+//   * ORIGINAL livelock (pre-fix): the trailing scan reused the forward lane
+//     past its over-produced position and spun 0-byte produce() calls -> ops
+//     grow without bound (bytes plateau) -> the OP bound trips.
+//   * PER-BLOCK-LEASE (the round-1 regression): the scan releases + reacquires
+//     its replay lane each block, so the interleaved read repositions the lane
+//     it will re-grab; every block then re-inflates from the nearest checkpoint
+//     up to the scan's position -> inflated bytes/ops grow ~= blocks x interval.
+//     Measured on this fixture (per-block-lease iso vs the committed fix):
+//     ~1.19 GiB / 4637 ops  vs  ~72.6 MiB / 282 ops  -- a ~16x gap.
+//
+// Driven single-threaded and DETERMINISTICALLY: api.gzScanStep advances the
+// scan one 2048-row block at a time on THIS thread with the worker parked
+// (api.gzScanParkWorker), and api.gzTouchReplayLane performs the between-block
+// behind-frontier replay-lane read. The inflate-work counters
+// (api.gzInflatedBytes / api.gzInflateOps) are a pure function of the inflate
+// work done, so the assertions are reproducible with no wall-clock or thread
+// race. (A concurrent worker-driven scan with hammered behind-frontier windows
+// streams identically on the fix; this single-threaded form is the frozen,
+// non-flaky witness.)
+// ---------------------------------------------------------------------------
+
+/// `n` fixed-width SHORT rows under header "k,v": col 0 is `filler` bytes of
+/// 'a' (so text "a" matches EVERY row -> exact terminal total == n), col 1 the
+/// 8-digit index. Row width is exactly filler+10, so row R starts at byte
+/// 4 + R*(filler+10) -- fixed enough to place the >2048-row, >64 MiB fixture
+/// deterministically across the 32/64 MiB checkpoints. Caller frees.
+fn genShortRows(gpa: std.mem.Allocator, n: u64, filler: usize) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(gpa);
+    try buf.appendSlice(gpa, "k,v\n");
+    const blob = try gpa.alloc(u8, filler);
+    defer gpa.free(blob);
+    @memset(blob, 'a');
+    var line: [16]u8 = undefined;
+    var i: u64 = 0;
+    while (i < n) : (i += 1) {
+        try buf.appendSlice(gpa, blob); // col 0: 'a' filler -> matches "a"
+        try buf.appendSlice(gpa, try std.fmt.bufPrint(&line, ",{d:0>8}\n", .{i}));
+    }
+    return buf.toOwnedSlice(gpa);
+}
+
+const gzmb_filler: usize = 502; // row width 512 bytes
+const gzmb_rows: u64 = 150_000; // ~73.2 MiB logical: 74 blocks; crosses the 32 & 64 MiB ckpts
+const gzmb_chunk: u64 = 256 * 1024; // source.chunk_bytes: the inflate op size
+// The between-block read grabs a replay lane JUST PAST the first durable 32 MiB
+// inflate-checkpoint: the retained-lane fix replays it once (~1 chunk) then
+// serves repeats from that lane's buffer, while a per-block-lease scan re-grabs
+// the repositioned lane every block and re-inflates from the 32 MiB checkpoint.
+const gzmb_touch: u64 = 32 * 1024 * 1024 + 4;
+
+const GzMbKind = enum { filter, search };
+
+fn expectStreamingGzMultiblock(kind: GzMbKind) !void {
+    const gpa = std.testing.allocator;
+    const plain = try genShortRows(gpa, gzmb_rows, gzmb_filler);
+    defer gpa.free(plain);
+    const g = try gz(gpa, plain);
+    defer gpa.free(g);
+    const logical: u64 = plain.len;
+
+    var od = try openWith(g, .{ .separator = ',', .index_mode = api.index_auto });
+    defer od.deinit();
+    const doc = od.doc;
+
+    // Index to EOF FIRST: the forward inflater reaches the frontier and drops
+    // durable 32 & 64 MiB inflate-checkpoints, so the whole document is behind
+    // the frontier and the match-scan trails it (the failing condition).
+    try scanToEnd(doc);
+
+    // Park the worker and drive the scan one 2048-row block at a time on this
+    // thread, so the between-block interleave is exact and the counters
+    // reproducible.
+    api.gzScanParkWorker(doc, true);
+    switch (kind) {
+        .filter => try setFilter(doc, textReq("a")),
+        .search => try startSearch(doc, textReq("a")),
+    }
+    api.gzInflateWorkReset(doc); // measure ONLY the trailing scan + interleave
+
+    var blocks: u64 = 0;
+    while (true) {
+        const st = api.gzScanStep(doc);
+        if (st == .idle) return error.ScanNotArmed; // arming failed
+        if (st == .done) break;
+        // Between blocks: a behind-frontier replay-lane read (the general form
+        // of an ls_window_set / ls_cell_copy / nav over a trailing row).
+        api.gzTouchReplayLane(doc, gzmb_touch);
+        blocks += 1;
+    }
+    api.gzScanParkWorker(doc, false);
+
+    const ops = api.gzInflateOps(doc);
+    const bytes = api.gzInflatedBytes(doc);
+    // One forward pass is ~1x logical bytes in ~logical/chunk ops; the retained
+    // lane keeps the scan there under the interleave. A per-block-lease scan
+    // (~16x) and the original livelock (unbounded ops) both blow these.
+    const byte_bound: u64 = 2 * logical;
+    const op_bound: u64 = 4 * (logical / gzmb_chunk);
+    if (bytes > byte_bound) {
+        std.debug.print("\n[gzfs_multiblock {s}] inflated {d} > {d} (2x logical): trailing scan re-inflates per block, does not stream\n", .{ @tagName(kind), bytes, byte_bound });
+        return error.NonStreamingInflate;
+    }
+    if (ops > op_bound) {
+        std.debug.print("\n[gzfs_multiblock {s}] inflate ops {d} > {d}: per-block re-inflation / livelock, not a single forward pass\n", .{ @tagName(kind), ops, op_bound });
+        return error.NonStreamingInflate;
+    }
+    try std.testing.expect(blocks >= 40); // truly multi-block, crossed both checkpoints
+    try std.testing.expect(ops > 0 and bytes > 0); // seams wired; real inflate happened
+
+    // Termination + EXACT terminal total: every one of the 150k rows visited and
+    // counted (text "a" matches every row), proving the streaming scan is also
+    // correct, not merely cheap.
+    switch (kind) {
+        .filter => {
+            const f = api.ls_filter_poll(doc);
+            try std.testing.expectEqual(api.FilterState.done, f.state);
+            try std.testing.expectEqual(gzmb_rows, f.total);
+        },
+        .search => {
+            const st = api.ls_search_poll(doc);
+            try std.testing.expectEqual(api.SearchState.done, st.state);
+            try std.testing.expectEqual(gzmb_rows, st.total);
+        },
+    }
+}
+
+test "gzfs_filter_multiblock: a gzip FILTER-scan trailing the frontier across many blocks + checkpoints streams under a between-block replay-lane read (regression)" {
+    try expectStreamingGzMultiblock(.filter);
+}
+
+test "gzfs_search_multiblock: a gzip FIND-scan trailing the frontier across many blocks + checkpoints streams under a between-block replay-lane read (regression)" {
+    try expectStreamingGzMultiblock(.search);
+}

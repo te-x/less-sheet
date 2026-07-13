@@ -102,6 +102,7 @@ pub const Decimal = struct {
 /// coordinate spaces, so a switch between them must never reuse the other
 /// view's cursor state.
 pub const CopyView = enum { identity, filtered };
+pub const MatchScanOwner = enum { none, filter, search };
 
 pub const Document = struct {
     gpa: std.mem.Allocator,
@@ -426,6 +427,22 @@ pub const Document = struct {
     gz_match_resident_bytes: u64 = 0, // AC13: peak per-row matcher residency
     gz_cache_copy_bytes: u64 = 0, // AC20: bytes copied THROUGH a cache (0 for mmap)
 
+    // The worker's active FILTER/SEARCH gzip cursor.  It deliberately stays
+    // leased across 2048-row commit boundaries so unrelated replay cursors
+    // cannot perturb the sequential inflater session between blocks.  Only
+    // the single scan worker (or the mutex-held degraded fallback) touches it.
+    match_scan_cursor: ?source_mod.Cursor = null,
+    match_scan_owner: MatchScanOwner = .none,
+    match_scan_gen: u64 = 0,
+
+    // TEST-ONLY seam (gz-filter-stream regression; contracts/api.zig
+    // gzScanParkWorker): when set, the background worker declines the
+    // FILTER/SEARCH match-scan slot so a test can drive that scan ONE 2048-row
+    // block at a time on its own thread and deterministically interleave
+    // behind-frontier window/copy work between blocks. DEFAULTED false, so
+    // production behavior is byte-identical; only test code ever sets it.
+    scan_park: std.atomic.Value(bool) = .init(false),
+
     // --- window-budget instrumentation state (ARCH-window-budget) -----------
     // DEFAULTED (like copy_cursor_* / gz_* above) so openWithAllocator's literal
     // need not mention them. Read ONLY via contracts/api.zig's
@@ -453,6 +470,39 @@ pub const Document = struct {
     pub fn waitWork(self: *Document) void {
         _ = c.pthread_cond_wait(&self.cond, &self.mutex);
     }
+
+    /// Return the whole-job FILTER/SEARCH cursor, replacing a stale cursor
+    /// only when scan ownership/generation changes or its continuation no
+    /// longer agrees with the caller's opaque position.
+    pub fn beginMatchScan(self: *Document, owner: MatchScanOwner, generation: u64, pos: Pos) ?*source_mod.Cursor {
+        if (self.source != .gzip) {
+            self.endMatchScan();
+            return null;
+        }
+        const logical = self.reader.logicalBytes(self.source, pos);
+        if (self.match_scan_owner != owner or self.match_scan_gen != generation or
+            self.match_scan_cursor == null or self.match_scan_cursor.?.logical != logical)
+        {
+            self.endMatchScan();
+            self.match_scan_cursor = source_mod.scanCursorAt(self.source, logical);
+            self.match_scan_owner = owner;
+            self.match_scan_gen = generation;
+        }
+        return &self.match_scan_cursor.?;
+    }
+
+    pub fn endMatchScan(self: *Document) void {
+        if (self.match_scan_cursor) |*cur| cur.deinit();
+        self.match_scan_cursor = null;
+        self.match_scan_owner = .none;
+        self.match_scan_gen = 0;
+    }
+
+    /// Release only the lease owned by the worker snapshot that completed.
+    /// A stale chunk must never tear down a different generation's cursor.
+    pub fn endMatchScanIf(self: *Document, owner: MatchScanOwner, generation: u64) void {
+        if (self.match_scan_owner == owner and self.match_scan_gen == generation) self.endMatchScan();
+    }
 };
 
 pub fn asDoc(doc: *const api.Doc) *const Document {
@@ -470,6 +520,7 @@ pub fn asDocMut(doc: *const api.Doc) *Document {
 /// was never spawned (open failure), so the sync primitives are quiescent and
 /// safe to destroy.
 pub fn freeDoc(doc: *Document) void {
+    doc.endMatchScan();
     source_mod.sourceShutdown(&doc.source);
     doc.checkpoints.deinit(doc.gpa);
     doc.oversized_checkpoints.deinit(doc.gpa);

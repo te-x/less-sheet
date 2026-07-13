@@ -85,24 +85,38 @@ pub fn refreshWorkerCtx(doc: *Document) bool {
 /// lesssheet.h FILTERED VIEWS FIND); `filter_matches` tallies the filter
 /// alone, letting the caller re-drive the filter's own counted region as a
 /// side effect (maybeAdvanceFilterFromSearch).
-pub fn searchScanChunk(doc: *Document, start_pos: Pos, start_row: u64, filtered: bool) SearchChunk {
+pub fn searchScanChunk(doc: *Document, start_pos: Pos, start_row: u64, filtered: bool, generation: u64) SearchChunk {
     var pos = start_pos;
     var row = start_row;
     var matches: u64 = 0;
     var filter_matches: u64 = 0;
+    const reader_mod = @import("reader.zig");
+    const scan = doc.beginMatchScan(.search, generation, start_pos);
     const target = ((start_row / checkpoint_interval) + 1) * checkpoint_interval;
     base.beginOversizedChunk(doc);
     while (row < target) {
-        if (doc.stop_atomic.load(.monotonic)) return .{ .end_pos = pos, .end_row = row, .eof = false, .checkpoint = null, .matches = matches, .filter_matches = filter_matches };
-        if (doc.reader.atEnd(doc.source, pos)) return .{ .end_pos = pos, .end_row = row, .eof = true, .checkpoint = null, .matches = matches, .filter_matches = filter_matches };
-        const res = @import("reader.zig").readerMatchRow(doc.reader, doc.source, pos, doc.w_ctx, if (filtered) doc.wf_ctx else null, .{});
+        if (doc.stop_atomic.load(.monotonic)) {
+            doc.endMatchScanIf(.search, generation);
+            return .{ .end_pos = pos, .end_row = row, .eof = false, .checkpoint = null, .matches = matches, .filter_matches = filter_matches };
+        }
+        if (doc.reader.atEnd(doc.source, pos)) {
+            doc.endMatchScanIf(.search, generation);
+            return .{ .end_pos = pos, .end_row = row, .eof = true, .checkpoint = null, .matches = matches, .filter_matches = filter_matches };
+        }
+        const res = if (scan) |cur|
+            reader_mod.readerMatchRowAtScanCursor(doc.reader, cur, doc.w_ctx, if (filtered) doc.wf_ctx else null)
+        else
+            reader_mod.readerMatchRow(doc.reader, doc.source, pos, doc.w_ctx, if (filtered) doc.wf_ctx else null, .{});
         if (filtered and res.filter_matched) filter_matches += 1;
         if (res.matched_col != null) matches += 1;
         base.stageOversized(doc, row, pos, res.next);
         pos = res.next;
         row += 1;
         if (doc.source == .gzip) doc.gz_match_resident_bytes = @max(doc.gz_match_resident_bytes, 2 * @sizeOf(matcher.StreamCell));
-        if (doc.reader.atEnd(doc.source, pos)) return .{ .end_pos = pos, .end_row = row, .eof = true, .checkpoint = null, .matches = matches, .filter_matches = filter_matches };
+        if (doc.reader.atEnd(doc.source, pos)) {
+            doc.endMatchScanIf(.search, generation);
+            return .{ .end_pos = pos, .end_row = row, .eof = true, .checkpoint = null, .matches = matches, .filter_matches = filter_matches };
+        }
     }
     return .{ .end_pos = pos, .end_row = row, .eof = false, .checkpoint = .{ .row = row, .pos = pos }, .matches = matches, .filter_matches = filter_matches };
 }
@@ -624,8 +638,9 @@ pub fn startSearch(d: *Document, request: *const api.SearchRequest) bool {
     if (filtered) {
         if (filter.refreshFilterWorkerCtx(d)) d.wf_gen = d.filter_gen else failSearchLocked(d);
     }
+    const generation = d.search_gen;
     while (d.search_state == .scanning) {
-        const res = searchScanChunk(d, d.search_pos, d.search_rows, filtered);
+        const res = searchScanChunk(d, d.search_pos, d.search_rows, filtered, generation);
         commitSearch(d, res, filtered);
         resolveNavLocked(d);
     }
@@ -685,8 +700,9 @@ pub fn navSearch(d: *Document, anchor_row: u64, dir: api.SearchDir) void {
             if (filtered and d.filter_gen != d.wf_gen) {
                 if (filter.refreshFilterWorkerCtx(d)) d.wf_gen = d.filter_gen else failSearchLocked(d);
             }
+            const generation = d.search_gen;
             while (d.nav_pending and d.search_state == .scanning) {
-                const res = searchScanChunk(d, d.search_pos, d.search_rows, filtered);
+                const res = searchScanChunk(d, d.search_pos, d.search_rows, filtered, generation);
                 commitSearch(d, res, filtered);
                 resolveNavLocked(d);
                 if (d.search_state == .scanning and !d.search_to_eof and !d.nav_pending) d.search_state = .cancelled;

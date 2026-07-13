@@ -758,6 +758,88 @@ pub fn gzInflateWorkReset(doc: *api.Doc) void {
     }
 }
 
+// --- gz-filter-stream: deterministic single-threaded scan driver (TEST-ONLY;
+// NOT the C ABI). The frozen gzfs_*_multiblock regression tests drive a gzip
+// FILTER/SEARCH match-scan ONE 2048-row block at a time on the CALLING thread,
+// with the background worker PARKED (gzScanParkWorker), so they can interleave
+// behind-frontier ls_window_set/ls_cell_copy work between blocks and assert the
+// document-owned replay lane keeps STREAMING (bounded inflate work) instead of
+// re-inflating a 32 MiB checkpoint interval per perturbed block. Each step runs
+// the EXACT chunk+commit the worker's do_search/do_filter branches run (see
+// index.workerMain), only on the test thread -- exercising the production
+// retention path (base.beginMatchScan) identically, with no wall-clock races.
+
+/// See contracts/api.zig `gzScanParkWorker`.
+pub fn gzScanParkWorker(doc: *api.Doc, parked: bool) void {
+    asDocMut(doc).scan_park.store(parked, .release);
+}
+
+/// See contracts/api.zig `gzScanStep`.
+pub fn gzScanStep(doc: *api.Doc) api.GzScanStep {
+    const d = asDocMut(doc);
+    d.lock();
+    if (d.search_state == .scanning) {
+        if (d.search_gen != d.w_gen) {
+            if (search.refreshWorkerCtx(d)) d.w_gen = d.search_gen else search.failSearchLocked(d);
+        }
+        const filtered = d.filter_state != .idle;
+        if (filtered and d.filter_gen != d.wf_gen) {
+            if (filter.refreshFilterWorkerCtx(d)) d.wf_gen = d.filter_gen else search.failSearchLocked(d);
+        }
+        if (d.search_state == .scanning) {
+            const gen = d.search_gen;
+            const start_pos = d.search_pos;
+            const start_row = d.search_rows;
+            d.unlock();
+            const res = search.searchScanChunk(d, start_pos, start_row, filtered, gen);
+            d.lock();
+            if (d.search_gen == gen and d.search_state == .scanning) {
+                search.commitSearch(d, res, filtered);
+                search.resolveNavLocked(d);
+                if (d.search_state == .scanning and !d.search_to_eof and !d.nav_pending) d.search_state = .cancelled;
+            }
+        }
+        const st = d.search_state;
+        d.unlock();
+        return if (st == .scanning) .scanning else .done;
+    }
+    if (d.filter_state == .scanning) {
+        if (d.filter_gen != d.wf_gen) {
+            if (filter.refreshFilterWorkerCtx(d)) d.wf_gen = d.filter_gen else filter.failFilterLocked(d);
+        }
+        if (d.filter_state == .scanning) {
+            const gen = d.filter_gen;
+            const start_pos = d.filter_pos;
+            const start_row = d.filter_rows;
+            d.unlock();
+            const res = filter.filterScanChunk(d, start_pos, start_row, gen);
+            d.lock();
+            if (d.filter_gen == gen and d.filter_state == .scanning) filter.commitFilter(d, res);
+        }
+        const st = d.filter_state;
+        d.unlock();
+        return if (st == .scanning) .scanning else .done;
+    }
+    d.unlock();
+    return .idle;
+}
+
+/// See contracts/api.zig `gzTouchReplayLane`. Model one behind-frontier replay
+/// cursor (an ls_window_set / ls_cell_copy / nav read at a trailing row): grab a
+/// replay lane at `logical` via the SAME primitive a trailing read uses
+/// (source.scanCursorAt), force it to serve a byte there (repositioning that
+/// lane's inflater session), then release. Interleaved between scan blocks it
+/// perturbs the OTHER replay lane; the whole-job-retained scan lane is
+/// untouched, but a per-block-leased scan re-grabs the repositioned lane and
+/// must re-inflate a checkpoint interval.
+pub fn gzTouchReplayLane(doc: *api.Doc, logical: u64) void {
+    const d = asDocMut(doc);
+    if (d.source != .gzip) return;
+    var cur = source_mod.scanCursorAt(d.source, logical);
+    defer cur.deinit();
+    _ = cur.peek(4);
+}
+
 // ===========================================================================
 // window-budget instrumentation seams (ARCH-window-budget). Zig-only test
 // instrumentation (NOT the C ABI -- like copyAdvances / gz*), reading DEFAULTED

@@ -119,17 +119,28 @@ fn drainOversizedMatches(doc: *Document) void {
 /// the Reader (immutable mmap bytes, for CSV) + the worker's lock-free filter
 /// snapshot (doc.wf_ctx, refreshed by refreshFilterWorkerCtx). Matches the
 /// FULL cell (cap = null), same rule as SEARCH.
-pub fn filterScanChunk(doc: *Document, start_pos: Pos, start_row: u64) FilterChunk {
+pub fn filterScanChunk(doc: *Document, start_pos: Pos, start_row: u64, generation: u64) FilterChunk {
     var pos = start_pos;
     var row = start_row;
     var matches: u64 = 0;
+    const reader_mod = @import("reader.zig");
+    const scan = doc.beginMatchScan(.filter, generation, start_pos);
     const target = ((start_row / checkpoint_interval) + 1) * checkpoint_interval;
     base.beginOversizedChunk(doc);
     doc.filter_oversized_stage.clearRetainingCapacity(); // ARCH-huge-row-filtered
     while (row < target) {
-        if (doc.stop_atomic.load(.monotonic)) return .{ .end_pos = pos, .end_row = row, .eof = false, .checkpoint = null, .matches = matches };
-        if (doc.reader.atEnd(doc.source, pos)) return .{ .end_pos = pos, .end_row = row, .eof = true, .checkpoint = null, .matches = matches };
-        const res = @import("reader.zig").readerMatchRow(doc.reader, doc.source, pos, doc.wf_ctx, null, .{});
+        if (doc.stop_atomic.load(.monotonic)) {
+            doc.endMatchScanIf(.filter, generation);
+            return .{ .end_pos = pos, .end_row = row, .eof = false, .checkpoint = null, .matches = matches };
+        }
+        if (doc.reader.atEnd(doc.source, pos)) {
+            doc.endMatchScanIf(.filter, generation);
+            return .{ .end_pos = pos, .end_row = row, .eof = true, .checkpoint = null, .matches = matches };
+        }
+        const res = if (scan) |cur|
+            reader_mod.readerMatchRowAtScanCursor(doc.reader, cur, doc.wf_ctx, null)
+        else
+            reader_mod.readerMatchRow(doc.reader, doc.source, pos, doc.wf_ctx, null, .{});
         const matched = res.matched_col != null;
         if (matched) matches += 1;
         // This scan also feeds the base row index (ARCH-huge-row-budget): see
@@ -139,7 +150,10 @@ pub fn filterScanChunk(doc: *Document, start_pos: Pos, start_row: u64) FilterChu
         pos = res.next;
         row += 1;
         if (doc.source == .gzip) doc.gz_match_resident_bytes = @max(doc.gz_match_resident_bytes, @sizeOf(matcher.StreamCell));
-        if (doc.reader.atEnd(doc.source, pos)) return .{ .end_pos = pos, .end_row = row, .eof = true, .checkpoint = null, .matches = matches };
+        if (doc.reader.atEnd(doc.source, pos)) {
+            doc.endMatchScanIf(.filter, generation);
+            return .{ .end_pos = pos, .end_row = row, .eof = true, .checkpoint = null, .matches = matches };
+        }
     }
     return .{ .end_pos = pos, .end_row = row, .eof = false, .checkpoint = .{ .row = row, .pos = pos }, .matches = matches };
 }
@@ -389,8 +403,9 @@ pub fn setFilter(d: *Document, request: *const api.SearchRequest) bool {
     // ls_search_start's degraded fallback — the caller is blocked here so no
     // other thread observes intermediate state.
     if (refreshFilterWorkerCtx(d)) d.wf_gen = d.filter_gen else failFilterLocked(d);
+    const generation = d.filter_gen;
     while (d.filter_state == .scanning) {
-        const res = filterScanChunk(d, d.filter_pos, d.filter_rows);
+        const res = filterScanChunk(d, d.filter_pos, d.filter_rows, generation);
         commitFilter(d, res);
     }
     d.unlock();

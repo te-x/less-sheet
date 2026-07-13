@@ -180,6 +180,13 @@ pub const CsvReader = struct {
     pub fn matchRow(self: CsvReader, source: Source, pos: Pos, primary: base.MatchCtx, filter_ctx: ?base.MatchCtx, limit: api.DualLimit) reader_mod.MatchRowResult {
         return matchStream(source, pos, self.sep, self.quote, self.encoding, primary, filter_ctx, limit);
     }
+
+    /// Match the row at a retained sequential scan cursor.  FILTER/SEARCH use
+    /// this only for gzip; keeping the Cursor alive keeps one inflater lane
+    /// alive across every row in the chunk.
+    pub fn matchRowAtScanCursor(self: CsvReader, cur: *source_mod.Cursor, primary: base.MatchCtx, filter_ctx: ?base.MatchCtx) reader_mod.MatchRowResult {
+        return matchCursor(cur, self.sep, self.quote, self.encoding, primary, filter_ctx);
+    }
 };
 
 fn wantsCell(ctx: base.MatchCtx, col: u32) bool {

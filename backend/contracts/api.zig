@@ -519,6 +519,26 @@ pub const gzInflateOps = core.gzInflateOps;
 /// Zero both inflate-work counters (before a measured trailing scan).
 pub const gzInflateWorkReset = core.gzInflateWorkReset;
 
+/// TEST-ONLY (Zig; NOT the C ABI): outcome of one `gzScanStep` block.
+pub const GzScanStep = enum(u8) { idle = 0, scanning = 1, done = 2 };
+
+// gzScanParkWorker + gzScanStep let the frozen gzfs_*_multiblock regressions
+// deterministically drive a gzip FILTER/SEARCH match-scan ONE 2048-row block at
+// a time on the TEST thread (the worker parked) and interleave behind-frontier
+// ls_window_set/ls_cell_copy work between blocks -- witnessing the retained
+// replay lane STREAMING (bounded inflate work) under contention rather than
+// re-inflating a 32 MiB checkpoint interval per perturbed block. See root.zig.
+/// Park (true) / unpark (false) the background worker's match-scan slot so a
+/// test can drive the scan single-threaded, block by block.
+pub const gzScanParkWorker = core.gzScanParkWorker;
+/// Run one 2048-row block of whichever gzip match-scan is .scanning (SEARCH has
+/// slot priority, like the worker) on the calling thread; report continuation.
+pub const gzScanStep = core.gzScanStep;
+/// TEST-ONLY (Zig): touch a behind-frontier gzip replay lane at logical byte
+/// `logical` (grab via scanCursorAt, serve one byte, release) -- models one
+/// interleaved behind-frontier window/copy/nav read that grabs a replay lane.
+pub const gzTouchReplayLane = core.gzTouchReplayLane;
+
 // --- Test-only instrumentation seams (ARCH-window-budget) -------------------
 // Zig-level seams (NOT C ABI -- like openWithAllocator/copyAdvances/gz*), so
 // api/lesssheet.h AND every ls_* signature stay BYTE-IDENTICAL (AC1): window-
@@ -697,6 +717,12 @@ comptime {
         @compileError("signature drift: gzInflateOps");
     if (@TypeOf(core.gzInflateWorkReset) != fn (*Doc) void)
         @compileError("signature drift: gzInflateWorkReset");
+    if (@TypeOf(core.gzScanParkWorker) != fn (*Doc, bool) void)
+        @compileError("signature drift: gzScanParkWorker");
+    if (@TypeOf(core.gzScanStep) != fn (*Doc) GzScanStep)
+        @compileError("signature drift: gzScanStep");
+    if (@TypeOf(core.gzTouchReplayLane) != fn (*Doc, u64) void)
+        @compileError("signature drift: gzTouchReplayLane");
 
     // === window-budget: instrumentation seam signatures (Zig-only test teeth,
     // NOT C ABI -- no callconv). Their BEHAVIOR is pinned by the wb_* suite +
