@@ -5808,3 +5808,693 @@ test "gzfs_filter_multiblock: a gzip FILTER-scan trailing the frontier across ma
 test "gzfs_search_multiblock: a gzip FIND-scan trailing the frontier across many blocks + checkpoints streams under a between-block replay-lane read (regression)" {
     try expectStreamingGzMultiblock(.search);
 }
+
+// ===========================================================================
+// column-config slice (ARCH-column-config) — the SHARED api/ + BACKEND piece.
+// Frozen; planner-owned. Drives the additive column-metadata C ABI (see
+// api/lesssheet.h "COLUMN METADATA EXTENSION") through @import("api"). The
+// display half (formatting/alignment/panel/search) lives in the macOS suite;
+// inference, publication, conflict/proposal, precedence, the sparse type model,
+// generations, and the windowed labels are proven HERE (the core owns typing —
+// PROJECT.md slice 9).
+//
+// AC -> test map (backend-relevant clauses of the 21 ARCH criteria):
+//   AC1  additive + layout ........ cc_ac1_layout_constants                 [GUARD]
+//   AC2  coherent/zero-alloc query  cc_ac2_get_many_order_dups, cc_ac2_query_zero_alloc [GUARD]
+//   AC3  atomic mutation/copy ...... cc_ac3_get_many_atomic, cc_ac3_poll_atomic,
+//        cc_ac3_override_validation, cc_ac3_sentinel_validation,
+//        cc_ac3_idempotent_and_no_proposal, cc_ac3_sentinel_copy_empty_vs_novalue [3 GUARD, 1 RED]
+//   AC4  cold open, no inference ... cc_ac4_open_no_inference                [GUARD]
+//   AC5  bounded/lazy/cancellable .. cc_ac5_request_publishes, cc_ac5_bounded_first_sample,
+//        cc_ac5_cancellable, cc_ac5_no_frontier_advance                      [RED]
+//   AC6  publication threshold ..... cc_ac6_threshold_7_vs_8, cc_ac6_exhaustive_small [RED]
+//   AC7  grammar + parameters ...... cc_ac7_grammar_kinds, cc_ac7_datetime_decimal_params [RED]
+//   AC8  no silent revision ........ cc_ac8_conflict_proposal_accept         [RED]
+//   AC9  empty/null/conflict distinct cc_ac9_empty_vs_null, cc_ac9_sentinel_exact [RED]
+//   AC9/gen one-commit ............. cc_gen_one_commit_per_mutation          [RED]
+//   AC10 precedence + reset ........ cc_ac10_precedence_and_reset            [RED]
+//   AC13 windowed header labels .... cc_ac13_windowed_labels                 [RED]
+//   AC17 raw ops invariant ......... cc_ac17_raw_unaffected_by_config        [GUARD]
+//   AC19 fresh session on re-open .. cc_ac19_reopen_is_fresh                 [GUARD]
+//
+// RED SEED (src/column.zig): every mutating call is a validated NO-OP and the
+// job never leaves JOB_IDLE, so `waitInferenceDone` returns error.InferenceNotStarted
+// (the requested job never polls IDLE — mirrors waitFilterDone) and every
+// "publishes / bounded / conflict / proposal / precedence / labels / one-commit"
+// assertion FAILS instead of hanging. The GUARD tests (layout, validation
+// atomicity, cold-open-no-inference, raw invariance, fresh re-open) are green
+// by construction and protect those invariants on the way to green.
+// ===========================================================================
+
+const cc_abi_version = api.column_metadata_abi_version;
+
+fn ccRequest(doc: *api.Doc, ids: []const u32) !void {
+    try std.testing.expectEqual(api.ColumnResult.ok, api.ls_column_inference_request(doc, ids.ptr, @intCast(ids.len)));
+}
+
+fn ccPoll(doc: *api.Doc) api.ColumnInferenceStatus {
+    var s: api.ColumnInferenceStatus = undefined;
+    s.struct_size = @sizeOf(api.ColumnInferenceStatus);
+    s.abi_version = cc_abi_version;
+    std.debug.assert(api.ls_column_metadata_poll(doc, &s) == .ok);
+    return s;
+}
+
+/// Poll the inference job (after a request) until DONE or CANCELLED; return the
+/// status. Errors on IDLE (a requested job never polls IDLE — the RED SEED does,
+/// so a test fails HERE with a clear error instead of hanging) or after 15 s.
+fn waitInferenceDone(doc: *api.Doc) !api.ColumnInferenceStatus {
+    const io = std.testing.io;
+    const t0: std.Io.Clock.Timestamp = .now(io, .awake);
+    while (true) {
+        const s = ccPoll(doc);
+        if (s.state == .done or s.state == .cancelled) return s;
+        if (s.state == .idle) return error.InferenceNotStarted;
+        if (elapsedMs(t0) > 15_000) return error.InferenceTimeout;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+}
+
+fn ccGetMany(doc: *api.Doc, ids: []const u32, items: []api.ColumnMetadata) !u64 {
+    std.debug.assert(items.len >= ids.len);
+    for (items) |*it| {
+        it.* = undefined;
+        it.struct_size = @sizeOf(api.ColumnMetadata);
+        it.abi_version = cc_abi_version;
+    }
+    var gen: u64 = 0;
+    try std.testing.expectEqual(api.ColumnResult.ok, api.ls_column_metadata_get_many(doc, ids.ptr, @intCast(ids.len), items.ptr, @intCast(items.len), &gen));
+    return gen;
+}
+
+fn ccGet1(doc: *api.Doc, col: u32) !api.ColumnMetadata {
+    var items: [1]api.ColumnMetadata = undefined;
+    const ids = [_]u32{col};
+    _ = try ccGetMany(doc, &ids, &items);
+    return items[0];
+}
+
+/// Request inference for `col` and wait for the job to settle, then return the
+/// column's committed metadata. RED SEED: the wait errors (job never leaves IDLE).
+fn ccInferAndGet(doc: *api.Doc, col: u32) !api.ColumnMetadata {
+    const ids = [_]u32{col};
+    try ccRequest(doc, &ids);
+    _ = try waitInferenceDone(doc);
+    return ccGet1(doc, col);
+}
+
+fn ccIntType() api.ColumnType {
+    return .{
+        .struct_size = @sizeOf(api.ColumnType),
+        .abi_version = cc_abi_version,
+        .kind = .integer,
+        .flags = 0,
+        .decimal_precision = api.column_type_precision_unspecified,
+        .decimal_scale = api.column_type_scale_unspecified,
+        .datetime_semantics = .none,
+        .datetime_fraction_digits = api.column_type_fraction_digits_unspecified,
+        .reserved = 0,
+    };
+}
+
+/// header + `eligible` integer rows + empty rows until the file exceeds the 4 MiB
+/// head budget, so open (MANUAL) leaves it NON-EXHAUSTIVE and the first inference
+/// sample (256 rows) sees exactly `eligible` eligible values. Caller frees.
+fn genEligibleThenEmpty(gpa: std.mem.Allocator, eligible: u32) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(gpa);
+    try buf.appendSlice(gpa, "n\n");
+    var i: u32 = 0;
+    while (i < eligible) : (i += 1) try buf.appendSlice(gpa, "123\n");
+    // Pad with empty rows past 4 MiB so the doc is not fully indexed by open.
+    const target: usize = api.open_head_max_bytes + 128 * 1024;
+    try buf.ensureTotalCapacity(gpa, target + 16);
+    while (buf.items.len < target) try buf.append(gpa, '\n');
+    return buf.toOwnedSlice(gpa);
+}
+
+// --- cc_ac1 — additive surface + fixed layout (GUARD) -----------------------
+
+test "cc_ac1_layout_constants: snapshot sizes/constants/enums are the frozen v1 values" {
+    // Sizes/aligns are pinned at comptime in contracts/api.zig + api/lesssheet.h;
+    // pin the same numbers as a runtime guard against silent drift.
+    try std.testing.expectEqual(@as(usize, 48), @sizeOf(api.ColumnType));
+    try std.testing.expectEqual(@as(usize, 384), @sizeOf(api.ColumnMetadata));
+    try std.testing.expectEqual(@as(usize, 112), @sizeOf(api.ColumnInferenceStatus));
+    try std.testing.expectEqual(@as(usize, 48), @sizeOf(api.ColumnLabelSpan));
+    try std.testing.expectEqual(@as(u32, 1), api.column_metadata_abi_version);
+    try std.testing.expectEqual(@as(u32, 1024), api.column_batch_max);
+    try std.testing.expectEqual(@as(u64, 256), api.column_inference_head_max_rows);
+    try std.testing.expectEqual(@as(u64, 262144), api.column_inference_window_max_bytes);
+    try std.testing.expectEqual(@as(usize, 256), api.column_sentinel_max_bytes);
+    try std.testing.expectEqual(@as(usize, 256), api.column_conflict_example_max_bytes);
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), api.column_type_precision_unspecified);
+    try std.testing.expectEqual(@as(i64, std.math.minInt(i64)), api.column_type_scale_unspecified);
+    try std.testing.expectEqual(@as(u32, std.math.maxInt(u32)), api.column_type_fraction_digits_unspecified);
+    try std.testing.expectEqual(@as(u32, 4), @intFromEnum(api.ColumnTypeKind.integer));
+    try std.testing.expectEqual(@as(u32, 7), @intFromEnum(api.ColumnTypeKind.datetime));
+    try std.testing.expectEqual(@as(c_int, 5), @intFromEnum(api.ColumnResult.buffer_too_small));
+}
+
+// --- cc_ac4 — cold open starts no inference (GUARD) -------------------------
+
+test "cc_ac4_open_no_inference: open creates no per-column state and no job" {
+    var od = try openBytes("a,b,c\n1,2,3\n4,5,6\n");
+    defer od.deinit();
+    const s = ccPoll(od.doc);
+    try std.testing.expectEqual(api.ColumnInferenceJobState.idle, s.state);
+    try std.testing.expectEqual(@as(u32, 0), s.requested_column_count);
+    try std.testing.expectEqual(@as(u64, 0), s.metadata_generation);
+    var items: [3]api.ColumnMetadata = undefined;
+    const ids = [_]u32{ 0, 1, 2 };
+    const gen = try ccGetMany(od.doc, &ids, &items);
+    try std.testing.expectEqual(@as(u64, 0), gen); // untouched document
+    for (items, 0..) |m, c| {
+        try std.testing.expectEqual(@as(u32, @intCast(c)), m.column);
+        try std.testing.expectEqual(@as(u64, 0), m.generation);
+        try std.testing.expectEqual(api.ColumnInferenceState.unrequested, m.inference_state);
+        try std.testing.expectEqual(api.ColumnTypeSource.none, m.effective_source);
+        try std.testing.expectEqual(api.ColumnTypeKind.unknown, m.effective.kind);
+    }
+}
+
+// --- cc_ac2 — coherent, caller-owned, zero-allocation batch snapshots -------
+
+test "cc_ac2_get_many_order_dups: caller order, duplicates, one generation" {
+    var od = try openBytes("a,b,c\n1,2,3\n");
+    defer od.deinit();
+    var items: [4]api.ColumnMetadata = undefined;
+    const ids = [_]u32{ 2, 0, 0, 1 };
+    _ = try ccGetMany(od.doc, &ids, &items);
+    // one item per requested ID, in the requested order (duplicates preserved).
+    try std.testing.expectEqual(@as(u32, 2), items[0].column);
+    try std.testing.expectEqual(@as(u32, 0), items[1].column);
+    try std.testing.expectEqual(@as(u32, 0), items[2].column);
+    try std.testing.expectEqual(@as(u32, 1), items[3].column);
+    // a zero-length batch is a valid no-op that still reports the generation.
+    var gen: u64 = 12345;
+    try std.testing.expectEqual(api.ColumnResult.ok, api.ls_column_metadata_get_many(od.doc, null, 0, null, 0, &gen));
+    try std.testing.expectEqual(@as(u64, 0), gen);
+}
+
+test "cc_ac2_query_zero_alloc: get_many / poll / copy allocate nothing" {
+    var counting: CountingAllocator = .{ .parent = std.testing.allocator };
+    var fx = try makeFixture("name,age\nAda,37\n", 0o644);
+    defer fx.deinit();
+    var doc_opt: ?*api.Doc = null;
+    try std.testing.expectEqual(api.Status.ok, api.openWithAllocator(counting.allocator(), fx.path.ptr, &manual, &doc_opt));
+    const doc = doc_opt.?;
+    defer api.ls_close(doc);
+    const baseline = counting.count;
+
+    var items: [2]api.ColumnMetadata = undefined;
+    const ids = [_]u32{ 0, 1 };
+    _ = try ccGetMany(doc, &ids, &items);
+    _ = ccPoll(doc);
+    var spans: [2]api.ColumnLabelSpan = undefined;
+    for (&spans) |*sp| {
+        sp.struct_size = @sizeOf(api.ColumnLabelSpan);
+        sp.abi_version = cc_abi_version;
+    }
+    var required: usize = 0;
+    _ = api.ls_column_labels_copy_many(doc, &ids, 2, &spans, 2, null, 0, &required);
+    _ = api.ls_column_null_sentinel_copy(doc, 0, null, 0, &required);
+    _ = api.ls_column_conflict_example_copy(doc, 0, null, 0, &required);
+
+    try std.testing.expectEqual(baseline, counting.count); // ZERO new allocations
+}
+
+// --- cc_ac3 — atomic mutation + copy errors ---------------------------------
+
+test "cc_ac3_get_many_atomic: bad size/version/ID leaves every output byte untouched" {
+    var od = try openBytes("a,b\n1,2\n");
+    defer od.deinit();
+    const ids = [_]u32{ 0, 1 };
+    var gen: u64 = 999;
+
+    // A wrong struct_size on one item -> INVALID_ARGUMENT, nothing written.
+    var items: [2]api.ColumnMetadata = undefined;
+    items[0].struct_size = 7; // wrong
+    items[0].abi_version = cc_abi_version;
+    items[0].column = 0xDEAD;
+    items[1].struct_size = @sizeOf(api.ColumnMetadata);
+    items[1].abi_version = cc_abi_version;
+    try std.testing.expectEqual(api.ColumnResult.invalid_argument, api.ls_column_metadata_get_many(od.doc, &ids, 2, &items, 2, &gen));
+    try std.testing.expectEqual(@as(u32, 0xDEAD), items[0].column); // untouched
+    try std.testing.expectEqual(@as(u64, 999), gen); // untouched
+
+    // capacity < count -> INVALID_ARGUMENT.
+    try std.testing.expectEqual(api.ColumnResult.invalid_argument, api.ls_column_metadata_get_many(od.doc, &ids, 2, &items, 1, &gen));
+
+    // An out-of-range ID (valid shape) -> NO_COLUMN.
+    const bad = [_]u32{ 0, 9 };
+    for (&items) |*it| {
+        it.struct_size = @sizeOf(api.ColumnMetadata);
+        it.abi_version = cc_abi_version;
+    }
+    try std.testing.expectEqual(api.ColumnResult.no_column, api.ls_column_metadata_get_many(od.doc, &bad, 2, &items, 2, &gen));
+}
+
+test "cc_ac3_poll_atomic: size/version mismatch is INVALID_ARGUMENT" {
+    var od = try openBytes("a\n1\n");
+    defer od.deinit();
+    var s: api.ColumnInferenceStatus = undefined;
+    s.struct_size = 3; // wrong
+    s.abi_version = cc_abi_version;
+    try std.testing.expectEqual(api.ColumnResult.invalid_argument, api.ls_column_metadata_poll(od.doc, &s));
+    s.struct_size = @sizeOf(api.ColumnInferenceStatus);
+    s.abi_version = 999; // wrong
+    try std.testing.expectEqual(api.ColumnResult.invalid_argument, api.ls_column_metadata_poll(od.doc, &s));
+}
+
+test "cc_ac3_override_validation: unknown/unsupported/malformed rejected; explicit kind accepted" {
+    var od = try openBytes("a,b\n1,2\n");
+    defer od.deinit();
+    var t = ccIntType();
+    // valid explicit integer override.
+    try std.testing.expectEqual(api.ColumnResult.ok, api.ls_column_override_set(od.doc, 0, &t));
+    // UNKNOWN / UNSUPPORTED are never valid overrides.
+    t.kind = .unknown;
+    try std.testing.expectEqual(api.ColumnResult.invalid_argument, api.ls_column_override_set(od.doc, 0, &t));
+    t.kind = .unsupported;
+    try std.testing.expectEqual(api.ColumnResult.invalid_argument, api.ls_column_override_set(od.doc, 0, &t));
+    // A datetime override MUST carry an explicit NAIVE/ZONED semantic.
+    t = ccIntType();
+    t.kind = .datetime;
+    try std.testing.expectEqual(api.ColumnResult.invalid_argument, api.ls_column_override_set(od.doc, 0, &t)); // semantics NONE
+    t.datetime_semantics = .naive;
+    try std.testing.expectEqual(api.ColumnResult.ok, api.ls_column_override_set(od.doc, 0, &t));
+    // precision/scale are inferred metadata — an override may not set them.
+    t = ccIntType();
+    t.kind = .decimal;
+    t.decimal_scale = 2;
+    try std.testing.expectEqual(api.ColumnResult.invalid_argument, api.ls_column_override_set(od.doc, 0, &t));
+    // A wrong struct_size is INVALID_ARGUMENT; an out-of-range column is NO_COLUMN.
+    t = ccIntType();
+    t.struct_size = 1;
+    try std.testing.expectEqual(api.ColumnResult.invalid_argument, api.ls_column_override_set(od.doc, 0, &t));
+    t = ccIntType();
+    try std.testing.expectEqual(api.ColumnResult.no_column, api.ls_column_override_set(od.doc, 9, &t));
+}
+
+test "cc_ac3_sentinel_validation: length / UTF-8 / null-pointer rules" {
+    var od = try openBytes("a,b\n1,2\n");
+    defer od.deinit();
+    // valid non-empty sentinel.
+    try std.testing.expectEqual(api.ColumnResult.ok, api.ls_column_null_sentinel_set(od.doc, 0, "NA", 2));
+    // the empty sentinel (NULL pointer, length 0) is valid.
+    try std.testing.expectEqual(api.ColumnResult.ok, api.ls_column_null_sentinel_set(od.doc, 0, null, 0));
+    // over the 256-byte cap -> INVALID_ARGUMENT.
+    var big: [257]u8 = undefined;
+    @memset(&big, 'x');
+    try std.testing.expectEqual(api.ColumnResult.invalid_argument, api.ls_column_null_sentinel_set(od.doc, 0, &big, big.len));
+    // invalid UTF-8 -> INVALID_ARGUMENT.
+    const bad = [_]u8{ 0xFF, 0xFE };
+    try std.testing.expectEqual(api.ColumnResult.invalid_argument, api.ls_column_null_sentinel_set(od.doc, 0, &bad, bad.len));
+    // NULL pointer with length > 0 -> INVALID_ARGUMENT.
+    try std.testing.expectEqual(api.ColumnResult.invalid_argument, api.ls_column_null_sentinel_set(od.doc, 0, null, 3));
+    // out-of-range column -> NO_COLUMN.
+    try std.testing.expectEqual(api.ColumnResult.no_column, api.ls_column_null_sentinel_set(od.doc, 9, "NA", 2));
+}
+
+test "cc_ac3_idempotent_and_no_proposal: clears idempotent; accept without a proposal" {
+    var od = try openBytes("a,b\n1,2\n");
+    defer od.deinit();
+    try std.testing.expectEqual(api.ColumnResult.ok, api.ls_column_override_clear(od.doc, 0));
+    try std.testing.expectEqual(api.ColumnResult.ok, api.ls_column_override_clear(od.doc, 0));
+    try std.testing.expectEqual(api.ColumnResult.ok, api.ls_column_null_sentinel_clear(od.doc, 0));
+    try std.testing.expectEqual(api.ColumnResult.ok, api.ls_column_null_sentinel_clear(od.doc, 0));
+    // accepting when there is no proposal is a no-op NO_PROPOSAL.
+    try std.testing.expectEqual(api.ColumnResult.no_proposal, api.ls_column_inference_accept_proposal(od.doc, 0));
+    // idempotent normalized request.
+    const ids = [_]u32{ 1, 0, 0 };
+    try std.testing.expectEqual(api.ColumnResult.ok, api.ls_column_inference_request(od.doc, &ids, ids.len));
+    try std.testing.expectEqual(api.ColumnResult.ok, api.ls_column_inference_request(od.doc, &ids, ids.len));
+    // request with count 0 is invalid (per header: 1..1024).
+    try std.testing.expectEqual(api.ColumnResult.invalid_argument, api.ls_column_inference_request(od.doc, null, 0));
+}
+
+test "cc_ac3_sentinel_copy_empty_vs_novalue: OK/len 0 (empty) is distinct from NO_VALUE" {
+    var od = try openBytes("a,b\n1,2\n");
+    defer od.deinit();
+    var required: usize = 424242;
+    // No sentinel set -> NO_VALUE.
+    try std.testing.expectEqual(api.ColumnResult.no_value, api.ls_column_null_sentinel_copy(od.doc, 0, null, 0, &required));
+    // An EMPTY sentinel round-trips as OK with required length 0 (RED: the seed
+    // stores nothing, so the copy still reports NO_VALUE).
+    try std.testing.expectEqual(api.ColumnResult.ok, api.ls_column_null_sentinel_set(od.doc, 0, null, 0));
+    required = 424242;
+    try std.testing.expectEqual(api.ColumnResult.ok, api.ls_column_null_sentinel_copy(od.doc, 0, null, 0, &required));
+    try std.testing.expectEqual(@as(usize, 0), required);
+}
+
+// --- cc_ac5 — bounded, lazy, cancellable inference (RED) --------------------
+
+test "cc_ac5_request_publishes: a requested integer column publishes an effective type" {
+    var od = try openBytes("n\n1\n2\n3\n4\n5\n6\n7\n8\n");
+    defer od.deinit();
+    const m = try ccInferAndGet(od.doc, 0); // RED: waitInferenceDone errors (job stays IDLE)
+    try std.testing.expectEqual(api.ColumnInferenceState.published, m.inference_state);
+    try std.testing.expectEqual(api.ColumnTypeKind.integer, m.effective.kind);
+    try std.testing.expectEqual(api.ColumnTypeSource.inferred, m.effective_source);
+    try std.testing.expect(m.evidence_count >= 8);
+}
+
+test "cc_ac5_bounded_first_sample: first sample touches at most 256 rows / 4 MiB and does real work" {
+    const gpa = std.testing.allocator;
+    const fixture = try genEligibleThenEmpty(gpa, 32); // >4 MiB, 32 eligible in the head
+    defer gpa.free(fixture);
+    var od = try openWith(fixture, manual);
+    defer od.deinit();
+    const ids = [_]u32{0};
+    try ccRequest(od.doc, &ids);
+    const s = try waitInferenceDone(od.doc); // RED: errors on the seed's IDLE job
+    // Real WORK happened, but within BOTH first-sample ceilings.
+    try std.testing.expect(s.rows_scanned > 0);
+    try std.testing.expect(s.rows_scanned <= api.column_inference_head_max_rows);
+    try std.testing.expect(s.rows_budget <= api.column_inference_head_max_rows);
+    try std.testing.expect(s.source_bytes_scanned > 0);
+    try std.testing.expect(s.source_bytes_scanned <= api.open_head_max_bytes);
+    try std.testing.expect(s.source_bytes_budget <= api.open_head_max_bytes);
+    try std.testing.expect(s.rows_scanned <= s.rows_budget);
+}
+
+test "cc_ac5_no_frontier_advance: inference never advances the scan frontier to EOF" {
+    const gpa = std.testing.allocator;
+    const fixture = try genEligibleThenEmpty(gpa, 16);
+    defer gpa.free(fixture);
+    var od = try openWith(fixture, manual);
+    defer od.deinit();
+    try std.testing.expectEqual(false, api.ls_index_poll(od.doc).complete); // >4 MiB, not fully indexed
+    const ids = [_]u32{0};
+    try ccRequest(od.doc, &ids);
+    _ = try waitInferenceDone(od.doc); // RED on the seed
+    // Inference read only the bounded head — the frontier is still short of EOF.
+    try std.testing.expectEqual(false, api.ls_index_poll(od.doc).complete);
+    try std.testing.expectEqual(false, api.ls_row_count_get(od.doc).exact);
+}
+
+test "cc_ac5_cancellable: cancel moves the job to CANCELLED" {
+    const gpa = std.testing.allocator;
+    const fixture = try genEligibleThenEmpty(gpa, 16);
+    defer gpa.free(fixture);
+    var od = try openWith(fixture, manual);
+    defer od.deinit();
+    const ids = [_]u32{0};
+    try ccRequest(od.doc, &ids);
+    api.ls_column_inference_cancel(od.doc);
+    try std.testing.expectEqual(api.ColumnInferenceJobState.cancelled, ccPoll(od.doc).state); // RED: seed reports IDLE
+}
+
+// --- cc_ac6 — exact publication threshold (RED) -----------------------------
+
+test "cc_ac6_threshold_7_vs_8: 7 eligible stay PROVISIONAL; the 8th publishes BOUNDED" {
+    const gpa = std.testing.allocator;
+    // Seven eligible values in a NON-exhaustive document: LOW/PROVISIONAL, and
+    // the effective type does NOT move off unknown.
+    {
+        const fx7 = try genEligibleThenEmpty(gpa, 7);
+        defer gpa.free(fx7);
+        var od = try openWith(fx7, manual);
+        defer od.deinit();
+        const m = try ccInferAndGet(od.doc, 0); // RED on the seed
+        try std.testing.expectEqual(api.ColumnInferenceState.provisional, m.inference_state);
+        try std.testing.expectEqual(api.ColumnConfidence.low, m.confidence);
+        try std.testing.expectEqual(api.ColumnTypeSource.none, m.effective_source);
+        try std.testing.expectEqual(api.ColumnTypeKind.unknown, m.effective.kind);
+        try std.testing.expectEqual(@as(u64, 7), m.evidence_count);
+    }
+    // Eight eligible values -> BOUNDED/PUBLISHED, effective integer.
+    {
+        const fx8 = try genEligibleThenEmpty(gpa, 8);
+        defer gpa.free(fx8);
+        var od = try openWith(fx8, manual);
+        defer od.deinit();
+        const m = try ccInferAndGet(od.doc, 0);
+        try std.testing.expectEqual(api.ColumnInferenceState.published, m.inference_state);
+        try std.testing.expectEqual(api.ColumnConfidence.bounded, m.confidence);
+        try std.testing.expectEqual(api.ColumnTypeKind.integer, m.effective.kind);
+    }
+}
+
+test "cc_ac6_exhaustive_small: <8 values publish EXHAUSTIVE at exhaustion; 0 -> unknown" {
+    // Three integer rows, fully indexed by open -> EXHAUSTIVE integer.
+    {
+        var od = try openBytes("n\n10\n20\n30\n");
+        defer od.deinit();
+        const m = try ccInferAndGet(od.doc, 0); // RED on the seed
+        try std.testing.expectEqual(api.ColumnInferenceState.published, m.inference_state);
+        try std.testing.expectEqual(api.ColumnConfidence.exhaustive, m.confidence);
+        try std.testing.expectEqual(api.ColumnTypeKind.integer, m.effective.kind);
+        try std.testing.expectEqual(@as(u64, 3), m.evidence_count);
+    }
+    // All-empty column, exhausted -> EXHAUSTIVE unknown (no eligible evidence).
+    {
+        var od = try openBytes("n\n\n\n\n");
+        defer od.deinit();
+        const m = try ccInferAndGet(od.doc, 0);
+        try std.testing.expectEqual(api.ColumnConfidence.exhaustive, m.confidence);
+        try std.testing.expectEqual(api.ColumnTypeKind.unknown, m.effective.kind);
+        try std.testing.expect(m.evidence_count == 0);
+        try std.testing.expect(m.empty_count >= 3);
+    }
+}
+
+// --- cc_ac7 — exact grammar + parameters (RED) ------------------------------
+
+test "cc_ac7_grammar_kinds: boolean / integer / decimal / date; widen; mixed->text" {
+    // 8 agreeing data rows per column.
+    const fixture =
+        "b,i,d,dt,mx,wd\n" ++
+        "true,1,1.5,2020-01-01,1,1\n" ++
+        "false,-2,2.5,2020-01-02,abc,2.5\n" ++
+        "TRUE,+3,3.5,2020-01-03,3,3\n" ++
+        "False,4,4.5,2020-01-04,def,4.5\n" ++
+        "true,5,5.5,2020-01-05,5,5\n" ++
+        "false,6,6.5,2020-01-06,ghi,6.5\n" ++
+        "TRUE,7,7.5,2020-01-07,7,7\n" ++
+        "false,8,8.5,2020-01-08,jkl,8.5\n";
+    var od = try openBytes(fixture);
+    defer od.deinit();
+    const ids = [_]u32{ 0, 1, 2, 3, 4, 5 };
+    try ccRequest(od.doc, &ids);
+    _ = try waitInferenceDone(od.doc); // RED on the seed
+    var items: [6]api.ColumnMetadata = undefined;
+    _ = try ccGetMany(od.doc, &ids, &items);
+    try std.testing.expectEqual(api.ColumnTypeKind.boolean, items[0].effective.kind);
+    try std.testing.expectEqual(api.ColumnTypeKind.integer, items[1].effective.kind);
+    try std.testing.expectEqual(api.ColumnTypeKind.decimal, items[2].effective.kind);
+    try std.testing.expectEqual(api.ColumnTypeKind.date, items[3].effective.kind);
+    try std.testing.expectEqual(api.ColumnTypeKind.text, items[4].effective.kind); // mixed int+text
+    try std.testing.expectEqual(api.ColumnTypeKind.decimal, items[5].effective.kind); // int+decimal widen
+}
+
+test "cc_ac7_datetime_decimal_params: datetime semantic/fraction + decimal precision/scale" {
+    const fixture =
+        "naive,zoned,decimal\n" ++
+        "2020-01-01T00:00:00,2020-01-01T00:00:00.123Z,12.5\n" ++
+        "2020-01-02T01:02:03,2020-01-02T00:00:00.123Z,12.5\n" ++
+        "2020-01-03T01:02:03,2020-01-03T00:00:00.123Z,12.5\n" ++
+        "2020-01-04T01:02:03,2020-01-04T00:00:00.123Z,12.5\n" ++
+        "2020-01-05T01:02:03,2020-01-05T00:00:00.123Z,12.5\n" ++
+        "2020-01-06T01:02:03,2020-01-06T00:00:00.123Z,12.5\n" ++
+        "2020-01-07T01:02:03,2020-01-07T00:00:00.123Z,12.5\n" ++
+        "2020-01-08T01:02:03,2020-01-08T00:00:00.123Z,12.5\n";
+    var od = try openBytes(fixture);
+    defer od.deinit();
+    const ids = [_]u32{ 0, 1, 2 };
+    try ccRequest(od.doc, &ids);
+    _ = try waitInferenceDone(od.doc); // RED on the seed
+    var items: [3]api.ColumnMetadata = undefined;
+    _ = try ccGetMany(od.doc, &ids, &items);
+    // naive datetime.
+    try std.testing.expectEqual(api.ColumnTypeKind.datetime, items[0].effective.kind);
+    try std.testing.expectEqual(api.ColumnDatetimeSemantics.naive, items[0].effective.datetime_semantics);
+    try std.testing.expectEqual(@as(u32, 0), items[0].effective.datetime_fraction_digits);
+    // zoned datetime with a 3-digit fraction.
+    try std.testing.expectEqual(api.ColumnTypeKind.datetime, items[1].effective.kind);
+    try std.testing.expectEqual(api.ColumnDatetimeSemantics.zoned, items[1].effective.datetime_semantics);
+    try std.testing.expectEqual(@as(u32, 3), items[1].effective.datetime_fraction_digits);
+    // decimal 12.5 -> coefficient "125" (precision 3), one fractional place (scale 1).
+    try std.testing.expectEqual(api.ColumnTypeKind.decimal, items[2].effective.kind);
+    try std.testing.expectEqual(@as(u64, 3), items[2].effective.decimal_precision);
+    try std.testing.expectEqual(@as(i64, 1), items[2].effective.decimal_scale);
+}
+
+// --- cc_ac8 — publication is frozen; contradictions propose, never revise ---
+
+test "cc_ac8_conflict_proposal_accept: published type is frozen; 8 agree -> proposal -> accept" {
+    // 8 integers publish INTEGER, then 8 decimals contradict and agree on DECIMAL.
+    const fixture =
+        "n\n1\n2\n3\n4\n5\n6\n7\n8\n" ++
+        "1.5\n2.5\n3.5\n4.5\n5.5\n6.5\n7.5\n8.5\n";
+    var od = try openBytes(fixture);
+    defer od.deinit();
+    const m = try ccInferAndGet(od.doc, 0); // RED on the seed
+    // The published effective type does NOT move off integer.
+    try std.testing.expectEqual(api.ColumnTypeKind.integer, m.effective.kind);
+    try std.testing.expect(@intFromEnum(m.confidence) >= @intFromEnum(api.ColumnConfidence.bounded));
+    // 8 agreeing contradictions -> a PROPOSAL to widen to decimal.
+    try std.testing.expectEqual(api.ColumnConflictState.proposed, m.conflict_state);
+    try std.testing.expectEqual(api.ColumnTypeKind.decimal, m.proposal.kind);
+    try std.testing.expect(m.conflict_count >= 8);
+    try std.testing.expect(m.conflict_source_row != api.no_row);
+    // The representative conflicting raw value is retrievable.
+    var buf: [64]u8 = undefined;
+    var required: usize = 0;
+    try std.testing.expectEqual(api.ColumnResult.ok, api.ls_column_conflict_example_copy(od.doc, 0, &buf, buf.len, &required));
+    try std.testing.expect(required > 0);
+
+    const gen_before = (try ccGet1(od.doc, 0)).generation;
+    // Accepting replaces INFERRED (stays Auto), clears the proposal, bumps the gen.
+    try std.testing.expectEqual(api.ColumnResult.ok, api.ls_column_inference_accept_proposal(od.doc, 0));
+    const after = try ccGet1(od.doc, 0);
+    try std.testing.expectEqual(api.ColumnTypeKind.decimal, after.effective.kind);
+    try std.testing.expectEqual(api.ColumnTypeSource.inferred, after.effective_source); // NOT an override
+    try std.testing.expectEqual(api.ColumnConflictState.none, after.conflict_state);
+    try std.testing.expect(after.generation > gen_before);
+}
+
+// --- cc_ac9 — empty vs null vs conflict are distinct ------------------------
+
+test "cc_ac9_empty_vs_null: empty text is not null; an empty sentinel makes it null" {
+    // row 0 empty, rows 1..2 integers; no sentinel -> empty text, no null.
+    var od = try openBytes("n\n\n5\n10\n");
+    defer od.deinit();
+    var m = try ccInferAndGet(od.doc, 0); // RED on the seed
+    try std.testing.expectEqual(api.ColumnTypeKind.integer, m.effective.kind);
+    try std.testing.expect(m.empty_count >= 1);
+    try std.testing.expectEqual(@as(u64, 0), m.null_count);
+    try std.testing.expectEqual(api.ColumnConflictState.none, m.conflict_state);
+    // An EMPTY sentinel reclassifies the empty field as null (fresh epoch).
+    try std.testing.expectEqual(api.ColumnResult.ok, api.ls_column_null_sentinel_set(od.doc, 0, null, 0));
+    const ids = [_]u32{0};
+    try ccRequest(od.doc, &ids);
+    _ = try waitInferenceDone(od.doc);
+    m = try ccGet1(od.doc, 0);
+    try std.testing.expect(m.null_count >= 1);
+    try std.testing.expectEqual(api.ColumnTypeKind.integer, m.effective.kind);
+}
+
+test "cc_ac9_sentinel_exact: a sentinel matches byte-for-byte, whitespace included" {
+    // Sentinel " NA " (spaces around NA). Only the exact 4-byte cell is null.
+    var od = try openBytes("n\n5\n NA \nNA\n na \n10\n");
+    defer od.deinit();
+    try std.testing.expectEqual(api.ColumnResult.ok, api.ls_column_null_sentinel_set(od.doc, 0, " NA ", 4));
+    const ids = [_]u32{0};
+    try ccRequest(od.doc, &ids);
+    _ = try waitInferenceDone(od.doc); // RED on the seed
+    const m = try ccGet1(od.doc, 0);
+    try std.testing.expectEqual(@as(u64, 1), m.null_count); // ONLY " NA " matched
+}
+
+// --- cc_gen — one generation commit per mutation ----------------------------
+
+test "cc_gen_one_commit_per_mutation: a valid override commits exactly one generation" {
+    var od = try openBytes("a,b\n1,2\n");
+    defer od.deinit();
+    const before = try ccGet1(od.doc, 0); // generation 0 (untouched)
+    try std.testing.expectEqual(@as(u64, 0), before.generation);
+    var t = ccIntType();
+    try std.testing.expectEqual(api.ColumnResult.ok, api.ls_column_override_set(od.doc, 0, &t));
+    var items: [2]api.ColumnMetadata = undefined;
+    const ids = [_]u32{ 0, 1 };
+    const gen = try ccGetMany(od.doc, &ids, &items);
+    try std.testing.expect(gen > 0); // RED: the seed never advances the generation
+    try std.testing.expectEqual(gen, items[0].generation); // the changed column is stamped
+    try std.testing.expectEqual(@as(u64, 0), items[1].generation); // the untouched one is not
+}
+
+// --- cc_ac10 — effective-type precedence + reset ----------------------------
+
+test "cc_ac10_precedence_and_reset: override wins; clearing reveals inferred" {
+    // A column that infers integer; an override to text must win, and clearing
+    // it must reveal the published inferred integer WITHOUT a re-open.
+    var od = try openBytes("n\n1\n2\n3\n4\n5\n6\n7\n8\n");
+    defer od.deinit();
+    var m = try ccInferAndGet(od.doc, 0); // RED on the seed
+    try std.testing.expectEqual(api.ColumnTypeKind.integer, m.effective.kind);
+    // override -> text.
+    var t = ccIntType();
+    t.kind = .text;
+    try std.testing.expectEqual(api.ColumnResult.ok, api.ls_column_override_set(od.doc, 0, &t));
+    m = try ccGet1(od.doc, 0);
+    try std.testing.expectEqual(api.ColumnTypeKind.text, m.effective.kind);
+    try std.testing.expectEqual(api.ColumnTypeSource.override, m.effective_source);
+    try std.testing.expect((m.presence_flags & api.column_has_inferred) != 0); // inferred not destroyed
+    // clear -> reveals the published inferred integer.
+    try std.testing.expectEqual(api.ColumnResult.ok, api.ls_column_override_clear(od.doc, 0));
+    m = try ccGet1(od.doc, 0);
+    try std.testing.expectEqual(api.ColumnTypeKind.integer, m.effective.kind);
+    try std.testing.expectEqual(api.ColumnTypeSource.inferred, m.effective_source);
+}
+
+// --- cc_ac13 — windowed header labels (RED) ---------------------------------
+
+test "cc_ac13_windowed_labels: labels copy in requested order with two-pass sizing" {
+    var od = try openBytes("alpha,beta,gamma\n1,2,3\n");
+    defer od.deinit();
+    const ids = [_]u32{ 0, 2 }; // a SUB-range (not all columns): windowed fetch
+    var spans: [2]api.ColumnLabelSpan = undefined;
+    for (&spans) |*sp| {
+        sp.struct_size = @sizeOf(api.ColumnLabelSpan);
+        sp.abi_version = cc_abi_version;
+    }
+    var required: usize = 0;
+    // pass 1 — preflight: spans + required length, no bytes.
+    try std.testing.expectEqual(api.ColumnResult.ok, api.ls_column_labels_copy_many(od.doc, &ids, 2, &spans, 2, null, 0, &required));
+    try std.testing.expectEqual(@as(usize, 10), required); // "alpha"(5) + "gamma"(5) — RED: seed reports 0
+    try std.testing.expect((spans[0].flags & api.column_label_present) != 0);
+    try std.testing.expectEqual(@as(u64, 5), spans[0].len);
+    try std.testing.expectEqual(@as(u64, 5), spans[1].len);
+    // a too-small arena -> BUFFER_TOO_SMALL, arena untouched.
+    var small: [4]u8 = undefined;
+    try std.testing.expectEqual(api.ColumnResult.buffer_too_small, api.ls_column_labels_copy_many(od.doc, &ids, 2, &spans, 2, &small, small.len, &required));
+    // pass 2 — copy the bytes.
+    var arena: [10]u8 = undefined;
+    try std.testing.expectEqual(api.ColumnResult.ok, api.ls_column_labels_copy_many(od.doc, &ids, 2, &spans, 2, &arena, arena.len, &required));
+    try std.testing.expectEqualStrings("alpha", arena[spans[0].offset .. spans[0].offset + spans[0].len]);
+    try std.testing.expectEqualStrings("gamma", arena[spans[1].offset .. spans[1].offset + spans[1].len]);
+}
+
+// --- cc_ac17 — raw copy/search/filter never see column config (GUARD) -------
+
+test "cc_ac17_raw_unaffected_by_config: overrides/sentinels never change raw cells or search" {
+    var od = try openBytes("n,v\n1,2\n3,4\n5,6\n");
+    defer od.deinit();
+    try scanToEnd(od.doc);
+    winAll(od.doc);
+    try expectCell(od.doc, 1, 0, "3"); // raw before config
+    const total_before = try searchTotal(od.doc, textReq("3"));
+
+    var t = ccIntType();
+    t.kind = .decimal;
+    _ = api.ls_column_override_set(od.doc, 0, &t);
+    _ = api.ls_column_null_sentinel_set(od.doc, 0, "3", 1);
+
+    winAll(od.doc);
+    try expectCell(od.doc, 1, 0, "3"); // raw cell byte-identical
+    try std.testing.expectEqual(total_before, try searchTotal(od.doc, textReq("3"))); // search unchanged
+}
+
+// --- cc_ac19 — a fresh handle is a fresh session (GUARD) --------------------
+
+test "cc_ac19_reopen_is_fresh: a new handle begins at generation 0 with no state" {
+    var od = try openBytes("a,b\n1,2\n");
+    defer od.deinit();
+    // Configure the first handle.
+    var t = ccIntType();
+    _ = api.ls_column_override_set(od.doc, 0, &t);
+    _ = api.ls_column_null_sentinel_set(od.doc, 0, "NA", 2);
+
+    // A distinct handle (the backend half of a re-open) shares no column state.
+    var od2 = try openBytes("a,b\n1,2\n");
+    defer od2.deinit();
+    const s = ccPoll(od2.doc);
+    try std.testing.expectEqual(api.ColumnInferenceJobState.idle, s.state);
+    try std.testing.expectEqual(@as(u64, 0), s.metadata_generation);
+    const m = try ccGet1(od2.doc, 0);
+    try std.testing.expectEqual(@as(u64, 0), m.generation);
+    try std.testing.expectEqual(api.ColumnTypeKind.unknown, m.effective.kind);
+    try std.testing.expectEqual(api.ColumnNullPolicyKind.none, m.null_policy);
+}

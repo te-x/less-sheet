@@ -1320,6 +1320,502 @@ ls_filter_status ls_filter_poll(const ls_doc *doc);
  */
 uint64_t ls_source_row(const ls_doc *doc, uint64_t row);
 
+/* =========================================================================
+ * COLUMN METADATA EXTENSION (column-config slice) — ADDITIVE, ABI v1
+ * =========================================================================
+ * Everything below this line is a single append-only extension block. It adds
+ * bounded, lazy CSV column TYPE INFERENCE, an explicit per-session type/null-
+ * sentinel/format configuration model, and stable conflict/proposal state,
+ * plus a zero-allocation batch way to read that metadata and copy header
+ * labels — all WITHOUT touching one existing byte above. Every constant, enum,
+ * struct, and prototype defined before this block keeps its exact value,
+ * layout, signature, allocation behavior, threading lane, and borrow lifetime;
+ * a client compiled against the pre-column-config header links and behaves
+ * identically. No existing enum gains a case and no existing struct grows.
+ *
+ * WHAT IT DOES NOT CHANGE. The document / window / index / jump / row-count /
+ * search / filter / raw-cell / full-cell-copy surface above is untouched. This
+ * extension NEVER changes what ls_cell / ls_cell_copy / search / filter see:
+ * they keep consuming the existing canonical raw cell (quoting removed, the
+ * truncate/pad rule applied, transcoded to UTF-8). The core still serves RAW
+ * cells and never serves display-formatted strings; grouping, rounding,
+ * localized dates, and null presentation are entirely a frontend concern built
+ * ON TOP of this metadata. Type inference does not advance the scan frontier,
+ * does not enlarge or delay ls_open, and does not turn the sparse index into a
+ * cell scan.
+ *
+ * FIXED-LAYOUT PLAIN-VALUE SNAPSHOTS. Every new struct is a fixed-layout plain
+ * value containing only fixed-width integers, `double`, nested fixed values,
+ * and explicit reserved storage — never a pointer, `bool`, native-width enum,
+ * or `size_t`. Enum-valued fields are stored as `uint32_t` (the typed enums
+ * below name the legal values). On every supported 64-bit target the sizes and
+ * field offsets are exactly those pinned by the LS_COLUMN_STATIC_ASSERT checks
+ * that follow each struct (and by matching Zig comptime pins); all explicit
+ * reserved fields and output padding are zero. Each snapshot carries its own
+ * `struct_size` + `abi_version` so a caller/core mismatch is a clean
+ * LS_COLUMN_INVALID_ARGUMENT, never an out-of-bounds write.
+ *
+ * CALLER-OWNED, WINDOW-INDEPENDENT. Unlike ls_cell's borrowed ls_str, every
+ * snapshot the caller receives, every metadata item, every label span, and
+ * every copied UTF-8 byte (header label, null sentinel, conflict example) is
+ * owned by the caller the instant the call returns and stays valid across every
+ * later ls_window_set, worker commit, inference request, and cancel. ls_close
+ * does not affect a caller-owned copy. No new call returns an ls_str, and the
+ * existing "until the next window/close" borrow rule is byte-for-byte unchanged.
+ * Variable-length UTF-8 crosses ONLY through the caller-buffer copy calls.
+ *
+ * ALLOCATION DISCIPLINE (extends, never alters, the legacy rule above). The
+ * MUTATING calls — ls_column_inference_request, ls_column_override_set,
+ * ls_column_null_sentinel_set — are the only NEW calls that may allocate (to
+ * create sparse per-column state / copy IDs or bytes); on failure they return
+ * LS_COLUMN_OUT_OF_MEMORY and leave the previous configuration untouched. Every
+ * other new call — the batch snapshot get, poll, cancel, override/sentinel
+ * clear, accept-proposal, and all label/sentinel/example copies — performs ZERO
+ * heap allocation and never fails for want of memory. No legacy symbol's
+ * allocation behavior changes.
+ *
+ * THREADING. All new calls are on the poll/control lane: internally
+ * synchronized with the worker and safe from any thread at any time, and safe
+ * concurrently with the serialized window lane — EXCEPT, exactly like every
+ * existing call, they must not race ls_open / ls_close on the same handle. They
+ * never invalidate an ls_str borrow.
+ *
+ * BATCH RULES (shared by the *_get_many / *_copy_many / inference_request calls).
+ * An ID batch preserves caller order and permits duplicates. A zero-length
+ * batch (count 0) is a valid no-op / empty query (its pointers may be NULL). A
+ * non-zero batch requires non-NULL input/output pointers, `count` and any item
+ * `capacity` at most LS_COLUMN_BATCH_MAX, output capacity at least `count`, and
+ * every ID below ls_column_count(). Validation is ALL-OR-NOTHING: an invalid ID,
+ * shape, descriptor, size/version, or capacity produces NO output and NO
+ * mutation. For an output status/metadata item/label span the caller initializes
+ * ONLY `struct_size` and `abi_version` to the v1 values before the call; for an
+ * input ls_column_type it initializes those two and zeros `flags`/`reserved`.
+ *
+ * TWO-PASS COPY PROTOCOL (labels / sentinel / conflict example). Call once with
+ * a NULL/zero output buffer to learn the required byte length (and, for labels,
+ * to fill the spans); call again with a buffer of at least that size to receive
+ * the bytes. A non-zero buffer smaller than required returns
+ * LS_COLUMN_BUFFER_TOO_SMALL with the required length written (and label spans
+ * filled) but NO partial byte payload. Every other error leaves all outputs
+ * untouched.
+ *
+ * GENERATIONS. The document starts at global metadata generation 0. Each
+ * successful atomic metadata commit allocates the next non-zero global
+ * generation and stamps every column it changed with that value. A worker chunk
+ * that changes several columns' evidence/counts/conflict is ONE commit; each
+ * config mutation is its own commit. Polling the single global generation
+ * (ls_column_metadata_poll / the out-generation of ls_column_metadata_get_many)
+ * tells the frontend only THAT some column changed; it then re-queries the
+ * currently visible IDs and compares per-column generations — it never
+ * enumerates all columns. Generation 0 on a column means "untouched" (no stored
+ * state). If the global generation ever saturates at UINT64_MAX it stays there.
+ */
+
+/* ---- column-config compile-time layout assertions (C11 / C++; else no-op) - */
+#if defined(__cplusplus)
+  #define LS_COLUMN_STATIC_ASSERT(cond, msg) static_assert(cond, msg)
+#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+  #define LS_COLUMN_STATIC_ASSERT(cond, msg) _Static_assert(cond, msg)
+#else
+  /* pre-C11: layout is still pinned authoritatively by the Zig comptime block. */
+  #define LS_COLUMN_STATIC_ASSERT(cond, msg)
+#endif
+
+/* ---- Constants ---------------------------------------------------------- */
+
+/* Version stamped into every column-config snapshot; bump only in a new ABI. */
+#define LS_COLUMN_METADATA_ABI_VERSION (1)
+/* Maximum column IDs / output items per batch call. */
+#define LS_COLUMN_BATCH_MAX (1024)
+/* First-sample bound: data rows (the byte ceiling is LS_OPEN_HEAD_MAX_BYTES). */
+#define LS_COLUMN_INFERENCE_HEAD_MAX_ROWS (256)
+/* Decoded complete-cell bytes per later materialized-window event / chunk. */
+#define LS_COLUMN_INFERENCE_WINDOW_MAX_BYTES (262144)
+/* Maximum null-sentinel UTF-8 bytes (0 is valid — empty sentinel). */
+#define LS_COLUMN_SENTINEL_MAX_BYTES (256)
+/* Maximum conflict-example UTF-8 bytes (cut only at a code-point boundary). */
+#define LS_COLUMN_CONFLICT_EXAMPLE_MAX_BYTES (256)
+/* ls_column_type.decimal_precision "not applicable / unknown" sentinel (never
+ * emitted as a real precision; a saturating precision stops at UINT64_MAX-1). */
+#define LS_COLUMN_TYPE_PRECISION_UNSPECIFIED (UINT64_MAX)
+/* ls_column_type.decimal_scale "not applicable / unknown" sentinel (real scale
+ * stays within [INT64_MIN+1, INT64_MAX]). */
+#define LS_COLUMN_TYPE_SCALE_UNSPECIFIED (INT64_MIN)
+/* ls_column_type.datetime_fraction_digits "not applicable / unknown" sentinel. */
+#define LS_COLUMN_TYPE_FRACTION_DIGITS_UNSPECIFIED (UINT32_MAX)
+
+/* ls_column_metadata.presence_flags bits (which optional slots are present). */
+#define LS_COLUMN_HAS_DECLARED (1u << 0)
+#define LS_COLUMN_HAS_INFERRED (1u << 1)
+#define LS_COLUMN_HAS_OVERRIDE (1u << 2)
+#define LS_COLUMN_HAS_PROPOSAL (1u << 3)
+#define LS_COLUMN_HAS_NULL_SENTINEL (1u << 4)
+#define LS_COLUMN_HAS_CONFLICT_EXAMPLE (1u << 5)
+
+/* ls_column_label_span.flags bits. */
+#define LS_COLUMN_LABEL_PRESENT (1u << 0)   /* a source header label exists */
+#define LS_COLUMN_LABEL_TRUNCATED (1u << 1) /* it was display-capped (see cap) */
+
+/* ---- Enumerations (each value is frozen; new cases only in a new ABI) --- */
+
+/* Result of every new column-config call (except the void cancel). */
+typedef enum ls_column_result {
+    LS_COLUMN_OK = 0,
+    /* A pointer/shape/ID/capacity/descriptor/size/version was invalid; nothing
+     * was written or mutated (all-or-nothing). */
+    LS_COLUMN_INVALID_ARGUMENT = 1,
+    /* The column ID is not below ls_column_count() (a valid-shape but absent
+     * column); nothing was written or mutated. */
+    LS_COLUMN_NO_COLUMN = 2,
+    /* A single-value copy target has no value (no null sentinel / no conflict
+     * example). Distinct from OK+length 0, which is a present-but-EMPTY value. */
+    LS_COLUMN_NO_VALUE = 3,
+    /* accept-proposal on a column that currently has no proposed replacement. */
+    LS_COLUMN_NO_PROPOSAL = 4,
+    /* A non-zero output buffer was smaller than the required length; the length
+     * (and label spans) were written but no partial byte payload. */
+    LS_COLUMN_BUFFER_TOO_SMALL = 5,
+    /* A mutating call could not allocate; the previous state is untouched. */
+    LS_COLUMN_OUT_OF_MEMORY = 6,
+} ls_column_result;
+
+/* Base type kind (stored as uint32_t in ls_column_type.kind). Null is an
+ * ORTHOGONAL cell state (see ls_column_null_policy_kind), never a base type:
+ * an all-null / all-empty column is UNKNOWN plus its null/empty counts. */
+typedef enum ls_column_type_kind {
+    LS_COLUMN_TYPE_UNKNOWN = 0,     /* no eligible evidence yet / all-null */
+    LS_COLUMN_TYPE_UNSUPPORTED = 1, /* a future reader/type this client can't read */
+    LS_COLUMN_TYPE_TEXT = 2,        /* deterministic fallback; never conflicts */
+    LS_COLUMN_TYPE_BOOLEAN = 3,     /* ASCII-case-insensitive true/false only */
+    LS_COLUMN_TYPE_INTEGER = 4,     /* pinned numeric grammar, no point/exponent */
+    LS_COLUMN_TYPE_DECIMAL = 5,     /* pinned numeric grammar with point/exponent */
+    LS_COLUMN_TYPE_DATE = 6,        /* exactly YYYY-MM-DD, valid Gregorian date */
+    LS_COLUMN_TYPE_DATETIME = 7,    /* exactly YYYY-MM-DDTHH:MM:SS[.f][Z|±HH:MM] */
+} ls_column_type_kind;
+
+/* Which slot resolved the effective type (stored as uint32_t). */
+typedef enum ls_column_type_source {
+    LS_COLUMN_SOURCE_NONE = 0,      /* unknown effective type */
+    LS_COLUMN_SOURCE_DECLARED = 1,  /* a self-describing reader (absent for CSV v1) */
+    LS_COLUMN_SOURCE_INFERRED = 2,  /* the published inferred candidate */
+    LS_COLUMN_SOURCE_OVERRIDE = 3,  /* the user's explicit session override */
+} ls_column_type_source;
+
+/* Datetime wall-clock vs zoned semantics (stored as uint32_t). NONE outside a
+ * datetime type. Naive and zoned values never agree; two differing explicit
+ * offsets agree as ZONED. */
+typedef enum ls_column_datetime_semantics {
+    LS_COLUMN_DATETIME_NONE = 0,
+    LS_COLUMN_DATETIME_NAIVE = 1,
+    LS_COLUMN_DATETIME_ZONED = 2,
+} ls_column_datetime_semantics;
+
+/* Per-column inference lifecycle (stored as uint32_t). */
+typedef enum ls_column_inference_state {
+    LS_COLUMN_INFERENCE_UNREQUESTED = 0, /* no inference requested for this column */
+    LS_COLUMN_INFERENCE_QUEUED = 1,      /* requested, not yet sampling */
+    LS_COLUMN_INFERENCE_SAMPLING = 2,    /* accumulating evidence */
+    LS_COLUMN_INFERENCE_PROVISIONAL = 3, /* 1..7 agreeing values; not yet effective */
+    LS_COLUMN_INFERENCE_PUBLISHED = 4,   /* a published inferred descriptor exists */
+} ls_column_inference_state;
+
+/* Confidence in the published inferred descriptor (stored as uint32_t). */
+typedef enum ls_column_confidence {
+    LS_COLUMN_CONFIDENCE_NONE = 0,       /* nothing published */
+    LS_COLUMN_CONFIDENCE_LOW = 1,        /* provisional (1..7 values) */
+    LS_COLUMN_CONFIDENCE_BOUNDED = 2,    /* published on 8 agreeing values */
+    LS_COLUMN_CONFIDENCE_EXHAUSTIVE = 3, /* every data row examined (exact count) */
+} ls_column_confidence;
+
+/* Null policy (stored as uint32_t). */
+typedef enum ls_column_null_policy_kind {
+    LS_COLUMN_NULL_NONE = 0,     /* empty fields are empty text, never null */
+    LS_COLUMN_NULL_SENTINEL = 1, /* an exact byte-for-byte sentinel marks null */
+} ls_column_null_policy_kind;
+
+/* Conflict / proposal state against the published effective type (uint32_t). */
+typedef enum ls_column_conflict_state {
+    LS_COLUMN_CONFLICT_NONE = 0,     /* no contradictory complete value seen */
+    LS_COLUMN_CONFLICT_OBSERVED = 1, /* >=1 contradiction; no agreed replacement */
+    LS_COLUMN_CONFLICT_PROPOSED = 2, /* >=8 rows agree on a replacement (a proposal) */
+} ls_column_conflict_state;
+
+/* Document-wide inference job state (stored as uint32_t in the poll snapshot). */
+typedef enum ls_column_inference_job_state {
+    LS_COLUMN_JOB_IDLE = 0,      /* no desired set (never requested / fully unrequested) */
+    LS_COLUMN_JOB_QUEUED = 1,    /* a desired set exists, work not yet started */
+    LS_COLUMN_JOB_RUNNING = 2,   /* the worker is sampling */
+    LS_COLUMN_JOB_DONE = 3,      /* the current finite work set is complete */
+    LS_COLUMN_JOB_CANCELLED = 4, /* cancelled; holds until the next request */
+} ls_column_inference_job_state;
+
+/* ---- Fixed-layout snapshot structs -------------------------------------- */
+
+/*
+ * One type descriptor. Fills the declared/inferred/override/effective/proposal
+ * slots of ls_column_metadata; also the input to ls_column_override_set. An
+ * absent slot is the canonical UNKNOWN value (kind UNKNOWN, all sentinels).
+ * Enum-valued fields are uint32_t (see the named enums). 48 bytes, align 8.
+ */
+typedef struct ls_column_type {
+    uint32_t struct_size;              /* == sizeof(ls_column_type) (48) */
+    uint32_t abi_version;              /* == LS_COLUMN_METADATA_ABI_VERSION */
+    uint32_t kind;                     /* ls_column_type_kind */
+    uint32_t flags;                    /* reserved type flags; zero in v1 */
+    uint64_t decimal_precision;        /* DECIMAL: coefficient digits after exact
+                                        * base-10 normalization; else UNSPECIFIED */
+    int64_t  decimal_scale;            /* DECIMAL: fractional places (may be
+                                        * negative for powers of ten); else UNSPECIFIED */
+    uint32_t datetime_semantics;       /* ls_column_datetime_semantics (NONE off datetime) */
+    uint32_t datetime_fraction_digits; /* DATETIME: max observed 0..9; else UNSPECIFIED */
+    uint64_t reserved;                 /* zero */
+} ls_column_type;
+LS_COLUMN_STATIC_ASSERT(sizeof(ls_column_type) == 48, "ls_column_type must be 48 bytes");
+LS_COLUMN_STATIC_ASSERT(offsetof(ls_column_type, kind) == 8, "ls_column_type.kind @8");
+LS_COLUMN_STATIC_ASSERT(offsetof(ls_column_type, decimal_precision) == 16, "ls_column_type.decimal_precision @16");
+LS_COLUMN_STATIC_ASSERT(offsetof(ls_column_type, decimal_scale) == 24, "ls_column_type.decimal_scale @24");
+LS_COLUMN_STATIC_ASSERT(offsetof(ls_column_type, datetime_semantics) == 32, "ls_column_type.datetime_semantics @32");
+LS_COLUMN_STATIC_ASSERT(offsetof(ls_column_type, datetime_fraction_digits) == 36, "ls_column_type.datetime_fraction_digits @36");
+LS_COLUMN_STATIC_ASSERT(offsetof(ls_column_type, reserved) == 40, "ls_column_type.reserved @40");
+
+/*
+ * The coherent per-column snapshot. `override` (a C++/Swift contextual keyword —
+ * access it with a backtick in Swift) is the user's explicit session type.
+ * `generation` is this column's last committed metadata generation (0 ==
+ * untouched). Counts are cumulative committed values under the current null /
+ * effective epoch — whole-document totals only when confidence is EXHAUSTIVE.
+ * 384 bytes, align 8. Enum-valued fields are uint32_t.
+ */
+typedef struct ls_column_metadata {
+    uint32_t struct_size;                /* == sizeof(ls_column_metadata) (384) */
+    uint32_t abi_version;                /* == LS_COLUMN_METADATA_ABI_VERSION */
+    uint32_t column;                     /* absolute column ID */
+    uint32_t presence_flags;             /* LS_COLUMN_HAS_* */
+    uint64_t generation;                 /* this column's committed generation; 0 == untouched */
+    ls_column_type declared;             /* @24  self-describing reader slot (CSV: absent) */
+    ls_column_type inferred;             /* @72  current CSV candidate */
+    ls_column_type override;             /* @120 user's explicit session type */
+    ls_column_type effective;            /* @168 override>inferred>declared>unknown */
+    ls_column_type proposal;             /* @216 proposed inferred replacement, if any */
+    uint32_t effective_source;           /* @264 ls_column_type_source */
+    uint32_t inference_state;            /* @268 ls_column_inference_state */
+    uint32_t confidence;                 /* @272 ls_column_confidence */
+    uint32_t null_policy;                /* @276 ls_column_null_policy_kind */
+    uint32_t conflict_state;             /* @280 ls_column_conflict_state */
+    uint32_t null_sentinel_bytes;        /* @284 sentinel length when present (may be 0) */
+    uint64_t evidence_count;             /* @288 cumulative eligible non-empty non-null values */
+    uint64_t sampled_row_count;          /* @296 cumulative source rows examined */
+    uint64_t sampled_decoded_bytes;      /* @304 cumulative decoded complete-cell bytes */
+    uint64_t empty_count;                /* @312 cumulative empty-text cells (current epoch) */
+    uint64_t null_count;                 /* @320 cumulative null cells (current epoch) */
+    uint64_t conflict_count;             /* @328 cumulative conflicting cells (current epoch) */
+    uint64_t conflict_source_row;        /* @336 representative source data-row; LS_NO_ROW if none */
+    uint32_t conflict_example_bytes;     /* @344 conflict-example copy length (see copy call) */
+    uint32_t conflict_example_truncated; /* @348 0/1: example cut at the example cap */
+    uint64_t reserved[4];                /* @352 zero */
+} ls_column_metadata;
+LS_COLUMN_STATIC_ASSERT(sizeof(ls_column_metadata) == 384, "ls_column_metadata must be 384 bytes");
+LS_COLUMN_STATIC_ASSERT(offsetof(ls_column_metadata, generation) == 16, "ls_column_metadata.generation @16");
+LS_COLUMN_STATIC_ASSERT(offsetof(ls_column_metadata, declared) == 24, "ls_column_metadata.declared @24");
+LS_COLUMN_STATIC_ASSERT(offsetof(ls_column_metadata, inferred) == 72, "ls_column_metadata.inferred @72");
+LS_COLUMN_STATIC_ASSERT(offsetof(ls_column_metadata, override) == 120, "ls_column_metadata.override @120");
+LS_COLUMN_STATIC_ASSERT(offsetof(ls_column_metadata, effective) == 168, "ls_column_metadata.effective @168");
+LS_COLUMN_STATIC_ASSERT(offsetof(ls_column_metadata, proposal) == 216, "ls_column_metadata.proposal @216");
+LS_COLUMN_STATIC_ASSERT(offsetof(ls_column_metadata, effective_source) == 264, "ls_column_metadata.effective_source @264");
+LS_COLUMN_STATIC_ASSERT(offsetof(ls_column_metadata, null_sentinel_bytes) == 284, "ls_column_metadata.null_sentinel_bytes @284");
+LS_COLUMN_STATIC_ASSERT(offsetof(ls_column_metadata, evidence_count) == 288, "ls_column_metadata.evidence_count @288");
+LS_COLUMN_STATIC_ASSERT(offsetof(ls_column_metadata, conflict_source_row) == 336, "ls_column_metadata.conflict_source_row @336");
+LS_COLUMN_STATIC_ASSERT(offsetof(ls_column_metadata, conflict_example_bytes) == 344, "ls_column_metadata.conflict_example_bytes @344");
+LS_COLUMN_STATIC_ASSERT(offsetof(ls_column_metadata, reserved) == 352, "ls_column_metadata.reserved @352");
+
+/*
+ * A coherent inference-job + global-generation snapshot (ls_column_metadata_poll).
+ * The progress axes describe the CURRENT FINITE queued sample; `progress` is 1
+ * only when that finite work is done and is frozen on cancel. 112 bytes, align 8.
+ */
+typedef struct ls_column_inference_status {
+    uint32_t struct_size;             /* == sizeof(ls_column_inference_status) (112) */
+    uint32_t abi_version;             /* == LS_COLUMN_METADATA_ABI_VERSION */
+    uint32_t state;                   /* ls_column_inference_job_state */
+    uint32_t reserved0;               /* zero */
+    uint64_t request_generation;      /* @16 desired-set epoch (changes on request/cancel) */
+    uint64_t metadata_generation;     /* @24 latest global commit generation */
+    uint32_t requested_column_count;  /* @32 columns in the current finite work set */
+    uint32_t completed_column_count;  /* @36 of those, resolved so far */
+    uint64_t source_bytes_scanned;    /* @40 source bytes consumed by the current sample */
+    uint64_t source_bytes_budget;     /* @48 source-byte ceiling of the current sample */
+    uint64_t rows_scanned;            /* @56 data rows examined by the current sample */
+    uint64_t rows_budget;             /* @64 data-row ceiling of the current sample */
+    double   progress;                /* @72 [0,1]; 1 only when finite work done */
+    uint64_t reserved[4];             /* @80 zero */
+} ls_column_inference_status;
+LS_COLUMN_STATIC_ASSERT(sizeof(ls_column_inference_status) == 112, "ls_column_inference_status must be 112 bytes");
+LS_COLUMN_STATIC_ASSERT(offsetof(ls_column_inference_status, request_generation) == 16, "status.request_generation @16");
+LS_COLUMN_STATIC_ASSERT(offsetof(ls_column_inference_status, requested_column_count) == 32, "status.requested_column_count @32");
+LS_COLUMN_STATIC_ASSERT(offsetof(ls_column_inference_status, source_bytes_scanned) == 40, "status.source_bytes_scanned @40");
+LS_COLUMN_STATIC_ASSERT(offsetof(ls_column_inference_status, progress) == 72, "status.progress @72");
+LS_COLUMN_STATIC_ASSERT(offsetof(ls_column_inference_status, reserved) == 80, "status.reserved @80");
+
+/*
+ * One header-label span into the caller arena filled by ls_column_labels_copy_many.
+ * A header-off / empty label has no LS_COLUMN_LABEL_PRESENT flag and len 0; a
+ * display-capped label carries LS_COLUMN_LABEL_TRUNCATED. Generic column names
+ * remain a frontend concern. 48 bytes, align 8.
+ */
+typedef struct ls_column_label_span {
+    uint32_t struct_size;  /* == sizeof(ls_column_label_span) (48) */
+    uint32_t abi_version;  /* == LS_COLUMN_METADATA_ABI_VERSION */
+    uint32_t column;       /* requested absolute column ID */
+    uint32_t flags;        /* LS_COLUMN_LABEL_* */
+    uint64_t offset;       /* @16 byte offset of this label in the caller arena */
+    uint64_t len;          /* @24 display-capped UTF-8 byte length */
+    uint64_t reserved[2];  /* @32 zero */
+} ls_column_label_span;
+LS_COLUMN_STATIC_ASSERT(sizeof(ls_column_label_span) == 48, "ls_column_label_span must be 48 bytes");
+LS_COLUMN_STATIC_ASSERT(offsetof(ls_column_label_span, offset) == 16, "label_span.offset @16");
+LS_COLUMN_STATIC_ASSERT(offsetof(ls_column_label_span, len) == 24, "label_span.len @24");
+LS_COLUMN_STATIC_ASSERT(offsetof(ls_column_label_span, reserved) == 32, "label_span.reserved @32");
+
+/* ---- Functions ---------------------------------------------------------- */
+
+/*
+ * Replace the desired active inference ID set with `ids[0..count]` (a live
+ * MUTABLE document). IDs are copied, sorted/coalesced internally; a byte-
+ * identical repeated set is idempotent. `count` must be 1..LS_COLUMN_BATCH_MAX
+ * and every ID below ls_column_count(). Only requested columns are ever
+ * sampled; untouched columns keep no stored state. Poll/control lane; MAY
+ * allocate (sparse state + copied IDs) — on OOM returns LS_COLUMN_OUT_OF_MEMORY
+ * and the prior request is intact.
+ */
+ls_column_result ls_column_inference_request(ls_doc *doc, const uint32_t *ids, uint32_t count);
+
+/*
+ * Cancel the current desired set/job (a live MUTABLE document). Committed
+ * evidence and published metadata remain; queued/no-evidence columns return to
+ * unrequested and partially-sampled columns stay provisional. The job state
+ * becomes LS_COLUMN_JOB_CANCELLED until a replacement request. Poll/control
+ * lane; ZERO allocation; cannot fail.
+ */
+void ls_column_inference_cancel(ls_doc *doc);
+
+/*
+ * Write one coherent job + global-generation snapshot into `*out_status` (a
+ * live CONST document). The caller pre-sets out_status->struct_size = 112 and
+ * abi_version = 1; a mismatch is LS_COLUMN_INVALID_ARGUMENT with no write.
+ * Poll/control lane; ZERO allocation.
+ */
+ls_column_result ls_column_metadata_poll(const ls_doc *doc, ls_column_inference_status *out_status);
+
+/*
+ * Read metadata for `ids[0..count]` into `out_items[0..count]` in caller order
+ * (duplicates allowed) under ONE lock, and write the global generation at which
+ * they were read to `*out_generation` (a live CONST document). Untouched IDs are
+ * SYNTHESIZED as a generation-0 unrequested/unknown item without creating state.
+ * `count`/`capacity` at most LS_COLUMN_BATCH_MAX, capacity >= count, every ID
+ * below ls_column_count(); each out item's struct_size/abi_version pre-set to
+ * 384/1. A zero-length batch is a valid no-op that still writes *out_generation.
+ * Poll/control lane; ZERO allocation. On any error every output byte is
+ * untouched; on success the caller owns the items permanently.
+ */
+ls_column_result ls_column_metadata_get_many(const ls_doc *doc, const uint32_t *ids, uint32_t count,
+                                             ls_column_metadata *out_items, uint32_t capacity,
+                                             uint64_t *out_generation);
+
+/*
+ * Set column `column`'s explicit session override to `*type` (a live MUTABLE
+ * document) and make it effective atomically. A valid override is an explicit
+ * v1 kind — TEXT, BOOLEAN, INTEGER, DECIMAL, DATE, or DATETIME — with `flags`
+ * and `reserved` zero and the metadata-only parameters (decimal_precision,
+ * decimal_scale, datetime_fraction_digits) left at their UNSPECIFIED sentinels;
+ * a DATETIME override additionally requires an explicit NAIVE or ZONED
+ * datetime_semantics, and every other kind requires DATETIME_NONE.
+ * UNKNOWN/UNSUPPORTED and any other parameter combination are rejected
+ * (LS_COLUMN_INVALID_ARGUMENT). The
+ * descriptor is copied (borrowed only for the call). Setting an override never
+ * discards inferred/declared slots and resets conflict aggregation against the
+ * prior effective descriptor. MAY allocate the first sparse state; on OOM /
+ * validation failure the prior state is untouched.
+ */
+ls_column_result ls_column_override_set(ls_doc *doc, uint32_t column, const ls_column_type *type);
+
+/*
+ * Idempotently remove column `column`'s override (a live MUTABLE document),
+ * revealing the published inferred/declared/unknown effective type and
+ * resetting conflicts against the old effective descriptor. Poll/control lane;
+ * ZERO allocation; distinguishes only an invalid column (LS_COLUMN_NO_COLUMN).
+ */
+ls_column_result ls_column_override_clear(ls_doc *doc, uint32_t column);
+
+/*
+ * Set column `column`'s null sentinel to `bytes[0..len]` (a live MUTABLE
+ * document). `len` is 0..LS_COLUMN_SENTINEL_MAX_BYTES; a NULL `bytes` is valid
+ * only when len == 0 (the empty sentinel — the explicit way to treat empty CSV
+ * fields as null). The bytes must be valid UTF-8. A null-epoch change resets
+ * this column's inferred evidence, conflicts, and proposal and requeues it if
+ * active. MAY allocate; invalid UTF-8 / over-length / OOM leaves the old state
+ * untouched (atomic).
+ */
+ls_column_result ls_column_null_sentinel_set(ls_doc *doc, uint32_t column, const uint8_t *bytes, size_t len);
+
+/*
+ * Idempotently remove column `column`'s null sentinel (a live MUTABLE document)
+ * and start the same fresh-evidence epoch as a sentinel change. Poll/control
+ * lane; ZERO allocation; reports only an invalid column.
+ */
+ls_column_result ls_column_null_sentinel_clear(ls_doc *doc, uint32_t column);
+
+/*
+ * Accept column `column`'s proposed inferred replacement (a live MUTABLE
+ * document): atomically move the proposal into the inferred/published slot,
+ * stay in Auto (never create an override), clear the proposal + conflict
+ * aggregate, and commit new generations. Returns LS_COLUMN_NO_PROPOSAL without
+ * mutation when there is no proposal. Poll/control lane; ZERO allocation.
+ */
+ls_column_result ls_column_inference_accept_proposal(ls_doc *doc, uint32_t column);
+
+/*
+ * Copy source header labels for `ids[0..count]` (a live CONST document). Fills
+ * `out_spans[0..count]` (each pre-set to struct_size 48 / abi_version 1) in
+ * requested order and, when `arena` has room, the label bytes into `arena`;
+ * writes the total required byte length to `*out_required`. Two-pass: pass a
+ * NULL/zero `arena` to fill spans + required length only; then pass an arena of
+ * at least *out_required bytes. A non-zero arena smaller than required returns
+ * LS_COLUMN_BUFFER_TOO_SMALL (spans + required length written, arena untouched).
+ * A header-off/empty label gets no PRESENT flag and len 0; a display-capped one
+ * carries TRUNCATED. `capacity` (spans) at most LS_COLUMN_BATCH_MAX and >= count.
+ * Poll/control lane; ZERO allocation. Spans/arena are caller-owned and
+ * window-independent.
+ */
+ls_column_result ls_column_labels_copy_many(const ls_doc *doc, const uint32_t *ids, uint32_t count,
+                                            ls_column_label_span *out_spans, uint32_t capacity,
+                                            uint8_t *arena, size_t arena_capacity,
+                                            size_t *out_required);
+
+/*
+ * Two-pass copy of column `column`'s null sentinel bytes into `buf[0..buf_capacity]`
+ * (a live CONST document), writing the required length to `*out_required`. A
+ * NULL/zero buffer reports the required length only. LS_COLUMN_OK with
+ * *out_required 0 is a present EMPTY sentinel; LS_COLUMN_NO_VALUE means no
+ * sentinel is set. A non-zero buffer smaller than required is
+ * LS_COLUMN_BUFFER_TOO_SMALL with the length written and no partial payload.
+ * Poll/control lane; ZERO allocation.
+ */
+ls_column_result ls_column_null_sentinel_copy(const ls_doc *doc, uint32_t column,
+                                              uint8_t *buf, size_t buf_capacity, size_t *out_required);
+
+/*
+ * Two-pass copy of column `column`'s bounded conflict-example UTF-8 prefix (the
+ * value identified by ls_column_metadata.conflict_example_bytes, cut only at a
+ * code-point boundary) into `buf[0..buf_capacity]` (a live CONST document),
+ * writing the required length to `*out_required`. Same two-pass / BUFFER_TOO_SMALL
+ * rules as the sentinel copy; LS_COLUMN_NO_VALUE when there is no example.
+ * Poll/control lane; ZERO allocation.
+ */
+ls_column_result ls_column_conflict_example_copy(const ls_doc *doc, uint32_t column,
+                                                 uint8_t *buf, size_t buf_capacity, size_t *out_required);
+
+#undef LS_COLUMN_STATIC_ASSERT
+
 #ifdef __cplusplus
 }
 #endif

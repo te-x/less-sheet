@@ -858,3 +858,82 @@ pub fn windowChargedBytes(doc: *const api.Doc) u64 {
 pub fn navChargedBytes(doc: *const api.Doc) u64 {
     return asDoc(doc).nav_charged_bytes;
 }
+
+// ===========================================================================
+// column-config slice (ARCH-column-config) — additive column-metadata C ABI.
+// See api/lesssheet.h "COLUMN METADATA EXTENSION". These `export fn`s delegate
+// to src/column.zig (implementer-owned); the RED SEED there validates every
+// argument and synthesizes generation-0 unknown metadata but stores/publishes
+// nothing, so every behavioral column-config AC is RED while conformance
+// (layout + signature pins in contracts/api.zig) stays green. api/lesssheet.h
+// is APPENDED-to, byte-identical above the extension block (AC1).
+// ===========================================================================
+
+const column = @import("column.zig");
+
+/// See api/lesssheet.h `ls_column_inference_request`.
+pub export fn ls_column_inference_request(doc: *api.Doc, ids: ?[*]const u32, count: u32) callconv(.c) api.ColumnResult {
+    const d: *Document = @ptrCast(@alignCast(doc));
+    return column.inferenceRequest(d, ids, count);
+}
+
+/// See api/lesssheet.h `ls_column_inference_cancel`.
+pub export fn ls_column_inference_cancel(doc: *api.Doc) callconv(.c) void {
+    const d: *Document = @ptrCast(@alignCast(doc));
+    column.inferenceCancel(d);
+}
+
+/// See api/lesssheet.h `ls_column_metadata_poll`.
+pub export fn ls_column_metadata_poll(doc: *const api.Doc, out_status: *api.ColumnInferenceStatus) callconv(.c) api.ColumnResult {
+    return column.metadataPoll(asDocMut(doc), out_status);
+}
+
+/// See api/lesssheet.h `ls_column_metadata_get_many`.
+pub export fn ls_column_metadata_get_many(doc: *const api.Doc, ids: ?[*]const u32, count: u32, out_items: ?[*]api.ColumnMetadata, capacity: u32, out_generation: *u64) callconv(.c) api.ColumnResult {
+    return column.metadataGetMany(asDocMut(doc), ids, count, out_items, capacity, out_generation);
+}
+
+/// See api/lesssheet.h `ls_column_override_set`.
+pub export fn ls_column_override_set(doc: *api.Doc, col: u32, ty: *const api.ColumnType) callconv(.c) api.ColumnResult {
+    const d: *Document = @ptrCast(@alignCast(doc));
+    return column.overrideSet(d, col, ty);
+}
+
+/// See api/lesssheet.h `ls_column_override_clear`.
+pub export fn ls_column_override_clear(doc: *api.Doc, col: u32) callconv(.c) api.ColumnResult {
+    const d: *Document = @ptrCast(@alignCast(doc));
+    return column.overrideClear(d, col);
+}
+
+/// See api/lesssheet.h `ls_column_null_sentinel_set`.
+pub export fn ls_column_null_sentinel_set(doc: *api.Doc, col: u32, bytes: ?[*]const u8, len: usize) callconv(.c) api.ColumnResult {
+    const d: *Document = @ptrCast(@alignCast(doc));
+    return column.nullSentinelSet(d, col, bytes, len);
+}
+
+/// See api/lesssheet.h `ls_column_null_sentinel_clear`.
+pub export fn ls_column_null_sentinel_clear(doc: *api.Doc, col: u32) callconv(.c) api.ColumnResult {
+    const d: *Document = @ptrCast(@alignCast(doc));
+    return column.nullSentinelClear(d, col);
+}
+
+/// See api/lesssheet.h `ls_column_inference_accept_proposal`.
+pub export fn ls_column_inference_accept_proposal(doc: *api.Doc, col: u32) callconv(.c) api.ColumnResult {
+    const d: *Document = @ptrCast(@alignCast(doc));
+    return column.acceptProposal(d, col);
+}
+
+/// See api/lesssheet.h `ls_column_labels_copy_many`.
+pub export fn ls_column_labels_copy_many(doc: *const api.Doc, ids: ?[*]const u32, count: u32, out_spans: ?[*]api.ColumnLabelSpan, capacity: u32, arena: ?[*]u8, arena_capacity: usize, out_required: *usize) callconv(.c) api.ColumnResult {
+    return column.labelsCopyMany(asDocMut(doc), ids, count, out_spans, capacity, arena, arena_capacity, out_required);
+}
+
+/// See api/lesssheet.h `ls_column_null_sentinel_copy`.
+pub export fn ls_column_null_sentinel_copy(doc: *const api.Doc, col: u32, buf: ?[*]u8, buf_capacity: usize, out_required: *usize) callconv(.c) api.ColumnResult {
+    return column.nullSentinelCopy(asDocMut(doc), col, buf, buf_capacity, out_required);
+}
+
+/// See api/lesssheet.h `ls_column_conflict_example_copy`.
+pub export fn ls_column_conflict_example_copy(doc: *const api.Doc, col: u32, buf: ?[*]u8, buf_capacity: usize, out_required: *usize) callconv(.c) api.ColumnResult {
+    return column.conflictExampleCopy(asDocMut(doc), col, buf, buf_capacity, out_required);
+}

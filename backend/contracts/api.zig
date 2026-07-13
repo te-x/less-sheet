@@ -750,3 +750,307 @@ comptime {
     if (!@hasField(Dz, "state")) @compileError("flate.Decompress: no `state` field (DEFLATE block/pending state)");
     if (@TypeOf(@as(Dz, undefined).consumed_bits) != u3) @compileError("flate.Decompress.consumed_bits must be u3 (bit alignment)");
 }
+
+// ===========================================================================
+// column-config slice (ARCH-column-config) — additive column-metadata ABI.
+// Mirrors api/lesssheet.h "COLUMN METADATA EXTENSION" EXACTLY: the frozen
+// constants/flags/enums, the four FIXED-LAYOUT snapshot structs, the 12 new
+// `ls_column_*` export fns, and — in the comptime block at the very bottom —
+// the authoritative LAYOUT (size/align/offset) + SIGNATURE pins. api/lesssheet.h
+// is byte-identical above its appended extension block (AC1); the C
+// LS_COLUMN_STATIC_ASSERTs and these Zig pins together freeze the layout on
+// every supported target. Planner-owned; amended only with the C header.
+//
+// Enum-valued snapshot fields are `enum(u32)` (layout-identical to the C
+// `uint32_t` the header stores); the RESULT enum is `enum(c_int)` (the C enum
+// return type). Nothing here allocates; nothing borrows an ls_str.
+// ===========================================================================
+
+/// Mirrors LS_COLUMN_METADATA_ABI_VERSION.
+pub const column_metadata_abi_version: u32 = 1;
+/// Mirrors LS_COLUMN_BATCH_MAX.
+pub const column_batch_max: u32 = 1024;
+/// Mirrors LS_COLUMN_INFERENCE_HEAD_MAX_ROWS (byte ceiling is open_head_max_bytes).
+pub const column_inference_head_max_rows: u64 = 256;
+/// Mirrors LS_COLUMN_INFERENCE_WINDOW_MAX_BYTES.
+pub const column_inference_window_max_bytes: u64 = 262144;
+/// Mirrors LS_COLUMN_SENTINEL_MAX_BYTES (0 valid — empty sentinel).
+pub const column_sentinel_max_bytes: usize = 256;
+/// Mirrors LS_COLUMN_CONFLICT_EXAMPLE_MAX_BYTES.
+pub const column_conflict_example_max_bytes: usize = 256;
+/// Mirrors LS_COLUMN_TYPE_PRECISION_UNSPECIFIED.
+pub const column_type_precision_unspecified: u64 = std.math.maxInt(u64);
+/// Mirrors LS_COLUMN_TYPE_SCALE_UNSPECIFIED.
+pub const column_type_scale_unspecified: i64 = std.math.minInt(i64);
+/// Mirrors LS_COLUMN_TYPE_FRACTION_DIGITS_UNSPECIFIED.
+pub const column_type_fraction_digits_unspecified: u32 = std.math.maxInt(u32);
+
+/// ls_column_metadata.presence_flags bits (LS_COLUMN_HAS_*).
+pub const column_has_declared: u32 = 1 << 0;
+pub const column_has_inferred: u32 = 1 << 1;
+pub const column_has_override: u32 = 1 << 2;
+pub const column_has_proposal: u32 = 1 << 3;
+pub const column_has_null_sentinel: u32 = 1 << 4;
+pub const column_has_conflict_example: u32 = 1 << 5;
+
+/// ls_column_label_span.flags bits (LS_COLUMN_LABEL_*).
+pub const column_label_present: u32 = 1 << 0;
+pub const column_label_truncated: u32 = 1 << 1;
+
+/// Mirrors `ls_column_result` (C enum return type; int-sized).
+pub const ColumnResult = enum(c_int) {
+    ok = 0,
+    invalid_argument = 1,
+    no_column = 2,
+    no_value = 3,
+    no_proposal = 4,
+    buffer_too_small = 5,
+    out_of_memory = 6,
+};
+
+/// Mirrors `ls_column_type_kind` (stored as uint32_t).
+pub const ColumnTypeKind = enum(u32) {
+    unknown = 0,
+    unsupported = 1,
+    text = 2,
+    boolean = 3,
+    integer = 4,
+    decimal = 5,
+    date = 6,
+    datetime = 7,
+};
+
+/// Mirrors `ls_column_type_source` (stored as uint32_t).
+pub const ColumnTypeSource = enum(u32) {
+    none = 0,
+    declared = 1,
+    inferred = 2,
+    override = 3,
+};
+
+/// Mirrors `ls_column_datetime_semantics` (stored as uint32_t).
+pub const ColumnDatetimeSemantics = enum(u32) {
+    none = 0,
+    naive = 1,
+    zoned = 2,
+};
+
+/// Mirrors `ls_column_inference_state` (stored as uint32_t).
+pub const ColumnInferenceState = enum(u32) {
+    unrequested = 0,
+    queued = 1,
+    sampling = 2,
+    provisional = 3,
+    published = 4,
+};
+
+/// Mirrors `ls_column_confidence` (stored as uint32_t).
+pub const ColumnConfidence = enum(u32) {
+    none = 0,
+    low = 1,
+    bounded = 2,
+    exhaustive = 3,
+};
+
+/// Mirrors `ls_column_null_policy_kind` (stored as uint32_t).
+pub const ColumnNullPolicyKind = enum(u32) {
+    none = 0,
+    sentinel = 1,
+};
+
+/// Mirrors `ls_column_conflict_state` (stored as uint32_t).
+pub const ColumnConflictState = enum(u32) {
+    none = 0,
+    observed = 1,
+    proposed = 2,
+};
+
+/// Mirrors `ls_column_inference_job_state` (stored as uint32_t).
+pub const ColumnInferenceJobState = enum(u32) {
+    idle = 0,
+    queued = 1,
+    running = 2,
+    done = 3,
+    cancelled = 4,
+};
+
+/// Mirrors `ls_column_type` (48 bytes, align 8). See api/lesssheet.h.
+pub const ColumnType = extern struct {
+    struct_size: u32,
+    abi_version: u32,
+    kind: ColumnTypeKind,
+    flags: u32,
+    decimal_precision: u64,
+    decimal_scale: i64,
+    datetime_semantics: ColumnDatetimeSemantics,
+    datetime_fraction_digits: u32,
+    reserved: u64,
+};
+
+/// Mirrors `ls_column_metadata` (384 bytes, align 8). `override` is not a Zig
+/// keyword (it is a C++/Swift contextual one). See api/lesssheet.h.
+pub const ColumnMetadata = extern struct {
+    struct_size: u32,
+    abi_version: u32,
+    column: u32,
+    presence_flags: u32,
+    generation: u64,
+    declared: ColumnType,
+    inferred: ColumnType,
+    override: ColumnType,
+    effective: ColumnType,
+    proposal: ColumnType,
+    effective_source: ColumnTypeSource,
+    inference_state: ColumnInferenceState,
+    confidence: ColumnConfidence,
+    null_policy: ColumnNullPolicyKind,
+    conflict_state: ColumnConflictState,
+    null_sentinel_bytes: u32,
+    evidence_count: u64,
+    sampled_row_count: u64,
+    sampled_decoded_bytes: u64,
+    empty_count: u64,
+    null_count: u64,
+    conflict_count: u64,
+    conflict_source_row: u64,
+    conflict_example_bytes: u32,
+    conflict_example_truncated: u32,
+    reserved: [4]u64,
+};
+
+/// Mirrors `ls_column_inference_status` (112 bytes, align 8). See api/lesssheet.h.
+pub const ColumnInferenceStatus = extern struct {
+    struct_size: u32,
+    abi_version: u32,
+    state: ColumnInferenceJobState,
+    reserved0: u32,
+    request_generation: u64,
+    metadata_generation: u64,
+    requested_column_count: u32,
+    completed_column_count: u32,
+    source_bytes_scanned: u64,
+    source_bytes_budget: u64,
+    rows_scanned: u64,
+    rows_budget: u64,
+    progress: f64,
+    reserved: [4]u64,
+};
+
+/// Mirrors `ls_column_label_span` (48 bytes, align 8). See api/lesssheet.h.
+pub const ColumnLabelSpan = extern struct {
+    struct_size: u32,
+    abi_version: u32,
+    column: u32,
+    flags: u32,
+    offset: u64,
+    len: u64,
+    reserved: [2]u64,
+};
+
+// C ABI — see api/lesssheet.h COLUMN METADATA EXTENSION for the full contract.
+pub const ls_column_inference_request = core.ls_column_inference_request;
+pub const ls_column_inference_cancel = core.ls_column_inference_cancel;
+pub const ls_column_metadata_poll = core.ls_column_metadata_poll;
+pub const ls_column_metadata_get_many = core.ls_column_metadata_get_many;
+pub const ls_column_override_set = core.ls_column_override_set;
+pub const ls_column_override_clear = core.ls_column_override_clear;
+pub const ls_column_null_sentinel_set = core.ls_column_null_sentinel_set;
+pub const ls_column_null_sentinel_clear = core.ls_column_null_sentinel_clear;
+pub const ls_column_inference_accept_proposal = core.ls_column_inference_accept_proposal;
+pub const ls_column_labels_copy_many = core.ls_column_labels_copy_many;
+pub const ls_column_null_sentinel_copy = core.ls_column_null_sentinel_copy;
+pub const ls_column_conflict_example_copy = core.ls_column_conflict_example_copy;
+
+comptime {
+    // --- Layout pins: sizes/aligns/offsets identical to the C header's
+    // LS_COLUMN_STATIC_ASSERTs (authoritative on every supported target). ------
+    if (@sizeOf(ColumnType) != 48) @compileError("layout drift: ls_column_type size != 48");
+    if (@alignOf(ColumnType) != 8) @compileError("layout drift: ls_column_type align != 8");
+    if (@offsetOf(ColumnType, "struct_size") != 0) @compileError("layout drift: ColumnType.struct_size");
+    if (@offsetOf(ColumnType, "abi_version") != 4) @compileError("layout drift: ColumnType.abi_version");
+    if (@offsetOf(ColumnType, "kind") != 8) @compileError("layout drift: ColumnType.kind");
+    if (@offsetOf(ColumnType, "flags") != 12) @compileError("layout drift: ColumnType.flags");
+    if (@offsetOf(ColumnType, "decimal_precision") != 16) @compileError("layout drift: ColumnType.decimal_precision");
+    if (@offsetOf(ColumnType, "decimal_scale") != 24) @compileError("layout drift: ColumnType.decimal_scale");
+    if (@offsetOf(ColumnType, "datetime_semantics") != 32) @compileError("layout drift: ColumnType.datetime_semantics");
+    if (@offsetOf(ColumnType, "datetime_fraction_digits") != 36) @compileError("layout drift: ColumnType.datetime_fraction_digits");
+    if (@offsetOf(ColumnType, "reserved") != 40) @compileError("layout drift: ColumnType.reserved");
+
+    if (@sizeOf(ColumnMetadata) != 384) @compileError("layout drift: ls_column_metadata size != 384");
+    if (@alignOf(ColumnMetadata) != 8) @compileError("layout drift: ls_column_metadata align != 8");
+    if (@offsetOf(ColumnMetadata, "struct_size") != 0) @compileError("layout drift: ColumnMetadata.struct_size");
+    if (@offsetOf(ColumnMetadata, "abi_version") != 4) @compileError("layout drift: ColumnMetadata.abi_version");
+    if (@offsetOf(ColumnMetadata, "column") != 8) @compileError("layout drift: ColumnMetadata.column");
+    if (@offsetOf(ColumnMetadata, "presence_flags") != 12) @compileError("layout drift: ColumnMetadata.presence_flags");
+    if (@offsetOf(ColumnMetadata, "generation") != 16) @compileError("layout drift: ColumnMetadata.generation");
+    if (@offsetOf(ColumnMetadata, "declared") != 24) @compileError("layout drift: ColumnMetadata.declared");
+    if (@offsetOf(ColumnMetadata, "inferred") != 72) @compileError("layout drift: ColumnMetadata.inferred");
+    if (@offsetOf(ColumnMetadata, "override") != 120) @compileError("layout drift: ColumnMetadata.override");
+    if (@offsetOf(ColumnMetadata, "effective") != 168) @compileError("layout drift: ColumnMetadata.effective");
+    if (@offsetOf(ColumnMetadata, "proposal") != 216) @compileError("layout drift: ColumnMetadata.proposal");
+    if (@offsetOf(ColumnMetadata, "effective_source") != 264) @compileError("layout drift: ColumnMetadata.effective_source");
+    if (@offsetOf(ColumnMetadata, "inference_state") != 268) @compileError("layout drift: ColumnMetadata.inference_state");
+    if (@offsetOf(ColumnMetadata, "confidence") != 272) @compileError("layout drift: ColumnMetadata.confidence");
+    if (@offsetOf(ColumnMetadata, "null_policy") != 276) @compileError("layout drift: ColumnMetadata.null_policy");
+    if (@offsetOf(ColumnMetadata, "conflict_state") != 280) @compileError("layout drift: ColumnMetadata.conflict_state");
+    if (@offsetOf(ColumnMetadata, "null_sentinel_bytes") != 284) @compileError("layout drift: ColumnMetadata.null_sentinel_bytes");
+    if (@offsetOf(ColumnMetadata, "evidence_count") != 288) @compileError("layout drift: ColumnMetadata.evidence_count");
+    if (@offsetOf(ColumnMetadata, "sampled_row_count") != 296) @compileError("layout drift: ColumnMetadata.sampled_row_count");
+    if (@offsetOf(ColumnMetadata, "sampled_decoded_bytes") != 304) @compileError("layout drift: ColumnMetadata.sampled_decoded_bytes");
+    if (@offsetOf(ColumnMetadata, "empty_count") != 312) @compileError("layout drift: ColumnMetadata.empty_count");
+    if (@offsetOf(ColumnMetadata, "null_count") != 320) @compileError("layout drift: ColumnMetadata.null_count");
+    if (@offsetOf(ColumnMetadata, "conflict_count") != 328) @compileError("layout drift: ColumnMetadata.conflict_count");
+    if (@offsetOf(ColumnMetadata, "conflict_source_row") != 336) @compileError("layout drift: ColumnMetadata.conflict_source_row");
+    if (@offsetOf(ColumnMetadata, "conflict_example_bytes") != 344) @compileError("layout drift: ColumnMetadata.conflict_example_bytes");
+    if (@offsetOf(ColumnMetadata, "conflict_example_truncated") != 348) @compileError("layout drift: ColumnMetadata.conflict_example_truncated");
+    if (@offsetOf(ColumnMetadata, "reserved") != 352) @compileError("layout drift: ColumnMetadata.reserved");
+
+    if (@sizeOf(ColumnInferenceStatus) != 112) @compileError("layout drift: ls_column_inference_status size != 112");
+    if (@alignOf(ColumnInferenceStatus) != 8) @compileError("layout drift: ls_column_inference_status align != 8");
+    if (@offsetOf(ColumnInferenceStatus, "state") != 8) @compileError("layout drift: ColumnInferenceStatus.state");
+    if (@offsetOf(ColumnInferenceStatus, "reserved0") != 12) @compileError("layout drift: ColumnInferenceStatus.reserved0");
+    if (@offsetOf(ColumnInferenceStatus, "request_generation") != 16) @compileError("layout drift: ColumnInferenceStatus.request_generation");
+    if (@offsetOf(ColumnInferenceStatus, "metadata_generation") != 24) @compileError("layout drift: ColumnInferenceStatus.metadata_generation");
+    if (@offsetOf(ColumnInferenceStatus, "requested_column_count") != 32) @compileError("layout drift: ColumnInferenceStatus.requested_column_count");
+    if (@offsetOf(ColumnInferenceStatus, "completed_column_count") != 36) @compileError("layout drift: ColumnInferenceStatus.completed_column_count");
+    if (@offsetOf(ColumnInferenceStatus, "source_bytes_scanned") != 40) @compileError("layout drift: ColumnInferenceStatus.source_bytes_scanned");
+    if (@offsetOf(ColumnInferenceStatus, "source_bytes_budget") != 48) @compileError("layout drift: ColumnInferenceStatus.source_bytes_budget");
+    if (@offsetOf(ColumnInferenceStatus, "rows_scanned") != 56) @compileError("layout drift: ColumnInferenceStatus.rows_scanned");
+    if (@offsetOf(ColumnInferenceStatus, "rows_budget") != 64) @compileError("layout drift: ColumnInferenceStatus.rows_budget");
+    if (@offsetOf(ColumnInferenceStatus, "progress") != 72) @compileError("layout drift: ColumnInferenceStatus.progress");
+    if (@offsetOf(ColumnInferenceStatus, "reserved") != 80) @compileError("layout drift: ColumnInferenceStatus.reserved");
+
+    if (@sizeOf(ColumnLabelSpan) != 48) @compileError("layout drift: ls_column_label_span size != 48");
+    if (@alignOf(ColumnLabelSpan) != 8) @compileError("layout drift: ls_column_label_span align != 8");
+    if (@offsetOf(ColumnLabelSpan, "column") != 8) @compileError("layout drift: ColumnLabelSpan.column");
+    if (@offsetOf(ColumnLabelSpan, "flags") != 12) @compileError("layout drift: ColumnLabelSpan.flags");
+    if (@offsetOf(ColumnLabelSpan, "offset") != 16) @compileError("layout drift: ColumnLabelSpan.offset");
+    if (@offsetOf(ColumnLabelSpan, "len") != 24) @compileError("layout drift: ColumnLabelSpan.len");
+    if (@offsetOf(ColumnLabelSpan, "reserved") != 32) @compileError("layout drift: ColumnLabelSpan.reserved");
+
+    // --- Signature pins: C-ABI drift in src/ fails `zig build` right here. ----
+    if (@TypeOf(core.ls_column_inference_request) != fn (*Doc, ?[*]const u32, u32) callconv(.c) ColumnResult)
+        @compileError("signature drift: ls_column_inference_request");
+    if (@TypeOf(core.ls_column_inference_cancel) != fn (*Doc) callconv(.c) void)
+        @compileError("signature drift: ls_column_inference_cancel");
+    if (@TypeOf(core.ls_column_metadata_poll) != fn (*const Doc, *ColumnInferenceStatus) callconv(.c) ColumnResult)
+        @compileError("signature drift: ls_column_metadata_poll");
+    if (@TypeOf(core.ls_column_metadata_get_many) != fn (*const Doc, ?[*]const u32, u32, ?[*]ColumnMetadata, u32, *u64) callconv(.c) ColumnResult)
+        @compileError("signature drift: ls_column_metadata_get_many");
+    if (@TypeOf(core.ls_column_override_set) != fn (*Doc, u32, *const ColumnType) callconv(.c) ColumnResult)
+        @compileError("signature drift: ls_column_override_set");
+    if (@TypeOf(core.ls_column_override_clear) != fn (*Doc, u32) callconv(.c) ColumnResult)
+        @compileError("signature drift: ls_column_override_clear");
+    if (@TypeOf(core.ls_column_null_sentinel_set) != fn (*Doc, u32, ?[*]const u8, usize) callconv(.c) ColumnResult)
+        @compileError("signature drift: ls_column_null_sentinel_set");
+    if (@TypeOf(core.ls_column_null_sentinel_clear) != fn (*Doc, u32) callconv(.c) ColumnResult)
+        @compileError("signature drift: ls_column_null_sentinel_clear");
+    if (@TypeOf(core.ls_column_inference_accept_proposal) != fn (*Doc, u32) callconv(.c) ColumnResult)
+        @compileError("signature drift: ls_column_inference_accept_proposal");
+    if (@TypeOf(core.ls_column_labels_copy_many) != fn (*const Doc, ?[*]const u32, u32, ?[*]ColumnLabelSpan, u32, ?[*]u8, usize, *usize) callconv(.c) ColumnResult)
+        @compileError("signature drift: ls_column_labels_copy_many");
+    if (@TypeOf(core.ls_column_null_sentinel_copy) != fn (*const Doc, u32, ?[*]u8, usize, *usize) callconv(.c) ColumnResult)
+        @compileError("signature drift: ls_column_null_sentinel_copy");
+    if (@TypeOf(core.ls_column_conflict_example_copy) != fn (*const Doc, u32, ?[*]u8, usize, *usize) callconv(.c) ColumnResult)
+        @compileError("signature drift: ls_column_conflict_example_copy");
+}

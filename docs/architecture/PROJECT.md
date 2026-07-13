@@ -18,8 +18,9 @@ in seconds and choke on large files; for less-sheet, **time-to-first-rows is the
 - **Docs-first Zig**: 0.16.0 postdates most training data and the language churns — every agent
   verifies Zig APIs against the locally installed std source / docs (pointers in `CLAUDE.md`),
   never from memory.
-- **macOS frontend**: Swift 6 / SwiftPM. SwiftUI baseline, AppKit escape hatch if the cold-start
-  budget demands it. Links the core **statically — in-process, no helper process, no IPC** (a
+- **macOS frontend**: Swift 6 / SwiftPM, **minimum macOS 26** (approved 2026-07-13 with column-config —
+  enables the chromeless Liquid-Glass control panel + native exact-decimal/ISO FormatStyles). SwiftUI
+  baseline, AppKit escape hatch if the cold-start budget demands it. Links the core **statically — in-process, no helper process, no IPC** (a
   process boundary would spend the cold-start budget before the file is even open).
 - **Future frontends**: Linux (toolkit TBD — research first), possibly a TUI. All consume the same
   `api/` headers.
