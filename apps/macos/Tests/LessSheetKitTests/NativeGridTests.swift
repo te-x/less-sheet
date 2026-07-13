@@ -33,14 +33,23 @@
 //      timing asserts here: the 250 ms jump heartbeat measurably absorbs the current
 //      grid's landing stall (max_gap_ms=593 on the baseline run), so a timing pin
 //      would duplicate test 1; criterion-2's "< 500 ms during scans" stays with the
-//      reviewer's release run on the big fixture.
+//      reviewer's release run on the big fixture. PHYSICAL-VIEWPORT LOCK (cc-macos
+//      defect pass): every jump landing's lesssheet.viewport.landed line must report
+//      target_visible=true — the target sits in the REAL NSTableView visible rect,
+//      not merely resolved in the model (ViewportLandingProbe fires only AFTER the
+//      shipping NSClipView is scrolled by NativeGrid.applyPendingLanding).
 //   3. findStepSequenceLandsOnEachMarker — LESSSHEET_FIND + LESSSHEET_FIND_STEP_SEQ
 //      equivalence: submit -> first match, step x2 during scan, step x1 after done —
 //      landings exactly on the fixture's 4 marker rows in order, final count exactly 4.
+//      Each landing also carries the same PHYSICAL-VIEWPORT LOCK (target_visible=true).
 //   4. layoutFramesArePinnedAtRest — LESSSHEET_LOG_LAYOUT equivalence: at-rest
 //      window-space frames band y[0,54], header y[32,54], row1 y[54,76] (+-1 pt),
 //      scrollview top at 0 — the same numbers the current grid logs; the new grid
 //      re-emits them over AppKit frames in the identical format (ARCH criterion 4).
+//   5. selectionSecondClickDeselectsCellRowAndColumn — LESSSHEET_SELECT_COPY: a
+//      second click on an already-selected cell / whole row / whole column clears
+//      the selection (deselected=true for all three), through the shipping
+//      controller's event-free semantic seam (cc-macos defect-pass regression-lock).
 //
 // REVIEWER-MEASURED (deliberately not gated — flaky gates are worse than reviewer
 // enforcement):
@@ -56,6 +65,12 @@
 //     no column drag (criterion 9 — needs synthetic click events, not cheaply
 //     probeable headless), wrap-landing stall + wrap-notice latch (LESSSHEET_FIND_WRAP),
 //     Reduce Transparency, dark mode.
+//   - Selection repaint preserves already-loaded row content (SelectCopyProbe's
+//     lesssheet.selectcopy.selection_repaint content_preserved=true): an off-screen
+//     headless run never materializes a paged NSTableView row view at probe time
+//     (the probe honestly logs skip=no_loaded_row instead), so THIS one defect-pass
+//     fix stays a human/reviewer visual check — the selection-toggle lock (test 5)
+//     and the jump/find physical-viewport locks above ARE gated.
 //
 // Fixture: generated once into the user temp dir and cached by exact byte size
 // (34_888_925 bytes) — header "id,tag,val" + 3_000_000 data rows "<i>,r,<i%10>",
@@ -251,6 +266,15 @@ private func doubleField(_ line: String, _ key: String) -> Double? {
     probeFields(line)[key].flatMap(Double.init)
 }
 
+/// The `true` / `false` value of a boolean probe field (nil if absent/other).
+private func boolField(_ line: String, _ key: String) -> Bool? {
+    switch probeFields(line)[key] {
+    case "true": return true
+    case "false": return false
+    default: return nil
+    }
+}
+
 /// A short tail of the log for failure messages.
 private func logTail(_ log: String, lines n: Int = 30) -> String {
     log.split(separator: "\n", omittingEmptySubsequences: true).suffix(n).joined(separator: "\n")
@@ -348,6 +372,20 @@ struct NativeGridProbeTests {
         let landed2 = probeLines(log, prefix: "lesssheet.jump.landed seq=2 ").first
         #expect(landed2.flatMap { intField($0, "landed_row_0based") } == 1_234_567,
                 "follow-up jump after a rejection must land exactly:\n\(logTail(log))")
+
+        // Physical-viewport lock (cc-macos defect pass): resolving the target in
+        // the MODEL is not enough — the shipping NSTableView must actually scroll so
+        // the target row is inside the LIVE visible rect. ViewportLandingProbe emits
+        // `lesssheet.viewport.landed` only after NativeGrid.applyPendingLanding has
+        // scrolled the real NSClipView (never on the resolved model row alone), so
+        // target_visible=true here is a true physical-viewport assertion. Both the
+        // far jump and the post-rejection follow-up jump must land in the viewport.
+        for target in [2_750_000, 1_234_567] {
+            let vp = probeLines(log, prefix: "lesssheet.viewport.landed ")
+                .last { intField($0, "requested_row_0based") == target }
+            #expect(vp.flatMap { boolField($0, "target_visible") } == true,
+                    "jump to 0-based \(target) must land it inside the REAL viewport:\n\(logTail(log))")
+        }
     }
 
     // Equivalence pin (ARCH criterion 3, gate-scaled): submit lands the FIRST match,
@@ -372,6 +410,15 @@ struct NativeGridProbeTests {
             #expect(landing.flatMap { intField($0, "row_0based") } == marker,
                     "find landing \(index + 1) must be 0-based row \(marker):\n\(logTail(log))")
             #expect(landing.flatMap { intField($0, "pos") } == index + 1)
+
+            // Physical-viewport lock (cc-macos defect pass): each find landing must
+            // scroll the shipping NSTableView so the marker row is in the LIVE
+            // visible rect — not merely resolved in the model. See the jump test's
+            // note; the probe emits this only after the real NSClipView is scrolled.
+            let vp = probeLines(log, prefix: "lesssheet.viewport.landed ")
+                .last { intField($0, "requested_row_0based") == marker }
+            #expect(vp.flatMap { boolField($0, "target_visible") } == true,
+                    "find landing \(index + 1) must put marker row \(marker) inside the REAL viewport:\n\(logTail(log))")
         }
 
         let complete = probeLines(log, prefix: "lesssheet.find.seq_complete ").first
@@ -380,6 +427,40 @@ struct NativeGridProbeTests {
         let countFinal = probeLines(log, prefix: "lesssheet.find.count_final ").first
         #expect(countFinal.flatMap { intField($0, "total") } == NativeGridFixture.markerRows.count,
                 "final match count must be exactly \(NativeGridFixture.markerRows.count):\n\(logTail(log))")
+    }
+
+    // Selection-toggle lock (cc-macos defect pass): a second click on an already-
+    // selected cell / whole row / whole column DESELECTS it. Driven through the
+    // controller's event-free semantic seam (the SAME functions the shipping mouse
+    // handlers call — no synthetic events, no TCC), so this pins the real toggle
+    // wiring. SelectCopyProbe emits one `deselected=` line per form after first
+    // paint; all three must be true. (Its sibling selection-repaint
+    // `content_preserved` guard is deliberately NOT gated — it needs a materialized,
+    // paged NSTableView row view, which an off-screen headless run never has at
+    // probe time; it stays a reviewer/human visual check — see REVIEWER-MEASURED.)
+    @Test func selectionSecondClickDeselectsCellRowAndColumn() throws {
+        let fixtureURL = try #require(
+            Bundle.module.url(forResource: "people", withExtension: "csv", subdirectory: "Fixtures"),
+            "missing fixture people.csv"
+        )
+        let env = ["LESSSHEET_SELECT_COPY": "1", "LESSSHEET_DUMP_EXIT": "1"]
+
+        var log = ""
+        for _ in 1...2 { // relaunch only when the probe sequence never reached its terminal line
+            log = try AppProbe.launchOnce(fixture: fixtureURL.path(percentEncoded: false), env: env, timeout: 60)
+            if !probeLines(log, prefix: "lesssheet.selectcopy.done ").isEmpty { break }
+        }
+
+        let forms: [(probe: String, label: String)] = [
+            ("toggle_cell", "cell"),
+            ("toggle_row", "whole row"),
+            ("toggle_column", "whole column"),
+        ]
+        for form in forms {
+            let line = probeLines(log, prefix: "lesssheet.selectcopy.\(form.probe) ").first
+            #expect(line.flatMap { boolField($0, "deselected") } == true,
+                    "second click on a selected \(form.label) must clear the selection:\n\(logTail(log))")
+        }
     }
 
     // Equivalence pin (ARCH criterion 4): at-rest window-space frames — glass band

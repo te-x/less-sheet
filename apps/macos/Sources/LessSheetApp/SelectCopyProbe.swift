@@ -74,6 +74,12 @@ enum SelectCopyProbe {
         model.selectAll()
         log("lesssheet.selectcopy.select_all rect=\(describe(model.selection?.rect))")
 
+        // AC21 live-pass regressions: use the controller's event-free semantic
+        // seam (the shipping mouse handlers call the same functions) to pin
+        // click-again toggle behavior and prove selection repaint preserves
+        // already-loaded row content instead of reconfiguring it as loading.
+        selectionInteractionRegressions()
+
         // AC5 — column resize + auto-fit (O(1)/O(visible rows); no reload).
         let before = model.windowWidths().first ?? 0
         NativeGridController.live?.resizeColumn(windowIndex: 0, toWidth: 250)
@@ -110,6 +116,47 @@ enum SelectCopyProbe {
         runCopy(label: "copy_small") {
             driveBigCopyOrFinish()
         }
+    }
+
+    private static func selectionInteractionRegressions() {
+        guard let model, let c = NativeGridController.live else { return }
+        let cell = GridCell(row: 0, column: 0)
+
+        model.clearSelection()
+        c.cellMouseDown(cell, shift: false); c.cellMouseUp(at: cell)
+        c.cellMouseDown(cell, shift: false); c.cellMouseUp(at: cell)
+        log("lesssheet.selectcopy.toggle_cell deselected=\(model.selection == nil)")
+
+        c.gutterMouseDown(atY: c.table.rect(ofRow: 0).midY, shift: false)
+        c.gutterMouseDown(atY: c.table.rect(ofRow: 0).midY, shift: false)
+        log("lesssheet.selectcopy.toggle_row deselected=\(model.selection == nil)")
+
+        guard !c.widths.isEmpty else { return }
+        let headerX = c.columnFirstX + c.widths[0] / 2
+        c.headerMouseDown(atX: headerX, shift: false)
+        c.headerMouseDown(atX: headerX, shift: false)
+        log("lesssheet.selectcopy.toggle_column deselected=\(model.selection == nil)")
+
+        var loadedRow: (row: Int, view: SheetRowView)?
+        c.table.enumerateAvailableRowViews { rowView, row in
+            guard loadedRow == nil, row < c.dataRowCount,
+                  let view = rowView as? SheetRowView, !view.pending, !view.cells.isEmpty
+            else { return }
+            loadedRow = (row, view)
+        }
+        guard let loadedRow else {
+            log("lesssheet.selectcopy.selection_repaint skip=no_loaded_row")
+            return
+        }
+        let cellsBefore = loadedRow.view.cells
+        let pendingBefore = loadedRow.view.pending
+        let start = GridCell(row: UInt64(loadedRow.row), column: c.absoluteColumns.first ?? 0)
+        c.cellMouseDown(start, shift: false)
+        c.cellMouseDragged(to: GridCell(row: start.row, column: min(start.column + 1, model.columnCount - 1)))
+        c.cellMouseUp(at: start)
+        let pass = loadedRow.view.cells == cellsBefore && loadedRow.view.pending == pendingBefore
+        log("lesssheet.selectcopy.selection_repaint content_preserved=\(pass)"
+            + " pending_before=\(pendingBefore) pending_after=\(loadedRow.view.pending)")
     }
 
     /// FIX 1 regression guard (ARCH-select-copy round 2, finding 1): a header

@@ -190,6 +190,25 @@ enum ScrollProbe {
     }
 }
 
+/// Viewport-level landing evidence for headless native-grid probes. Unlike the
+/// existing jump/find logs (which prove the model resolved a target), this is
+/// emitted only after the shipping NSClipView has been scrolled. Inert unless
+/// a jump, find, or landing-stall probe is armed.
+@MainActor
+enum ViewportLandingProbe {
+    static func note(requestedRow: Int, visibleRows: NSRange, offsetY: CGFloat) {
+        guard JumpProbe.active || FindProbe.active || LandingStallProbe.active else { return }
+        let visible = visibleRows.length > 0
+            && requestedRow >= visibleRows.location
+            && requestedRow < visibleRows.location + visibleRows.length
+        FileHandle.standardError.write(Data(String(
+            format: "lesssheet.viewport.landed requested_row_0based=%d visible_first=%d visible_count=%d"
+                + " offset_y=%.1f target_visible=\(visible)\n",
+            requestedRow, visibleRows.location, visibleRows.length, offsetY
+        ).utf8))
+    }
+}
+
 // Diagnostic: report the grid's column-width geometry — the visible data
 // columns' summed width, the clip/viewport width, the scroll view's own frame
 // width, the NSTableView documentView's frame width, the single table

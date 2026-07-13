@@ -178,6 +178,13 @@ final class DocumentModel {
     // A row the grid should bring into view (jump landing / cancel restore),
     // consumed and cleared by the grid once applied.
     var pendingScrollRow: UInt64?
+    /// Direct AppKit hand-off for jump/find landings. SwiftUI observation is
+    /// still the state bridge of record (`pendingScrollRow`), but an update can
+    /// legitimately be coalesced while the representable is attaching to its
+    /// window. The native controller installs this weak callback so every
+    /// landing also schedules a post-layout apply; no request is lost merely
+    /// because there was no subsequent observable mutation.
+    @ObservationIgnored var viewportLandingHandler: ((UInt64) -> Void)?
 
     // Overlay presentation state.
     var overlayRevealed = false
@@ -1269,6 +1276,17 @@ final class DocumentModel {
         selection = selectionModel.select(GridCell(row: row, column: column), in: selectionExtent())
     }
 
+    /// Whether the live selection is exactly this one cell. Kept in the app
+    /// layer because the frozen selection algebra intentionally defines only
+    /// geometry, while click-again toggling is an input-routing concern.
+    func isOnlySelectedCell(_ cell: GridCell) -> Bool {
+        selection?.anchor == cell && selection?.active == cell
+    }
+
+    func clearSelection() {
+        selection = nil
+    }
+
     /// A drag or shift-click: anchor kept, active moves to the clicked cell.
     /// Nothing selected yet: falls back to a plain click (there is no
     /// anchor to extend from).
@@ -1292,9 +1310,21 @@ final class DocumentModel {
         selection = selectionModel.wholeRow(row, in: selectionExtent())
     }
 
+    /// Plain gutter clicks toggle only an identical whole-row selection.
+    func toggleWholeRow(_ row: UInt64) {
+        let candidate = selectionModel.wholeRow(row, in: selectionExtent())
+        selection = selection == candidate ? nil : candidate
+    }
+
     /// A header click: the whole (capped) column.
     func selectWholeColumn(_ column: Int) {
         selection = selectionModel.wholeColumn(column, in: selectionExtent())
+    }
+
+    /// Plain header clicks toggle only an identical whole-column selection.
+    func toggleWholeColumn(_ column: Int) {
+        let candidate = selectionModel.wholeColumn(column, in: selectionExtent())
+        selection = selection == candidate ? nil : candidate
     }
 
     /// A shift-click on the gutter (ARCH: whole-row EXTEND is "composed by
@@ -1962,6 +1992,7 @@ final class DocumentModel {
         firstVisibleRow = Int(min(row, UInt64(Int.max)))
         materialize(start: row, count: GridMetrics.scrollBufferRows * 2)
         pendingScrollRow = row
+        viewportLandingHandler?(row)
     }
 
     // MARK: - Find (search)

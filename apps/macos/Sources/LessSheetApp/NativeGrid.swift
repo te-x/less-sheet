@@ -67,7 +67,6 @@ struct GridView: View {
         _ = model.columnPresentationRevision
         _ = model.columnWidthRevision
         _ = model.columnConfigurationRevision
-        _ = model.selection
         return NativeGridRepresentable(model: model)
             .background(Color(nsColor: .textBackgroundColor))
     }
@@ -94,6 +93,14 @@ final class GridContainerView: NSView {
     override func layout() {
         super.layout()
         controller?.layoutContainer()
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        // An observable landing may have arrived between `makeNSView` and the
+        // representable entering a window. Re-apply now that AppKit has usable
+        // viewport geometry instead of waiting for an unrelated model change.
+        if window != nil { controller?.apply() }
     }
 }
 
@@ -149,13 +156,18 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
     private var lastColumnConfigurationRevision = -1
     private var lastIsFiltered = false
     private var built = false
+    private var landingApplyScheduled = false
+    private var pendingCellToggle: GridCell?
 
     init(model: DocumentModel) {
         self.model = model
         super.init()
+        model.viewportLandingHandler = { [weak self] _ in self?.scheduleLandingApply() }
     }
 
-    deinit { NotificationCenter.default.removeObserver(self) }
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+    }
 
     /// Data rows the file exposes (the estimate that the scrollbar reflects,
     /// refined toward exact). Filler rows extend below for the spreadsheet fill.
@@ -453,10 +465,11 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
                 landOn(row: landed)      // re-anchor vertically to the same record
                 HeaderToggleProbe.toggled(oldTop: preToggleTop, newTop: landed,
                                           newHasHeader: model.dialect.hasHeader, shift: shift)
-            } else {
+            } else if model.pendingScrollRow == nil {
                 scrollToTopLeft()
             }
             refreshVisibleRows()
+            applyPendingLanding()
             return
         }
 
@@ -534,10 +547,33 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
         refreshVisibleRows()
 
         // A pending landing (jump / find / wrap / cancel restore): O(viewport).
-        if let target = model.pendingScrollRow {
-            model.pendingScrollRow = nil
-            landOn(row: Int(min(target, UInt64(Int.max))))
+        applyPendingLanding()
+    }
+
+    /// Schedule outside the model mutation turn. This is the direct half of
+    /// the landing bridge; the observed `pendingScrollRow` remains a safety
+    /// net, while this guarantees an AppKit apply even if SwiftUI coalesces the
+    /// representable update or the request arrived before window attachment.
+    private func scheduleLandingApply() {
+        guard !landingApplyScheduled else { return }
+        landingApplyScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.landingApplyScheduled = false
+            self.apply()
         }
+    }
+
+    private func applyPendingLanding() {
+        guard let target = model.pendingScrollRow else { return }
+        model.pendingScrollRow = nil
+        let row = Int(min(target, UInt64(Int.max)))
+        landOn(row: row)
+        ViewportLandingProbe.note(
+            requestedRow: row,
+            visibleRows: table.rows(in: table.visibleRect),
+            offsetY: scroll.contentView.bounds.origin.y
+        )
     }
 
     // MARK: Row-count estimate <-> elastic-overscroll guard
@@ -1068,9 +1104,21 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
     func mouseDown(_ event: NSEvent, in view: NSView) {
         container.window?.makeFirstResponder(table)
         guard let cell = cellAt(view.convert(event.locationInWindow, from: nil)) else { return }
-        if event.modifierFlags.contains(.shift) {
+        cellMouseDown(cell, shift: event.modifierFlags.contains(.shift))
+    }
+
+    /// Event-free semantic seam used by the headless native-grid probe. The
+    /// shipping mouse path maps AppKit coordinates once, then runs this exact
+    /// transition.
+    func cellMouseDown(_ cell: GridCell, shift: Bool) {
+        if shift {
+            pendingCellToggle = nil
             model.extendSelection(toRow: cell.row, column: cell.column)
         } else {
+            // Keep the cell selected during mouse-down so a drag still begins
+            // at the original anchor. Only mouse-up without a drag performs
+            // the click-again deselection.
+            pendingCellToggle = model.isOnlySelectedCell(cell) ? cell : nil
             model.selectCell(row: cell.row, column: cell.column)
         }
         refreshSelectionDisplay()
@@ -1080,13 +1128,27 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
     /// is under the (possibly out-of-bounds) drag point — `cellAt` clamps.
     func mouseDragged(_ event: NSEvent, in view: NSView) {
         guard let cell = cellAt(view.convert(event.locationInWindow, from: nil)) else { return }
+        cellMouseDragged(to: cell)
+    }
+
+    func cellMouseDragged(to cell: GridCell) {
+        pendingCellToggle = nil
         model.extendSelection(toRow: cell.row, column: cell.column)
         refreshSelectionDisplay()
     }
 
-    /// Mouse up on a data cell: the selection is already live from
-    /// `mouseDown`/`mouseDragged` — nothing further to apply.
-    func mouseUp(_ event: NSEvent, in view: NSView) {}
+    /// Mouse up completes click-again toggling. A drag clears the pending
+    /// candidate above, preserving ordinary rectangle selection semantics.
+    func mouseUp(_ event: NSEvent, in view: NSView) {
+        cellMouseUp(at: cellAt(view.convert(event.locationInWindow, from: nil)))
+    }
+
+    func cellMouseUp(at cell: GridCell?) {
+        defer { pendingCellToggle = nil }
+        guard let candidate = pendingCellToggle, cell == candidate else { return }
+        model.clearSelection()
+        refreshSelectionDisplay()
+    }
 
     /// Gutter click: whole-row select; shift-click extends a whole-row
     /// selection to this row (ARCH: composed from `extend(_:to:in:)`).
@@ -1096,7 +1158,7 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
         if shift {
             model.extendSelectionToWholeRow(row)
         } else {
-            model.selectWholeRow(row)
+            model.toggleWholeRow(row)
         }
         refreshSelectionDisplay()
     }
@@ -1117,7 +1179,7 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
         if shift {
             model.extendSelectionToWholeColumn(column)
         } else {
-            model.selectWholeColumn(column)
+            model.toggleWholeColumn(column)
         }
         refreshSelectionDisplay()
     }
@@ -1160,15 +1222,18 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
         model.cancelCopy()
     }
 
-    /// Immediate, targeted redraw after a selection change — O(visible
-    /// rows), never a `reloadData()`: the same `enumerateAvailableRowViews`
-    /// sweep `refreshVisibleRows` already uses for highlight/data changes
-    /// (`configure` re-reads the fresh `model.windowSelectionMarks`). Called
-    /// directly so a drag-select feels live rather than waiting on the next
-    /// SwiftUI `apply()` cycle; `model.selection` is ALSO tracked by
-    /// `GridView.body` as a safety net for any path that doesn't call this.
+    /// Selection changes alter only overlay geometry. Recompute marks and
+    /// repaint the recycled rows without calling `configure`: reconfiguration
+    /// re-reads paging state and could transiently replace already-rendered
+    /// values with loading placeholders while a drag is in progress.
     private func refreshSelectionDisplay() {
-        refreshVisibleRows()
+        table.enumerateAvailableRowViews { rowView, row in
+            guard let rv = rowView as? SheetRowView else { return }
+            rv.selectionMarks = row < self.dataRowCount
+                ? self.model.windowSelectionMarks(forRow: row) : []
+            rv.needsDisplay = true
+        }
+        gutter.needsDisplay = true
     }
 
     // MARK: Column resize + auto-fit (ARCH-select-copy AC5) — hit-testing and
