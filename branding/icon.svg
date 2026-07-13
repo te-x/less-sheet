@@ -1,5 +1,5 @@
 <svg width="800" height="800" xmlns="http://www.w3.org/2000/svg">
- <g>
+ <g transform="translate(80,80) scale(0.8)">
   <title>Layer 1</title>
   <rect fill="#000000" stroke="#000" x="250" y="367.00001" width="300" height="70" id="svg_1" rx="26" stroke-width="0"/>
   <rect fill="#000000" stroke="#000" x="250" y="267" width="300" height="70" id="svg_4" rx="26" stroke-width="0"/>
