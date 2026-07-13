@@ -23,6 +23,141 @@ const BoundsResult = reader_mod.BoundsResult;
 const MaterializeResult = reader_mod.MaterializeResult;
 const CellResult = reader_mod.CellResult;
 
+pub const SelectedStep = union(enum) {
+    paused: Pos,
+    done: Pos,
+    oversized: Pos,
+};
+
+pub const SelectedScanner = struct {
+    cursor: source_mod.Cursor,
+    sep: u8,
+    quote: ?u8,
+    encoding: u8,
+    produced: u32 = 0,
+    selected_index: usize = 0,
+    field_start: usize = 0,
+    truncated: bool = false,
+    mode: enum { start, quoted, unquoted } = .start,
+    source_start: u64,
+
+    pub fn init(reader: CsvReader, source: Source, pos: Pos) SelectedScanner {
+        return .{
+            .cursor = source_mod.cursorAt(source, toOffset(pos), null, null),
+            .sep = reader.sep,
+            .quote = reader.quote,
+            .encoding = reader.encoding,
+            .source_start = pos.logical,
+        };
+    }
+
+    pub fn deinit(self: *SelectedScanner) void {
+        self.cursor.deinit();
+    }
+
+    pub fn releaseLane(self: *SelectedScanner) void {
+        self.cursor.releaseLane();
+    }
+
+    fn stores(self: *const SelectedScanner, selected: []const u32) bool {
+        return self.selected_index < selected.len and selected[self.selected_index] == self.produced;
+    }
+
+    fn appendUnit(self: *SelectedScanner, selected: []const u32, cap: usize, unit: enc.Unit, buf: *std.ArrayList(u8), gpa: std.mem.Allocator) !void {
+        if (!self.stores(selected) or self.truncated) return;
+        if (buf.items.len - self.field_start + unit.out_len > cap) {
+            self.truncated = true;
+            return;
+        }
+        try buf.appendSlice(gpa, unit.out[0..unit.out_len]);
+    }
+
+    fn finishField(self: *SelectedScanner, selected: []const u32, refs: *std.ArrayList(CellRef), buf: *std.ArrayList(u8), gpa: std.mem.Allocator) !void {
+        if (self.stores(selected)) {
+            if (self.truncated and self.encoding == api.encoding_utf8)
+                buf.shrinkRetainingCapacity(self.field_start + enc.utf8TrimToBoundary(buf.items[self.field_start..]));
+            try refs.append(gpa, .{ .start = self.field_start, .len = buf.items.len - self.field_start, .truncated = self.truncated });
+            self.selected_index += 1;
+        }
+        self.produced += 1;
+        self.field_start = buf.items.len;
+        self.truncated = false;
+        self.mode = .start;
+    }
+
+    fn finishRecord(self: *SelectedScanner, selected: []const u32, refs: *std.ArrayList(CellRef), buf: *std.ArrayList(u8), gpa: std.mem.Allocator) !SelectedStep {
+        try self.finishField(selected, refs, buf, gpa);
+        while (self.selected_index < selected.len) : (self.selected_index += 1)
+            try refs.append(gpa, .{ .start = 0, .len = 0 });
+        return .{ .done = cursorPos(&self.cursor) };
+    }
+
+    pub fn step(self: *SelectedScanner, selected: []const u32, cap: usize, work_budget: u64, row_budget: u64, buf: *std.ArrayList(u8), refs: *std.ArrayList(CellRef), gpa: std.mem.Allocator) !SelectedStep {
+        self.cursor.resumeLane();
+        const step_start = self.cursor.logical;
+        const decoded_start = buf.items.len;
+        const source_boundary = work_budget -| @min(work_budget, @as(u64, 8));
+        const decoded_boundary = work_budget -| @min(work_budget, @as(u64, 4));
+        while (true) {
+            if (self.cursor.logical -| self.source_start >= row_budget)
+                return .{ .oversized = cursorPos(&self.cursor) };
+            if (self.cursor.logical -| step_start >= source_boundary or
+                buf.items.len - decoded_start >= decoded_boundary)
+                return .{ .paused = cursorPos(&self.cursor) };
+            const unit = streamUnit(&self.cursor, self.encoding) orelse return self.finishRecord(selected, refs, buf, gpa);
+            if (self.cursor.logical -| step_start +| unit.src_len > work_budget)
+                return .{ .paused = cursorPos(&self.cursor) };
+            if (self.cursor.logical -| self.source_start +| unit.src_len > row_budget)
+                return .{ .oversized = cursorPos(&self.cursor) };
+            switch (self.mode) {
+                .start => {
+                    self.field_start = buf.items.len;
+                    if (self.quote) |q| if (enc.unitIsByte(unit, q)) {
+                        self.cursor.advance(unit.src_len);
+                        self.mode = .quoted;
+                        continue;
+                    };
+                    self.mode = .unquoted;
+                },
+                .quoted => {
+                    self.cursor.advance(unit.src_len);
+                    if (self.quote) |q| if (enc.unitIsByte(unit, q)) {
+                        if (streamUnit(&self.cursor, self.encoding)) |peek| if (enc.unitIsByte(peek, q)) {
+                            if (self.cursor.logical -| self.source_start +| peek.src_len > row_budget)
+                                return .{ .oversized = cursorPos(&self.cursor) };
+                            try self.appendUnit(selected, cap, unit, buf, gpa);
+                            self.cursor.advance(peek.src_len);
+                            continue;
+                        };
+                        self.mode = .unquoted;
+                        continue;
+                    };
+                    try self.appendUnit(selected, cap, unit, buf, gpa);
+                    continue;
+                },
+                .unquoted => {},
+            }
+            if (enc.unitIsByte(unit, self.sep)) {
+                self.cursor.advance(unit.src_len);
+                try self.finishField(selected, refs, buf, gpa);
+            } else if (enc.unitIsByte(unit, '\r') or enc.unitIsByte(unit, '\n')) {
+                self.cursor.advance(unit.src_len);
+                if (enc.unitIsByte(unit, '\r')) if (streamUnit(&self.cursor, self.encoding)) |next| {
+                    if (enc.unitIsByte(next, '\n')) {
+                        if (self.cursor.logical -| self.source_start +| next.src_len > row_budget)
+                            return .{ .oversized = cursorPos(&self.cursor) };
+                        self.cursor.advance(next.src_len);
+                    }
+                };
+                return self.finishRecord(selected, refs, buf, gpa);
+            } else {
+                try self.appendUnit(selected, cap, unit, buf, gpa);
+                self.cursor.advance(unit.src_len);
+            }
+        }
+    }
+};
+
 fn toPos(off: usize, physical: u64) Pos {
     return .{ .logical = off, .physical = physical };
 }
@@ -140,6 +275,28 @@ pub const CsvReader = struct {
                 return .{ .next = toPos(res.next, source.mmap.physical_base +| res.next), .capped = res.capped };
             },
             .gzip => try lexStream(source, pos, want, cap, limit, self.sep, self.quote, self.encoding, buf, refs, gpa),
+        };
+    }
+
+    pub fn materializeSelected(
+        self: CsvReader,
+        source: Source,
+        pos: Pos,
+        selected: []const u32,
+        cap: usize,
+        limit: ?Pos,
+        buf: *std.ArrayList(u8),
+        refs: *std.ArrayList(CellRef),
+        gpa: std.mem.Allocator,
+    ) std.mem.Allocator.Error!MaterializeResult {
+        return switch (source) {
+            .mmap => {
+                const content = source.slice(0, source.len());
+                const lim: usize = if (limit) |l| toOffset(l) else content.len;
+                const res = try lexer.lexSelected(content, toOffset(pos), self.sep, self.quote, selected, cap, lim, self.encoding, buf, refs, gpa);
+                return .{ .next = toPos(res.next, source.mmap.physical_base +| res.next), .capped = res.capped };
+            },
+            .gzip => try lexStreamSelected(source, pos, selected, cap, limit, self.sep, self.quote, self.encoding, buf, refs, gpa),
         };
     }
 
@@ -544,6 +701,69 @@ fn lexStream(source: Source, pos: Pos, want: ?u32, cap: ?usize, limit: ?Pos, sep
         }
         finishTerminator(&cur, structural, encoding);
         if (want) |w| while (produced < w) : (produced += 1) try refs.append(gpa, .{ .start = 0, .len = 0 });
+        return .{ .next = cursorPos(&cur), .capped = false };
+    }
+}
+
+fn lexStreamSelected(source: Source, pos: Pos, selected: []const u32, cap: usize, limit: ?Pos, sep: u8, quote: ?u8, encoding: u8, buf: *std.ArrayList(u8), refs: *std.ArrayList(CellRef), gpa: std.mem.Allocator) !MaterializeResult {
+    var cur = source_mod.cursorAt(source, toOffset(pos), if (limit) |l| toOffset(l) else null, null);
+    defer cur.deinit();
+    var produced: u32 = 0;
+    var selected_index: usize = 0;
+    while (true) {
+        const store = selected_index < selected.len and selected[selected_index] == produced;
+        const start = buf.items.len;
+        var truncated = false;
+        var ended = false;
+        if (quote) |q| if (streamUnit(&cur, encoding)) |first| {
+            if (enc.unitIsByte(first, q)) {
+                cur.advance(first.src_len);
+                while (streamUnit(&cur, encoding)) |u| {
+                    cur.advance(u.src_len);
+                    if (enc.unitIsByte(u, q)) {
+                        if (streamUnit(&cur, encoding)) |peek| {
+                            if (enc.unitIsByte(peek, q)) {
+                                if (store) try appendStreamUnit(buf, gpa, start, u, cap, &truncated);
+                                cur.advance(peek.src_len);
+                                continue;
+                            }
+                        }
+                        break;
+                    }
+                    if (store) try appendStreamUnit(buf, gpa, start, u, cap, &truncated);
+                } else ended = true;
+            }
+        };
+        if (!ended) {
+            while (streamUnit(&cur, encoding)) |u| {
+                if (enc.unitIsByte(u, sep) or enc.unitIsByte(u, '\r') or enc.unitIsByte(u, '\n')) break;
+                if (store) try appendStreamUnit(buf, gpa, start, u, cap, &truncated);
+                cur.advance(u.src_len);
+            } else ended = true;
+        }
+
+        const capped = ended and streamAtLimit(&cur);
+        if (store) {
+            truncated = truncated or capped;
+            if (truncated and encoding == api.encoding_utf8)
+                buf.shrinkRetainingCapacity(start + enc.utf8TrimToBoundary(buf.items[start..]));
+            try refs.append(gpa, .{ .start = start, .len = buf.items.len - start, .truncated = truncated });
+            selected_index += 1;
+        }
+        produced += 1;
+        if (ended) {
+            while (selected_index < selected.len) : (selected_index += 1)
+                try refs.append(gpa, .{ .start = 0, .len = 0, .truncated = capped });
+            return .{ .next = cursorPos(&cur), .capped = capped };
+        }
+        const structural = streamUnit(&cur, encoding).?;
+        if (enc.unitIsByte(structural, sep)) {
+            cur.advance(structural.src_len);
+            continue;
+        }
+        finishTerminator(&cur, structural, encoding);
+        while (selected_index < selected.len) : (selected_index += 1)
+            try refs.append(gpa, .{ .start = 0, .len = 0 });
         return .{ .next = cursorPos(&cur), .capped = false };
     }
 }

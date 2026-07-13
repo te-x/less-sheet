@@ -28,6 +28,7 @@ fn clearWindow(d: *Document, first_row: u64) void {
     d.win_buf.clearRetainingCapacity();
     d.win_refs.clearRetainingCapacity();
     d.win_source.clearRetainingCapacity();
+    d.win_pos.clearRetainingCapacity();
     d.win_oversized.clearRetainingCapacity();
     d.win_first = first_row;
     d.win_rows = 0;
@@ -47,14 +48,21 @@ fn remainingBudget(d: *const Document) u64 {
     return aggregate_budget_max -| d.window_charged_bytes;
 }
 
-fn appendRowMetadata(d: *Document, source_row: u64, oversized: bool, buf_mark: usize, refs_mark: usize) bool {
+fn appendRowMetadata(d: *Document, source_row: u64, pos: Pos, oversized: bool, buf_mark: usize, refs_mark: usize) bool {
     d.win_source.append(d.gpa, source_row) catch {
+        d.win_buf.items.len = buf_mark;
+        d.win_refs.items.len = refs_mark;
+        return false;
+    };
+    d.win_pos.append(d.gpa, pos) catch {
+        d.win_source.items.len -= 1;
         d.win_buf.items.len = buf_mark;
         d.win_refs.items.len = refs_mark;
         return false;
     };
     d.win_oversized.append(d.gpa, oversized) catch {
         d.win_source.items.len -= 1;
+        d.win_pos.items.len -= 1;
         d.win_buf.items.len = buf_mark;
         d.win_refs.items.len = refs_mark;
         return false;
@@ -124,7 +132,7 @@ pub fn windowSet(d: *Document, first_row: u64, row_count: u32) api.RowRange {
                 return .{ .first_row = first_row, .row_count = 0 };
             };
         }
-        if (appendRowMetadata(d, 0, true, buf_mark, refs_mark)) d.win_rows = 1;
+        if (appendRowMetadata(d, 0, d.reader.start(d.source), true, buf_mark, refs_mark)) d.win_rows = 1;
     }
     if (d.win_rows >= clamped) return .{ .first_row = first_row, .row_count = d.win_rows };
 
@@ -175,7 +183,7 @@ pub fn windowSet(d: *Document, first_row: u64, row_count: u32) api.RowRange {
             d.win_refs.items.len = refs_mark;
             break;
         }
-        if (!appendRowMetadata(d, d.win_cursor_row, res.capped, buf_mark, refs_mark)) break;
+        if (!appendRowMetadata(d, d.win_cursor_row, pos, res.capped, buf_mark, refs_mark)) break;
         d.win_rows += 1;
         d.win_cursor_row += 1;
         if (!res.capped) {
@@ -308,7 +316,7 @@ fn windowSetFiltered(d: *Document, first_row: u64, clamped: u64) api.RowRange {
             d.win_refs.items.len = refs_mark;
             break;
         }
-        if (!appendRowMetadata(d, d.win_cursor_row, d.win_candidate_capped, buf_mark, refs_mark)) break;
+        if (!appendRowMetadata(d, d.win_cursor_row, pos, d.win_candidate_capped, buf_mark, refs_mark)) break;
         d.win_rows += 1;
         d.win_cursor_pos = d.win_candidate_next_pos;
         d.win_cursor_row = d.win_candidate_next_row;

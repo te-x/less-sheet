@@ -294,3 +294,76 @@ pub fn lexInto(
         return .{ .next = next_i, .capped = false };
     }
 }
+
+/// Decode an ordered set of columns in one record pass. `selected` must be
+/// strictly increasing; `refs` receives exactly one entry per selected ID in
+/// that same order. Fields between selected IDs are scanned but never stored,
+/// avoiding the O(ids × column-index) repeated-prefix cost of per-cell reads.
+pub fn lexSelected(
+    content: []const u8,
+    pos: usize,
+    sep: u8,
+    quote: ?u8,
+    selected: []const u32,
+    cap: usize,
+    limit: usize,
+    encoding: u8,
+    buf: *std.ArrayList(u8),
+    refs: *std.ArrayList(CellRef),
+    gpa: std.mem.Allocator,
+) !Bounds {
+    var i = pos;
+    var produced: u32 = 0;
+    var selected_index: usize = 0;
+    while (true) {
+        const store = selected_index < selected.len and selected[selected_index] == produced;
+        const start = buf.items.len;
+        var truncated = false;
+        var hit_limit = false;
+
+        if (quote) |q| {
+            const first = enc.decodeUnit(content, i, limit, encoding);
+            if (first != null and enc.unitIsByte(first.?, q)) {
+                i += first.?.src_len;
+                const qr = try consumeQuotedBody(content, i, start, q, limit, encoding, store, cap, &truncated, buf, gpa);
+                hit_limit = qr.hit_limit;
+                i = qr.pos;
+            }
+        }
+        if (!hit_limit) {
+            const sr = try storeToStructural(content, i, start, sep, limit, encoding, store, cap, &truncated, buf, gpa);
+            hit_limit = sr.hit_limit;
+            i = sr.pos;
+        }
+
+        const was_truncated = truncated or (hit_limit and limit != content.len);
+        if (store) {
+            if (was_truncated and encoding == api.encoding_utf8)
+                buf.shrinkRetainingCapacity(start + enc.utf8TrimToBoundary(buf.items[start..]));
+            try refs.append(gpa, .{ .start = start, .len = buf.items.len - start, .truncated = was_truncated });
+            selected_index += 1;
+        }
+        produced += 1;
+
+        if (hit_limit) {
+            const capped = limit != content.len;
+            while (selected_index < selected.len) : (selected_index += 1)
+                try refs.append(gpa, .{ .start = 0, .len = 0, .truncated = capped });
+            return .{ .next = limit, .capped = capped };
+        }
+
+        const u = enc.decodeUnit(content, i, limit, encoding).?;
+        if (enc.unitIsByte(u, sep)) {
+            i += u.src_len;
+            continue;
+        }
+        var next_i = i + u.src_len;
+        if (enc.unitIsByte(u, '\r')) {
+            const nxt = enc.decodeUnit(content, next_i, limit, encoding);
+            if (nxt != null and enc.unitIsByte(nxt.?, '\n')) next_i += nxt.?.src_len;
+        }
+        while (selected_index < selected.len) : (selected_index += 1)
+            try refs.append(gpa, .{ .start = 0, .len = 0 });
+        return .{ .next = next_i, .capped = false };
+    }
+}

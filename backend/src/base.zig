@@ -12,6 +12,7 @@ const std = @import("std");
 const api = @import("api");
 const reader_mod = @import("reader.zig");
 const source_mod = @import("source.zig");
+const column_state = @import("column_state.zig");
 
 const posix = std.posix;
 const c = std.c;
@@ -103,6 +104,8 @@ pub const Decimal = struct {
 /// view's cursor state.
 pub const CopyView = enum { identity, filtered };
 pub const MatchScanOwner = enum { none, filter, search };
+pub const ColumnSampleKind = enum { head, window };
+pub const ColumnWindowRow = struct { row: u64, pos: Pos, oversized: bool };
 
 pub const Document = struct {
     gpa: std.mem.Allocator,
@@ -298,6 +301,10 @@ pub const Document = struct {
     win_buf: std.ArrayList(u8),
     win_refs: std.ArrayList(CellRef),
     win_source: std.ArrayList(u64),
+    // Source position corresponding to each win_source row. This is copied
+    // into the bounded inference event queue after materialization, so the
+    // worker never borrows the evictable window buffers.
+    win_pos: std.ArrayList(Pos) = .empty,
     // win_oversized[i] mirrors win_source[i]: true iff materialized row
     // win_first+i's SOURCE extent exceeded LS_WINDOW_ROW_SCAN_MAX_BYTES, so it
     // was served as a bounded prefix (see ls_row_oversized / ARCH-huge-row-
@@ -458,6 +465,40 @@ pub const Document = struct {
     nav_charge_active: bool = false,
     nav_gen: u64 = 0, // replacement/cancel guard for off-main filtered navigation
 
+    // ARCH-column-config: entirely empty at open. Dynamic storage remains
+    // sparse and is first allocated only by an explicit column request or
+    // configuration mutation.
+    column_store: column_state.Store = .{},
+    // Lazily allocated inference worker/event storage. Empty ArrayList
+    // headers add no inference payload allocation to cold open.
+    column_buf: std.ArrayList(u8) = .empty,
+    column_refs: std.ArrayList(CellRef) = .empty,
+    column_worker_ids: std.ArrayList(u32) = .empty,
+    column_changed_ids: std.ArrayList(u32) = .empty,
+    column_window_events: std.ArrayList(ColumnWindowRow) = .empty,
+    column_event_index: usize = 0,
+    column_event_decoded_bytes: u64 = 0,
+    column_window_generation: u64 = 0,
+    column_work_generation: u64 = 0,
+    column_head_pos: Pos = .{ .logical = 0, .physical = 0 },
+    column_head_row: u64 = 0,
+    column_head_target: u64 = 0,
+    column_head_exact: bool = false,
+    column_head_active: bool = false,
+    column_parsed: bool = false,
+    column_parsed_kind: ColumnSampleKind = .head,
+    column_parsed_source_row: u64 = 0,
+    column_parsed_next_pos: Pos = .{ .logical = 0, .physical = 0 },
+    column_parsed_oversized: bool = false,
+    column_commit_index: usize = 0,
+    column_scanner: ?reader_mod.SelectedScanner = null,
+    column_scan_start_pos: Pos = .{ .logical = 0, .physical = 0 },
+    column_scan_accounted_bytes: u64 = 0,
+    column_parsed_source_bytes: u64 = 0,
+    column_parsed_request_gen: u64 = 0,
+    column_parsed_window_gen: u64 = 0,
+    column_parsed_work_gen: u64 = 0,
+
     pub fn lock(self: *Document) void {
         _ = c.pthread_mutex_lock(&self.mutex);
     }
@@ -521,6 +562,7 @@ pub fn asDocMut(doc: *const api.Doc) *Document {
 /// safe to destroy.
 pub fn freeDoc(doc: *Document) void {
     doc.endMatchScan();
+    if (doc.column_scanner) |*scanner| scanner.deinit();
     source_mod.sourceShutdown(&doc.source);
     doc.checkpoints.deinit(doc.gpa);
     doc.oversized_checkpoints.deinit(doc.gpa);
@@ -528,6 +570,7 @@ pub fn freeDoc(doc: *Document) void {
     doc.win_buf.deinit(doc.gpa);
     doc.win_refs.deinit(doc.gpa);
     doc.win_source.deinit(doc.gpa);
+    doc.win_pos.deinit(doc.gpa);
     doc.win_oversized.deinit(doc.gpa);
     doc.block_counts.deinit(doc.gpa);
     doc.search_scratch.deinit(doc.gpa);
@@ -545,6 +588,12 @@ pub fn freeDoc(doc: *Document) void {
     doc.wf_value.deinit(doc.gpa);
     doc.wf_mask.deinit(doc.gpa);
     doc.wf_failure.deinit(doc.gpa);
+    doc.column_store.deinit(doc.gpa);
+    doc.column_buf.deinit(doc.gpa);
+    doc.column_refs.deinit(doc.gpa);
+    doc.column_worker_ids.deinit(doc.gpa);
+    doc.column_changed_ids.deinit(doc.gpa);
+    doc.column_window_events.deinit(doc.gpa);
     if (doc.search_value.len > 0) doc.gpa.free(doc.search_value);
     if (doc.scope_mask.len > 0) doc.gpa.free(doc.scope_mask);
     if (doc.search_failure.len > 0) doc.gpa.free(doc.search_failure);

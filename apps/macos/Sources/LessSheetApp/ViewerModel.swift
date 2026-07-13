@@ -71,6 +71,17 @@ enum GridMetrics {
     static let titleBarInset: CGFloat = 32
 }
 
+struct PanelColumnLabel {
+    let text: String
+    let truncated: Bool
+}
+
+struct WindowCellPresentation {
+    let text: String
+    let formatUnavailable: Bool
+    let conflict: Bool
+}
+
 @MainActor
 @Observable
 final class DocumentModel {
@@ -93,6 +104,31 @@ final class DocumentModel {
     private(set) var path: String = ""
     private(set) var columnCount = 0
     private(set) var headerCells: [String]?
+    /// Bounded label cache for the core-backed grid fetch. Unlike the legacy
+    /// protocol property, this never grows with the document: every horizontal
+    /// re-materialize replaces it with exactly that buffered column window.
+    private var windowColumnLabels: [Int: String] = [:]
+    private var windowTruncatedLabels: Set<Int> = []
+    private var windowColumnMetadata: [Int: ColumnMetadata] = [:]
+    private var gridInferenceIDs: [UInt32] = []
+    private var panelInferenceIDs: [UInt32] = []
+    private var panelSelectedColumn: UInt32?
+    private var panelLabels: [Int: PanelColumnLabel] = [:]
+    private var panelMetadata: [Int: ColumnMetadata] = [:]
+    private var panelFetchTask: Task<Void, Never>?
+    private var columnMetadataGeneration: UInt64 = 0
+    private(set) var columnPresentationRevision = 0
+    private(set) var columnWidthRevision = 0
+    private(set) var columnConfigurationRevision = 0
+    private(set) var columnPanelRevision = 0
+    private struct ColumnConfigurationEvent {
+        let revision: Int
+        let columns: Set<Int>
+    }
+    private var columnConfigurationEvents: [ColumnConfigurationEvent] = []
+    private(set) var columnInferenceProgress: Double?
+    var columnPanelPresented = false
+    var columnPanelSelection: Int?
     private(set) var dialect = DialectReport(
         separator: 0x2C, quote: 0x22, hasHeader: false,
         separatorForced: false, quoteForced: false, headerForced: false
@@ -114,6 +150,8 @@ final class DocumentModel {
 
     // Hidden-column + jump view-model state.
     private(set) var visibility = ColumnVisibility(columnCount: 0, hiddenColumns: [])
+    private(set) var columnUserSettings: [Int: ColumnUserSettings] = [:]
+    private(set) var sessionLocale = Locale.current
     private(set) var jumpFlow: JumpFlow = .idle
 
     // Selection + copy (ARCH-select-copy AC1-4): the live rectangular
@@ -282,26 +320,82 @@ final class DocumentModel {
         // lands — closing first left a window where the orphaned build could
         // call `ls_cell_copy` on an already-freed `doc`.
         cancelCopy()
-        session?.close()
-        session = nil
+        let oldSession = session
+        let oldDialect = dialect
+        let authoredSettings = columnUserSettings
+        let authoredManualWidths = manualColumnWidths
 
         do {
-            let session = try await opener.open(path: path, forcing: override)
-            self.session = session
+            let candidate = try await opener.open(path: path, forcing: override)
+            var replayAuthoredSettings = false
+            if previous != nil, let oldSession {
+                let headerOnly = oldDialect.separator == candidate.dialect.separator
+                    && oldDialect.quote == candidate.dialect.quote
+                    && oldDialect.encoding == candidate.dialect.encoding
+                let change: ColumnReopenChange = headerOnly ? .headerOnly : .separatorQuoteEncoding
+                let oldHeaders = change == .separatorQuoteEncoding ? Self.headerIdentities(oldSession) : nil
+                let newHeaders = change == .separatorQuoteEncoding ? Self.headerIdentities(candidate) : nil
+                replayAuthoredSettings = ColumnSessionModel().decide(
+                    change: change, oldCount: oldSession.columnCount, newCount: candidate.columnCount,
+                    oldHeaders: oldHeaders, newHeaders: newHeaders
+                ) == .replayOrdinally
+
+                if replayAuthoredSettings, let core = candidate as? CoreDocumentSession {
+                    var replaySucceeded = true
+                    for (column, setting) in authoredSettings {
+                        guard let id = UInt32(exactly: column),
+                              core.setColumnOverride(setting.overrideType, column: id),
+                              core.setColumnNullSentinel(setting.nullSentinel, column: id) else {
+                            replaySucceeded = false
+                            break
+                        }
+                    }
+                    if !replaySucceeded {
+                        candidate.close()
+                        startPolling()
+                        return
+                    }
+                }
+            }
+
+            oldSession?.close()
+            let session = candidate
+            self.session = candidate
             self.path = path
             self.columnCount = session.columnCount
-            self.headerCells = session.headerCells
             self.dialect = session.dialect
+            if session is CoreDocumentSession {
+                // Do not touch the compatibility `headerCells` property here:
+                // it intentionally materializes all labels for legacy callers.
+                self.headerCells = session.dialect.hasHeader ? [] : nil
+            } else {
+                self.headerCells = session.headerCells
+            }
+            self.windowColumnLabels = [:]
+            self.windowTruncatedLabels = []
+            self.windowColumnMetadata = [:]
+            self.gridInferenceIDs = []
+            self.panelInferenceIDs = []
+            self.panelSelectedColumn = nil
+            self.panelLabels = [:]
+            self.panelMetadata = [:]
+            self.panelFetchTask?.cancel()
+            self.panelFetchTask = nil
+            self.columnMetadataGeneration = 0
+            self.columnInferenceProgress = nil
+            self.columnPresentationRevision += 1
             self.rowCountInfo = session.rowCount()
             self.indexProgress = session.indexProgress()
 
             // Hidden-column state: carry across a re-open when the column count
             // is unchanged, else reset to all-visible (ARCH req. 10).
-            if let previous {
+            if let previous, replayAuthoredSettings {
                 setVisibility(visibilityManager.carriedOver(previous, toColumnCount: session.columnCount))
             } else {
                 setVisibility(visibilityManager.allVisible(columnCount: session.columnCount))
-                self.pendingHeaderShift = nil   // a fresh open never re-anchors to a prior toggle
+                self.columnUserSettings = [:]
+                if previous == nil { self.sessionLocale = .current }
+                if previous == nil { self.pendingHeaderShift = nil } // a fresh open never re-anchors
             }
 
             // Verification-only: pre-hide columns (comma-separated indices) so a
@@ -324,7 +418,7 @@ final class DocumentModel {
             self.lastVisibleCount = 40   // sensible default until the first geometry callback
             materialize(start: 0, count: GridMetrics.scrollBufferRows)
             self.columnWidths = Self.measureColumnWidths(
-                header: session.headerCells,
+                header: self.headerCells,
                 sample: window.rows,
                 columnCount: session.columnCount
             )
@@ -349,13 +443,48 @@ final class DocumentModel {
             // there is nothing left to cancel, only this leftover selection
             // state to clear.
             self.selection = nil
-            self.manualColumnWidths = [:]
+            if !replayAuthoredSettings {
+                self.manualColumnWidths = [:]
+                self.columnUserSettings = [:]
+            } else {
+                self.manualColumnWidths = authoredManualWidths
+                self.columnUserSettings = authoredSettings
+            }
             self.phase = .document
             startPolling()
         } catch {
-            self.phase = .failure(error, path: path)
+            if previous != nil, oldSession != nil {
+                self.session = oldSession
+                startPolling()
+            } else {
+                oldSession?.close()
+                self.session = nil
+                self.phase = .failure(error, path: path)
+            }
         }
         openGeneration += 1
+    }
+
+    /// Ordered decoded identities for the strict dialect/encoding re-open
+    /// check. This path runs only for an explicit Parsing change, never cold
+    /// open; the core copy itself stays in ABI-bounded batches.
+    private static func headerIdentities(_ session: any DocumentSession) -> [ColumnHeaderIdentity]? {
+        guard session.dialect.hasHeader else { return nil }
+        if let core = session as? CoreDocumentSession {
+            var identities = [ColumnHeaderIdentity]()
+            identities.reserveCapacity(session.columnCount)
+            var start = 0
+            while start < session.columnCount {
+                let end = min(session.columnCount, start + columnLabelSearchBatchMax)
+                let values = core.columnLabels((start..<end).map { UInt32($0) })
+                guard values.count == end - start else { return nil }
+                identities.append(contentsOf: values.map { $0 ?? ColumnHeaderIdentity(bytes: [], truncated: false) })
+                start = end
+            }
+            return identities
+        }
+        guard let headers = session.headerCells, headers.count == session.columnCount else { return nil }
+        return headers.map { ColumnHeaderIdentity(bytes: Array($0.utf8), truncated: false) }
     }
 
     /// Re-open the current document with one dialect parameter changed
@@ -570,8 +699,119 @@ final class DocumentModel {
         guard let session else { return }
         desiredStart = start
         desiredCount = count
-        window = session.setWindow(firstRow: start, rowCount: count, columns: columnFetchRange())
+        let columns = columnFetchRange()
+        window = session.setWindow(firstRow: start, rowCount: count, columns: columns)
+        refreshWindowLabels(columns: columns)
         growColumnWidthsToFitWindow()
+    }
+
+    /// Refreshes only the buffered horizontal label window. The core ABI caps
+    /// a call at 1024 IDs, so unusually large viewports are split into bounded
+    /// batches while the retained cache remains O(the fetch window).
+    private func refreshWindowLabels(columns: Range<Int>) {
+        guard let core = session as? CoreDocumentSession else { return }
+        var labels: [Int: String] = [:]
+        var truncatedLabels: Set<Int> = []
+        var metadata: [Int: ColumnMetadata] = [:]
+        labels.reserveCapacity(columns.count)
+        metadata.reserveCapacity(columns.count)
+        var start = columns.lowerBound
+        while start < columns.upperBound {
+            let end = min(columns.upperBound, start + columnLabelSearchBatchMax)
+            let ids = (start..<end).map { UInt32($0) }
+            let values = dialect.hasHeader ? core.columnLabels(ids) : Array(repeating: nil, count: ids.count)
+            let snapshots = core.columnMetadata(ids)
+            for (offset, value) in values.enumerated() {
+                guard let value, !value.bytes.isEmpty else { continue }
+                labels[start + offset] = String(decoding: value.bytes, as: UTF8.self)
+                if value.truncated { truncatedLabels.insert(start + offset) }
+            }
+            for snapshot in snapshots { metadata[snapshot.column] = snapshot }
+            start = end
+        }
+        windowColumnLabels = labels
+        windowTruncatedLabels = truncatedLabels
+        windowColumnMetadata = metadata
+        gridInferenceIDs = columns.prefix(columnLabelSearchBatchMax).compactMap(UInt32.init(exactly:))
+        requestCoordinatedInference(core)
+        columnPresentationRevision += 1
+    }
+
+    /// Declares the panel's layout-bounded viewport+overscan ID set. Label and
+    /// metadata copies happen off-main and replace the prior bounded cache.
+    func updatePanelViewport(_ ids: [UInt32]) {
+        let bounded = Array(ids.prefix(columnLabelSearchBatchMax))
+        guard bounded != panelInferenceIDs else { return }
+        panelInferenceIDs = bounded
+        let retained = Set(bounded.map(Int.init))
+        panelLabels = panelLabels.filter { retained.contains($0.key) }
+        panelMetadata = panelMetadata.filter { retained.contains($0.key) }
+        panelFetchTask?.cancel()
+        guard let core = session as? CoreDocumentSession, !bounded.isEmpty else {
+            requestCoordinatedInference(core: session as? CoreDocumentSession)
+            columnPanelRevision += 1
+            return
+        }
+        requestCoordinatedInference(core)
+        startPolling()
+        panelFetchTask = Task { [weak self] in
+            let snapshot = await Task.detached(priority: .userInitiated) {
+                (core.columnLabels(bounded), core.columnMetadata(bounded))
+            }.value
+            guard let self, !Task.isCancelled, self.panelInferenceIDs == bounded else { return }
+            var labels: [Int: PanelColumnLabel] = [:]
+            for (offset, id) in bounded.enumerated() {
+                guard offset < snapshot.0.count, let value = snapshot.0[offset], !value.bytes.isEmpty else { continue }
+                labels[Int(id)] = PanelColumnLabel(text: String(decoding: value.bytes, as: UTF8.self),
+                                                   truncated: value.truncated)
+            }
+            self.panelLabels = labels
+            self.panelMetadata = Dictionary(uniqueKeysWithValues: snapshot.1.map { ($0.column, $0) })
+            self.columnPanelRevision += 1
+        }
+    }
+
+    func setPanelSelection(_ column: Int?) {
+        panelSelectedColumn = column.flatMap(UInt32.init(exactly:))
+        guard let core = session as? CoreDocumentSession else { return }
+        requestCoordinatedInference(core)
+        startPolling()
+    }
+
+    func closeColumnPanel() {
+        panelFetchTask?.cancel()
+        panelFetchTask = nil
+        panelInferenceIDs = []
+        panelSelectedColumn = nil
+        panelLabels = [:]
+        panelMetadata = [:]
+        requestCoordinatedInference(core: session as? CoreDocumentSession)
+        if !gridInferenceIDs.isEmpty { startPolling() }
+    }
+
+    private func coordinatedInferenceIDs() -> [UInt32] {
+        // Panel rows are the actively inspected viewport and must never be
+        // starved by a very wide grid window consuming the ABI's 1024-ID cap.
+        // The selected inspector column is first, then panel viewport, then
+        // the grid fills the remaining bounded slots.
+        var ids = panelSelectedColumn.map { [$0] } ?? []
+        for id in panelInferenceIDs where !ids.contains(id) && ids.count < columnLabelSearchBatchMax {
+            ids.append(id)
+        }
+        for id in gridInferenceIDs where !ids.contains(id) && ids.count < columnLabelSearchBatchMax {
+            ids.append(id)
+        }
+        return ids
+    }
+
+    private func requestCoordinatedInference(_ core: CoreDocumentSession) {
+        let ids = coordinatedInferenceIDs()
+        if !ids.isEmpty { _ = core.requestColumnInference(ids) }
+    }
+
+    private func requestCoordinatedInference(core: CoreDocumentSession?) {
+        guard let core else { return }
+        requestCoordinatedInference(core)
     }
 
     private var desiredWindow: DesiredWindow {
@@ -594,13 +834,14 @@ final class DocumentModel {
     /// columns, NEVER `columnCount` — so this stays cheap however wide the
     /// document is; called on every materialize (vertical scroll/jump) AND
     /// every horizontal-window change (`horizontalViewportChanged`), so a
-    /// column gets its first accurate refine the moment it is revealed either
-    /// way (a viewport-fitting file's columns are ALL in the window from the
-    /// first layout, so they refine immediately — identical to an unwindowed
-    /// measurement; ARCH AC4). The header label is measured here too — the
-    /// cheap open-time estimate (`measureColumnWidths`) never touches it —
-    /// so a revealed column's header gets the same accurate treatment its
-    /// body cells do. A cell the core already clipped — display-TRUNCATED
+    /// column gets an accurate body-cell refine when it is revealed either
+    /// way. Header contribution is refined only before the first frame: the
+    /// initial viewport receives exact header sizing, while an off-window
+    /// column keeps its deterministic open-time width when later revealed.
+    /// That avoids both an O(all-columns) header preflight on cold-open and a
+    /// visible header-driven width jump during horizontal reveal. Explicit
+    /// auto-fit/configuration can still intentionally remeasure one column.
+    /// A cell the core already clipped — display-TRUNCATED
     /// (`RowWindow.truncated`), or any cell of an OVERSIZED row
     /// (`RowWindow.oversized`, ARCH-huge-row-budget) — is excluded from the
     /// measurement: it isn't the cell's real content, just a cut prefix, so
@@ -630,6 +871,7 @@ final class DocumentModel {
 
         let bodyFont = NSFont.monospacedSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
         let headFont = NSFont.systemFont(ofSize: NSFont.systemFontSize, weight: .semibold)
+        let refineHeaderWidths = markedGeneration != openGeneration
         // Keyed by VISIBLE POSITION (an index into `cachedLayoutWidths`, the
         // SAME array `horizontalViewportChanged` feeds `ColumnLayouting.
         // window`) rather than absolute column index — `grown` doesn't care
@@ -648,7 +890,7 @@ final class DocumentModel {
             // exactly as the user set them until they clear/auto-fit it.
             guard manualColumnWidths[c] == nil else { continue }
             let rel = c - base
-            var w = Self.textWidth(columnLabel(c), headFont)
+            var w = refineHeaderWidths ? Self.textWidth(columnLabel(c), headFont) : 0
             for r in lo..<hi {
                 let idx = r - start
                 if idx < window.oversized.count, window.oversized[idx] { continue }
@@ -885,6 +1127,11 @@ final class DocumentModel {
         windowColumns().map { columnLabel($0) }
     }
 
+    /// Header-label truncation flags parallel to `windowHeaderLabels`.
+    func windowHeaderTruncated() -> [Bool] {
+        windowColumns().map { windowTruncatedLabels.contains($0) }
+    }
+
     /// Absolute column indices of the current column window, in render
     /// order — PARALLEL to `windowWidths()`/`windowHeaderLabels()`: the
     /// click→cell mapping's column half (ARCH-select-copy). Position `i`
@@ -896,7 +1143,90 @@ final class DocumentModel {
     /// Column-window cells for a data row, empty-padded while not yet loaded
     /// — the window-bound analog of `visibleBodyCells`.
     func windowBodyCells(forRow row: Int) -> [String] {
-        cellsAt(windowColumns(), forRow: row)
+        windowCellPresentations(forRow: row).map(\.text)
+    }
+
+    func windowCellPresentations(forRow row: Int) -> [WindowCellPresentation] {
+        let columns = windowColumns()
+        let raw = cellsAt(columns, forRow: row)
+        let truncated = truncatedAt(columns, forRow: row)
+        let rowIsOversized = rowOversized(forRow: row)
+        let formatter = ColumnDisplayFormatter()
+        return columns.enumerated().map { offset, column in
+            let source = offset < raw.count ? raw[offset] : ""
+            guard !rowIsOversized, !(offset < truncated.count && truncated[offset]),
+                  let metadata = windowColumnMetadata[column] else {
+                return WindowCellPresentation(text: source, formatUnavailable: false, conflict: false)
+            }
+            let settings = userSettings(for: column)
+            if let sentinel = settings.nullSentinel, sentinel == Array(source.utf8) {
+                return WindowCellPresentation(text: source, formatUnavailable: false, conflict: false)
+            }
+            let outcome = formatter.display(raw: source, type: metadata.effective,
+                                            options: settings.format, locale: sessionLocale)
+            let unavailable: Bool
+            if case .formatUnavailable = outcome { unavailable = true } else { unavailable = false }
+            return WindowCellPresentation(
+                text: outcome.text, formatUnavailable: unavailable,
+                conflict: Self.cellConflicts(source, type: metadata.effective, formatter: formatter)
+            )
+        }
+    }
+
+    /// Targeted counterpart used by a direct column-config redraw. It reads
+    /// and formats one logical column only, preserving the same raw/truncated/
+    /// oversized/null/conflict rules as the vector helper above.
+    func windowCellPresentation(forRow row: Int, column: Int) -> WindowCellPresentation {
+        let source = cellsAt([column], forRow: row).first ?? ""
+        let isTruncated = truncatedAt([column], forRow: row).first ?? false
+        guard !rowOversized(forRow: row), !isTruncated,
+              let metadata = windowColumnMetadata[column] else {
+            return WindowCellPresentation(text: source, formatUnavailable: false, conflict: false)
+        }
+        let settings = userSettings(for: column)
+        if let sentinel = settings.nullSentinel, sentinel == Array(source.utf8) {
+            return WindowCellPresentation(text: source, formatUnavailable: false, conflict: false)
+        }
+        let formatter = ColumnDisplayFormatter()
+        let outcome = formatter.display(raw: source, type: metadata.effective,
+                                        options: settings.format, locale: sessionLocale)
+        let unavailable: Bool
+        if case .formatUnavailable = outcome { unavailable = true } else { unavailable = false }
+        return WindowCellPresentation(
+            text: outcome.text, formatUnavailable: unavailable,
+            conflict: Self.cellConflicts(source, type: metadata.effective, formatter: formatter)
+        )
+    }
+
+    private static func cellConflicts(_ raw: String, type: ColumnType,
+                                      formatter: ColumnDisplayFormatter) -> Bool {
+        guard !raw.isEmpty else { return false }
+        switch type.kind {
+        case .unknown, .unsupported, .text: return false
+        case .boolean: return formatter.strictKind(of: raw) != .boolean
+        case .integer: return formatter.strictKind(of: raw) != .integer
+        case .decimal:
+            let kind = formatter.strictKind(of: raw)
+            return kind != .integer && kind != .decimal
+        case .date: return formatter.strictKind(of: raw) != .date
+        case .datetime:
+            let expected: ColumnScalarKind = type.datetimeSemantics == .zoned ? .datetimeZoned : .datetimeNaive
+            return formatter.strictKind(of: raw) != expected
+        }
+    }
+
+    func windowColumnAlignments() -> [ColumnTextAlignment] {
+        let rules = ColumnAlignmentRules()
+        return windowColumns().map { column in
+            rules.alignment(for: windowColumnMetadata[column]?.effective.kind ?? .unknown, isConflict: false)
+        }
+    }
+
+    func columnAlignment(_ column: Int) -> ColumnTextAlignment {
+        ColumnAlignmentRules().alignment(
+            for: windowColumnMetadata[column]?.effective.kind ?? .unknown,
+            isConflict: false
+        )
     }
 
     /// Column-window truncation flags for a data row — the window-bound
@@ -1222,6 +1552,9 @@ final class DocumentModel {
         manualColumnWidths = columnSizer.resized(
             manual: manualColumnWidths, column: column, to: width, minWidth: Double(GridMetrics.minColumnWidth)
         )
+        var settings = userSettings(for: column)
+        settings.manualWidth = manualColumnWidths[column]
+        storeColumnSettings(settings, column: column)
         syncEffectiveWidthCache(column: column, windowIndex: windowIndex, previous: previous)
     }
 
@@ -1241,6 +1574,9 @@ final class DocumentModel {
         )
         manualColumnWidths = columnSizer.cleared(manual: manualColumnWidths, column: column)
         if column < columnWidths.count { columnWidths[column] = CGFloat(fitted) }
+        var settings = userSettings(for: column)
+        settings.manualWidth = nil
+        storeColumnSettings(settings, column: column)
         syncEffectiveWidthCache(column: column, windowIndex: windowIndex, previous: previous)
     }
 
@@ -1282,6 +1618,7 @@ final class DocumentModel {
         guard lo < hi else { return widths }
         let rel = column - window.firstColumn
         guard rel >= 0 else { return widths }
+        let visibleOffset = windowColumns().firstIndex(of: column)
 
         for r in lo..<hi {
             let idx = r - start
@@ -1289,7 +1626,14 @@ final class DocumentModel {
             let row = window.rows[idx]
             guard rel < row.count else { continue }
             if idx < window.truncated.count, rel < window.truncated[idx].count, window.truncated[idx][rel] { continue }
-            widths.append(Double(Self.textWidth(row[rel], bodyFont) + padding))
+            let displayed: String
+            if let visibleOffset {
+                let presentation = windowCellPresentations(forRow: r)
+                displayed = visibleOffset < presentation.count ? presentation[visibleOffset].text : row[rel]
+            } else {
+                displayed = row[rel]
+            }
+            widths.append(Double(Self.textWidth(displayed, bodyFont) + padding))
         }
         return widths
     }
@@ -1306,6 +1650,165 @@ final class DocumentModel {
 
     func toggleColumn(_ column: Int) {
         setVisibility(visibilityManager.toggling(visibility, column: column))
+        var settings = columnUserSettings[column] ?? .default
+        settings.hidden = visibility.isHidden(column)
+        storeColumnSettings(settings, column: column)
+    }
+
+    func showAllColumns() {
+        setVisibility(visibilityManager.allVisible(columnCount: columnCount))
+        for column in Array(columnUserSettings.keys) {
+            var settings = columnUserSettings[column] ?? .default
+            settings.hidden = false
+            storeColumnSettings(settings, column: column)
+        }
+        columnPresentationRevision += 1
+    }
+
+    func presentColumnPanel(selecting column: Int? = nil) {
+        columnPanelSelection = column
+        columnPanelPresented = true
+    }
+
+    func columnPanelCore() -> CoreDocumentSession? { session as? CoreDocumentSession }
+
+    func userSettings(for column: Int) -> ColumnUserSettings {
+        columnUserSettings[column] ?? .default
+    }
+
+    func panelLabel(for column: Int) -> PanelColumnLabel {
+        panelLabels[column] ?? PanelColumnLabel(text: columnLabel(column),
+                                                truncated: windowTruncatedLabels.contains(column))
+    }
+
+    func metadata(for column: Int) -> ColumnMetadata? {
+        panelMetadata[column] ?? windowColumnMetadata[column]
+    }
+
+    func panelColumnHasFormatUnavailable(_ column: Int) -> Bool {
+        let columns = windowColumns()
+        guard let offset = columns.firstIndex(of: column) else { return false }
+        let start = Int(window.firstRow)
+        for row in start..<(start + window.rows.count) {
+            let presentations = windowCellPresentations(forRow: row)
+            if offset < presentations.count, presentations[offset].formatUnavailable { return true }
+        }
+        return false
+    }
+
+    func columnWidth(_ column: Int) -> Double { Double(effectiveWidth(column)) }
+
+    func setPanelColumnWidth(_ width: Double, column: Int) {
+        guard column >= 0, column < columnCount else { return }
+        manualColumnWidths[column] = max(width, Double(GridMetrics.minColumnWidth))
+        var settings = userSettings(for: column)
+        settings.manualWidth = manualColumnWidths[column]
+        storeColumnSettings(settings, column: column)
+        markLayoutWidthsStale()
+        columnWidthRevision += 1
+        columnPanelRevision += 1
+    }
+
+    func autoFitPanelColumn(_ column: Int) {
+        guard column >= 0, column < columnCount else { return }
+        let fitted = columnSizer.autoFit(
+            contentWidths: measuredContentWidths(forColumn: column),
+            minWidth: Double(GridMetrics.minColumnWidth), maxWidth: Double(GridMetrics.maxColumnWidth)
+        )
+        manualColumnWidths = columnSizer.cleared(manual: manualColumnWidths, column: column)
+        columnWidths[column] = CGFloat(fitted)
+        var settings = userSettings(for: column)
+        settings.manualWidth = nil
+        storeColumnSettings(settings, column: column)
+        markLayoutWidthsStale()
+        columnWidthRevision += 1
+        columnPanelRevision += 1
+    }
+
+    func setColumnOverride(_ type: ColumnType?, column: Int) {
+        guard let id = UInt32(exactly: column), let core = session as? CoreDocumentSession,
+              core.setColumnOverride(type, column: id) else { return }
+        var settings = userSettings(for: column)
+        settings.overrideType = type
+        storeColumnSettings(settings, column: column)
+        refreshAfterColumnConfiguration(column, remeasure: true)
+    }
+
+    func setColumnNullSentinel(_ sentinel: String?, column: Int) {
+        let bytes = sentinel.map { Array($0.utf8) }
+        guard bytes?.count ?? 0 <= 256, let id = UInt32(exactly: column),
+              let core = session as? CoreDocumentSession,
+              core.setColumnNullSentinel(bytes, column: id) else { return }
+        var settings = userSettings(for: column)
+        settings.nullSentinel = bytes
+        storeColumnSettings(settings, column: column)
+        refreshAfterColumnConfiguration(column, remeasure: true)
+    }
+
+    func setColumnFormat(_ format: ColumnFormatOptions, column: Int) {
+        var settings = userSettings(for: column)
+        settings.format = format
+        storeColumnSettings(settings, column: column)
+        refreshAfterColumnConfiguration(column, remeasure: true)
+    }
+
+    private func refreshAfterColumnConfiguration(_ column: Int, remeasure: Bool) {
+        if let id = UInt32(exactly: column), let core = session as? CoreDocumentSession {
+            if let metadata = core.columnMetadata([id]).first {
+                if windowColumnMetadata[column] != nil { windowColumnMetadata[column] = metadata }
+                if panelMetadata[column] != nil { panelMetadata[column] = metadata }
+            }
+            requestCoordinatedInference(core)
+        }
+        if remeasure { remeasureConfiguredColumn(column) }
+        requestColumnConfigurationRedraw([column])
+        startPolling()
+    }
+
+    /// Bounded revision log for targeted logical-column redraws. A consumer
+    /// that falls more than 32 batches behind receives `nil` and must perform
+    /// a conservative global refresh; the normal direct-edit path carries one
+    /// column from the inspector to the grid without an all-window revision.
+    private func requestColumnConfigurationRedraw(_ columns: Set<Int>) {
+        guard !columns.isEmpty else { return }
+        columnConfigurationRevision += 1
+        columnConfigurationEvents.append(ColumnConfigurationEvent(
+            revision: columnConfigurationRevision, columns: columns
+        ))
+        if columnConfigurationEvents.count > 32 {
+            columnConfigurationEvents.removeFirst(columnConfigurationEvents.count - 32)
+        }
+    }
+
+    func columnConfigurationChanges(after revision: Int) -> (revision: Int, columns: Set<Int>?) {
+        guard revision != columnConfigurationRevision else {
+            return (columnConfigurationRevision, [])
+        }
+        guard let first = columnConfigurationEvents.first,
+              revision >= first.revision - 1 else {
+            return (columnConfigurationRevision, nil)
+        }
+        var columns = Set<Int>()
+        for event in columnConfigurationEvents where event.revision > revision {
+            columns.formUnion(event.columns)
+        }
+        return (columnConfigurationRevision, columns)
+    }
+
+    private func remeasureConfiguredColumn(_ column: Int) {
+        guard manualColumnWidths[column] == nil, column >= 0, column < columnWidths.count else { return }
+        let candidate = measuredContentWidths(forColumn: column).max() ?? Double(columnWidths[column])
+        let grown = min(max(CGFloat(candidate), columnWidths[column]), GridMetrics.maxColumnWidth)
+        if grown > columnWidths[column] {
+            columnWidths[column] = grown
+            markLayoutWidthsStale()
+            columnWidthRevision += 1
+        }
+    }
+
+    private func storeColumnSettings(_ settings: ColumnUserSettings, column: Int) {
+        if settings.isDefault { columnUserSettings.removeValue(forKey: column) }
+        else { columnUserSettings[column] = settings }
     }
 
     /// Assigns `visibility` and its memoized `visibleColumns` in lockstep —
@@ -1320,6 +1823,7 @@ final class DocumentModel {
     /// The label for a column (effective header name, else generic A/B/C…),
     /// used by the grid header and the Settings checkboxes.
     func columnLabel(_ column: Int) -> String {
+        if let label = windowColumnLabels[column], !label.isEmpty { return label }
         if let headerCells, column < headerCells.count, !headerCells[column].isEmpty {
             return headerCells[column]
         }
@@ -1619,7 +2123,7 @@ final class DocumentModel {
     /// (ARCH-column-windowing): O(column window), never O(visible columns).
     func windowCellHighlights(forRow row: Int) -> [SheetCellHighlight] {
         let cols = windowColumns()
-        return highlights(forRow: row, over: cols, cells: windowBodyCells(forRow: row))
+        return highlights(forRow: row, over: cols, cells: cellsAt(cols, forRow: row))
     }
 
     /// Shared highlight derivation over an explicit (absolute-indexed) column
@@ -1871,6 +2375,8 @@ final class DocumentModel {
         snapshot.path = live.path
         snapshot.columnCount = live.columnCount
         snapshot.headerCells = live.headerCells
+        snapshot.windowColumnLabels = live.windowColumnLabels
+        snapshot.windowColumnMetadata = live.windowColumnMetadata
         snapshot.dialect = live.dialect
         snapshot.columnWidths = live.columnWidths
         snapshot.window = live.window
@@ -1913,7 +2419,11 @@ final class DocumentModel {
                 let js = session.jumpStatus()
                 let ss = session.searchStatus()
                 let fs = session.filterStatus()
-                let keepGoing = await self?.applyPoll(rowCount: rc, progress: ip, jump: js, search: ss, filter: fs) ?? false
+                let columns = (session as? CoreDocumentSession)?.columnInferenceState()
+                let columnProgress = (session as? CoreDocumentSession)?.columnInferenceProgress()
+                let keepGoing = await self?.applyPoll(rowCount: rc, progress: ip, jump: js, search: ss,
+                                                       filter: fs, columns: columns,
+                                                       columnProgress: columnProgress) ?? false
                 if !keepGoing { break }
                 try? await Task.sleep(for: .milliseconds(100))
             }
@@ -1925,13 +2435,35 @@ final class DocumentModel {
     /// index, a jump, a search, nor a filter-scan is active, so idle documents
     /// cost nothing).
     private func applyPoll(
-        rowCount: RowCountInfo, progress: ScanProgress, jump: JumpStatus, search: SearchSnapshot?, filter: FilterSnapshot?
+        rowCount: RowCountInfo, progress: ScanProgress, jump: JumpStatus, search: SearchSnapshot?, filter: FilterSnapshot?,
+        columns: (active: Bool, generation: UInt64)?, columnProgress: Double?
     ) -> Bool {
         rowCountInfo = rowCount
         indexProgress = progress
         filterSnapshot = filter
+        columnInferenceProgress = columnProgress
         foldJump(jump)
         foldSearch(search)
+        if let columns, columns.generation != columnMetadataGeneration,
+           let core = session as? CoreDocumentSession {
+            columnMetadataGeneration = columns.generation
+            var changedColumns = Set<Int>()
+            for metadata in core.columnMetadata(coordinatedInferenceIDs()) {
+                if gridInferenceIDs.contains(UInt32(metadata.column)) {
+                    if windowColumnMetadata[metadata.column] != metadata {
+                        changedColumns.insert(metadata.column)
+                    }
+                    windowColumnMetadata[metadata.column] = metadata
+                }
+                if panelInferenceIDs.contains(UInt32(metadata.column)) || panelSelectedColumn == UInt32(metadata.column) {
+                    if panelMetadata[metadata.column] != metadata {
+                        changedColumns.insert(metadata.column)
+                    }
+                    panelMetadata[metadata.column] = metadata
+                }
+            }
+            requestColumnConfigurationRedraw(changedColumns)
+        }
 
         let filterOngoing = filter.map { !$0.totalIsFinal } ?? false
         let jumpScanning: Bool = { if case .scanning = jumpFlow { return true } else { return false } }()
@@ -1946,7 +2478,7 @@ final class DocumentModel {
             materialize(start: desiredStart, count: desiredCount)
         }
 
-        return decision.continuePolling
+        return decision.continuePolling || (columns?.active ?? false)
     }
 
     /// A search still needs polling while its match-scan runs or a navigation

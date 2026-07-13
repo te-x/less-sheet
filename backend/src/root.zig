@@ -441,7 +441,9 @@ pub export fn ls_index_poll(doc: *const api.Doc) callconv(.c) api.ScanProgress {
 /// display-capped to LS_CELL_MAX_BYTES (requirement 8).
 pub export fn ls_window_set(doc: *api.Doc, first_row: u64, row_count: u32) callconv(.c) api.RowRange {
     const d: *Document = @ptrCast(@alignCast(doc));
-    return window.windowSet(d, first_row, row_count);
+    const result = window.windowSet(d, first_row, row_count);
+    column.windowMaterialized(d);
+    return result;
 }
 
 /// See api/lesssheet.h `ls_cell`. Zero allocation; total function.

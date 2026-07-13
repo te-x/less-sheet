@@ -80,10 +80,7 @@ struct SettingsView: View {
 
             if model.columnCount > 0 {
                 Section("Columns") {
-                    ForEach(0..<model.columnCount, id: \.self) { column in
-                        Toggle(model.columnLabel(column), isOn: visibilityBinding(column))
-                            .disabled(isLastVisible(column))
-                    }
+                    Button("Configure Columns…") { model.presentColumnPanel() }
                 }
             }
         }
@@ -202,18 +199,4 @@ struct SettingsView: View {
         return q
     }
 
-    // MARK: Column visibility
-
-    private func visibilityBinding(_ column: Int) -> Binding<Bool> {
-        Binding(
-            get: { !model.visibility.isHidden(column) },
-            set: { _ in model.toggleColumn(column) }
-        )
-    }
-
-    /// The last visible column's checkbox is disabled — it is checked (visible)
-    /// but cannot be hidden.
-    private func isLastVisible(_ column: Int) -> Bool {
-        !model.visibility.isHidden(column) && !model.canHide(column)
-    }
 }

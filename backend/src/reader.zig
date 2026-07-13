@@ -39,6 +39,29 @@ pub const BoundsResult = struct { next: Pos, capped: bool };
 pub const MaterializeResult = struct { next: Pos, capped: bool };
 pub const CellResult = struct { len: usize, truncated: bool };
 pub const ScanRowsResult = struct { next: Pos, rows: u64, eof: bool };
+pub const SelectedStep = csv_reader.SelectedStep;
+
+pub const SelectedScanner = union(enum) {
+    csv: csv_reader.SelectedScanner,
+
+    pub fn deinit(self: *SelectedScanner) void {
+        switch (self.*) {
+            .csv => |*scanner| scanner.deinit(),
+        }
+    }
+
+    pub fn releaseLane(self: *SelectedScanner) void {
+        switch (self.*) {
+            .csv => |*scanner| scanner.releaseLane(),
+        }
+    }
+
+    pub fn step(self: *SelectedScanner, selected: []const u32, cap: usize, work_budget: u64, row_budget: u64, buf: *std.ArrayList(u8), refs: *std.ArrayList(CellRef), gpa: std.mem.Allocator) std.mem.Allocator.Error!SelectedStep {
+        return switch (self.*) {
+            .csv => |*scanner| scanner.step(selected, cap, work_budget, row_budget, buf, refs, gpa),
+        };
+    }
+};
 
 /// A pluggable format Reader. One tagged-union variant per format — CSV is
 /// the only member in this slice (see csv_reader.CsvReader). Every op takes
@@ -53,6 +76,12 @@ pub const ScanRowsResult = struct { next: Pos, rows: u64, eof: bool };
 /// window/index/nav hot-path cost (unchanged vs. calling `lexer` directly).
 pub const Reader = union(enum) {
     csv: csv_reader.CsvReader,
+
+    pub fn selectedScanner(self: Reader, source: Source, pos: Pos) SelectedScanner {
+        return switch (self) {
+            .csv => |r| .{ .csv = csv_reader.SelectedScanner.init(r, source, pos) },
+        };
+    }
 
     /// The position of the very first row (byte 0 of `source` for CSV).
     pub fn start(self: Reader, source: Source) Pos {
@@ -131,6 +160,24 @@ pub const Reader = union(enum) {
     ) std.mem.Allocator.Error!MaterializeResult {
         return switch (self) {
             .csv => |r| r.materialize(source, pos, want, cap, limit, buf, refs, gpa),
+        };
+    }
+
+    /// Decode only the strictly-increasing selected column IDs, sharing one
+    /// record scan and returning refs in selected-ID order.
+    pub fn materializeSelected(
+        self: Reader,
+        source: Source,
+        pos: Pos,
+        selected: []const u32,
+        cap: usize,
+        limit: ?Pos,
+        buf: *std.ArrayList(u8),
+        refs: *std.ArrayList(CellRef),
+        gpa: std.mem.Allocator,
+    ) std.mem.Allocator.Error!MaterializeResult {
+        return switch (self) {
+            .csv => |r| r.materializeSelected(source, pos, selected, cap, limit, buf, refs, gpa),
         };
     }
 

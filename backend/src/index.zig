@@ -15,6 +15,7 @@ const c = std.c;
 const base = @import("base.zig");
 const filter = @import("filter.zig");
 const search = @import("search.zig");
+const column = @import("column.zig");
 
 const Document = base.Document;
 const Checkpoint = base.Checkpoint;
@@ -106,7 +107,12 @@ pub fn workerMain(doc: *Document) void {
             doc.search_state == .done and doc.filter_total_exact;
         const do_filter = !do_jump and !do_search and !do_nav and
             (doc.filter_state == .scanning or (doc.filter_state == .cancelled and doc.auto));
-        const do_index = !do_jump and !do_search and !do_nav and !do_filter and doc.auto and !doc.complete;
+        // Column inference is deliberately behind every interactive scan
+        // owner, but ahead of the opportunistic AUTO frontier indexer. Its
+        // bounded sampler only re-reads the already-known head.
+        const do_column = !do_jump and !do_search and !do_nav and !do_filter and
+            doc.column_store.job_state == .queued;
+        const do_index = !do_jump and !do_search and !do_nav and !do_filter and !do_column and doc.auto and !doc.complete;
         const wanted_scan: base.MatchScanOwner = if (do_jump and doc.filter_state != .idle)
             .filter
         else if (do_search)
@@ -116,8 +122,19 @@ pub fn workerMain(doc: *Document) void {
         else
             .none;
         if (doc.match_scan_owner != wanted_scan) doc.endMatchScan();
-        if (!(do_jump or do_search or do_nav or do_filter or do_index)) {
+        if (!(do_jump or do_search or do_nav or do_filter or do_column or do_index)) {
             doc.waitWork();
+            continue;
+        }
+
+        if (do_column) {
+            column.workerRunLocked(doc);
+            // Every inference chunk hands the control mutex back before the
+            // worker arbitrates again, so cancel/poll and newly-arrived
+            // jump/Find/filter work take effect at this boundary.
+            doc.unlock();
+            std.Thread.yield() catch {};
+            doc.lock();
             continue;
         }
 
@@ -190,6 +207,7 @@ pub fn workerMain(doc: *Document) void {
             if (doc.filter_gen == gen and doc.jump_state == .scanning) {
                 filter.commitFilter(doc, res);
                 filter.resolveFilterJumpLocked(doc);
+                column.sourceCompletedLocked(doc);
             }
             const advanced = doc.reader.physicalBytes(doc.source, doc.frontier_pos);
             doc.unlock();
@@ -224,6 +242,7 @@ pub fn workerMain(doc: *Document) void {
             doc.lock();
             if (doc.filter_gen == gen and doc.filter_state == .scanning) {
                 filter.commitFilter(doc, res);
+                column.sourceCompletedLocked(doc);
             }
             const advanced = doc.reader.physicalBytes(doc.source, doc.frontier_pos);
             doc.unlock();
@@ -274,6 +293,7 @@ pub fn workerMain(doc: *Document) void {
             // the slot — counts freeze at the last committed chunk).
             if (doc.search_gen == gen and doc.search_state == .scanning) {
                 search.commitSearch(doc, res, filtered);
+                column.sourceCompletedLocked(doc);
                 search.resolveNavLocked(doc);
                 if (doc.search_state == .scanning and !doc.search_to_eof and !doc.nav_pending) {
                     // A nav-limited resume served its navigation before EOF.
@@ -311,6 +331,7 @@ pub fn workerMain(doc: *Document) void {
             doc.complete = true;
             doc.total_rows = doc.frontier_rows;
         }
+        column.sourceCompletedLocked(doc);
         if (doc.jump_state == .scanning) updateJump(doc);
         const advanced = doc.reader.physicalBytes(doc.source, doc.frontier_pos);
         doc.unlock();

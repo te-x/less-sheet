@@ -259,6 +259,9 @@ struct ContentView: View {
     var body: some View {
         content
             .background(WindowConfigurator(title: windowTitle))
+            .sheet(isPresented: $model.columnPanelPresented) {
+                ColumnConfigurationPanel(model: model)
+            }
     }
 
     @ViewBuilder

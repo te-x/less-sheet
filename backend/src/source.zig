@@ -571,6 +571,22 @@ pub const Cursor = struct {
         self.locked = false;
     }
 
+    /// A resumable background cursor must not retain a gzip lane across a
+    /// scheduler yield. Reacquisition happens off the document mutex on the
+    /// next step, after higher-priority foreground work has had its turn.
+    pub fn releaseLane(self: *Cursor) void {
+        self.deinit();
+    }
+
+    pub fn resumeLane(self: *Cursor) void {
+        if (self.locked) return;
+        const source = self.source orelse return;
+        if (source == .mmap) return;
+        const logical = self.logical;
+        const limit = self.limit;
+        self.* = cursorAt(source, logical, limit, null);
+    }
+
     pub fn peek(self: *Cursor, n: usize) []const u8 {
         const max_n = @min(n, self.look.len);
         if (self.limit) |lim| if (self.logical >= lim) return self.look[0..0];

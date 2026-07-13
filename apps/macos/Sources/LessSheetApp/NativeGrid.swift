@@ -64,6 +64,9 @@ struct GridView: View {
         _ = model.isFiltered
         _ = model.visibleColumns
         _ = model.columnWidths
+        _ = model.columnPresentationRevision
+        _ = model.columnWidthRevision
+        _ = model.columnConfigurationRevision
         _ = model.selection
         return NativeGridRepresentable(model: model)
             .background(Color(nsColor: .textBackgroundColor))
@@ -120,6 +123,8 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
     // the SAME x a full, unwindowed draw would give it; ARCH AC4/AC5).
     private(set) var widths: [CGFloat] = []
     private(set) var headerLabels: [String] = []
+    private(set) var headerTruncated: [Bool] = []
+    private(set) var columnAlignments: [ColumnTextAlignment] = []
     /// Absolute column indices PARALLEL to `widths`/`headerLabels` (ARCH-
     /// select-copy): the click→cell mapping's column half — position `i`
     /// here is the SAME absolute column `widths[i]` is the width of.
@@ -139,6 +144,9 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
     private var lastRowCount = -1
     private var lastVisibleColumns: [Int] = []
     private var lastColumnWidths: [CGFloat] = []
+    private var lastColumnPresentationRevision = -1
+    private var lastColumnWidthRevision = -1
+    private var lastColumnConfigurationRevision = -1
     private var lastIsFiltered = false
     private var built = false
 
@@ -219,6 +227,9 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
         lastOpenGeneration = model.openGeneration
         lastVisibleColumns = model.visibleColumns
         lastColumnWidths = model.columnWidths
+        lastColumnPresentationRevision = model.columnPresentationRevision
+        lastColumnWidthRevision = model.columnWidthRevision
+        lastColumnConfigurationRevision = model.columnConfigurationRevision
         lastIsFiltered = model.isFiltered
         layoutContainer()
         table.reloadData()
@@ -386,8 +397,18 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
         model.horizontalViewportChanged(viewportX: clip.origin.x, viewportWidth: clip.width)
         widths = model.windowWidths()
         headerLabels = model.windowHeaderLabels()
+        headerTruncated = model.windowHeaderTruncated()
+        columnAlignments = model.windowColumnAlignments()
         absoluteColumns = model.windowAbsoluteColumns()
         columnFirstX = CGFloat(model.columnWindow.firstX)
+        let truncatedColumns = zip(absoluteColumns, headerTruncated).compactMap { column, truncated in
+            truncated ? "column \(column + 1) label truncated" : nil
+        }
+        header.setAccessibilityElement(true)
+        header.setAccessibilityRole(.group)
+        header.setAccessibilityLabel(truncatedColumns.isEmpty
+            ? "Column headers"
+            : "Column headers, \(truncatedColumns.joined(separator: ", "))")
         // The header's resize hit-zones (ARCH-select-copy AC5) sit at fixed
         // OFFSETS from this same geometry — AppKit does not re-derive cursor
         // rects on a mere content-offset/width change (only on a frame change
@@ -417,6 +438,9 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
             refreshLayoutMetrics()
             lastVisibleColumns = model.visibleColumns
             lastColumnWidths = model.columnWidths
+            lastColumnPresentationRevision = model.columnPresentationRevision
+            lastColumnWidthRevision = model.columnWidthRevision
+            lastColumnConfigurationRevision = model.columnConfigurationRevision
             layoutContainer()
             table.reloadData()
             lastRowCount = numberOfRows(in: table)
@@ -434,6 +458,44 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
             }
             refreshVisibleRows()
             return
+        }
+
+        let configurationChanges = model.columnConfigurationChanges(after: lastColumnConfigurationRevision)
+        if configurationChanges.revision != lastColumnConfigurationRevision {
+            lastColumnConfigurationRevision = configurationChanges.revision
+            let canTarget = configurationChanges.columns != nil
+                && model.columnPresentationRevision == lastColumnPresentationRevision
+                && model.visibleColumns == lastVisibleColumns
+                && model.isFiltered == lastIsFiltered
+                && numberOfRows(in: table) == lastRowCount
+                && model.pendingScrollRow == nil
+            if canTarget, let columns = configurationChanges.columns {
+                if model.columnWidthRevision != lastColumnWidthRevision {
+                    lastColumnWidthRevision = model.columnWidthRevision
+                    refreshConfiguredColumnWidths(columns)
+                    lastColumnWidths = model.columnWidths
+                } else {
+                    refreshConfiguredColumns(columns)
+                }
+                return
+            }
+            refreshColumnWindow()
+            header.needsDisplay = true
+        }
+
+        // Type/format/metadata changes can alter displayed text/alignment
+        // without changing structural arrays. Re-pull only the bounded
+        // horizontal window. A panel width edit additionally refreshes the
+        // document extent through the existing targeted width path.
+        if model.columnWidthRevision != lastColumnWidthRevision {
+            lastColumnWidthRevision = model.columnWidthRevision
+            lastColumnPresentationRevision = model.columnPresentationRevision
+            refreshAfterWidthChange()
+            lastColumnWidths = model.columnWidths
+        } else if model.columnPresentationRevision != lastColumnPresentationRevision {
+            lastColumnPresentationRevision = model.columnPresentationRevision
+            refreshColumnWindow()
+            header.needsDisplay = true
         }
 
         // Hidden-column reflow / width change: recompute strip + reload. Preserve
@@ -806,6 +868,96 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
         gutter.needsDisplay = true
     }
 
+    /// Recomputes only the configured logical column in each recycled row and
+    /// invalidates only that subcolumn's rectangle. There is one physical
+    /// NSTableColumn, so NSTableView's column-index reload API would reload the
+    /// whole custom row; this is the equivalent targeted path for our packed
+    /// logical columns.
+    private func refreshConfiguredColumns(_ columns: Set<Int>) {
+        let targets = absoluteColumns.enumerated().filter { columns.contains($0.element) }
+        guard !targets.isEmpty else { return }
+        for (index, column) in targets where columnAlignments.indices.contains(index) {
+            columnAlignments[index] = model.columnAlignment(column)
+        }
+        table.enumerateAvailableRowViews { rowView, row in
+            guard row < self.dataRowCount, let rv = rowView as? SheetRowView else { return }
+            for (index, column) in targets where rv.cells.indices.contains(index) {
+                let presentation = self.model.windowCellPresentation(forRow: row, column: column)
+                rv.cells[index] = presentation.text
+                if rv.formatUnavailable.indices.contains(index) {
+                    rv.formatUnavailable[index] = presentation.formatUnavailable
+                }
+                if rv.conflicts.indices.contains(index) { rv.conflicts[index] = presentation.conflict }
+                self.refreshAccessibilityWarning(rv, row: row, index: index)
+                let rect = self.logicalCellRect(index: index, height: rv.bounds.height)
+                rv.setNeedsDisplay(rect)
+            }
+            self.applyAccessibilityLabel(rv, row: row)
+        }
+    }
+
+    /// A one-column width remeasure can shift following pixels, but it does
+    /// not require recomputing their cell presentations. Refresh geometry,
+    /// update only the configured column's arrays, and invalidate the shifted
+    /// suffix. A rare horizontal-window boundary change falls back globally.
+    private func refreshConfiguredColumnWidths(_ columns: Set<Int>) {
+        let oldColumns = absoluteColumns
+        let oldFirstX = columnFirstX
+        let oldWidths = widths
+        refreshLayoutMetrics()
+        refreshColumnWindow()
+        refreshColumnWidth(site: "column-config")
+        guard absoluteColumns == oldColumns else {
+            table.reloadData()
+            refreshVisibleRows()
+            header.needsDisplay = true
+            return
+        }
+        refreshConfiguredColumns(columns)
+
+        // An upstream off-window width changes the exact prefix-sum origin
+        // while leaving the visible IDs untouched. In that case every visible
+        // cell moved, so repaint the shifted viewport (presentations remain
+        // reusable). Otherwise invalidate only from the first changed visible
+        // width; the common in-window edit therefore stays a suffix repaint.
+        if columnFirstX != oldFirstX {
+            invalidateVisibleGeometry()
+        } else if let firstChangedWidth = widths.indices.first(where: {
+            !oldWidths.indices.contains($0) || oldWidths[$0] != widths[$0]
+        }) {
+            invalidateVisibleGeometry(from: firstChangedWidth)
+        }
+    }
+
+    private func invalidateVisibleGeometry(from index: Int? = nil) {
+        table.enumerateAvailableRowViews { rowView, _ in
+            guard let index else {
+                rowView.setNeedsDisplay(rowView.bounds)
+                return
+            }
+            let rect = self.logicalCellRect(index: index, height: rowView.bounds.height)
+            rowView.setNeedsDisplay(NSRect(x: rect.minX, y: 0,
+                                           width: max(0, rowView.bounds.maxX - rect.minX),
+                                           height: rowView.bounds.height))
+        }
+        guard let index else {
+            header.setNeedsDisplay(header.bounds)
+            return
+        }
+        let rect = logicalCellRect(index: index, height: header.bounds.height)
+        let localX = rect.minX - header.contentOffsetX
+        header.setNeedsDisplay(NSRect(x: localX, y: 0,
+                                      width: max(0, header.bounds.maxX - localX),
+                                      height: header.bounds.height))
+    }
+
+    private func logicalCellRect(index: Int, height: CGFloat) -> NSRect {
+        var x = columnFirstX
+        if index > 0 { x += widths.prefix(index).reduce(0, +) }
+        let width = widths.indices.contains(index) ? widths[index] : 0
+        return NSRect(x: x, y: 0, width: width, height: height)
+    }
+
     private func configure(_ rv: SheetRowView, row: Int) {
         rv.controller = self
         if row < dataRowCount {
@@ -820,7 +972,10 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
             // Column-WINDOW bound (ARCH-column-windowing) — O(window), never
             // O(columnCount): the live grid only ever needs the columns it is
             // about to draw, unlike the eager dump grid (FrameDump).
-            rv.cells = model.windowBodyCells(forRow: row)
+            let presentations = model.windowCellPresentations(forRow: row)
+            rv.cells = presentations.map(\.text)
+            rv.formatUnavailable = presentations.map(\.formatUnavailable)
+            rv.conflicts = presentations.map(\.conflict)
             rv.truncated = model.windowBodyTruncated(forRow: row)
             rv.highlights = model.windowCellHighlights(forRow: row)
             rv.selectionMarks = model.windowSelectionMarks(forRow: row)
@@ -828,10 +983,35 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
             rv.isFiller = true
             rv.pending = false
             rv.cells = []
+            rv.formatUnavailable = []
+            rv.conflicts = []
             rv.truncated = []
             rv.highlights = []
             rv.selectionMarks = []
         }
+        rv.accessibilityWarnings.removeAll(keepingCapacity: true)
+        for index in rv.cells.indices { refreshAccessibilityWarning(rv, row: row, index: index) }
+        applyAccessibilityLabel(rv, row: row)
+    }
+
+    private func refreshAccessibilityWarning(_ rv: SheetRowView, row: Int, index: Int) {
+        var value = [String]()
+        if index < rv.truncated.count, rv.truncated[index] { value.append("value truncated") }
+        if index < rv.conflicts.count, rv.conflicts[index] { value.append("type conflict") }
+        if index < rv.formatUnavailable.count, rv.formatUnavailable[index] { value.append("format unavailable") }
+        guard !value.isEmpty else {
+            rv.accessibilityWarnings.removeValue(forKey: index)
+            return
+        }
+        let column = index < absoluteColumns.count ? absoluteColumns[index] + 1 : index + 1
+        rv.accessibilityWarnings[index] = "column \(column) \(value.joined(separator: ", "))"
+    }
+
+    private func applyAccessibilityLabel(_ rv: SheetRowView, row: Int) {
+        let states = rv.accessibilityWarnings.keys.sorted().compactMap { rv.accessibilityWarnings[$0] }
+        rv.setAccessibilityElement(true)
+        rv.setAccessibilityRole(.row)
+        rv.setAccessibilityLabel("Row \(row + 1)" + (states.isEmpty ? "" : ", \(states.joined(separator: ", "))"))
     }
 
     // MARK: Selection + copy + resize (ARCH-select-copy) — NSResponder mouse/
@@ -940,6 +1120,13 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
             model.selectWholeColumn(column)
         }
         refreshSelectionDisplay()
+    }
+
+    /// Header context-menu entry into the same per-session column panel used
+    /// by Settings, deep-linked to the clicked absolute column.
+    func configureColumnFromHeader(atX x: CGFloat) {
+        guard let index = windowColumnIndex(atX: x), index < absoluteColumns.count else { return }
+        model.presentColumnPanel(selecting: absoluteColumns[index])
     }
 
     /// Arrow / shift-arrow (via `SheetTableView`'s `NSStandardKeyBindingResponding`
@@ -1094,6 +1281,11 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
 final class SheetRowView: NSTableRowView {
     weak var controller: NativeGridController?
     var cells: [String] = []
+    /// Display-only warning states parallel to `cells`. They never alter raw
+    /// copy/find/filter values; the row paints and exposes them accessibly.
+    var formatUnavailable: [Bool] = []
+    var conflicts: [Bool] = []
+    var accessibilityWarnings: [Int: String] = [:]
     /// Per-cell display-truncation flags, PARALLEL to `cells` (ARCH req. 13/20;
     /// mirrors `RowWindow.truncated`). Drives `drawTruncationMarker` only — the
     /// core's flag is rendered as-is, never re-derived from measured text.
@@ -1141,6 +1333,10 @@ final class SheetRowView: NSTableRowView {
 
         for (i, w) in c.widths.enumerated() {
             let cell = NSRect(x: x, y: 0, width: w, height: h)
+            guard cell.intersects(dirtyRect) else {
+                x += w
+                continue
+            }
             let hl = i < highlights.count ? highlights[i] : .none
             switch hl {
             case .subtle: accent.withAlphaComponent(0.20).setFill(); cell.fill()
@@ -1156,13 +1352,28 @@ final class SheetRowView: NSTableRowView {
                 cell.fill()
             }
             if i < cells.count, !cells[i].isEmpty {
+                let alignment: NSTextAlignment
+                switch i < c.columnAlignments.count ? c.columnAlignments[i] : .leading {
+                case .leading: alignment = .left
+                case .center: alignment = .center
+                case .trailing: alignment = .right
+                }
                 SheetRowView.drawText(cells[i], in: cell.insetBy(dx: GridMetrics.cellHPadding, dy: 0),
-                                      font: SheetRowView.font, color: .labelColor, alignment: .left)
+                                      font: SheetRowView.font, color: .labelColor, alignment: alignment)
             } else if pending {
                 SheetRowView.drawPendingPlaceholder(in: cell)
             }
             if i < truncated.count, truncated[i] {
                 SheetRowView.drawTruncationMarker(in: cell)
+            }
+            if i < formatUnavailable.count, formatUnavailable[i] {
+                SheetRowView.drawStatusMarker(symbol: "number.circle", description: "Format unavailable",
+                                              in: cell, trailingSlot: 0)
+            }
+            if i < conflicts.count, conflicts[i] {
+                SheetRowView.drawStatusMarker(symbol: "exclamationmark.triangle", description: "Type conflict",
+                                              in: cell, trailingSlot: formatUnavailable.indices.contains(i)
+                                                && formatUnavailable[i] ? 1 : 0)
             }
             if hl == .strong {
                 accent.setStroke()
@@ -1180,10 +1391,12 @@ final class SheetRowView: NSTableRowView {
         grid.setFill()
         for _ in 0..<c.fillerColumns {
             x += GridMetrics.fillerColumnWidth
-            NSRect(x: x - NativeGrid.hairline, y: 0, width: NativeGrid.hairline, height: h).fill()
+            let line = NSRect(x: x - NativeGrid.hairline, y: 0, width: NativeGrid.hairline, height: h)
+            if line.intersects(dirtyRect) { line.fill() }
         }
         // Full-width bottom hairline (data -> filler seam is continuous).
-        NSRect(x: 0, y: h - NativeGrid.hairline, width: bounds.width, height: NativeGrid.hairline).fill()
+        NSRect(x: dirtyRect.minX, y: h - NativeGrid.hairline,
+               width: dirtyRect.width, height: NativeGrid.hairline).fill()
     }
 
     /// A truncated cell's indicator (ARCH req. 13/20): a subtle dot inset from
@@ -1200,6 +1413,18 @@ final class SheetRowView: NSTableRowView {
                          width: diameter, height: diameter)
         NSColor.secondaryLabelColor.withAlphaComponent(0.6).setFill()
         NSBezierPath(ovalIn: dot).fill()
+    }
+
+    /// Non-colour-only warning glyph used for formatting fallback/conflicts.
+    static func drawStatusMarker(symbol: String, description: String, in cell: NSRect, trailingSlot: Int) {
+        guard cell.width >= 22,
+              let image = NSImage(systemSymbolName: symbol, accessibilityDescription: description) else { return }
+        image.isTemplate = true
+        let size: CGFloat = 12
+        let x = cell.maxX - 10 - size - CGFloat(trailingSlot) * (size + 3)
+        image.draw(in: NSRect(x: x, y: cell.midY - size / 2, width: size, height: size),
+                   from: .zero, operation: .sourceOver, fraction: 0.75,
+                   respectFlipped: true, hints: nil)
     }
 
     /// The selection RANGE border (ARCH-select-copy AC1): strokes only the
@@ -1383,6 +1608,23 @@ final class GridHeaderView: NSView {
         handleClick(atLocalX: point.x, doubleClick: event.clickCount >= 2, shift: event.modifierFlags.contains(.shift))
     }
 
+    override func menu(for event: NSEvent) -> NSMenu? {
+        let point = convert(event.locationInWindow, from: nil)
+        guard let c = controller else { return nil }
+        let menu = NSMenu(title: "Column")
+        let item = NSMenuItem(title: "Configure Column…", action: #selector(configureColumn(_:)), keyEquivalent: "")
+        item.target = self
+        item.representedObject = point.x + contentOffsetX
+        menu.addItem(item)
+        c.container.window?.makeFirstResponder(self)
+        return menu
+    }
+
+    @objc private func configureColumn(_ sender: NSMenuItem) {
+        guard let x = sender.representedObject as? CGFloat else { return }
+        controller?.configureColumnFromHeader(atX: x)
+    }
+
     /// The resize-vs-select dispatch `mouseDown(with:)` performs, factored out
     /// so it is directly callable with a known HEADER-LOCAL x — no synthetic
     /// `NSEvent` (mirrors how `NativeGridController.headerMouseDown`/
@@ -1450,6 +1692,9 @@ final class GridHeaderView: NSView {
                 SheetRowView.drawText(c.headerLabels[i], in: cell.insetBy(dx: GridMetrics.cellHPadding, dy: 0),
                                       font: .systemFont(ofSize: NSFont.systemFontSize), color: .labelColor,
                                       alignment: .left, weight: .semibold)
+            }
+            if i < c.headerTruncated.count, c.headerTruncated[i] {
+                SheetRowView.drawTruncationMarker(in: cell)
             }
             grid.setFill()
             NSRect(x: x + w - NativeGrid.hairline, y: 0, width: NativeGrid.hairline, height: h).fill()
@@ -1570,4 +1815,3 @@ final class GridGutterView: NSView, NSViewToolTipOwner {
         GridGutterView.oversizedTooltip
     }
 }
-
