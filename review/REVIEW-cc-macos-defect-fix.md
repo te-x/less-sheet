@@ -24,6 +24,17 @@ macOS-only; `api/lesssheet.h` and Swift Contracts byte-identical. Bound tree `03
   `selectionSecondClickDeselectsCellRowAndColumn` asserts `deselected=true` for cell/row/column. No existing
   assertion weakened.
 
+## Round 2 — scroll-during-search (found in the human re-test)
+After confirming round-1 (jump/find/select), the human found that an active Find popup **disabled free
+scrolling** (only match-stepping worked until Find was dismissed). Root cause: `anyPopupOpen` installed a
+full-window transparent SwiftUI scrim that consumed scroll-wheel events. Fix: an AppKit click-away scrim
+(`OverlayView`) that dismisses on click but forwards wheel events unchanged to the grid's `NSScrollView`
+(`NativeGrid.forwardScrollWheel`); search stays active. Reviewer: no `[impl]`; one `[contract]` → planner froze
+`scrollWheelMovesViewportWhileFindPopupActive` (`LESSSHEET_FIND_SCROLL_ACTIVE=1`: probe_ready/moved/
+search_active/popup_active all true). Committed `a4e57d1`; `--require-frozen` gate PASS (133 tests); reviewer
+**PASS**. Human-confirmed live ("perfect now"). Rectangle-select `content_preserved` (round-1 human-gated item)
+also **confirmed** by the human ("selecting rectangle is perfect now").
+
 ## Human gates outstanding
 - **Rectangle-select `content_preserved`** cannot be asserted headlessly: `SelectCopyProbe` emits
   `selection_repaint content_preserved=…` only when a materialized non-pending row view exists; off-screen
