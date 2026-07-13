@@ -5517,3 +5517,143 @@ test "wb_ac13: window retries add no leak and never touch the source file (ARCH 
     defer gpa.free(reread);
     try std.testing.expectEqual(before, std.hash.Crc32.hash(reread)); // source never written
 }
+
+
+// ===========================================================================
+// gz-filter-stream slice — REGRESSION test for a diagnosed csv-gz defect
+// (frozen; planner-owned). A background FILTER or SEARCH scan that TRAILS the
+// index frontier — the document already inflated once by the AUTO indexer, so
+// every row the scan wants is at or behind the forward inflater — must reuse
+// ONE live inflater and STREAM forward (ARCH-csv-gz req6: "Sequential forward
+// work reuses its live inflater and never restarts per row"): O(logical) bytes
+// in O(logical/chunk) inflate operations.
+//
+// The shipped trailing scan does NOT. It acquires a fresh cursor per row
+// (reader.readerMatchRow -> csv_reader.matchStream -> source.cursorAt) and,
+// resuming at the position the previous row left off, reuses the FORWARD lane
+// via the `internal == forward_resume` fast path. As it reads past the open
+// head, the forward session's inflated high-water mark (s.logical) races AHEAD
+// of the cursor (the cursor's 4-byte peek-ahead + 256 KiB chunk over-production
+// push it past the cursor's actual offset). The forward lane can only move
+// forward — source.byteAtLane cannot serve a byte BEHIND s.logical on lane 0 —
+// so the cursor stalls: byteAtLane returns null / the scan re-issues produce()
+// which now yields 0 bytes (terminal), and the scan LIVELOCKS. It spins issuing
+// 0-byte produce() calls forever: it never terminates and never reports the
+// correct count (measured symptom: a filtered .csv.gz was pathologically slow /
+// effectively non-terminating — a handful of near-cap rows after ~226 s).
+//
+// DETERMINISTIC TEETH: api.gzInflateOps (produce invocations) and
+// api.gzInflatedBytes are WIRED to real inflate work in the seed (source.zig),
+// unlike the not-yet-built gz_*/wb_* RED seeds. The livelock makes the OP count
+// grow WITHOUT BOUND (0-byte spins) while inflated BYTES plateau at ~1x logical,
+// so a byte bound alone cannot catch it — the OP count is the signal. The poll
+// below TRIPS on the op bound within microseconds of the spin (no 226 s hang;
+// ls_close then stops the worker at its per-row shutdown check). The streaming
+// fix keeps ops at O(logical/chunk) << the bound, completes, and counts right.
+// ---------------------------------------------------------------------------
+
+const GzScanKind = enum { filter, search };
+
+fn gzScanDone(doc: *api.Doc, kind: GzScanKind) bool {
+    return switch (kind) {
+        .filter => api.ls_filter_poll(doc).state == .done,
+        .search => api.ls_search_poll(doc).state == .done,
+    };
+}
+
+/// Poll a trailing background gzip scan to completion while holding its inflate
+/// WORK to a streaming budget. Reset api.gzInflateWorkReset(doc) AND start the
+/// scan just before calling, so the counters measure only THIS scan.
+///   * op_bound  = logical / 4096 : a streaming pass does ~logical/256KiB inflate
+///     ops (<< this, ~64x slack even if the chunk size shrank); the livelocking /
+///     re-inflating scan blows past it near-instantly -> RED, deterministic + fast.
+///   * byte_bound = 4 x logical   : one forward pass is ~1x logical; this guards
+///     against a future PURE re-inflation regression (the current defect plateaus
+///     under it — the op bound is what catches the shipped livelock).
+/// A 20 s wall-clock backstop only fires if a scan somehow neither streams,
+/// spins ops, nor completes (never expected); the op bound is the real RED.
+fn expectStreamingGzScan(doc: *api.Doc, logical: u64, kind: GzScanKind) !void {
+    const op_bound: u64 = logical / 4096;
+    const byte_bound: u64 = 4 * logical;
+    const io = std.testing.io;
+    const t0: std.Io.Clock.Timestamp = .now(io, .awake);
+    while (true) {
+        const ops = api.gzInflateOps(doc);
+        if (ops > op_bound) {
+            std.debug.print("\n[gzfs] {s}-scan inflate ops {d} > streaming bound {d}: the trailing scan does not stream forward (livelock / per-row restart)\n", .{ @tagName(kind), ops, op_bound });
+            return error.NonStreamingInflate;
+        }
+        if (api.gzInflatedBytes(doc) > byte_bound) {
+            std.debug.print("\n[gzfs] {s}-scan inflated bytes exceed 4x logical: re-inflation, not a linear pass\n", .{@tagName(kind)});
+            return error.QuadraticInflate;
+        }
+        if (gzScanDone(doc, kind)) break;
+        if (elapsedMs(t0) > 20_000) return error.ScanTimeout;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    // Completed within the streaming budget: real work happened (seam wired) and
+    // it was a bounded forward pass, not an unbounded spin / re-inflation.
+    try std.testing.expect(api.gzInflateOps(doc) > 0);
+    try std.testing.expect(api.gzInflateOps(doc) <= op_bound);
+    try std.testing.expect(api.gzInflatedBytes(doc) > 0);
+    try std.testing.expect(api.gzInflatedBytes(doc) <= byte_bound);
+}
+
+// ~48 near-cap (~0.94 MiB) rows -> ~45 MiB inflated: several rows share each
+// 32-MiB gzip inflate-checkpoint window AND the scan crosses >= 1 window (a
+// durable checkpoint is written at 32 MiB), so the fix must stream ACROSS a
+// checkpoint boundary. Big enough that the trailing scan reads well past the
+// 4 MiB open head, where the shipped defect manifests.
+const gzfs_rows: u64 = 48;
+
+test "gzfs_filter: a gzip FILTER-scan trailing the frontier streams forward, does not livelock/re-inflate (regression)" {
+    const gpa = std.testing.allocator;
+    const plain = try genNearCapRows(gpa, gzfs_rows);
+    defer gpa.free(plain);
+    const g = try gz(gpa, plain);
+    defer gpa.free(g);
+    const logical: u64 = plain.len;
+
+    var od = try openWith(g, .{ .separator = ',', .index_mode = api.index_auto });
+    defer od.deinit();
+    // Drive the AUTO indexer to EOF FIRST so the whole document is behind the
+    // frontier: the filter-scan then reads every row trailing the inflater —
+    // the exact condition under which the shipped scan fails to stream.
+    try scanToEnd(od.doc);
+    api.gzInflateWorkReset(od.doc);
+
+    // A predicate matching a SUBSET (col 1 "v" < 24 -> rows 0..23); the scan
+    // still visits all 48 rows.
+    try setFilter(od.doc, predReq(1, .lt, "24"));
+    try expectStreamingGzScan(od.doc, logical, .filter);
+
+    // The streaming fix must also be CORRECT: the subset is counted exactly.
+    const st = api.ls_filter_poll(od.doc);
+    try std.testing.expectEqual(api.FilterState.done, st.state);
+    try std.testing.expectEqual(@as(u64, 24), st.total);
+}
+
+test "gzfs_search: a gzip FIND-scan trailing the frontier streams forward, does not livelock/re-inflate (regression)" {
+    const gpa = std.testing.allocator;
+    const plain = try genNearCapRows(gpa, gzfs_rows);
+    defer gpa.free(plain);
+    const g = try gz(gpa, plain);
+    defer gpa.free(g);
+    const logical: u64 = plain.len;
+
+    var od = try openWith(g, .{ .separator = ',', .index_mode = api.index_auto });
+    defer od.deinit();
+    // Same trailing condition as the filter: index complete, then a find that
+    // must re-lex behind the frontier to COUNT (it runs even after the index is
+    // complete — see index.workerMain slot priority). col-0 filler is all 'a',
+    // so text "a" matches every row: the scan visits all 48.
+    try scanToEnd(od.doc);
+    api.gzInflateWorkReset(od.doc);
+
+    try startSearch(od.doc, textReq("a"));
+    try expectStreamingGzScan(od.doc, logical, .search);
+
+    const st = api.ls_search_poll(od.doc);
+    try std.testing.expectEqual(api.SearchState.done, st.state);
+    try std.testing.expectEqual(gzfs_rows, st.total);
+}

@@ -492,6 +492,33 @@ pub const gzCacheCopyBytes = core.gzCacheCopyBytes;
 /// checkpoint was taken/restored and the restart was byte-identical.
 pub const gzSnapshotProbe = core.gzSnapshotProbe;
 
+// --- Test-only instrumentation seam (gz-filter-stream regression) -----------
+// Zig-only (NOT the C ABI -- like the gz*/wb* seams above), so api/lesssheet.h
+// stays BYTE-IDENTICAL. A REGRESSION seam for a diagnosed csv-gz defect: a
+// background FILTER or SEARCH scan that TRAILS the index frontier must reuse ONE
+// live inflater and STREAM forward (ARCH-csv-gz req6: "Sequential forward work
+// reuses its live inflater and never restarts per row") -- inflating O(logical)
+// bytes in O(logical/chunk) inflate ops. The shipped trailing scan instead reuses
+// the forward lane past the point its session has over-produced (cursor peek-
+// ahead + chunk over-production race s.logical ahead of the cursor); the forward
+// lane cannot serve a byte BEHIND its position, so the scan LIVELOCKS -- spinning
+// 0-byte produce() calls forever (never terminating; wrong/frozen count). So the
+// INFLATE-OP count (produce invocations) grows UNBOUNDED while inflated BYTES
+// plateau at ~1x logical -- ops is the deterministic regression signal, bytes the
+// complementary O(logical) work witness (+ a guard against a future pure-re-
+// inflation regression). UNLIKE the other gz_*/wb_* seeds these are WIRED to real
+// inflate work in the SEED (source.produce), so the gzfs_* tests FAIL on the
+// current behavior and pass only once the fix streams. 0 for a plain mmap document.
+/// Cumulative inflated-OUTPUT bytes the gzip Source produced for this document
+/// since the last gzInflateWorkReset (0 for a plain mmap document).
+pub const gzInflatedBytes = core.gzInflatedBytes;
+/// Cumulative inflate OPERATIONS (produce invocations) the gzip Source performed
+/// since the last gzInflateWorkReset. A streaming pass is O(logical/chunk); a
+/// livelocking/re-inflating scan grows this without bound (the RED signal).
+pub const gzInflateOps = core.gzInflateOps;
+/// Zero both inflate-work counters (before a measured trailing scan).
+pub const gzInflateWorkReset = core.gzInflateWorkReset;
+
 // --- Test-only instrumentation seams (ARCH-window-budget) -------------------
 // Zig-level seams (NOT C ABI -- like openWithAllocator/copyAdvances/gz*), so
 // api/lesssheet.h AND every ls_* signature stay BYTE-IDENTICAL (AC1): window-
@@ -662,6 +689,14 @@ comptime {
         @compileError("signature drift: gzCacheCopyBytes");
     if (@TypeOf(core.gzSnapshotProbe) != fn (std.mem.Allocator, []const u8, u64) SnapshotProbe)
         @compileError("signature drift: gzSnapshotProbe");
+
+    // === gz-filter-stream: regression seam signatures (Zig-only test teeth). =
+    if (@TypeOf(core.gzInflatedBytes) != fn (*const Doc) u64)
+        @compileError("signature drift: gzInflatedBytes");
+    if (@TypeOf(core.gzInflateOps) != fn (*const Doc) u64)
+        @compileError("signature drift: gzInflateOps");
+    if (@TypeOf(core.gzInflateWorkReset) != fn (*Doc) void)
+        @compileError("signature drift: gzInflateWorkReset");
 
     // === window-budget: instrumentation seam signatures (Zig-only test teeth,
     // NOT C ABI -- no callconv). Their BEHAVIOR is pinned by the wb_* suite +

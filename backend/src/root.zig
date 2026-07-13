@@ -729,6 +729,35 @@ pub fn gzSnapshotProbe(gpa: std.mem.Allocator, gzip_bytes: []const u8, probe_log
     return .{ .restored = identical, .identical = identical };
 }
 
+// --- gz-filter-stream regression seams (Zig-only; NOT the C ABI) ---------
+// Cumulative inflate WORK the gzip Source did for this document since the last
+// gzInflateWorkReset: bytes produced, and produce() invocations. A streaming
+// trailing scan is O(logical) bytes in O(logical/chunk) ops; the shipped
+// livelocking trailing scan spins produce() without bound (ops -> infinity,
+// bytes plateau). Both 0 on the mmap fast path. WIRED in the seed (source.zig),
+// so the gzfs_* tests MEASURE the real defect.
+
+/// See contracts/api.zig `gzInflatedBytes`.
+pub fn gzInflatedBytes(doc: *const api.Doc) u64 {
+    const d = asDoc(doc);
+    if (d.source == .gzip) return d.source.gzip.inflated_total.load(.monotonic);
+    return 0;
+}
+/// See contracts/api.zig `gzInflateOps`.
+pub fn gzInflateOps(doc: *const api.Doc) u64 {
+    const d = asDoc(doc);
+    if (d.source == .gzip) return d.source.gzip.inflate_ops.load(.monotonic);
+    return 0;
+}
+/// See contracts/api.zig `gzInflateWorkReset`.
+pub fn gzInflateWorkReset(doc: *api.Doc) void {
+    const d = asDocMut(doc);
+    if (d.source == .gzip) {
+        d.source.gzip.inflated_total.store(0, .monotonic);
+        d.source.gzip.inflate_ops.store(0, .monotonic);
+    }
+}
+
 // ===========================================================================
 // window-budget instrumentation seams (ARCH-window-budget). Zig-only test
 // instrumentation (NOT the C ABI -- like copyAdvances / gz*), reading DEFAULTED

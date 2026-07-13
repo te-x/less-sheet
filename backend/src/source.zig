@@ -117,6 +117,16 @@ pub const Gzip = struct {
     replay_inflated: u64 = 0,
     open_physical: u64 = 0,
     open_inflated: u64 = 0,
+    /// gz-filter-stream regression seams (api.gzInflatedBytes / api.gzInflateOps):
+    /// cumulative inflated OUTPUT bytes AND inflate OPERATIONS (produce calls)
+    /// since the last reset. A trailing FILTER/SEARCH scan that STREAMS forward
+    /// inflates O(logical) bytes in O(logical/chunk) ops; the shipped trailing
+    /// scan cannot serve a byte behind the forward session's over-produced
+    /// position, so it LIVELOCKS -- spinning 0-byte produce calls forever (ops
+    /// grow UNBOUNDED while bytes plateau). ops is thus the deterministic
+    /// regression signal. Reset via root.gzInflateWorkReset.
+    inflated_total: std.atomic.Value(u64) = .init(0),
+    inflate_ops: std.atomic.Value(u64) = .init(0),
     spill_fd: ?posix.fd_t = null,
     spill_bytes: u64 = 0,
     spill_ops: u64 = 0,
@@ -195,6 +205,7 @@ pub const Gzip = struct {
     /// resumable budget stop; a real decoder/end-of-input failure is a stable
     /// damaged end once useful bytes exist.
     fn produce(self: *Gzip, s: *Session, out: []u8) usize {
+        _ = self.inflate_ops.fetchAdd(1, .monotonic); // gz-filter-stream: count EVERY inflate op (0-byte spins included)
         if (out.len == 0 or self.shutdown.load(.acquire)) return 0;
         var written: usize = 0;
         while (written < out.len and s.terminal == .inflating) {
@@ -240,6 +251,7 @@ pub const Gzip = struct {
                 else => {},
             }
         }
+        _ = self.inflated_total.fetchAdd(@intCast(written), .monotonic); // gz-filter-stream: inflated output bytes
         return written;
     }
 
