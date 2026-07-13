@@ -32,6 +32,13 @@ pub const Match = struct { row: u64, col: u32 };
 
 pub const SourceLoc = struct { row: u64, pos: Pos };
 
+fn chargeNav(doc: *Document, from: Pos, to: Pos) void {
+    if (!doc.nav_charge_active) return;
+    const a = doc.reader.logicalBytes(doc.source, from);
+    const b = doc.reader.logicalBytes(doc.source, to);
+    doc.nav_charged_bytes += b -| a;
+}
+
 /// True iff `filter_ctx` is absent or satisfied — the composed per-row test
 /// shared by search-nav (unfiltered: filter_ctx null) and search-nav-under-a-
 /// filter (filter_ctx = the active filter, so find evaluates only rows that
@@ -45,11 +52,14 @@ fn relexBlock(doc: *Document, filter_ctx: ?MatchCtx, primary_ctx: MatchCtx, b: u
     var pos = cp.pos;
     var row = cp.row;
     while (row < lo and !doc.reader.atEnd(doc.source, pos)) : (row += 1) {
+        const start = pos;
         pos = doc.reader.boundsAfter(doc.source, pos, null).next;
+        chargeNav(doc, start, pos);
     }
     var result: ?Match = null;
     while (row < hi and !doc.reader.atEnd(doc.source, pos)) : (row += 1) {
         const res = @import("reader.zig").readerMatchRow(doc.reader, doc.source, pos, primary_ctx, filter_ctx, .{});
+        chargeNav(doc, pos, res.next);
         if (res.matched_col) |col| {
             result = .{ .row = row, .col = col };
             if (dir == .forward) return result;
@@ -104,6 +114,7 @@ fn countInBlockUpTo(doc: *Document, filter_ctx: ?MatchCtx, primary_ctx: MatchCtx
     var count: u64 = 0;
     while (r <= row and !doc.reader.atEnd(doc.source, pos)) : (r += 1) {
         const res = @import("reader.zig").readerMatchRow(doc.reader, doc.source, pos, primary_ctx, filter_ctx, .{});
+        chargeNav(doc, pos, res.next);
         if (res.matched_col != null) count += 1;
         pos = res.next;
     }

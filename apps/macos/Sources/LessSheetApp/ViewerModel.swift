@@ -172,6 +172,7 @@ final class DocumentModel {
     private let composer = DialectComposer()
     private let findControl = FindControl()
     private let filterControl = FilterControl()
+    private let windowPoll = WindowPoll()
     private let cellMatcher = CellMatcher()
     /// The pure selection geometry, TSV copy builder, and column-width algebra
     /// (ARCH-select-copy) — same layering as the collaborators above.
@@ -419,6 +420,12 @@ final class DocumentModel {
         let newStart = max(0, v - buffer)
         let newCount = vc + buffer * 2
         materialize(start: UInt64(newStart), count: newCount)
+        if desiredWindow.isShort {
+            // A settled document's poll task may already have exited. Wake the
+            // coalesced driver for this changed request so its short prefix is
+            // retried at the normal cadence until it fills or reaches EOF.
+            startPolling()
+        }
     }
 
     /// The grid reports its horizontal scroll clip (x-offset + viewport
@@ -565,6 +572,14 @@ final class DocumentModel {
         desiredCount = count
         window = session.setWindow(firstRow: start, rowCount: count, columns: columnFetchRange())
         growColumnWidthsToFitWindow()
+    }
+
+    private var desiredWindow: DesiredWindow {
+        DesiredWindow(
+            requestedCount: desiredCount,
+            returnedCount: window.rows.count,
+            moreWithinView: Int(window.firstRow) + window.rows.count < displayRowCount
+        )
     }
 
     /// The DECIDED width behaviour (ARCH-column-windowing "Column-width
@@ -1906,8 +1921,8 @@ final class DocumentModel {
     }
 
     /// Fold one poll snapshot into state; returns whether polling should
-    /// continue (stops once the index is complete and neither a jump, a
-    /// search, nor an unfinished filter-scan is active, so idle documents
+    /// continue (stops once the desired window is resolved and neither the
+    /// index, a jump, a search, nor a filter-scan is active, so idle documents
     /// cost nothing).
     private func applyPoll(
         rowCount: RowCountInfo, progress: ScanProgress, jump: JumpStatus, search: SearchSnapshot?, filter: FilterSnapshot?
@@ -1918,21 +1933,20 @@ final class DocumentModel {
         foldJump(jump)
         foldSearch(search)
 
-        // Under a filter, rows beyond its discovered-match frontier become
-        // servable as the filter-scan (or a jump/find sharing its slot)
-        // advances (ARCH-filtered-views req. 5) — re-materialize on the same
-        // short-window signal already used for the base index. A CANCELLED
-        // filter-scan still counts as "ongoing": under LS_INDEX_AUTO it
-        // resumes to completion on its own (api/lesssheet.h FILTERED VIEWS),
-        // so polling must keep watching it rather than going silent.
         let filterOngoing = filter.map { !$0.totalIsFinal } ?? false
-        if (!progress.isComplete || filterOngoing), window.rows.count < desiredCount,
-           Int(window.firstRow) + window.rows.count < displayRowCount {
+        let jumpScanning: Bool = { if case .scanning = jumpFlow { return true } else { return false } }()
+        let decision = windowPoll.decide(WindowPollInputs(
+            window: desiredWindow,
+            indexComplete: progress.isComplete,
+            jumpScanning: jumpScanning,
+            searchActive: Self.searchActive(search),
+            filterOngoing: filterOngoing
+        ))
+        if decision.reissueWindow {
             materialize(start: desiredStart, count: desiredCount)
         }
 
-        let jumpScanning: Bool = { if case .scanning = jumpFlow { return true } else { return false } }()
-        return !progress.isComplete || jumpScanning || Self.searchActive(search) || filterOngoing
+        return decision.continuePolling
     }
 
     /// A search still needs polling while its match-scan runs or a navigation

@@ -231,6 +231,11 @@ fn setExhausted(doc: *Document) void {
 pub fn resolveNavLocked(doc: *Document) void {
     if (!doc.nav_pending) return;
     if (doc.filter_state != .idle) {
+        // Filtered counted-region resolution can re-lex a full checkpoint
+        // block. With a worker present it is a worker job, never mutex-held
+        // caller work; the no-worker degraded mode retains its terminating
+        // synchronous fallback.
+        if (doc.worker != null) return;
         resolveNavLockedFiltered(doc);
         return;
     }
@@ -303,6 +308,212 @@ fn resolveNavLockedFiltered(doc: *Document) void {
             if (nav.findBackwardMatch(doc, doc.block_counts.items, fctx, pctx, upper)) |m| setFound(doc, m) else setExhausted(doc);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Off-main filtered navigation. The worker snapshots only scalar plans and a
+// checkpoint while holding the document mutex, then performs all source
+// parsing after releasing it. search_gen/filter_gen/nav_gen validate every
+// phase and the final short commit, so replacement and cancellation cannot
+// publish stale results.
+// ---------------------------------------------------------------------------
+
+pub const FilteredNavOutcome = struct {
+    found: bool,
+    row: u64 = 0,
+    col: u32 = 0,
+    position: u64 = 0,
+};
+
+fn navJobCurrentLocked(doc: *Document, nav_gen: u64, search_gen: u64, filter_gen: u64) bool {
+    return doc.nav_pending and doc.search_nav == .searching and
+        doc.nav_gen == nav_gen and doc.search_gen == search_gen and
+        doc.filter_gen == filter_gen and doc.filter_state != .idle;
+}
+
+fn locateFilteredIndexJob(doc: *Document, nav_gen: u64, search_gen: u64, filter_gen: u64, fctx: MatchCtx, idx: u64) ?nav.SourceLoc {
+    dlock: {
+        doc.lock();
+        if (!navJobCurrentLocked(doc, nav_gen, search_gen, filter_gen)) {
+            doc.unlock();
+            return null;
+        }
+        var cum: u64 = 0;
+        var b: usize = 0;
+        while (b < doc.filter_block_counts.items.len) : (b += 1) {
+            const count = doc.filter_block_counts.items[b];
+            if (cum + count > idx) break;
+            cum += count;
+        }
+        if (b >= doc.filter_block_counts.items.len or b >= doc.checkpoints.items.len) {
+            doc.unlock();
+            return null;
+        }
+        const cp = doc.checkpoints.items[b];
+        const hi = @min((@as(u64, @intCast(b)) + 1) * checkpoint_interval, doc.filter_rows);
+        const need = idx - cum;
+        doc.unlock();
+
+        var pos = cp.pos;
+        var row = cp.row;
+        var seen: u64 = 0;
+        while (row < hi and !doc.reader.atEnd(doc.source, pos)) : (row += 1) {
+            if (doc.stop_atomic.load(.monotonic)) return null;
+            const row_pos = pos;
+            const res = @import("reader.zig").readerMatchRow(doc.reader, doc.source, pos, fctx, null, .{});
+            if (res.matched_col != null) {
+                if (seen == need) return .{ .row = row, .pos = row_pos };
+                seen += 1;
+            }
+            pos = res.next;
+        }
+        break :dlock;
+    }
+    return null;
+}
+
+fn scanSearchBlockJob(doc: *Document, pctx: MatchCtx, fctx: MatchCtx, cp: Checkpoint, lo: u64, hi: u64, dir: api.SearchDir) ?Match {
+    var pos = cp.pos;
+    var row = cp.row;
+    while (row < lo and !doc.reader.atEnd(doc.source, pos)) : (row += 1) {
+        if (doc.stop_atomic.load(.monotonic)) return null;
+        pos = doc.reader.boundsAfter(doc.source, pos, null).next;
+    }
+    var found: ?Match = null;
+    while (row < hi and !doc.reader.atEnd(doc.source, pos)) : (row += 1) {
+        if (doc.stop_atomic.load(.monotonic)) return null;
+        const res = @import("reader.zig").readerMatchRow(doc.reader, doc.source, pos, pctx, fctx, .{});
+        if (res.matched_col) |col| {
+            found = .{ .row = row, .col = col };
+            if (dir == .forward) return found;
+        }
+        pos = res.next;
+    }
+    return found;
+}
+
+fn findSearchMatchJob(doc: *Document, nav_gen: u64, search_gen: u64, filter_gen: u64, pctx: MatchCtx, fctx: MatchCtx, bound: u64, dir: api.SearchDir) ?Match {
+    if (dir == .forward) {
+        var b: u64 = bound / checkpoint_interval;
+        while (true) : (b += 1) {
+            doc.lock();
+            if (!navJobCurrentLocked(doc, nav_gen, search_gen, filter_gen) or b >= doc.block_counts.items.len) {
+                doc.unlock();
+                return null;
+            }
+            const count = doc.block_counts.items[@intCast(b)];
+            const cp = doc.checkpoints.items[@intCast(b)];
+            const hi = @min((b + 1) * checkpoint_interval, doc.search_rows);
+            doc.unlock();
+            if (count == 0) continue;
+            const lo = @max(bound, b * checkpoint_interval);
+            if (scanSearchBlockJob(doc, pctx, fctx, cp, lo, hi, .forward)) |m| return m;
+        }
+    }
+
+    if (bound == 0) return null;
+    doc.lock();
+    if (!navJobCurrentLocked(doc, nav_gen, search_gen, filter_gen) or doc.block_counts.items.len == 0) {
+        doc.unlock();
+        return null;
+    }
+    var b: u64 = (bound - 1) / checkpoint_interval;
+    if (b >= doc.block_counts.items.len) b = doc.block_counts.items.len - 1;
+    doc.unlock();
+    while (true) {
+        doc.lock();
+        if (!navJobCurrentLocked(doc, nav_gen, search_gen, filter_gen)) {
+            doc.unlock();
+            return null;
+        }
+        const count = doc.block_counts.items[@intCast(b)];
+        const cp = doc.checkpoints.items[@intCast(b)];
+        const hi = @min(@min((b + 1) * checkpoint_interval, bound), doc.search_rows);
+        doc.unlock();
+        if (count != 0) {
+            if (scanSearchBlockJob(doc, pctx, fctx, cp, b * checkpoint_interval, hi, .backward)) |m| return m;
+        }
+        if (b == 0) return null;
+        b -= 1;
+    }
+}
+
+fn positionFilteredMatchJob(doc: *Document, nav_gen: u64, search_gen: u64, filter_gen: u64, pctx: MatchCtx, fctx: MatchCtx, found: Match) ?FilteredNavOutcome {
+    const b = found.row / checkpoint_interval;
+    doc.lock();
+    if (!navJobCurrentLocked(doc, nav_gen, search_gen, filter_gen) or
+        b >= doc.checkpoints.items.len or b >= doc.block_counts.items.len or
+        b >= doc.filter_block_counts.items.len)
+    {
+        doc.unlock();
+        return null;
+    }
+    var search_before: u64 = 0;
+    var filter_before: u64 = 0;
+    var i: usize = 0;
+    while (i < b) : (i += 1) {
+        search_before += doc.block_counts.items[i];
+        filter_before += doc.filter_block_counts.items[i];
+    }
+    const cp = doc.checkpoints.items[@intCast(b)];
+    doc.unlock();
+
+    var pos = cp.pos;
+    var row = cp.row;
+    var search_in_block: u64 = 0;
+    var filter_in_block: u64 = 0;
+    while (row <= found.row and !doc.reader.atEnd(doc.source, pos)) : (row += 1) {
+        if (doc.stop_atomic.load(.monotonic)) return null;
+        const res = @import("reader.zig").readerMatchRow(doc.reader, doc.source, pos, pctx, fctx, .{});
+        if (res.filter_matched) filter_in_block += 1;
+        if (res.matched_col != null) search_in_block += 1;
+        pos = res.next;
+    }
+    if (search_in_block == 0 or filter_in_block == 0) return null;
+    return .{
+        .found = true,
+        .row = filter_before + filter_in_block - 1,
+        .col = found.col,
+        .position = search_before + search_in_block,
+    };
+}
+
+/// Resolve one exact filtered navigation on the worker. Called with the
+/// document mutex released; returns null only for a stale/cancelled job.
+pub fn resolveFilteredNavOffMain(doc: *Document, nav_gen: u64, search_gen: u64, filter_gen: u64, anchor: u64, dir: api.SearchDir, pctx: MatchCtx, fctx: MatchCtx) ?FilteredNavOutcome {
+    doc.lock();
+    if (!navJobCurrentLocked(doc, nav_gen, search_gen, filter_gen) or
+        doc.search_state != .done or !doc.filter_total_exact)
+    {
+        doc.unlock();
+        return null;
+    }
+    const total = doc.filter_total;
+    const filter_rows = doc.filter_rows;
+    doc.unlock();
+
+    var source_bound: u64 = 0;
+    if (dir == .forward) {
+        if (anchor >= total) return .{ .found = false };
+        const loc = locateFilteredIndexJob(doc, nav_gen, search_gen, filter_gen, fctx, anchor) orelse return null;
+        source_bound = loc.row;
+    } else {
+        if (anchor == 0 or total == 0) return .{ .found = false };
+        if (anchor >= total) {
+            source_bound = filter_rows;
+        } else {
+            const loc = locateFilteredIndexJob(doc, nav_gen, search_gen, filter_gen, fctx, anchor - 1) orelse return null;
+            source_bound = loc.row + 1;
+        }
+    }
+
+    const found = findSearchMatchJob(doc, nav_gen, search_gen, filter_gen, pctx, fctx, source_bound, dir) orelse {
+        doc.lock();
+        const current = navJobCurrentLocked(doc, nav_gen, search_gen, filter_gen);
+        doc.unlock();
+        return if (current) .{ .found = false } else null;
+    };
+    return positionFilteredMatchJob(doc, nav_gen, search_gen, filter_gen, pctx, fctx, found);
 }
 
 // ---------------------------------------------------------------------------
@@ -426,11 +637,13 @@ pub fn startSearch(d: *Document, request: *const api.SearchRequest) bool {
 pub fn navSearch(d: *Document, anchor_row: u64, dir: api.SearchDir) void {
     d.lock();
     defer d.unlock();
+    d.nav_charged_bytes = 0;
     if (d.search_state == .idle) return; // no active search: no-op
     const dir_i = @intFromEnum(dir);
     if (dir_i != 0 and dir_i != 1) return; // out-of-domain direction: no-op
 
     // Replace any pending navigation; clear the previous found result.
+    d.nav_gen +%= 1;
     d.nav_pending = true;
     d.nav_anchor = anchor_row;
     d.nav_dir = dir;
@@ -439,9 +652,17 @@ pub fn navSearch(d: *Document, anchor_row: u64, dir: api.SearchDir) void {
     d.search_found_col = 0;
     d.search_position = 0;
 
-    // Instant fast path: answer from the counted region when already determined.
+    // The identity-view fast path is bounded by ordinary row sizes and retains
+    // its existing synchronous behavior. Filtered resolution is deliberately
+    // left SEARCHING for the worker because a counted block may contain giant
+    // rows. nav_charge_active meters only work completed before this call
+    // returns; the off-main branch therefore remains zero/constant.
+    d.nav_charge_active = true;
     resolveNavLocked(d);
+    d.nav_charge_active = false;
     if (!d.nav_pending) return;
+
+    if (d.filter_state != .idle and d.worker != null) d.wakeWorker();
 
     // Must scan to answer: ensure the match-scan runs and owns the slot.
     if (d.search_state == .cancelled) {
@@ -484,6 +705,11 @@ pub fn cancelSearch(d: *Document) void {
             d.search_nav = .none; // a pending nav resolves to NONE
             d.nav_pending = false;
         }
+    }
+    if (d.search_nav == .searching) {
+        d.nav_gen +%= 1;
+        d.search_nav = .none;
+        d.nav_pending = false;
     }
     // LS_SEARCH_DONE persists; the jump slot and the AUTO indexer are untouched.
 }

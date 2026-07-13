@@ -82,16 +82,66 @@ pub fn workerMain(doc: *Document) void {
         if (doc.stop) break;
         // Slot priority: a scanning jump owns the frontier; else a scanning
         // search (find — which runs even after the index is complete; it must
-        // re-lex behind the frontier to COUNT); else a scanning (or, under
-        // AUTO, cancelled-but-resumable) filter-scan; else the AUTO background
-        // indexer. See api/lesssheet.h FILTERED VIEWS "the single scan slot".
+        // re-lex behind the frontier to COUNT); else exact filtered navigation;
+        // else a scanning (or, under AUTO, cancelled-but-resumable) filter-scan;
+        // else the AUTO background indexer. See api/lesssheet.h FILTERED VIEWS
+        // "the single scan slot".
         const do_jump = doc.jump_state == .scanning and (doc.filter_state != .idle or !doc.complete);
         const do_search = !do_jump and doc.search_state == .scanning;
-        const do_filter = !do_jump and !do_search and
+        const do_nav = !do_jump and !do_search and doc.filter_state != .idle and
+            doc.nav_pending and doc.search_nav == .searching and
+            doc.search_state == .done and doc.filter_total_exact;
+        const do_filter = !do_jump and !do_search and !do_nav and
             (doc.filter_state == .scanning or (doc.filter_state == .cancelled and doc.auto));
-        const do_index = !do_jump and !do_search and !do_filter and doc.auto and !doc.complete;
-        if (!(do_jump or do_search or do_filter or do_index)) {
+        const do_index = !do_jump and !do_search and !do_nav and !do_filter and doc.auto and !doc.complete;
+        if (!(do_jump or do_search or do_nav or do_filter or do_index)) {
             doc.waitWork();
+            continue;
+        }
+
+        if (do_nav) {
+            if (doc.search_gen != doc.w_gen) {
+                if (!search.refreshWorkerCtx(doc)) {
+                    search.failSearchLocked(doc);
+                    continue;
+                }
+                doc.w_gen = doc.search_gen;
+            }
+            if (doc.filter_gen != doc.wf_gen) {
+                if (!filter.refreshFilterWorkerCtx(doc)) {
+                    search.failSearchLocked(doc);
+                    continue;
+                }
+                doc.wf_gen = doc.filter_gen;
+            }
+            const nav_gen = doc.nav_gen;
+            const search_gen = doc.search_gen;
+            const filter_gen = doc.filter_gen;
+            const anchor = doc.nav_anchor;
+            const dir = doc.nav_dir;
+            const pctx = doc.w_ctx;
+            const fctx = doc.wf_ctx;
+            doc.unlock();
+
+            const outcome = search.resolveFilteredNavOffMain(doc, nav_gen, search_gen, filter_gen, anchor, dir, pctx, fctx);
+
+            doc.lock();
+            if (outcome) |result| {
+                if (doc.nav_pending and doc.search_nav == .searching and
+                    doc.nav_gen == nav_gen and doc.search_gen == search_gen and
+                    doc.filter_gen == filter_gen)
+                {
+                    if (result.found) {
+                        doc.search_found_row = result.row;
+                        doc.search_found_col = result.col;
+                        doc.search_position = result.position;
+                        doc.search_nav = .found;
+                    } else {
+                        doc.search_nav = .exhausted;
+                    }
+                    doc.nav_pending = false;
+                }
+            }
             continue;
         }
 

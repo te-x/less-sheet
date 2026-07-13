@@ -22,33 +22,85 @@ const Checkpoint = base.Checkpoint;
 const Pos = base.Pos;
 
 const empty_str: api.Str = .{ .ptr = "", .len = 0 };
+const aggregate_budget_max: u64 = 8 * 1024 * 1024;
 
-/// See api/lesssheet.h `ls_window_set`. Never advances the frontier; re-lexes
-/// the requested rows (behind the frontier) from the nearest checkpoint into
-/// the owned window buffer, evicting the previous window. Every cell is
-/// decoded through the Reader (the document's resolved encoding) and
-/// display-capped to LS_CELL_MAX_BYTES (requirement 8). ARCH-huge-row-budget:
-/// the SOURCE bytes scanned per row are ALSO bounded to
-/// `api.window_row_scan_max_bytes`, so this stays O(min(row bytes, cap) x
-/// rows) regardless of row size (see the materialize loop below).
-pub fn windowSet(d: *Document, first_row: u64, row_count: u32) api.RowRange {
-    // Evict the previous window regardless of the outcome.
+fn clearWindow(d: *Document, first_row: u64) void {
     d.win_buf.clearRetainingCapacity();
     d.win_refs.clearRetainingCapacity();
     d.win_source.clearRetainingCapacity();
     d.win_oversized.clearRetainingCapacity();
     d.win_first = first_row;
     d.win_rows = 0;
+    d.win_cursor_valid = false;
+    d.win_filter_locating = false;
+    d.win_filter_skip = 0;
+    d.win_candidate_tested = false;
+}
 
-    if (d.column_count == 0) return .{ .first_row = first_row, .row_count = 0 };
+fn charge(d: *Document, from: Pos, to: Pos) void {
+    const a = d.reader.logicalBytes(d.source, from);
+    const b = d.reader.logicalBytes(d.source, to);
+    d.window_charged_bytes += b -| a;
+}
+
+fn remainingBudget(d: *const Document) u64 {
+    return aggregate_budget_max -| d.window_charged_bytes;
+}
+
+fn appendRowMetadata(d: *Document, source_row: u64, oversized: bool, buf_mark: usize, refs_mark: usize) bool {
+    d.win_source.append(d.gpa, source_row) catch {
+        d.win_buf.items.len = buf_mark;
+        d.win_refs.items.len = refs_mark;
+        return false;
+    };
+    d.win_oversized.append(d.gpa, oversized) catch {
+        d.win_source.items.len -= 1;
+        d.win_buf.items.len = buf_mark;
+        d.win_refs.items.len = refs_mark;
+        return false;
+    };
+    return true;
+}
+
+/// See api/lesssheet.h `ls_window_set`. Never advances the frontier; re-lexes
+/// the requested rows (behind the frontier) from the nearest checkpoint into
+/// the owned window buffer. Changed requests evict; identical requests retain
+/// and extend their completed prefix. Every cell is
+/// decoded through the Reader (the document's resolved encoding) and
+/// display-capped to LS_CELL_MAX_BYTES (requirement 8). ARCH-huge-row-budget:
+/// the SOURCE bytes scanned per row are ALSO bounded to
+/// `api.window_row_scan_max_bytes`, so this stays O(min(row bytes, cap) x
+/// rows) regardless of row size (see the materialize loop below).
+pub fn windowSet(d: *Document, first_row: u64, row_count: u32) api.RowRange {
+    d.window_charged_bytes = 0;
     const clamped: u64 = @min(@as(u64, row_count), @as(u64, api.window_max_rows));
-    if (clamped == 0) return .{ .first_row = first_row, .row_count = 0 };
+
+    d.lock();
+    const filtered = d.filter_state != .idle;
+    const filter_gen = d.filter_gen;
+    d.unlock();
+
+    const identical = d.win_request_valid and
+        d.win_first == first_row and
+        d.win_request_count == clamped and
+        d.win_request_filtered == filtered and
+        d.win_request_filter_gen == filter_gen;
+    if (!identical) {
+        clearWindow(d, first_row);
+        d.win_request_valid = true;
+        d.win_request_count = clamped;
+        d.win_request_filtered = filtered;
+        d.win_request_filter_gen = filter_gen;
+    }
+
+    if (d.column_count == 0 or clamped == 0)
+        return .{ .first_row = first_row, .row_count = 0 };
 
     // While filtered, first_row/row_count are FILTERED coordinates and rows
     // are served by counting into the filter's per-block counters + a bounded
     // in-block re-lex — see FILTERED VIEWS. The BOUNDED RECORD 1 pinned-row-0
     // special case below is an identity-view-only edge case.
-    if (d.filter_state != .idle) return windowSetFiltered(d, first_row, clamped);
+    if (filtered) return windowSetFiltered(d, first_row, clamped);
 
     // BOUNDED RECORD 1 (requirement 9): when record 1 is ALSO data row 0
     // (header off) and never terminated within the O(head) budget, its
@@ -56,83 +108,87 @@ pub fn windowSet(d: *Document, first_row: u64, row_count: u32) api.RowRange {
     // frontier never claims a row whose true extent past the budget is
     // unknown. Served directly here so row 0 stays instantly available,
     // independent of the frontier/checkpoint machinery below.
-    var pinned_rows: u64 = 0;
-    if (first_row == 0 and d.record1_capped and !d.has_header and d.row0_pinned_refs.len > 0) {
+    if (d.win_rows == 0 and first_row == 0 and d.record1_capped and !d.has_header and d.row0_pinned_refs.len > 0) {
+        const buf_mark = d.win_buf.items.len;
+        const refs_mark = d.win_refs.items.len;
         for (d.row0_pinned_refs) |ref| {
             const start = d.win_buf.items.len;
-            d.win_buf.appendSlice(d.gpa, d.row0_pinned_buf[ref.start .. ref.start + ref.len]) catch break;
-            d.win_refs.append(d.gpa, .{ .start = start, .len = ref.len, .truncated = ref.truncated }) catch break;
+            d.win_buf.appendSlice(d.gpa, d.row0_pinned_buf[ref.start .. ref.start + ref.len]) catch {
+                d.win_buf.items.len = buf_mark;
+                d.win_refs.items.len = refs_mark;
+                return .{ .first_row = first_row, .row_count = 0 };
+            };
+            d.win_refs.append(d.gpa, .{ .start = start, .len = ref.len, .truncated = ref.truncated }) catch {
+                d.win_buf.items.len = buf_mark;
+                d.win_refs.items.len = refs_mark;
+                return .{ .first_row = first_row, .row_count = 0 };
+            };
         }
-        d.win_source.append(d.gpa, 0) catch {}; // identity: row 0's source is row 0
-        // Record 1 spilled past the (far larger) O(head) budget, so it also
-        // exceeds the window scan cap: this pinned prefix is OVERSIZED by the
-        // same "served bounded; more source exists" definition (ARCH-huge-
-        // row-budget / requirement 9).
-        d.win_oversized.append(d.gpa, true) catch {};
-        pinned_rows = 1;
-        d.win_rows = 1;
+        if (appendRowMetadata(d, 0, true, buf_mark, refs_mark)) d.win_rows = 1;
     }
-    if (pinned_rows >= clamped) return .{ .first_row = first_row, .row_count = pinned_rows };
+    if (d.win_rows >= clamped) return .{ .first_row = first_row, .row_count = d.win_rows };
 
-    const next_row = first_row + pinned_rows;
-    const remaining = clamped - pinned_rows;
-
-    d.lock();
-    const avail_end = if (d.complete) d.total_rows else d.frontier_rows;
-    var materialize: u64 = 0;
-    var cp: Checkpoint = .{ .row = 0, .pos = d.data_start };
-    if (next_row < avail_end) {
-        materialize = @min(remaining, avail_end - next_row);
-        cp = nav.bestCheckpoint(d, next_row);
-    }
-    d.unlock();
-
-    if (materialize == 0) return .{ .first_row = first_row, .row_count = pinned_rows };
-
-    // Skip from the checkpoint to next_row. This never crosses an oversized
-    // row's bytes: `cp` already lands at/after the checkpoint the frontier
-    // drops immediately after every oversized row it scans (ARCH-huge-row-
-    // budget decision 2), and any oversized row before next_row has
-    // necessarily already been scanned (next_row < avail_end).
-    var pos = cp.pos;
-    var r = cp.row;
-    while (r < next_row) : (r += 1) {
-        pos = d.reader.boundsAfter(d.source, pos, null).next;
-    }
-
-    var produced: u64 = 0;
-    while (produced < materialize) {
-        // Bound the SOURCE bytes scanned for this ONE row to the per-row cap:
-        // a row whose terminator isn't found within it is served as a bounded
-        // prefix (cells stay individually display-capped, as before) and
-        // flagged oversized — this call never re-lexes a giant row's full
-        // bytes.
-        const row_limit = d.reader.posAtByteBudget(d.source, pos, api.window_row_scan_max_bytes);
-        const res = d.reader.materialize(d.source, pos, d.column_count, api.cell_max_bytes, row_limit, &d.win_buf, &d.win_refs, d.gpa) catch break;
-        d.win_source.append(d.gpa, next_row + produced) catch {}; // identity: source == physical row
-        d.win_oversized.append(d.gpa, res.capped) catch {};
-        produced += 1;
-        if (!res.capped) {
-            pos = res.next;
-            continue;
-        }
-        if (produced >= materialize) break; // that was the last row wanted
-        // Oversized: `res.next` is only the cap boundary, not the row's true
-        // end — locate the next row via the checkpoint the frontier already
-        // dropped right after this one (decision 2) instead of re-scanning
-        // its (possibly gigabytes of) remaining bytes.
-        const target_row = next_row + produced;
+    const next_row = first_row +| d.win_rows;
+    if (!d.win_cursor_valid) {
         d.lock();
-        const skip_cp = nav.bestCheckpoint(d, target_row);
+        const avail_end = if (d.complete) d.total_rows else d.frontier_rows;
+        if (next_row < avail_end) {
+            const cp = nav.bestCheckpoint(d, next_row);
+            d.win_cursor_pos = cp.pos;
+            d.win_cursor_row = cp.row;
+            d.win_cursor_valid = true;
+        }
         d.unlock();
-        pos = skip_cp.pos;
-        var rr = skip_cp.row;
-        while (rr < target_row) : (rr += 1) {
-            pos = d.reader.boundsAfter(d.source, pos, null).next;
+        if (!d.win_cursor_valid) return .{ .first_row = first_row, .row_count = d.win_rows };
+    }
+
+    // First spend from the same aggregate meter locating the requested row.
+    while (d.win_cursor_row < next_row) {
+        const left = remainingBudget(d);
+        if (left == 0) return .{ .first_row = first_row, .row_count = d.win_rows };
+        const pos = d.win_cursor_pos;
+        const limit = d.reader.posAtByteBudget(d.source, pos, left);
+        const b = d.reader.boundsAfter(d.source, pos, limit);
+        charge(d, pos, b.next);
+        if (b.capped) return .{ .first_row = first_row, .row_count = d.win_rows };
+        d.win_cursor_pos = b.next;
+        d.win_cursor_row += 1;
+    }
+
+    while (d.win_rows < clamped) {
+        d.lock();
+        const avail_end = if (d.complete) d.total_rows else d.frontier_rows;
+        d.unlock();
+        if (d.win_cursor_row >= avail_end) break;
+
+        const left = remainingBudget(d);
+        if (left == 0) break;
+        const allowance = @min(left, @as(u64, api.window_row_scan_max_bytes));
+        const pos = d.win_cursor_pos;
+        const row_limit = d.reader.posAtByteBudget(d.source, pos, allowance);
+        const buf_mark = d.win_buf.items.len;
+        const refs_mark = d.win_refs.items.len;
+        const res = d.reader.materialize(d.source, pos, d.column_count, api.cell_max_bytes, row_limit, &d.win_buf, &d.win_refs, d.gpa) catch break;
+        charge(d, pos, res.next);
+        if (res.capped and allowance < api.window_row_scan_max_bytes) {
+            d.win_buf.items.len = buf_mark;
+            d.win_refs.items.len = refs_mark;
+            break;
+        }
+        if (!appendRowMetadata(d, d.win_cursor_row, res.capped, buf_mark, refs_mark)) break;
+        d.win_rows += 1;
+        d.win_cursor_row += 1;
+        if (!res.capped) {
+            d.win_cursor_pos = res.next;
+        } else {
+            d.lock();
+            const cp = nav.bestCheckpoint(d, d.win_cursor_row);
+            d.unlock();
+            d.win_cursor_pos = cp.pos;
+            d.win_cursor_row = cp.row;
         }
     }
-    d.win_rows = pinned_rows + produced;
-    return .{ .first_row = first_row, .row_count = pinned_rows + produced };
+    return .{ .first_row = first_row, .row_count = d.win_rows };
 }
 
 /// ls_window_set while a filter is active: `first_row`/`clamped` are FILTERED
@@ -161,64 +217,104 @@ pub fn windowSet(d: *Document, first_row: u64, row_count: u32) api.RowRange {
 fn windowSetFiltered(d: *Document, first_row: u64, clamped: u64) api.RowRange {
     d.lock();
     defer d.unlock();
-    if (first_row >= d.filter_total) return .{ .first_row = first_row, .row_count = 0 };
-    const materialize = @min(clamped, d.filter_total - first_row);
     const fctx = filter.filterCtx(d);
-    const start = nav.nthMatchLocation(d, d.filter_block_counts.items, fctx, d.filter_rows, first_row) orelse
-        return .{ .first_row = first_row, .row_count = 0 };
+    if (d.win_rows >= clamped) return .{ .first_row = first_row, .row_count = d.win_rows };
 
-    var produced: u64 = 0;
-    var pos = start.pos;
-    var row = start.row;
-    while (produced < materialize and row < d.filter_rows and !d.reader.atEnd(d.source, pos)) {
-        // Bound the SOURCE bytes scanned testing this ONE candidate to the
-        // per-row cap (ARCH-huge-row-filtered), exactly like windowSet.
-        const row_limit = d.reader.posAtByteBudget(d.source, pos, api.window_row_scan_max_bytes);
-        // Test the FULL cell within the bound (cap = null), same rule as
-        // SEARCH, using the nav scratch (mutex already held throughout this
-        // call).
-        d.nav_scratch.clearRetainingCapacity();
-        d.nav_refs.clearRetainingCapacity();
-        const test_res = d.reader.materialize(d.source, pos, d.column_count, null, row_limit, &d.nav_scratch, &d.nav_refs, d.gpa) catch break;
-        if (test_res.capped) {
-            // OVERSIZED candidate: consult the background filter-scan's
-            // already-recorded FULL-cell match -- never re-tested on this
-            // bounded prefix (would wrongly decide on a prefix) and never by
-            // re-lexing to the row's true end (would hang).
-            const matched = nav.oversizedMatch(d.filter_oversized_matches.items, row) orelse false;
-            if (matched) {
-                // Re-lex the same bounded prefix WITH the display cap
-                // directly into the window -- a bounded prefix, flagged.
-                _ = d.reader.materialize(d.source, pos, d.column_count, api.cell_max_bytes, row_limit, &d.win_buf, &d.win_refs, d.gpa) catch break;
-                d.win_source.append(d.gpa, row) catch break;
-                d.win_oversized.append(d.gpa, true) catch break;
-                produced += 1;
-                if (produced >= materialize) break; // that was the last row wanted
+    if (!d.win_cursor_valid) {
+        if (first_row >= d.filter_total) return .{ .first_row = first_row, .row_count = d.win_rows };
+        var cum: u64 = 0;
+        var b: usize = 0;
+        while (b < d.filter_block_counts.items.len) : (b += 1) {
+            const count = d.filter_block_counts.items[b];
+            if (cum + count > first_row) break;
+            cum += count;
+        }
+        if (b >= d.filter_block_counts.items.len or b >= d.checkpoints.items.len)
+            return .{ .first_row = first_row, .row_count = d.win_rows };
+        const cp = d.checkpoints.items[b];
+        d.win_cursor_pos = cp.pos;
+        d.win_cursor_row = cp.row;
+        d.win_cursor_valid = true;
+        d.win_filter_locating = true;
+        d.win_filter_skip = first_row - cum;
+    }
+
+    while (d.win_rows < clamped and d.win_cursor_row < d.filter_rows and !d.reader.atEnd(d.source, d.win_cursor_pos)) {
+        if (!d.win_candidate_tested) {
+            const left = remainingBudget(d);
+            if (left == 0) break;
+            const allowance = @min(left, @as(u64, api.window_row_scan_max_bytes));
+            const pos = d.win_cursor_pos;
+            const row_limit = d.reader.posAtByteBudget(d.source, pos, allowance);
+            d.nav_scratch.clearRetainingCapacity();
+            d.nav_refs.clearRetainingCapacity();
+            const test_res = d.reader.materialize(d.source, pos, d.column_count, null, row_limit, &d.nav_scratch, &d.nav_refs, d.gpa) catch break;
+            charge(d, pos, test_res.next);
+            if (test_res.capped and allowance < api.window_row_scan_max_bytes) break;
+
+            d.win_candidate_tested = true;
+            d.win_candidate_capped = test_res.capped;
+            d.win_candidate_matched = if (test_res.capped)
+                nav.oversizedMatch(d.filter_oversized_matches.items, d.win_cursor_row) orelse false
+            else
+                matcher.matchRecord(fctx, d.nav_scratch.items, d.nav_refs.items) != null;
+            if (test_res.capped) {
+                const cp = nav.bestCheckpoint(d, d.win_cursor_row + 1);
+                d.win_candidate_next_pos = cp.pos;
+                d.win_candidate_next_row = cp.row;
+            } else {
+                d.win_candidate_next_pos = test_res.next;
+                d.win_candidate_next_row = d.win_cursor_row + 1;
             }
-            // Advance past the oversized row's true end via the checkpoint
-            // the frontier drops immediately after it (decision 2), instead
-            // of re-scanning its (possibly gigabytes of) remaining bytes.
-            const target_row = row + 1;
-            const skip_cp = nav.bestCheckpoint(d, target_row);
-            pos = skip_cp.pos;
-            row = skip_cp.row;
-            while (row < target_row) : (row += 1) {
-                pos = d.reader.boundsAfter(d.source, pos, null).next;
+        }
+
+        if (d.win_filter_locating) {
+            if (d.win_candidate_matched) {
+                if (d.win_filter_skip == 0) {
+                    d.win_filter_locating = false;
+                } else {
+                    d.win_filter_skip -= 1;
+                }
             }
+            if (d.win_filter_locating) {
+                d.win_cursor_pos = d.win_candidate_next_pos;
+                d.win_cursor_row = d.win_candidate_next_row;
+                d.win_candidate_tested = false;
+                continue;
+            }
+        }
+
+        if (!d.win_candidate_matched) {
+            d.win_cursor_pos = d.win_candidate_next_pos;
+            d.win_cursor_row = d.win_candidate_next_row;
+            d.win_candidate_tested = false;
             continue;
         }
-        if (matcher.matchRecord(fctx, d.nav_scratch.items, d.nav_refs.items) != null) {
-            // Re-lex the same row WITH the display cap directly into the window.
-            _ = d.reader.materialize(d.source, pos, d.column_count, api.cell_max_bytes, row_limit, &d.win_buf, &d.win_refs, d.gpa) catch break;
-            d.win_source.append(d.gpa, row) catch break;
-            d.win_oversized.append(d.gpa, false) catch break;
-            produced += 1;
+
+        // A matching filtered row is visited a second time for display. If
+        // the aggregate limit cuts this pass, retain the completed test
+        // decision and retry only the display operation next call.
+        const left = remainingBudget(d);
+        if (left == 0) break;
+        const allowance = @min(left, @as(u64, api.window_row_scan_max_bytes));
+        const pos = d.win_cursor_pos;
+        const row_limit = d.reader.posAtByteBudget(d.source, pos, allowance);
+        const buf_mark = d.win_buf.items.len;
+        const refs_mark = d.win_refs.items.len;
+        const display_res = d.reader.materialize(d.source, pos, d.column_count, api.cell_max_bytes, row_limit, &d.win_buf, &d.win_refs, d.gpa) catch break;
+        charge(d, pos, display_res.next);
+        if (display_res.capped and allowance < api.window_row_scan_max_bytes) {
+            d.win_buf.items.len = buf_mark;
+            d.win_refs.items.len = refs_mark;
+            break;
         }
-        pos = test_res.next;
-        row += 1;
+        if (!appendRowMetadata(d, d.win_cursor_row, d.win_candidate_capped, buf_mark, refs_mark)) break;
+        d.win_rows += 1;
+        d.win_cursor_pos = d.win_candidate_next_pos;
+        d.win_cursor_row = d.win_candidate_next_row;
+        d.win_candidate_tested = false;
     }
-    d.win_rows = produced;
-    return .{ .first_row = first_row, .row_count = produced };
+    return .{ .first_row = first_row, .row_count = d.win_rows };
 }
 
 /// See api/lesssheet.h `ls_cell`. Zero allocation; total function.

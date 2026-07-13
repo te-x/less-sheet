@@ -729,15 +729,13 @@ pub fn gzSnapshotProbe(gpa: std.mem.Allocator, gzip_bytes: []const u8, probe_log
     return .{ .restored = identical, .identical = identical };
 }
 
-
 // ===========================================================================
 // window-budget instrumentation seams (ARCH-window-budget). Zig-only test
 // instrumentation (NOT the C ABI -- like copyAdvances / gz*), reading DEFAULTED
 // base.Document state, so api/lesssheet.h stays BYTE-IDENTICAL (AC1) and a
-// document that never hit the aggregate window cap / the #6 nav reports zero.
-// SEED: the aggregate window meter and the bounded/off-main filtered nav are NOT
-// built, so both report zero -> the quantitative window-budget/#6 ACs are RED;
-// the existing window/search/filter behavior is unchanged and stays GREEN.
+// document that has not performed source work on the corresponding synchronous
+// lane reports zero. Filtered navigation source resolution runs off-main, so its
+// synchronous latch remains independent of giant-row length.
 // ===========================================================================
 
 /// See contracts/api.zig `windowChargedBytes` (AC2/AC3/AC4/AC8).

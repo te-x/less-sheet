@@ -305,6 +305,24 @@ pub const Document = struct {
     win_first: u64,
     win_rows: u64,
 
+    // Aggregate-window request identity and continuation. The materialized
+    // prefix stays in win_* above; these fields retain only the O(1) source
+    // cursor needed to extend an identical request without replaying it.
+    win_request_valid: bool = false,
+    win_request_count: u64 = 0,
+    win_request_filtered: bool = false,
+    win_request_filter_gen: u64 = 0,
+    win_cursor_valid: bool = false,
+    win_cursor_pos: Pos = .{ .logical = 0, .physical = 0 },
+    win_cursor_row: u64 = 0,
+    win_filter_locating: bool = false,
+    win_filter_skip: u64 = 0,
+    win_candidate_tested: bool = false,
+    win_candidate_matched: bool = false,
+    win_candidate_capped: bool = false,
+    win_candidate_next_pos: Pos = .{ .logical = 0, .physical = 0 },
+    win_candidate_next_row: u64 = 0,
+
     // --- Copy cursor + test instrumentation (ARCH-stream-copy) --------------
     // The forward, view-scoped COPY CURSOR that accelerates consecutive,
     // monotonically-non-decreasing ls_cell_copy calls (window.cellCopy /
@@ -410,18 +428,18 @@ pub const Document = struct {
 
     // --- window-budget instrumentation state (ARCH-window-budget) -----------
     // DEFAULTED (like copy_cursor_* / gz_* above) so openWithAllocator's literal
-    // need not mention them AND the SEED reports zero -> every quantitative
-    // window-budget/#6 AC is RED until the aggregate window meter + the bounded/
-    // off-main filtered nav are built + wired. Read ONLY via contracts/api.zig's
+    // need not mention them. Read ONLY via contracts/api.zig's
     // windowChargedBytes / navChargedBytes (Zig-only seams -> root.zig), NEVER the
     // C ABI. Per-call latches: ls_window_set / ls_search_nav each reset their OWN
     // field at entry and add every charged source-byte visit to it (checkpoint
     // skips, the filtered test+display double pass, any replay -- see the seam doc
-    // comments). The plain additive accounting is single-lane and caller-
-    // serialized (the window / poll-control lanes), exactly like copy_advances --
-    // pure instrumentation, irrelevant to any returned byte.
+    // comments). Navigation replacement uses nav_gen so a worker result from a
+    // superseded/cancelled request cannot publish. The counters are pure
+    // instrumentation, irrelevant to any returned byte.
     window_charged_bytes: u64 = 0, // AC2/AC3/AC4/AC8: last ls_window_set charged work
     nav_charged_bytes: u64 = 0, // AC11/AC12 (#6): last ls_search_nav SYNCHRONOUS charged work
+    nav_charge_active: bool = false,
+    nav_gen: u64 = 0, // replacement/cancel guard for off-main filtered navigation
 
     pub fn lock(self: *Document) void {
         _ = c.pthread_mutex_lock(&self.mutex);
