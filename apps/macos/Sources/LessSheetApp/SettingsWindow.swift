@@ -98,7 +98,7 @@ struct SettingsView: View {
             Divider()
             ColumnSettingsSection(model: model)
         }
-        .frame(minWidth: 720, minHeight: 620)
+        .frame(minWidth: 490, minHeight: 620)
     }
 
     // MARK: Parse-parameter bindings (write == a dialect re-open)

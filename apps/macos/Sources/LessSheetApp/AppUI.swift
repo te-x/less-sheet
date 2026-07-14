@@ -206,14 +206,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 780, height: 680),
+            contentRect: NSRect(x: 0, y: 0, width: 660, height: 680),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
         window.title = "Settings"
         window.isReleasedWhenClosed = false
-        window.contentMinSize = NSSize(width: 720, height: 620)
+        window.contentMinSize = NSSize(width: 500, height: 620)
         window.contentView = NSHostingView(rootView: SettingsView(model: .shared))
         window.center()
         window.delegate = SettingsWindowObserver.shared

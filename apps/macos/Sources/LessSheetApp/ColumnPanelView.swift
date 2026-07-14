@@ -87,7 +87,7 @@ struct ColumnSettingsSection: View {
                     }
                 }
                 .padding(10)
-                .frame(minWidth: 250, idealWidth: 290)
+                .frame(minWidth: 130, idealWidth: 150)
                 .background(SettingsProbeMarker(name: "discovery"))
 
                 if let selection {
@@ -102,7 +102,7 @@ struct ColumnSettingsSection: View {
                 }
             }
         }
-        .frame(minWidth: 650, minHeight: 330)
+        .frame(minWidth: 460, minHeight: 330)
         .task(id: "\(model.openGeneration):\(model.settingsOpen):\(query)") { await search() }
     }
 

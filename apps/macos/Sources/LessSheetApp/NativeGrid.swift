@@ -470,6 +470,7 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
             }
             refreshVisibleRows()
             applyPendingLanding()
+            flushGridDisplay()
             return
         }
 
@@ -490,6 +491,7 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
                 } else {
                     refreshConfiguredColumns(columns)
                 }
+                flushGridDisplay()
                 return
             }
             refreshColumnWindow()
@@ -548,6 +550,13 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
 
         // A pending landing (jump / find / wrap / cancel restore): O(viewport).
         applyPendingLanding()
+
+        // Flush any config/visibility-driven repaint to screen NOW (see
+        // `flushGridDisplay`): an edit made from the separate, key Settings
+        // window otherwise only marks this window's rows/header needsDisplay,
+        // and AppKit defers that draw until this window next handles an event
+        // (the reported "changes only appear on click").
+        flushGridDisplay()
     }
 
     /// Schedule outside the model mutation turn. This is the direct half of
@@ -894,6 +903,23 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
     }
 
     // MARK: Row refresh (data / highlights)
+
+    /// Forces the grid's already-marked-dirty viewport (rows, header, gutter)
+    /// to draw synchronously, without waiting for the next event in this
+    /// window. A column-config or visibility mutation arrives from the SEPARATE
+    /// (key) Settings window; SwiftUI observation still re-runs `GridView.body`
+    /// -> `apply()` promptly on the main actor, and the branches above mark the
+    /// affected cells/columns needsDisplay — but AppKit only flushes that draw
+    /// for a non-key window on its next event (the reported "instant in the
+    /// header, but the data waits for a click"). `displayIfNeeded` repaints just
+    /// what is dirty in the visible viewport (O(viewport), never a full-file
+    /// rescan) and is a no-op when nothing is dirty, so the config path is
+    /// instant while the scroll path — which never calls this — pays nothing.
+    private func flushGridDisplay() {
+        table.displayIfNeeded()
+        header.displayIfNeeded()
+        gutter.displayIfNeeded()
+    }
 
     private func refreshVisibleRows() {
         // Reconfigure EVERY live row view, not just those in the current
