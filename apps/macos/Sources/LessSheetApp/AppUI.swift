@@ -551,11 +551,18 @@ struct ContentView: View {
             OverlayView(model: model)
             // Our own always-visible filename, drawn in the title-bar band
             // (the native title stays hidden to preserve the under-titlebar
-            // frost + header alignment). Centered, clear of the traffic lights.
+            // frost + header alignment). Centered, clear of the traffic
+            // lights on both edges; when the title is too long to fit, it
+            // truncates at the START (keeps the tail) — for a network doc
+            // the tail of a URL (…/actual-file.csv) is the informative part,
+            // unlike the default `.tail` mode that would keep the scheme/host
+            // and hide exactly the part that matters.
             Text(windowTitle)
                 .font(.system(size: 13, weight: .medium))
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
+                .truncationMode(.head)
+                .padding(.horizontal, Self.titleTrafficLightReserve)
                 .frame(height: GridMetrics.titleBarInset)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
                 .allowsHitTesting(false)
@@ -612,6 +619,11 @@ struct ContentView: View {
             }
         }
     }
+
+    /// Horizontal clearance reserved on each side of the centered title so it
+    /// never overlaps the traffic lights (~70pt cluster + margin from the
+    /// leading edge); applied symmetrically since the title is centered.
+    private static let titleTrafficLightReserve: CGFloat = 78
 
     private var windowTitle: String {
         if case .document = model.phase, !model.path.isEmpty {
