@@ -39,6 +39,81 @@ public struct CoreSessionOpener: DocumentSessionOpening {
             throw DocumentOpenError.io
         }
     }
+
+    /// OVERRIDES the RED default: drives the core's async open-job
+    /// (`ls_open_url_start` -> poll `ls_net_open_poll` -> `ls_net_open_release`),
+    /// mapping `ls_net_status` -> `NetworkOpenError` on failure (a non-http/https
+    /// scheme is rejected SYNCHRONOUSLY by the core with `.invalidArgument`, no
+    /// network). Honors Task cancellation (cancels the fetch, throws
+    /// `.cancelled`). Returns the live session once the open is DONE. A thin
+    /// wrapper over `openURL(_:forcing:onProgress:cancelToken:)` with a no-op
+    /// progress callback and a throwaway token — this is the frozen protocol
+    /// requirement `DocumentSessionOpening` pins; callers that want the
+    /// always-visible progress affordance + an explicit Cancel button (ARCH
+    /// req 10 / AC9) use the tracking overload below instead.
+    public func openURL(_ url: String, forcing override: DialectOverride) async throws(NetworkOpenError) -> any DocumentSession {
+        try await openURL(url, forcing: override, onProgress: { _ in }, cancelToken: NetworkOpenCancelToken())
+    }
+
+    /// Tracking variant (LessSheetKit-only; not part of the frozen protocol):
+    /// identical open-job drive as above, but invokes `onProgress` with a live
+    /// snapshot on every poll tick (not just at start/terminal) — this is what
+    /// lets the UI show a real, incrementally-updating percentage/byte counter
+    /// (ARCH AC9 / round-2 review finding 1) — and honors `cancelToken`
+    /// explicitly (a plain dispatch-queue background op has no ambient Swift
+    /// Task to observe `Task.isCancelled` on, so a caller-owned token is the
+    /// only reliable cancel signal here).
+    public func openURL(
+        _ url: String,
+        forcing override: DialectOverride,
+        onProgress: @escaping @Sendable (NetworkOpenProgress) -> Void,
+        cancelToken: NetworkOpenCancelToken
+    ) async throws(NetworkOpenError) -> any DocumentSession {
+        do {
+            return try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<CoreDocumentSession, any Error>) in
+                    Self.openQueue.async {
+                        do {
+                            continuation.resume(returning: try CoreDocumentSession.openURLSync(url, forcing: override, onProgress: onProgress, cancelToken: cancelToken))
+                        } catch {
+                            continuation.resume(throwing: error)
+                        }
+                    }
+                }
+            } onCancel: {
+                cancelToken.cancel()
+            }
+        } catch let error as NetworkOpenError {
+            throw error
+        } catch {
+            throw NetworkOpenError.unreachable
+        }
+    }
+}
+
+/// Explicit, thread-safe cancel signal for an in-flight `openURL` (LessSheetKit
+/// / App only — not part of the frozen `Contracts` surface). The tracking
+/// `openURL(...)` overload polls `isCancelled` between core polls and, once
+/// true, calls `ls_net_open_cancel` on the job — this is the backing state for
+/// the UI's explicit Cancel button (round-2 review finding 1); Swift Task
+/// cancellation ALSO sets it via `withTaskCancellationHandler`.
+public final class NetworkOpenCancelToken: @unchecked Sendable {
+    private let lock = NSLock()
+    private var flag = false
+
+    public init() {}
+
+    public func cancel() {
+        lock.lock()
+        flag = true
+        lock.unlock()
+    }
+
+    var isCancelled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return flag
+    }
 }
 
 /// One live core document. See `DocumentSession` for the full contract.
@@ -118,6 +193,74 @@ public final class CoreDocumentSession: DocumentSession, @unchecked Sendable {
             encoding: Self.abiEncoding(d.encoding),
             encodingForced: d.encoding_forced
         )
+    }
+
+    /// Adopt an already-open core handle (the DONE doc a network open-job
+    /// produced via `ls_open_url_start`). Reads the same fixed-at-open facts as
+    /// the path initializer; the doc then follows the normal `ls_close`
+    /// lifecycle exactly like a local open.
+    private init(adopting doc: OpaquePointer) {
+        self.doc = doc
+        columnCount = Int(ls_column_count(doc))
+        let d = ls_dialect_get(doc)
+        dialect = DialectReport(
+            separator: d.separator,
+            quote: d.has_quote ? d.quote : nil,
+            hasHeader: d.header,
+            separatorForced: d.separator_forced,
+            quoteForced: d.quote_forced,
+            headerForced: d.header_forced,
+            encoding: Self.abiEncoding(d.encoding),
+            encodingForced: d.encoding_forced
+        )
+    }
+
+    /// Blocking network open (runs on `CoreSessionOpener.openQueue`): starts the
+    /// core job, polls it to a terminal state, and maps the result. A disallowed
+    /// scheme / malformed URL fails synchronously as `.invalidArgument`.
+    static func openURLSync(
+        _ url: String,
+        forcing override: DialectOverride,
+        onProgress: @escaping @Sendable (NetworkOpenProgress) -> Void,
+        cancelToken: NetworkOpenCancelToken
+    ) throws(NetworkOpenError) -> CoreDocumentSession {
+        var options = ls_open_options(
+            separator: abiSeparator(override.separator),
+            quote: abiQuote(override.quote),
+            header: abiHeader(override.header),
+            index_mode: Int32(LS_INDEX_AUTO),
+            encoding: abiEncodingOption(override.encoding)
+        )
+        let job: OpaquePointer? = url.withCString { cptr in
+            ls_open_url_start(cptr, url.utf8.count, &options)
+        }
+        guard let job else { throw NetworkOpenError.io } // handle-alloc failure
+        defer { ls_net_open_release(job) }
+        while true {
+            if cancelToken.isCancelled {
+                ls_net_open_cancel(job)
+            }
+            let s = ls_net_open_poll(job)
+            // ARCH AC9 / round-2 review finding 1: report a LIVE snapshot every
+            // tick (not only start/terminal) so the always-visible progress
+            // affordance shows real, incrementally-updating bytes/percentage.
+            onProgress(NetworkOpenProgress(
+                abiState: Int32(s.state.rawValue), progress: s.progress,
+                bytesFetched: s.bytes_fetched, bytesTotal: s.bytes_total,
+                abiError: Int32(s.error.rawValue), httpStatus: s.http_status
+            ))
+            switch s.state.rawValue {
+            case ls_net_open_state.RawValue(LS_NET_OPEN_DONE.rawValue):
+                guard let raw = s.doc else { throw NetworkOpenError.io }
+                return CoreDocumentSession(adopting: raw)
+            case ls_net_open_state.RawValue(LS_NET_OPEN_FAILED.rawValue):
+                throw NetworkOpenError(abiCode: Int32(s.error.rawValue), httpStatus: s.http_status) ?? .unreachable
+            case ls_net_open_state.RawValue(LS_NET_OPEN_CANCELLED.rawValue):
+                throw NetworkOpenError.cancelled
+            default:
+                Thread.sleep(forTimeInterval: 0.005) // PENDING / FETCHING: poll again
+            }
+        }
     }
 
     deinit { close() }

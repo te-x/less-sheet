@@ -10,6 +10,11 @@ const Decompress = flate.Decompress;
 const c = std.c;
 const posix = std.posix;
 
+const net_source = @import("net_source.zig");
+/// The network `http_range` Source state (ARCH-network-source) — a genuinely
+/// random-access byte provider peer to mmap/gzip, defined in net_source.zig.
+pub const HttpRange = net_source.HttpRange;
+
 pub const chunk_bytes: usize = 256 * 1024;
 pub const checkpoint_interval: u64 = 32 * 1024 * 1024;
 const open_bytes: usize = @intCast(api.open_head_max_bytes);
@@ -489,11 +494,13 @@ pub const Gzip = struct {
 pub const Source = union(enum) {
     mmap: Mmap,
     gzip: *Gzip,
+    http_range: *HttpRange,
 
     pub fn len(self: Source) u64 {
         return switch (self) {
             .mmap => |m| m.bytes.len,
             .gzip => |g| g.terminalLogical() orelse (g.forward_logical.load(.acquire) -| g.bom_len),
+            .http_range => |hr| hr.logicalLen(),
         };
     }
 
@@ -501,6 +508,7 @@ pub const Source = union(enum) {
         return switch (self) {
             .mmap => |m| m.bytes[@intCast(start)..@intCast(end)],
             .gzip => unreachable,
+            .http_range => unreachable, // http_range reads via the streaming Cursor, never a direct slice
         };
     }
 
@@ -512,6 +520,7 @@ pub const Source = union(enum) {
         return switch (self) {
             .mmap => |m| m.bytes.len,
             .gzip => |g| g.terminalLogical(),
+            .http_range => |hr| hr.logicalLen(),
         };
     }
 
@@ -519,6 +528,7 @@ pub const Source = union(enum) {
         return switch (self) {
             .mmap => |m| m.bytes[0..@min(m.bytes.len, open_bytes)],
             .gzip => |g| g.head.items,
+            .http_range => |hr| hr.openHead(),
         };
     }
 
@@ -526,6 +536,7 @@ pub const Source = union(enum) {
         return switch (self) {
             .mmap => true,
             .gzip => |g| g.openUsable(),
+            .http_range => true,
         };
     }
 };
@@ -547,6 +558,7 @@ pub const Cursor = struct {
 
     pub fn deinit(self: *Cursor) void {
         if (self.locked) switch (self.source.?) {
+            .http_range => {}, // random-access: no lane lease to release
             .gzip => |g| {
                 g.lock();
                 const internal = self.logical +| g.bom_len;
@@ -587,7 +599,40 @@ pub const Cursor = struct {
         self.* = cursorAt(source, logical, limit, null);
     }
 
+    /// http_range: a genuinely random-access provider over the spool mapping;
+    /// peek/span ensure the requested range is fetched (persist-once) then
+    /// return a stable spool slice directly — no look-buffer copy needed.
+    fn peekHttp(self: *Cursor, n: usize) []const u8 {
+        const hr = self.source.?.http_range;
+        const max_n = @min(n, self.look.len);
+        const logical_end = if (self.limit) |lim| @min(lim, hr.logicalLen()) else hr.logicalLen();
+        if (self.logical >= logical_end) return self.look[0..0];
+        var avail: u64 = @min(@as(u64, max_n), logical_end - self.logical);
+        if (self.physical_limit) |pl| {
+            const at = hr.physical_base +| self.logical;
+            avail = @min(avail, pl -| at);
+        }
+        if (avail == 0) return self.look[0..0];
+        const s = hr.ensureSlice(self.logical + hr.bom_len, avail);
+        return s[0..@min(s.len, @as(usize, @intCast(avail)))];
+    }
+
+    fn spanHttp(self: *Cursor) []const u8 {
+        const hr = self.source.?.http_range;
+        const logical_end = if (self.limit) |lim| @min(lim, hr.logicalLen()) else hr.logicalLen();
+        if (self.logical >= logical_end) return &.{};
+        const internal = self.logical + hr.bom_len;
+        // Bound to the next chunk boundary so each span triggers at most one
+        // fresh fetch (incremental, never fetch-the-whole-file).
+        const chunk_end_internal = ((internal / net_source.chunk_bytes) + 1) * net_source.chunk_bytes;
+        var end_logical = @min(logical_end, chunk_end_internal -| hr.bom_len);
+        if (self.physical_limit) |pl| end_logical = @min(end_logical, pl -| hr.physical_base);
+        if (end_logical <= self.logical) return &.{};
+        return hr.ensureSlice(internal, end_logical - self.logical);
+    }
+
     pub fn peek(self: *Cursor, n: usize) []const u8 {
+        if (self.source.? == .http_range) return self.peekHttp(n);
         const max_n = @min(n, self.look.len);
         if (self.limit) |lim| if (self.logical >= lim) return self.look[0..0];
         var got: usize = 0;
@@ -623,16 +668,19 @@ pub const Cursor = struct {
                 if (got == 0 and internal >= g.op_start[lane] and internal + max_n <= g.op_start[lane] + g.op_len[lane] and internal + max_n <= logical_end)
                     return g.lane_buf[lane][@intCast(internal - g.op_start[lane])..@intCast(internal - g.op_start[lane] + max_n)];
             },
+            .http_range => unreachable, // handled by peekHttp early return
         }
         while (got < max_n) : (got += 1) {
             if (self.limit) |lim| if (self.logical + got >= lim) break;
             if (self.physical_limit) |lim| switch (self.source.?) {
                 .mmap => |m| if (m.physical_base +| self.logical +| got >= lim) break,
                 .gzip => {},
+                .http_range => {},
             };
             const b = switch (self.source.?) {
                 .mmap => |m| if (self.logical + got < m.bytes.len) m.bytes[@intCast(self.logical + got)] else break,
                 .gzip => |g| g.byteAtLane(self.lane, self.logical + got + g.bom_len) orelse break,
+                .http_range => unreachable,
             };
             self.look[got] = b;
         }
@@ -648,6 +696,7 @@ pub const Cursor = struct {
     pub fn physicalPosition(self: *Cursor) u64 {
         return switch (self.source.?) {
             .mmap => |m| m.physical_base +| self.logical,
+            .http_range => |hr| hr.physical_base +| self.logical,
             .gzip => |g| blk: {
                 const internal = self.logical +| g.bom_len;
                 if (internal <= g.head.items.len) break :blk g.physicalFor(internal -| g.bom_len);
@@ -663,6 +712,7 @@ pub const Cursor = struct {
         if (self.physical_limit == null) return false;
         return switch (self.source.?) {
             .mmap => |m| m.physical_base +| self.logical >= self.physical_limit.?,
+            .http_range => |hr| hr.physical_base +| self.logical >= self.physical_limit.?,
             .gzip => |g| blk: {
                 const session = if (self.lane == 0) g.forward else if (self.lane == 1) g.replay else g.replay2;
                 break :blk session.terminal == .budget;
@@ -675,11 +725,13 @@ pub const Cursor = struct {
         if (self.hitPhysicalLimit()) return true;
         return switch (self.source.?) {
             .mmap => false,
+            .http_range => false,
             .gzip => |g| g.opening and g.forward.terminal == .budget,
         };
     }
 
     pub fn span(self: *Cursor) []const u8 {
+        if (self.source.? == .http_range) return self.spanHttp();
         if (self.limit) |lim| if (self.logical >= lim) return &.{};
         return switch (self.source.?) {
             .mmap => |m| blk: {
@@ -705,6 +757,7 @@ pub const Cursor = struct {
                 if (forced > 0 and result.len > forced) result = result[0..@intCast(forced)];
                 break :blk result;
             },
+            .http_range => unreachable, // handled by spanHttp early return
         };
     }
 };
@@ -749,6 +802,7 @@ pub fn sourceShutdown(source: *Source) void {
     switch (source.*) {
         .mmap => {},
         .gzip => |g| g.shutdown.store(true, .release),
+        .http_range => |hr| hr.shutdown.store(true, .release),
     }
 }
 
@@ -756,6 +810,7 @@ pub fn sourceFinishOpen(source: *Source) void {
     switch (source.*) {
         .mmap => {},
         .gzip => |g| g.finishOpen(),
+        .http_range => {},
     }
 }
 
@@ -763,6 +818,7 @@ pub fn sourceDeinit(source: *Source) void {
     switch (source.*) {
         .mmap => {},
         .gzip => |g| g.deinit(),
+        .http_range => |hr| hr.deinit(),
     }
 }
 
@@ -771,6 +827,9 @@ pub fn cursorAt(source: Source, logical: u64, logical_limit: ?u64, physical_budg
     switch (source) {
         .mmap => |m| if (physical_budget) |budget| {
             cur.physical_limit = m.physical_base +| logical +| budget;
+        },
+        .http_range => |hr| if (physical_budget) |budget| {
+            cur.physical_limit = hr.physical_base +| logical +| budget;
         },
         .gzip => |g| {
             g.lock();
@@ -819,6 +878,7 @@ pub fn scanCursorAt(source: Source, logical: u64) Cursor {
     var cur: Cursor = .{ .source = source, .logical = logical };
     switch (source) {
         .mmap => {},
+        .http_range => {},
         .gzip => |g| {
             g.lock();
             const internal = logical +| g.bom_len;
@@ -858,5 +918,10 @@ pub fn rebaseBom(source: *Source, bom_len: u64) void {
             m.physical_base +|= used;
         },
         .gzip => |g| g.bom_len = @min(bom_len, g.head.items.len),
+        .http_range => |hr| {
+            const used = @min(bom_len, hr.head_len);
+            hr.bom_len = used;
+            hr.physical_base +|= used;
+        },
     }
 }

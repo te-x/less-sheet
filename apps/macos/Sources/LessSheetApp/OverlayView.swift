@@ -62,27 +62,39 @@ enum OverlayMetrics {
 
 struct OverlayView: View {
     @Bindable var model: DocumentModel
+    @Environment(\.overlayDumpChrome) private var dumpChrome
 
     var body: some View {
         ZStack(alignment: .bottomTrailing) {
             // Click-away scrim — clicks dismiss, while wheel events pass to the
             // native grid. An active search is navigation chrome, not a modal
-            // interaction that replaces normal viewport scrolling.
-            if model.anyPopupOpen {
+            // interaction that replaces normal viewport scrolling. SKIPPED in
+            // headless dumps: it is an NSViewRepresentable, which ImageRenderer
+            // renders as a full-frame red "no entry" placeholder (masking the
+            // whole scene), and a dump has no clicks to dismiss anyway.
+            if model.anyPopupOpen && !dumpChrome {
                 PopupDismissScrim(model: model)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .accessibilityHidden(true)
             }
 
-            // ARCH-select-copy AC2: a brief, subtle "what was copied" notice —
-            // floats above the control row, auto-cleared by the model after a
-            // readable beat (`DocumentModel.completeCopy`), never blocking or
-            // requiring dismissal.
-            if let notice = model.copyNotice {
-                CopyNoticeView(model: model, text: notice)
-                    .padding(.trailing, 24)
-                    .padding(.bottom, 24 + OverlayMetrics.controlSize + 10)
-                    .transition(.opacity.combined(with: .move(edge: .bottom)))
+            // Brief, subtle notices floating above the control row, auto-
+            // cleared by the model after a readable beat, never blocking or
+            // requiring dismissal: the "what was copied" notice (ARCH-select-
+            // copy AC2) and the header-toggle "what changed" notice. Stacked
+            // when both are live, so neither ever covers the other.
+            if model.copyNotice != nil || model.dialectNotice != nil {
+                VStack(alignment: .trailing, spacing: 8) {
+                    if let notice = model.dialectNotice {
+                        NoticeCapsule(text: notice)
+                    }
+                    if let notice = model.copyNotice {
+                        CopyNoticeView(model: model, text: notice)
+                    }
+                }
+                .padding(.trailing, 24)
+                .padding(.bottom, 24 + OverlayMetrics.controlSize + 10)
+                .transition(.opacity.combined(with: .move(edge: .bottom)))
             }
 
             GlassEffectContainer(spacing: 8) {
@@ -109,6 +121,84 @@ struct OverlayView: View {
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Viewer controls")
         .animation(.easeInOut(duration: 0.2), value: model.copyNotice)
+        .animation(.easeInOut(duration: 0.2), value: model.dialectNotice)
+    }
+}
+
+/// A plain transient notice pill — the same glass language as the copy notice,
+/// for one-line "what changed" feedback that needs no progress or cancel
+/// affordance (currently the header toggle).
+struct NoticeCapsule: View {
+    let text: String
+
+    var body: some View {
+        Text(text)
+            .font(.caption)
+            .foregroundStyle(.primary)
+            .lineLimit(1)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .glassChrome(.regular, in: Capsule())
+            .accessibilityLabel(text)
+    }
+}
+
+/// The network-open progress affordance (ARCH-network-source req 10 / AC9;
+/// round-2 review finding 1) — the SAME glass-capsule language as
+/// `CopyNoticeView`/`JumpControlView`'s popup, but ALWAYS visible from the
+/// instant the open starts (no 500 ms `DelayedProgressGate` threshold: network
+/// latency is unpredictable even for a small file). Determinate (a linear bar +
+/// percentage) once `Content-Length`/`Content-Range` is known; indeterminate
+/// (a spinner + live byte counter) otherwise. Carries its own Cancel, mirroring
+/// the jump-scan popup's Cancel/Esc — `model.cancelNetworkOpen()` signals the
+/// in-flight open-job.
+struct NetworkOpenBanner: View {
+    @Bindable var model: DocumentModel
+    let progress: NetworkOpenProgress
+
+    private static let byteFormatter: ByteCountFormatter = {
+        let f = ByteCountFormatter()
+        f.countStyle = .binary
+        return f
+    }()
+
+    var body: some View {
+        HStack(spacing: 10) {
+            if let fraction = progress.fraction {
+                ProgressView(value: fraction)
+                    .progressViewStyle(.linear)
+                    .frame(width: 120)
+                Text("\(Int((fraction * 100).rounded()))%")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            } else {
+                ProgressView()
+                    .controlSize(.small)
+                Text(Self.byteFormatter.string(fromByteCount: Int64(progress.bytesFetched)))
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            Text("Opening URL…")
+                .font(.caption)
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+            Button("Cancel", role: .cancel) { model.cancelNetworkOpen() }
+                .buttonStyle(.plain)
+                .font(.caption)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .glassChrome(.regular, in: Capsule())
+        .onExitCommand { model.cancelNetworkOpen() }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(accessibilityText)
+    }
+
+    private var accessibilityText: String {
+        if let fraction = progress.fraction {
+            return "Opening URL, \(Int((fraction * 100).rounded())) percent. Press Escape to cancel."
+        }
+        return "Opening URL, \(Self.byteFormatter.string(fromByteCount: Int64(progress.bytesFetched))) fetched. Press Escape to cancel."
     }
 }
 

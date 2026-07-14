@@ -197,6 +197,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// File › Open URL… (⌘⇧O) — a small sheet with a URL field, funneling into
+    /// `DocumentModel.openURL` (ARCH-network-source req 9). ⌘O's local panel is
+    /// unaffected. The URL is opened as typed; no recents entry.
+    static func openURLViaSheet() {
+        let alert = NSAlert()
+        alert.messageText = "Open URL"
+        alert.informativeText = "Enter the http:// or https:// address of a CSV or .csv.gz file."
+        alert.addButton(withTitle: "Open")
+        alert.addButton(withTitle: "Cancel")
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
+        field.placeholderString = "https://example.com/data.csv"
+        alert.accessoryView = field
+        alert.window.initialFirstResponder = field
+        if alert.runModal() == .alertFirstButtonReturn {
+            let url = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !url.isEmpty else { return }
+            Task { await DocumentModel.shared.openURL(url, forcing: launchForcedOverride()) }
+        }
+    }
+
     /// Raises the sole normal Settings surface, optionally deep-linked from a
     /// grid header to one logical column.
     func presentSettings(selecting column: Int? = nil) {
@@ -431,6 +451,8 @@ struct LessSheetApp: App {
                 CommandGroup(replacing: .newItem) {
                     Button("Open…") { AppDelegate.openViaPanel() }
                         .keyboardShortcut("o", modifiers: .command)
+                    Button("Open URL…") { AppDelegate.openURLViaSheet() }
+                        .keyboardShortcut("o", modifiers: [.command, .shift])
                 }
                 CommandMenu("Go") {
                     Button("Jump to Row…") { DocumentModel.shared.requestJumpFocus() }
@@ -454,7 +476,23 @@ struct ContentView: View {
     @Bindable var model: DocumentModel
 
     var body: some View {
-        content.background(WindowConfigurator(title: windowTitle))
+        ZStack(alignment: .bottomTrailing) {
+            content
+            // The network-open progress affordance rides ABOVE whatever
+            // `content` shows — including the pre-open `.launch` empty state,
+            // since a network open can be the very FIRST thing the user does
+            // (ARCH req 10 / AC9: visible from t0, no phase/document required).
+            if let progress = model.networkOpenProgress {
+                NetworkOpenBanner(model: model, progress: progress)
+                    .padding(.trailing, 24)
+                    // Clear the existing control row when a document is ALREADY
+                    // showing (a re-open of a new URL over a live document).
+                    .padding(.bottom, model.phase == .document ? 24 + OverlayMetrics.controlSize + 10 : 24)
+                    .transition(.opacity.combined(with: .move(edge: .bottom)))
+            }
+        }
+        .animation(.easeInOut(duration: 0.2), value: model.networkOpenProgress)
+        .background(WindowConfigurator(title: windowTitle))
     }
 
     @ViewBuilder
@@ -476,11 +514,26 @@ struct ContentView: View {
             }
 
         case let .failure(error, path):
-            ErrorPanel(error: error, path: path)
-                .task(id: model.openGeneration) {
-                    FrameDump.dumpError(error: error, path: path)
-                    FrameDump.terminateIfRequested()
-                }
+            // A NETWORK open's failure carries its OWN distinct taxonomy
+            // (`NetworkOpenError`, 7 cases — round-2 review finding 2: a 404,
+            // timeout, DNS failure, redirect-loop, invalid scheme, and spool-IO
+            // error must each render distinctly, never collapse into one
+            // generic message). `phase` itself stays `DocumentOpenError`-typed
+            // (frozen), so the network failure detail rides alongside in
+            // `model.networkOpenError` and is rendered here instead when present.
+            if model.currentOpenKind == .network, let networkError = model.networkOpenError {
+                NetworkErrorPanel(error: networkError, path: path)
+                    .task(id: model.openGeneration) {
+                        FrameDump.dumpError(error: error, path: path)
+                        FrameDump.terminateIfRequested()
+                    }
+            } else {
+                ErrorPanel(error: error, path: path)
+                    .task(id: model.openGeneration) {
+                        FrameDump.dumpError(error: error, path: path)
+                        FrameDump.terminateIfRequested()
+                    }
+            }
         }
     }
 
@@ -562,6 +615,9 @@ struct ContentView: View {
 
     private var windowTitle: String {
         if case .document = model.phase, !model.path.isEmpty {
+            // A network document shows its URL AS-IS (no filename extraction —
+            // ARCH-network-source req 11); a local file shows its basename.
+            if model.currentOpenKind == .network { return model.path }
             return (model.path as NSString).lastPathComponent
         }
         return "LessSheet"
@@ -618,6 +674,59 @@ struct ErrorPanel: View {
         case .notFound: "Check the path, then open it again."
         case .permissionDenied: "Grant read access to this file, then open it again."
         case .io, .invalidArgument: "It may be a folder or otherwise unreadable. Try another file."
+        }
+    }
+}
+
+/// The network-open analog of `ErrorPanel` (ARCH-network-source AC7 — round-2
+/// review finding 2): renders each of the 7 distinct `NetworkOpenError` cases
+/// with its own fact + fix, so a 404, a DNS/connect failure, a timeout, a
+/// redirect-loop, a disallowed scheme, and a spool-IO error never read as the
+/// same generic message.
+struct NetworkErrorPanel: View {
+    let error: NetworkOpenError
+    let path: String
+
+    var body: some View {
+        VStack(spacing: 10) {
+            Image(systemName: "wifi.exclamationmark")
+                .font(.system(size: 34))
+                .foregroundStyle(.secondary)
+            Text(fact).font(.headline)
+            Text(fix).font(.callout).foregroundStyle(.secondary)
+            Text(path)
+                .font(.callout.monospaced())
+                .foregroundStyle(.secondary)
+                .textSelection(.enabled)
+                .padding(.top, 4)
+        }
+        .padding(40)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color(nsColor: .textBackgroundColor))
+    }
+
+    private var fact: String {
+        switch error {
+        case .invalidArgument: "Not an http:// or https:// address"
+        case .unreachable: "Couldn't reach that host"
+        case .timeout: "The connection timed out"
+        case let .httpStatus(code): "Server returned \(code)"
+        case .tooManyRedirects: "Too many redirects"
+        case .io: "Couldn't create the local download"
+        case .cancelled: "Open cancelled"
+        }
+    }
+
+    private var fix: String {
+        switch error {
+        case .invalidArgument: "Only http:// and https:// URLs are supported. Check the address and try again."
+        case .unreachable: "Check the address and your network connection, then try again."
+        case .timeout: "The server didn't respond in time. Try again."
+        case let .httpStatus(code) where code == 401 || code == 403: "This URL requires authentication, which isn't supported. Try a public URL."
+        case .httpStatus: "The server rejected the request. Check the address and try again."
+        case .tooManyRedirects: "The URL redirected too many times. Check the address."
+        case .io: "Couldn't create the local spool file. Check available disk space and try again."
+        case .cancelled: "The open was cancelled before it finished."
         }
     }
 }

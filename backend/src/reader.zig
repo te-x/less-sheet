@@ -224,6 +224,7 @@ const source_mod2 = @import("source.zig");
 pub fn sourceEndAt(source: Source, pos: Pos) api.SourceEnd {
     if (source.knownEnd()) |end| return if (pos.logical >= end) switch (source) {
         .mmap => .clean_eof,
+        .http_range => .clean_eof,
         .gzip => |g| if (g.terminal_kind.load(.acquire) == 1) .clean_eof else .damaged_eof,
     } else .inflating;
     return .inflating;

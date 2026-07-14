@@ -365,7 +365,7 @@ fn scanChunk(doc: *Document, start_pos: Pos, start_row: u64) ChunkResult {
     var row = start_row;
     const target = ((start_row / checkpoint_interval) + 1) * checkpoint_interval;
     base.beginOversizedChunk(doc);
-    if (doc.source == .gzip) {
+    if (doc.source != .mmap) {
         if (doc.stop_atomic.load(.monotonic)) return .{ .end_pos = pos, .end_row = row, .eof = false, .checkpoint = null };
         const batch = doc.reader.scanRows(doc.source, pos, target - row);
         pos = batch.next;

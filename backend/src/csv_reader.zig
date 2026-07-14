@@ -217,6 +217,7 @@ pub const CsvReader = struct {
         return toPos(0, switch (source) {
             .mmap => |m| m.physical_base,
             .gzip => 0,
+            .http_range => |hr| hr.physical_base,
         });
     }
 
@@ -252,7 +253,7 @@ pub const CsvReader = struct {
                 const b = lexer.recordBounds(content, toOffset(pos), self.sep, self.quote, lim, self.encoding);
                 return .{ .next = toPos(b.next, source.mmap.physical_base +| b.next), .capped = b.capped };
             },
-            .gzip => boundsStream(source, pos, limit, self.sep, self.quote, self.encoding),
+            .gzip, .http_range => boundsStream(source, pos, limit, self.sep, self.quote, self.encoding),
         };
     }
 
@@ -274,7 +275,7 @@ pub const CsvReader = struct {
                 const res = try lexer.lexInto(content, toOffset(pos), self.sep, self.quote, want, cap, lim, self.encoding, buf, refs, gpa);
                 return .{ .next = toPos(res.next, source.mmap.physical_base +| res.next), .capped = res.capped };
             },
-            .gzip => try lexStream(source, pos, want, cap, limit, self.sep, self.quote, self.encoding, buf, refs, gpa),
+            .gzip, .http_range => try lexStream(source, pos, want, cap, limit, self.sep, self.quote, self.encoding, buf, refs, gpa),
         };
     }
 
@@ -296,7 +297,7 @@ pub const CsvReader = struct {
                 const res = try lexer.lexSelected(content, toOffset(pos), self.sep, self.quote, selected, cap, lim, self.encoding, buf, refs, gpa);
                 return .{ .next = toPos(res.next, source.mmap.physical_base +| res.next), .capped = res.capped };
             },
-            .gzip => try lexStreamSelected(source, pos, selected, cap, limit, self.sep, self.quote, self.encoding, buf, refs, gpa),
+            .gzip, .http_range => try lexStreamSelected(source, pos, selected, cap, limit, self.sep, self.quote, self.encoding, buf, refs, gpa),
         };
     }
 
@@ -316,7 +317,7 @@ pub const CsvReader = struct {
                 const res = decodeColumn(content, toOffset(pos), self.sep, self.quote, lim, self.encoding, col, buf, buf_len);
                 return .{ .len = res.len, .truncated = res.truncated };
             },
-            .gzip => cellStream(source, pos, col, limit, self.sep, self.quote, self.encoding, buf, buf_len),
+            .gzip, .http_range => cellStream(source, pos, col, limit, self.sep, self.quote, self.encoding, buf, buf_len),
         };
     }
 
@@ -368,7 +369,7 @@ fn matchStream(source: Source, pos: Pos, sep: u8, quote: ?u8, encoding: u8, prim
             };
             break :blk matchCursor(&cur, sep, quote, encoding, primary, filter_ctx);
         },
-        .gzip => blk: {
+        .gzip, .http_range => blk: {
             var cur = source_mod.cursorAt(source, toOffset(pos), logical_limit, limit.physical);
             defer cur.deinit();
             break :blk matchCursor(&cur, sep, quote, encoding, primary, filter_ctx);

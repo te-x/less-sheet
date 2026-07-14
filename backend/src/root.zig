@@ -29,6 +29,8 @@ const c = std.c;
 const base = @import("base.zig");
 const csv_reader = @import("csv_reader.zig");
 const source_mod = @import("source.zig");
+const open = @import("open.zig");
+const net_source = @import("net_source.zig");
 const matcher = @import("matcher.zig");
 const filter = @import("filter.zig");
 const search = @import("search.zig");
@@ -86,7 +88,9 @@ fn validateOptions(opt: api.OpenOptions) bool {
 }
 
 /// See contracts/api.zig `openWithAllocator`. Every heap allocation for the
-/// document goes through `gpa`; the file mapping itself (mmap) is exempt.
+/// document goes through `gpa`; the file mapping itself (mmap) is exempt. The
+/// Document construction, head scan, shape build, and worker spawn are shared
+/// with the network open path — see src/open.zig `buildDocument`.
 pub fn openWithAllocator(gpa: std.mem.Allocator, path: [*:0]const u8, options: ?*const api.OpenOptions, out_doc: *?*api.Doc) api.Status {
     out_doc.* = null;
 
@@ -114,279 +118,21 @@ pub fn openWithAllocator(gpa: std.mem.Allocator, path: [*:0]const u8, options: ?
         mapping = m;
     }
 
-    // Resolve the source encoding then the dialect from the raw head bytes
-    // (see csv_reader.openHead: encoding BEFORE dialect sniffing -- TEXT AND
-    // ENCODING) and hand back the ready CSV Reader + the post-BOM content
-    // slice -- everything CSV-specific behind the Reader interface (see
-    // docs/architecture/ARCH-reader-interface.md). `raw` is the whole
-    // mapping (== file_size bytes) or empty for a 0-byte file; openHead runs
-    // unconditionally either way, exactly like the pre-reorg pipeline.
     const raw: []const u8 = if (mapping) |m| m else &.{};
     const kind: source_mod.SourceKind = if (raw.len >= 2 and raw[0] == 0x1f and raw[1] == 0x8b) .gzip else .mmap;
     var source = source_mod.sourceFromMappingAlloc(gpa, raw, kind) catch {
         if (mapping) |m| posix.munmap(m);
         return .io;
     };
-    var source_owned = true;
-    defer if (source_owned) source_mod.sourceDeinit(&source);
     if (!source.gzipUsable()) {
+        source_mod.sourceDeinit(&source);
         if (mapping) |m| posix.munmap(m);
         return .io;
     }
-    const head_bytes = if (kind == .gzip) source.openHead() else raw;
-    const oh = csv_reader.openHead(head_bytes, opt, encoding_sample_bytes);
-    source_mod.rebaseBom(&source, oh.bom_len);
 
-    const doc = gpa.create(Document) catch {
-        if (mapping) |m| posix.munmap(m);
-        return .io;
-    };
-    doc.* = .{
-        .gpa = gpa,
-        .mapping = mapping,
-        .source = source,
-        .reader = .{ .csv = oh.reader },
-        .content_len = if (kind == .mmap) oh.content.len else file_size,
-        .file_size = file_size,
-        .bom_len = oh.bom_len,
-        .dialect = undefined,
-        .column_count = 0,
-        .data_start = undefined, // set unconditionally right after construction, below
-        .auto = opt.index_mode == api.index_auto,
-        .has_header = false,
-        .header_buf = &.{},
-        .header_refs = &.{},
-        .record1_capped = false,
-        .row0_pinned_buf = &.{},
-        .row0_pinned_refs = &.{},
-        .mutex = .{},
-        .cond = .{},
-        .checkpoints = .empty,
-        .oversized_checkpoints = .empty,
-        .oversized_stage = .empty,
-        .frontier_rows = 0,
-        .frontier_pos = undefined, // set unconditionally right after construction, below
-        .complete = true, // an empty document is complete at open
-        .total_rows = 0,
-        .jump_state = .idle,
-        .jump_target = 0,
-        .jump_start_rows = 0,
-        .jump_progress = 0.0,
-        .jump_landed = 0,
-        .search_state = .idle,
-        .search_nav = .none,
-        .search_progress = 0.0,
-        .search_found_row = 0,
-        .search_found_col = 0,
-        .search_position = 0,
-        .search_total = 0,
-        .search_total_exact = false,
-        .search_pos = undefined, // set unconditionally right after construction, below
-        .search_rows = 0,
-        .search_to_eof = true,
-        .search_gen = 0,
-        .nav_pending = false,
-        .nav_anchor = 0,
-        .nav_dir = .forward,
-        .search_kind = .text,
-        .search_op = .eq,
-        .search_column = 0,
-        .search_value = &.{},
-        .search_value_dec = .{},
-        .search_fold = false,
-        .search_failure = &.{},
-        .scope_mask = &.{},
-        .block_counts = .empty,
-        .search_scratch = .empty,
-        .search_refs = .empty,
-        .w_value = .empty,
-        .w_mask = .empty,
-        .w_failure = .empty,
-        .w_ctx = .{},
-        .w_gen = 0,
-        .nav_scratch = .empty,
-        .nav_refs = .empty,
-        .filter_state = .idle,
-        .filter_progress = 0.0,
-        .filter_total = 0,
-        .filter_total_exact = false,
-        .filter_pos = undefined, // set unconditionally right after construction, below
-        .filter_rows = 0,
-        .filter_gen = 0,
-        .filter_kind = .text,
-        .filter_op = .eq,
-        .filter_column = 0,
-        .filter_value = &.{},
-        .filter_value_dec = .{},
-        .filter_fold = false,
-        .filter_failure = &.{},
-        .filter_scope_mask = &.{},
-        .filter_block_counts = .empty,
-        .filter_oversized_stage = .empty,
-        .filter_oversized_matches = .empty,
-        .filter_scratch = .empty,
-        .filter_refs = .empty,
-        .wf_value = .empty,
-        .wf_mask = .empty,
-        .wf_failure = .empty,
-        .wf_ctx = .{},
-        .wf_gen = 0,
-        .worker = null,
-        .stop = false,
-        .stop_atomic = .init(false),
-        .win_buf = .empty,
-        .win_refs = .empty,
-        .win_source = .empty,
-        .win_oversized = .empty,
-        .win_first = 0,
-        .win_rows = 0,
-    };
-    source_owned = false;
-
-    if (kind == .gzip) switch (doc.source) {
-        .gzip => |g| {
-            doc.gz_physical_in = g.open_physical;
-            doc.gz_inflated_out = g.open_inflated;
-            doc.gz_resident_bytes = g.residentBytes();
-        },
-        .mmap => unreachable,
-    };
-
-    // `data_start`/`frontier_pos`/`search_pos`/`filter_pos` all start at the
-    // Reader's own notion of "the very beginning" (0 for CSV) -- obtained
-    // opaquely (never a bare literal; see reader.zig's module doc) now that
-    // `doc.reader`/`doc.source` exist.
-    const start_pos = doc.reader.start(doc.source);
-    doc.data_start = start_pos;
-    doc.frontier_pos = start_pos;
-    doc.search_pos = start_pos;
-    doc.filter_pos = start_pos;
-
-    // Record 1 -> column count, header decision, header cells.
-    if (oh.content.len > 0) {
-        if (!buildShape(doc, opt)) {
-            freeDoc(doc);
-            return .io;
-        }
-        // The base checkpoint must exist: findCheckpoint always reads [0].
-        doc.checkpoints.append(gpa, .{ .row = 0, .pos = doc.data_start }) catch {
-            freeDoc(doc);
-            return .io;
-        };
-        doc.frontier_pos = doc.data_start;
-        if (doc.has_header and doc.record1_capped) {
-            // The header record itself never terminated within the head
-            // budget (requirement 9): its true end -- and therefore where
-            // data would even start -- is unknown. Report 0 data rows,
-            // exact, and do NOT headScan/index past the budget limit: doing
-            // so would lex the still-open header field's tail as bogus data
-            // records. The header cells themselves (capped + flagged) are
-            // already pinned by buildShape and served by ls_header_cell.
-            doc.complete = true;
-            doc.total_rows = 0;
-        } else {
-            doc.complete = false;
-            index.headScan(doc);
-        }
-    }
-
-    doc.dialect = .{
-        .separator = oh.reader.sep,
-        .quote = oh.reader.quote orelse api.default_quote,
-        .has_quote = oh.reader.quote != null,
-        .header = doc.has_header,
-        .encoding = oh.reader.encoding,
-        .separator_forced = opt.separator != api.sniff,
-        .quote_forced = opt.quote != api.sniff,
-        .header_forced = opt.header != api.sniff,
-        .encoding_forced = opt.encoding != api.encoding_auto,
-    };
-
-    // Only after encoding/shape/header and the complete bounded head scan may
-    // subsequent worker/cursor work consume compressed input past 4 MiB.
-    source_mod.sourceFinishOpen(&doc.source);
-
-    // One worker for the document's lifetime: advances the frontier (AUTO) or
-    // parks until a jump (MANUAL). Failure to spawn only forfeits background
-    // progress; the head frontier still serves the first screen.
-    doc.worker = std.Thread.spawn(.{}, index.workerMain, .{doc}) catch null;
-
+    const doc = open.buildDocument(gpa, source, mapping, file_size, opt) orelse return .io;
     out_doc.* = @ptrCast(doc);
     return .ok;
-}
-
-/// Decode record 1, fix the column count, decide the header, and (when the
-/// header is on) retain its cells. Bounded to the O(head) budget (requirement
-/// 9 / BOUNDED RECORD 1): a record 1 that doesn't terminate within it still
-/// yields a column count (>= 1, the fields decoded so far) and a display-
-/// capped, truncation-flagged final field; when record 1 is ALSO data row 0
-/// (header off) its capped decode is pinned (see Document.row0_pinned_*) so
-/// ls_window_set never has to re-scan the pathological record. When record 1
-/// IS the effective header instead, `data_start` becomes the budget cut point
-/// only as a marker -- the caller (openWithAllocator) sees `record1_capped &&
-/// has_header` and reports 0 data rows instead of headScan-ing from there
-/// (the header's true end is unknown, so there is no confirmed data, and
-/// nothing may lex the still-open header field's tail as bogus rows). Every
-/// cell is ALSO subject to the LS_CELL_MAX_BYTES display cap regardless of
-/// capping (header/row-0 cells are never re-decoded after open). Returns
-/// false only on allocation failure.
-fn buildShape(doc: *Document, opt: api.OpenOptions) bool {
-    var tmp_buf: std.ArrayList(u8) = .empty;
-    var tmp_refs: std.ArrayList(CellRef) = .empty;
-    const lim = index.headSourceLimit(doc);
-    const res = doc.reader.materialize(doc.source, doc.reader.start(doc.source), null, api.cell_max_bytes, lim, &tmp_buf, &tmp_refs, doc.gpa) catch {
-        tmp_buf.deinit(doc.gpa);
-        tmp_refs.deinit(doc.gpa);
-        return false;
-    };
-    doc.column_count = @intCast(tmp_refs.items.len);
-    doc.record1_capped = res.capped;
-
-    var all_numeric = true;
-    for (tmp_refs.items) |ref| {
-        if (!matcher.isNumeric(tmp_buf.items[ref.start .. ref.start + ref.len])) {
-            all_numeric = false;
-            break;
-        }
-    }
-    doc.has_header = switch (opt.header) {
-        api.header_on => true,
-        api.header_off => false,
-        else => !all_numeric, // sniff: header unless every record-1 cell is numeric
-    };
-
-    if (doc.has_header) {
-        doc.header_buf = tmp_buf.toOwnedSlice(doc.gpa) catch {
-            tmp_buf.deinit(doc.gpa);
-            tmp_refs.deinit(doc.gpa);
-            return false;
-        };
-        doc.header_refs = tmp_refs.toOwnedSlice(doc.gpa) catch {
-            doc.gpa.free(doc.header_buf);
-            doc.header_buf = &.{};
-            tmp_refs.deinit(doc.gpa);
-            return false;
-        };
-        doc.data_start = res.next;
-    } else if (doc.record1_capped) {
-        doc.row0_pinned_buf = tmp_buf.toOwnedSlice(doc.gpa) catch {
-            tmp_buf.deinit(doc.gpa);
-            tmp_refs.deinit(doc.gpa);
-            return false;
-        };
-        doc.row0_pinned_refs = tmp_refs.toOwnedSlice(doc.gpa) catch {
-            doc.gpa.free(doc.row0_pinned_buf);
-            doc.row0_pinned_buf = &.{};
-            tmp_refs.deinit(doc.gpa);
-            return false;
-        };
-        doc.data_start = doc.reader.start(doc.source); // record 1 is data row 0
-    } else {
-        tmp_buf.deinit(doc.gpa);
-        tmp_refs.deinit(doc.gpa);
-        doc.data_start = doc.reader.start(doc.source); // record 1 is data row 0
-    }
-    return true;
 }
 
 /// See api/lesssheet.h `ls_close`.
@@ -993,22 +739,49 @@ pub fn openUrlStartFake(fixture: *const api.NetFixture, url: [*]const u8, url_le
 pub fn netRangeMode(doc: *const api.Doc) api.NetRangeMode {
     return @enumFromInt(asDoc(doc).net_range_mode);
 }
-/// See contracts/api.zig `netFetchCount` (AC6/AC13).
+/// See contracts/api.zig `netFetchCount` (AC6/AC13). Reads live off the
+/// http_range Source (like gzResidentBytes off the gzip Source); a non-network
+/// document reports 0.
 pub fn netFetchCount(doc: *const api.Doc) u64 {
-    return asDoc(doc).net_fetch_count;
+    const d = asDoc(doc);
+    if (d.source == .http_range) {
+        const hr = d.source.http_range;
+        hr.lock();
+        defer hr.unlock();
+        return hr.fetch_count;
+    }
+    return d.net_fetch_count;
 }
 /// See contracts/api.zig `netResidentBytes` (AC15).
 pub fn netResidentBytes(doc: *const api.Doc) u64 {
-    return asDoc(doc).net_resident_bytes;
+    const d = asDoc(doc);
+    if (d.source == .http_range) {
+        const hr = d.source.http_range;
+        hr.lock();
+        defer hr.unlock();
+        return hr.resident_bytes;
+    }
+    return d.net_resident_bytes;
 }
 /// See contracts/api.zig `netSpoolStore` (AC14).
 pub fn netSpoolStore(doc: *const api.Doc) api.NetSpoolStore {
     const d = asDoc(doc);
+    if (d.source == .http_range) {
+        const hr = d.source.http_range;
+        hr.lock();
+        defer hr.unlock();
+        return .{ .present = hr.spool_fd != null, .bytes = hr.spool_bytes, .mode = if (hr.spool_fd != null) 0o600 else 0, .unlinked = hr.spool_fd != null };
+    }
     return .{ .present = d.net_spool_present, .bytes = d.net_spool_bytes, .mode = d.net_spool_mode, .unlinked = d.net_spool_unlinked };
 }
 /// See contracts/api.zig `netForceCacheBytes` (AC6).
 pub fn netForceCacheBytes(doc: *api.Doc, n: u64) void {
-    asDocMut(doc).net_force_cache_bytes = n;
+    const d = asDocMut(doc);
+    if (d.source == .http_range) {
+        d.source.http_range.setCacheCap(n);
+        return;
+    }
+    d.net_force_cache_bytes = n;
 }
 /// See contracts/api.zig `netJobProbe` (AC8).
 pub fn netJobProbe(job: *const api.NetOpenJob) api.NetJobProbe {

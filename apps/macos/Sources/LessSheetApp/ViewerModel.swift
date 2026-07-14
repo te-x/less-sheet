@@ -102,6 +102,19 @@ final class DocumentModel {
 
     // Document facts (constant for the open session).
     private(set) var path: String = ""
+    /// Whether the current document was opened locally or over the network
+    /// (ARCH-network-source): keys the cold-start marker policy (AC10) and the
+    /// window title (the URL is shown as-is, no filename extraction — req 11).
+    private(set) var currentOpenKind: DocumentOpenKind = .local
+    /// The last network-open failure (for the affordance); cleared on a new open.
+    private(set) var networkOpenError: NetworkOpenError?
+    /// Live progress of an in-flight network open (nil when none). Drives the
+    /// always-visible progress affordance (req 10 / AC9); no 500 ms delay gate.
+    private(set) var networkOpenProgress: NetworkOpenProgress?
+    /// The in-flight network open's cancel signal (nil when none); `cancelNetworkOpen()`
+    /// fires it. Not `@Observable`-visible state on its own (the affordance reads
+    /// `networkOpenProgress`); private so only `openURL`/`cancelNetworkOpen` touch it.
+    private var networkCancelToken: NetworkOpenCancelToken?
     private(set) var columnCount = 0
     private(set) var headerCells: [String]?
     /// Bounded label cache for the core-backed grid fetch. Unlike the legacy
@@ -160,6 +173,13 @@ final class DocumentModel {
     // on every (re-)open like the find/filter state below.
     private(set) var selection: Selection?
     private(set) var copyNotice: String?
+
+    /// A brief, auto-fading "what changed" notice for immediate dialect
+    /// toggles — the header button flips with no popup, so the glyph swap
+    /// alone is easy to miss. Mirrors `copyNotice`'s lifecycle (set on the
+    /// action, cleared by its own task after a readable beat).
+    private(set) var dialectNotice: String?
+    @ObservationIgnored private var dialectNoticeTask: Task<Void, Never>?
 
     // Find (search) session state: the editable draft + the active search's
     // display (highlights render exactly while `display.request` is non-nil).
@@ -368,6 +388,105 @@ final class DocumentModel {
                 }
             }
 
+            adoptSession(candidate, path: path, kind: .local, previous: previous, replayAuthoredSettings: replayAuthoredSettings, reopenDecision: reopenDecision, oldSession: oldSession, authoredSettings: authoredSettings, authoredManualWidths: authoredManualWidths)
+        } catch {
+            if previous != nil, oldSession != nil {
+                self.session = oldSession
+                startPolling()
+            } else {
+                oldSession?.close()
+                self.session = nil
+                self.phase = .failure(error, path: path)
+            }
+        }
+        openGeneration += 1
+        // Cross-window poke (same bridge as the column-config mutators): a
+        // dialect re-open driven from the separate (key) Settings window — or
+        // a header toggle whose observation turn gets coalesced — must reach
+        // the grid's openGeneration branch NOW, not on the next interaction.
+        // Without it the sticky header and the top rows keep the pre-toggle
+        // content until a scroll repages them ("header only changes once I
+        // scroll down and up"). Idempotent; on first launch the grid isn't
+        // built/attached yet and the call is a guarded no-op.
+        NativeGridController.live?.apply()
+        if SettingsRedesignProbe.active {
+            DispatchQueue.main.async {
+                AppDelegate.shared?.runSettingsProbeAfterFirstPaint(model: self)
+            }
+        }
+    }
+
+    /// Ordered decoded identities for the strict dialect/encoding re-open
+    /// check. This path runs only for an explicit Parsing change, never cold
+    /// open; the core copy itself stays in ABI-bounded batches.
+
+    /// Open a CSV / .csv.gz served over HTTP(S) (ARCH-network-source req 9) —
+    /// the network analog of `open(path:)`, parallel and additive. Drives the
+    /// core's async open-job via `DocumentSessionOpening.openURL`, shows the URL
+    /// as-is in the title with no recents entry, and never emits the cold-start
+    /// marker (AC10 — `currentOpenKind == .network`). A disallowed scheme is
+    /// rejected synchronously as `.invalidArgument`, no network.
+    func openURL(_ url: String, forcing override: DialectOverride = .sniffAll) async {
+        await stopPolling()
+        cancelCopy()
+        let oldSession = session
+        networkOpenError = nil
+        networkOpenProgress = NetworkOpenProgress(state: .pending, fraction: nil, bytesFetched: 0, bytesTotal: 0, error: nil)
+        currentOpenKind = .network
+        // A fresh cancel token per open (round-2 review finding 1): `cancelNetworkOpen()`
+        // signals THIS token; a superseded/earlier open's stale token, if fired
+        // late, no longer matches `networkCancelToken` and is a no-op below.
+        let token = NetworkOpenCancelToken()
+        networkCancelToken = token
+        do {
+            let candidate: any DocumentSession
+            if let core = opener as? CoreSessionOpener {
+                // The tracking overload: reports a LIVE snapshot every poll tick,
+                // driving the always-visible progress affordance from t0 (AC9),
+                // and honors `cancelToken` for the UI's explicit Cancel button.
+                candidate = try await core.openURL(url, forcing: override, onProgress: { [weak self] progress in
+                    Task { @MainActor in
+                        guard let self, self.networkCancelToken === token else { return }
+                        self.networkOpenProgress = progress
+                    }
+                }, cancelToken: token)
+            } else {
+                candidate = try await opener.openURL(url, forcing: override)
+            }
+            networkOpenProgress = nil
+            networkCancelToken = nil
+            adoptSession(candidate, path: url, kind: .network, previous: nil, replayAuthoredSettings: false, reopenDecision: nil, oldSession: oldSession, authoredSettings: [:], authoredManualWidths: [:])
+        } catch {
+            // `openURL` is a typed throw (NetworkOpenError only).
+            networkOpenProgress = nil
+            networkCancelToken = nil
+            networkOpenError = error
+            oldSession?.close()
+            self.session = nil
+            // The network taxonomy has no DocumentOpenError analogue; surface the
+            // fact through the failure panel with a stable code, the distinct
+            // detail via `networkOpenError` — `ContentView` renders a
+            // `NetworkErrorPanel` from it instead of the generic one (AC7 /
+            // round-2 review finding 2: each of the 7 cases gets its own text).
+            self.phase = .failure(.io, path: url)
+        }
+        openGeneration += 1
+        NativeGridController.live?.apply()
+    }
+
+    /// Cancel the in-flight network open (round-2 review finding 1 — the
+    /// affordance's Cancel button). No-op once the open has already settled
+    /// (`networkCancelToken` is cleared as soon as `openURL` returns/throws).
+    func cancelNetworkOpen() {
+        networkCancelToken?.cancel()
+    }
+
+    /// The session-adoption tail shared by the local `open(path:)` and the
+    /// network `openURL(_:)` funnels: closes the old handle, installs the new
+    /// session, and resets all per-document view state. `kind` records whether
+    /// this open is local or network (AC10 marker policy / window title).
+    private func adoptSession(_ candidate: any DocumentSession, path: String, kind: DocumentOpenKind, previous: ColumnVisibility?, replayAuthoredSettings: Bool, reopenDecision: ColumnReopenDecision?, oldSession: (any DocumentSession)?, authoredSettings: [Int: ColumnUserSettings], authoredManualWidths: [Int: Double]) {
+        self.currentOpenKind = kind
             oldSession?.close()
             let session = candidate
             self.session = candidate
@@ -473,27 +592,8 @@ final class DocumentModel {
             }
             self.phase = .document
             startPolling()
-        } catch {
-            if previous != nil, oldSession != nil {
-                self.session = oldSession
-                startPolling()
-            } else {
-                oldSession?.close()
-                self.session = nil
-                self.phase = .failure(error, path: path)
-            }
-        }
-        openGeneration += 1
-        if SettingsRedesignProbe.active {
-            DispatchQueue.main.async {
-                AppDelegate.shared?.runSettingsProbeAfterFirstPaint(model: self)
-            }
-        }
     }
 
-    /// Ordered decoded identities for the strict dialect/encoding re-open
-    /// check. This path runs only for an explicit Parsing change, never cold
-    /// open; the core copy itself stays in ABI-bounded batches.
     private static func headerIdentities(_ session: any DocumentSession) -> [ColumnHeaderIdentity]? {
         guard session.dialect.hasHeader else { return nil }
         if let core = session as? CoreDocumentSession {
@@ -529,11 +629,27 @@ final class DocumentModel {
         // only pass the ±1 shift). A separator/quote change resets to the top.
         if case let .header(newValue) = change {
             pendingHeaderShift = (newValue == dialect.hasHeader) ? 0 : (newValue ? -1 : +1)
+            // The H button toggles with no popup or text of its own — surface
+            // what just changed (same vocabulary as the button's tooltip).
+            showDialectNotice(newValue ? "First row is now a header" : "First row is now data")
         } else {
             pendingHeaderShift = nil
         }
         Task { await self.open(path: path, forcing: override, carrying: carried) }
         return true
+    }
+
+    /// Raises the brief dialect notice and schedules its auto-clear —
+    /// exactly `completeCopy`'s notice lifecycle (a fresh notice supersedes
+    /// a still-fading one by cancelling its task first).
+    private func showDialectNotice(_ text: String) {
+        dialectNoticeTask?.cancel()
+        dialectNotice = text
+        dialectNoticeTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(2.5))
+            guard let self, !Task.isCancelled else { return }
+            self.dialectNotice = nil
+        }
     }
 
     /// The grid reads (and clears) the pending header-toggle shift when it handles
@@ -2486,6 +2602,10 @@ final class DocumentModel {
     func markFirstRowsVisible() {
         guard markedGeneration != openGeneration else { return }
         markedGeneration = openGeneration
+        // AC10: a NETWORK open never emits the cold-start marker — the <500 ms
+        // budget does not apply. Route through the frozen policy so the marker
+        // still fires for local opens (regression-guarded).
+        guard TimingMarker.emitsFirstRowsMarker(for: currentOpenKind) else { return }
         LaunchTiming.markFirstRowsVisible()
     }
 
