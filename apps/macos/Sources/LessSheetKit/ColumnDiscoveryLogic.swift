@@ -1,38 +1,38 @@
 import Contracts
 import Foundation
 
-// RED SEED (planner freeze) for the settings-panel-redesign discovery + Settings
-// lifecycle contracts (ARCH-column-config amendment, criteria 12/13/17/19/22).
-// These two types satisfy the frozen `ColumnDiscoveryRouting` /
-// `SettingsLifecycleReducing` signatures so the tree COMPILES, but each method
-// deliberately reproduces the PRE-amendment behavior (always list the full
-// column set, no `#N` addressing, unbounded match retention, an always-expanded
-// single-selection panel that never validates/collapses/clears). That makes the
-// new-behavior assertions in ColumnDiscoveryTests FAIL on VALUE while the guard
-// cases pass — a behavior RED, never a compile/import failure.
-//
-// The implementer replaces these bodies with the pinned semantics documented on
-// the protocols in Sources/Contracts (ColumnDiscovery.swift / SettingsLifecycle.swift).
-// This file is implementer-owned (not frozen); the contracts + tests are.
-
 public struct ColumnDiscovery: ColumnDiscoveryRouting {
     public init() {}
 
     public func mode(columnCount: Int) -> ColumnDiscoveryMode {
-        // SEED: the old panel always showed a list regardless of column count.
-        .fullList
+        if columnCount <= 0 { return .empty }
+        return columnCount <= columnDiscoveryInlineListMax ? .fullList : .searchOnly
     }
 
     public func resolveDirectAddress(_ query: String, columnCount: Int) -> ColumnDirectAddress? {
-        // SEED: the old panel had no `#N` direct addressing — every input is an
-        // ordinary label query.
-        nil
+        guard query.first == "#" else { return nil }
+        let digits = query.dropFirst().utf8
+        guard !digits.isEmpty, digits.first != Character("0").asciiValue else {
+            return .noSuchColumn
+        }
+        var value = 0
+        for digit in digits {
+            guard digit >= 0x30, digit <= 0x39 else { return .noSuchColumn }
+            let (timesTen, multiplyOverflow) = value.multipliedReportingOverflow(by: 10)
+            let (next, addOverflow) = timesTen.addingReportingOverflow(Int(digit - 0x30))
+            guard !multiplyOverflow, !addOverflow else { return .noSuchColumn }
+            value = next
+        }
+        guard value > 0, value <= columnCount else { return .noSuchColumn }
+        return .column(value - 1)
     }
 
     public func accumulate(_ accumulation: ColumnMatchAccumulation, matches batch: [UInt32]) -> ColumnMatchAccumulation {
-        // SEED: the old search appended every match and never capped / flagged
-        // overflow (it retained all matching IDs).
-        ColumnMatchAccumulation(retained: accumulation.retained + batch, overflow: false)
+        guard !accumulation.overflow else { return accumulation }
+        let remaining = max(0, columnDiscoveryResultMax - accumulation.retained.count)
+        var retained = accumulation.retained
+        retained.append(contentsOf: batch.prefix(remaining))
+        return ColumnMatchAccumulation(retained: retained, overflow: batch.count > remaining)
     }
 }
 
@@ -40,43 +40,56 @@ public struct SettingsLifecycleReducer: SettingsLifecycleReducing {
     public init() {}
 
     public func opened(columnCount: Int, restoring: Int?) -> SettingsLifecycleState {
-        // SEED: does not validate/fall back the restored selection and leaves
-        // both disclosures expanded (the old panel had no collapsible sections).
-        SettingsLifecycleState(selection: restoring, query: "",
-                               nullValuesExpanded: true, widthAutoFitExpanded: true)
+        SettingsLifecycleState(selection: valid(restoring, columnCount: columnCount) ?? fallback(columnCount))
     }
 
     public func closed(_ state: SettingsLifecycleState) -> SettingsLifecycleState {
-        // SEED: leaves the query and disclosure expansion untouched on close.
-        state
+        SettingsLifecycleState(selection: state.selection)
     }
 
     public func columnSelected(_ state: SettingsLifecycleState, column: Int?) -> SettingsLifecycleState {
-        // SEED: moves the selection but wrongly collapses the disclosures (they
-        // must SURVIVE a column change).
         SettingsLifecycleState(selection: column, query: state.query,
-                               nullValuesExpanded: false, widthAutoFitExpanded: false)
+                               nullValuesExpanded: state.nullValuesExpanded,
+                               widthAutoFitExpanded: state.widthAutoFitExpanded)
     }
 
     public func disclosureSet(_ state: SettingsLifecycleState, _ disclosure: SettingsDisclosure, expanded: Bool) -> SettingsLifecycleState {
-        // SEED: ignores the disclosure toggle.
-        state
+        var next = state
+        switch disclosure {
+        case .nullValues: next.nullValuesExpanded = expanded
+        case .widthAutoFit: next.widthAutoFitExpanded = expanded
+        }
+        return next
     }
 
     public func headerAction(_ state: SettingsLifecycleState, target: Int, columnCount: Int, targetInCurrentRows: Bool) -> SettingsLifecycleState {
-        // SEED: does not deep-link the target (neither selects it nor replaces an
-        // excluding label query with `#N`).
-        state
+        guard valid(target, columnCount: columnCount) != nil else { return state }
+        var next = state
+        next.selection = target
+        if !targetInCurrentRows { next.query = "#\(target + 1)" }
+        return next
     }
 
     public func parsingReopened(_ state: SettingsLifecycleState, decision: ColumnReopenDecision, columnCount: Int) -> SettingsLifecycleState {
-        // SEED: does not clear the search or reset the selection on an unsafe map.
-        state
+        var next = state
+        next.query = ""
+        switch decision {
+        case .replayOrdinally:
+            next.selection = valid(state.selection, columnCount: columnCount) ?? fallback(columnCount)
+        case .resetAll:
+            next.selection = fallback(columnCount)
+        }
+        return next
     }
 
     public func documentOpened(columnCount: Int) -> SettingsLifecycleState {
-        // SEED: no column-0 fallback and leaves disclosures expanded.
-        SettingsLifecycleState(selection: nil, query: "",
-                               nullValuesExpanded: true, widthAutoFitExpanded: true)
+        SettingsLifecycleState(selection: fallback(columnCount))
     }
+
+    private func valid(_ selection: Int?, columnCount: Int) -> Int? {
+        guard let selection, selection >= 0, selection < columnCount else { return nil }
+        return selection
+    }
+
+    private func fallback(_ columnCount: Int) -> Int? { columnCount > 0 ? 0 : nil }
 }

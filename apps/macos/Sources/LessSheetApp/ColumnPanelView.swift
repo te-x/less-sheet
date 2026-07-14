@@ -20,16 +20,25 @@ private enum PanelRowSource: Equatable {
     }
 }
 
-struct ColumnConfigurationPanel: View {
+/// The embedded Columns section of the normal Settings window. The legacy
+/// `panel` names below describe the bounded caches/contracts, not another
+/// user-visible surface.
+struct ColumnSettingsSection: View {
     @Bindable var model: DocumentModel
-    @Environment(\.dismiss) private var dismiss
-    @State private var selection: Int?
-    @State private var query = ""
     @State private var matches: [UInt32] = []
+    @State private var overflow = false
+    @State private var noSuchColumn = false
     @State private var searching = false
 
+    private var mode: ColumnDiscoveryMode { ColumnDiscovery().mode(columnCount: model.columnCount) }
+    private var query: String { model.settingsLifecycle.query }
+    private var selection: Int? { model.settingsLifecycle.selection }
+
     private var source: PanelRowSource {
-        query.isEmpty ? .all(model.columnCount) : .matches(matches)
+        switch mode {
+        case .empty, .searchOnly: .matches(matches)
+        case .fullList: .all(model.columnCount)
+        }
     }
 
     var body: some View {
@@ -38,22 +47,37 @@ struct ColumnConfigurationPanel: View {
         let _ = model.columnPanelRevision
         VStack(spacing: 0) {
             HStack {
-                Text("Configure Columns").font(.headline)
+                Text("Columns").font(.headline)
                 Spacer()
                 Button("Show All") { model.showAllColumns() }
-                Button("Done") { dismiss() }.keyboardShortcut(.defaultAction)
             }
-            .padding(14)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
 
             Divider()
 
             HSplitView {
                 VStack(spacing: 8) {
-                    TextField("Search columns", text: $query)
-                        .textFieldStyle(.roundedBorder)
-                        .accessibilityLabel("Search columns by name or number")
-                    ColumnPanelTable(model: model, source: source, selection: $selection)
-                    if searching {
+                    if mode == .searchOnly {
+                        TextField("Search columns or enter #N", text: queryBinding)
+                            .textFieldStyle(.roundedBorder)
+                            .accessibilityLabel("Search columns by name or exact number")
+                            .background(SettingsProbeMarker(name: "search_field"))
+                    }
+                    if mode == .empty {
+                        ContentUnavailableView("No Columns", systemImage: "rectangle.split.3x1")
+                    } else {
+                        ColumnPanelTable(model: model, source: source, selection: selectionBinding)
+                    }
+                    if noSuchColumn {
+                        Label("No such column", systemImage: "exclamationmark.circle")
+                            .foregroundStyle(.secondary)
+                            .accessibilityLabel("No such column")
+                    } else if overflow {
+                        Label("More matches—refine your search", systemImage: "ellipsis.circle")
+                            .foregroundStyle(.secondary)
+                            .accessibilityLabel("More matches; refine your search")
+                    } else if searching {
                         ProgressView().controlSize(.small)
                             .accessibilityLabel("Searching column labels")
                     } else if let progress = model.columnInferenceProgress {
@@ -64,54 +88,71 @@ struct ColumnConfigurationPanel: View {
                 }
                 .padding(10)
                 .frame(minWidth: 250, idealWidth: 290)
+                .background(SettingsProbeMarker(name: "discovery"))
 
                 if let selection {
                     ColumnInspector(model: model, column: selection)
-                        .id(selection)
+                        .id("\(selection):\(model.openGeneration)")
                         .frame(minWidth: 310, idealWidth: 350)
+                        .background(SettingsProbeMarker(name: "inspector"))
                 } else {
                     ContentUnavailableView("Select a Column", systemImage: "rectangle.split.3x1")
                         .frame(minWidth: 310)
+                        .background(SettingsProbeMarker(name: "inspector"))
                 }
             }
         }
-        .frame(minWidth: 650, minHeight: 460)
-        .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-        .task(id: query) { await search() }
-        .onAppear { resetForOpen(selecting: model.columnPanelSelection) }
-        .onChange(of: selection) { _, value in model.setPanelSelection(value) }
-        .onChange(of: model.columnPanelSelection) { _, value in
-            if let value { selection = value }
-        }
-        .onChange(of: model.openGeneration) { _, _ in resetForOpen(selecting: nil) }
-        .onDisappear { model.closeColumnPanel() }
+        .frame(minWidth: 650, minHeight: 330)
+        .task(id: "\(model.openGeneration):\(model.settingsOpen):\(query)") { await search() }
     }
 
-    private func resetForOpen(selecting requested: Int?) {
-        query = ""
-        matches = []
-        searching = false
-        selection = requested.flatMap { (0..<model.columnCount).contains($0) ? $0 : nil }
-            ?? (model.columnCount > 0 ? 0 : nil)
-        model.setPanelSelection(selection)
+    private var queryBinding: Binding<String> {
+        Binding(get: { model.settingsLifecycle.query }, set: { model.setSettingsQuery($0) })
     }
 
-    /// Each batch is copied and matched off-main, then immediately appended on
-    /// the main actor. Query replacement/panel close cancels between batches;
-    /// only UInt32 matches survive beyond the batch.
+    private var selectionBinding: Binding<Int?> {
+        Binding(get: { model.settingsLifecycle.selection }, set: { model.selectSettingsColumn($0) })
+    }
+
+    /// Each fixed-size batch is copied and matched off-main. Between batches
+    /// only the first ten IDs plus one overflow bit survive.
     private func search() async {
         matches = []
-        guard !query.isEmpty, let core = model.columnPanelCore() else {
+        overflow = false
+        noSuchColumn = false
+        model.setSettingsDiscoveryRows(mode == .fullList ? Array(0..<model.columnCount) : [])
+        guard model.settingsOpen, mode == .searchOnly, !query.isEmpty else {
             searching = false
             return
         }
+
+        switch ColumnDiscovery().resolveDirectAddress(query, columnCount: model.columnCount) {
+        case .some(.column(let column)):
+            matches = [UInt32(column)]
+            model.setSettingsDiscoveryRows([column])
+            model.selectSettingsColumn(column)
+            searching = false
+            return
+        case .some(.noSuchColumn):
+            noSuchColumn = true
+            searching = false
+            return
+        case .none:
+            break
+        }
+
+        guard let core = model.columnPanelCore() else { searching = false; return }
         searching = true
         let needle = query
         let count = model.columnCount
         let locale = model.sessionLocale
         let searcher = ColumnLabelSearch()
+        let discovery = ColumnDiscovery()
+        var accumulation = ColumnMatchAccumulation.empty
         var start = 0
-        while start < count, !Task.isCancelled, query == needle {
+        while start < count, !Task.isCancelled,
+              model.settingsOpen, model.settingsLifecycle.query == needle,
+              !accumulation.stop {
             let end = min(count, start + searcher.batchSize)
             let ids = (start..<end).map { UInt32($0) }
             let batch = await Task.detached(priority: .userInitiated) {
@@ -122,12 +163,16 @@ struct ColumnConfigurationPanel: View {
                 }
                 return searcher.matches(query: needle, in: candidates, locale: locale)
             }.value
-            guard !Task.isCancelled, query == needle else { return }
-            matches.append(contentsOf: batch)
+            guard !Task.isCancelled, model.settingsOpen,
+                  model.settingsLifecycle.query == needle else { return }
+            accumulation = discovery.accumulate(accumulation, matches: batch)
+            matches = accumulation.retained
+            overflow = accumulation.overflow
+            model.setSettingsDiscoveryRows(matches.map(Int.init))
             start = end
             await Task.yield()
         }
-        if query == needle { searching = false }
+        if model.settingsLifecycle.query == needle { searching = false }
     }
 }
 
@@ -322,6 +367,14 @@ private struct ColumnInspector: View {
 
     var body: some View {
         Form {
+            Section("Column") {
+                Toggle("Visible", isOn: Binding(
+                    get: { !model.visibility.isHidden(column) },
+                    set: { _ in model.toggleColumn(column) }
+                ))
+                .disabled(!model.visibility.isHidden(column) && !model.canHide(column))
+            }
+
             Section("Type") {
                 Picker("Type", selection: typeSelection) {
                     Text("Auto").tag(0)
@@ -358,37 +411,34 @@ private struct ColumnInspector: View {
                 }
             }
 
-            Section("Null values") {
-                Toggle("Use sentinel", isOn: Binding(
-                    get: { nullEnabled },
-                    set: { enabled in
-                        nullEnabled = enabled
-                        model.setColumnNullSentinel(enabled ? nullText : nil, column: column)
-                    }
-                ))
-                if nullEnabled {
-                    TextField("Exact value", text: $nullText)
-                        .onSubmit { model.setColumnNullSentinel(nullText, column: column) }
-                }
-            }
-
             formatControls
 
-            Section("Layout") {
-                Toggle("Visible", isOn: Binding(
-                    get: { !model.visibility.isHidden(column) },
-                    set: { _ in model.toggleColumn(column) }
-                ))
-                .disabled(!model.visibility.isHidden(column) && !model.canHide(column))
-                Slider(value: widthBinding, in: Double(GridMetrics.minColumnWidth)...Double(GridMetrics.maxColumnWidth)) {
-                    Text("Column width")
+            Section("Advanced") {
+                DisclosureGroup("Null values", isExpanded: nullDisclosureBinding) {
+                    Toggle("Use sentinel", isOn: Binding(
+                        get: { nullEnabled },
+                        set: { enabled in
+                            nullEnabled = enabled
+                            model.setColumnNullSentinel(enabled ? nullText : nil, column: column)
+                        }
+                    ))
+                    if nullEnabled {
+                        TextField("Exact value", text: $nullText)
+                            .onSubmit { model.setColumnNullSentinel(nullText, column: column) }
+                    }
                 }
-                LabeledContent("Width", value: "\(Int(model.columnWidth(column))) pt")
-                Button("Auto-fit Width") { model.autoFitPanelColumn(column) }
+
+                DisclosureGroup("Width and Auto-fit", isExpanded: widthDisclosureBinding) {
+                    Slider(value: widthBinding, in: Double(GridMetrics.minColumnWidth)...Double(GridMetrics.maxColumnWidth)) {
+                        Text("Column width")
+                    }
+                    LabeledContent("Width", value: "\(Int(model.columnWidth(column))) pt")
+                    Button("Auto-fit Width") { model.autoFitPanelColumn(column) }
+                }
             }
         }
         .formStyle(.grouped)
-        .task(id: column) {
+        .task(id: "\(column):\(model.openGeneration)") {
             let setting = model.userSettings(for: column)
             nullEnabled = setting.nullSentinel != nil
             nullText = setting.nullSentinel.map { String(decoding: $0, as: UTF8.self) } ?? ""
@@ -459,6 +509,20 @@ private struct ColumnInspector: View {
     private var widthBinding: Binding<Double> {
         Binding(get: { model.columnWidth(column) },
                 set: { model.setPanelColumnWidth($0, column: column) })
+    }
+
+    private var nullDisclosureBinding: Binding<Bool> {
+        Binding(
+            get: { model.settingsLifecycle.nullValuesExpanded },
+            set: { model.setSettingsDisclosure(.nullValues, expanded: $0) }
+        )
+    }
+
+    private var widthDisclosureBinding: Binding<Bool> {
+        Binding(
+            get: { model.settingsLifecycle.widthAutoFitExpanded },
+            set: { model.setSettingsDisclosure(.widthAutoFit, expanded: $0) }
+        )
     }
 
     private func formatBinding(_ keyPath: WritableKeyPath<ColumnFormatOptions, Bool>) -> Binding<Bool> {

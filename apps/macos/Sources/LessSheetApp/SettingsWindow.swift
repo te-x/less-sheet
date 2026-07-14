@@ -1,13 +1,25 @@
+import AppKit
 import Contracts
 import SwiftUI
 
-// The Settings window's content (ARCH req. 9): a normal titled window with the
-// SAME three parse parameters as the overlay controls — bound to the same
-// session state, so a change here re-opens the document exactly as a popup would
-// — plus per-column visibility checkboxes (the last visible column's box
-// disabled). The parameter terms are identical to the popups' ("First row is
-// header", "Separator", "Quote character"). The form leaves obvious room for
-// future datatype/formatting sections and ships no dead controls.
+/// A transparent AppKit node used by the opt-in Settings probes to observe the
+/// real rendered hierarchy and geometry. It carries no production behavior.
+struct SettingsProbeMarker: NSViewRepresentable {
+    let name: String
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView(frame: .zero)
+        view.identifier = NSUserInterfaceItemIdentifier("lesssheet.settings.\(name)")
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        nsView.identifier = NSUserInterfaceItemIdentifier("lesssheet.settings.\(name)")
+    }
+}
+
+// The sole column-configuration surface: compact full-width Parsing above the
+// adaptive discovery list and selected-column inspector.
 //
 // csv-hardening (ARCH req. 11/12) adds a fourth Parsing control, "Text
 // encoding": Automatic + the five forced encodings, routed through the SAME
@@ -34,58 +46,59 @@ struct SettingsView: View {
     private enum QuoteChoice: Hashable { case byte(UInt8); case none; case custom }
 
     var body: some View {
-        Form {
-            Section("Parsing") {
-                Toggle("First row is header", isOn: headerBinding)
+        VStack(spacing: 0) {
+            Form {
+                Section("Parsing") {
+                    Toggle("First row is header", isOn: headerBinding)
 
-                Picker("Separator", selection: separatorChoiceBinding) {
-                    ForEach(separatorOptions, id: \.self) { byte in
-                        Text(DialectGlyph.separatorName(byte)).tag(SeparatorChoice.byte(byte))
+                    Picker("Separator", selection: separatorChoiceBinding) {
+                        ForEach(separatorOptions, id: \.self) { byte in
+                            Text(DialectGlyph.separatorName(byte)).tag(SeparatorChoice.byte(byte))
+                        }
+                        Text("Custom…").tag(SeparatorChoice.custom)
                     }
-                    Text("Custom…").tag(SeparatorChoice.custom)
-                }
-                if showSeparatorCustom {
-                    customCharField(text: $separatorCustomText, field: .separator) { byte in
-                        if model.applyDialectChange(.separator(byte)) { showSeparatorCustom = false }
-                        separatorCustomText = ""
+                    if showSeparatorCustom {
+                        customCharField(text: $separatorCustomText, field: .separator) { byte in
+                            if model.applyDialectChange(.separator(byte)) { showSeparatorCustom = false }
+                            separatorCustomText = ""
+                        }
                     }
-                }
 
-                Picker("Quote character", selection: quoteChoiceBinding) {
-                    Text("Double quote  \"").tag(QuoteChoice.byte(0x22))
-                    Text("Single quote  '").tag(QuoteChoice.byte(0x27))
-                    Text("None").tag(QuoteChoice.none)
-                    if let custom = customQuote {
-                        Text(DialectGlyph.quoteName(custom)).tag(QuoteChoice.byte(custom))
+                    Picker("Quote character", selection: quoteChoiceBinding) {
+                        Text("Double quote  \"").tag(QuoteChoice.byte(0x22))
+                        Text("Single quote  '").tag(QuoteChoice.byte(0x27))
+                        Text("None").tag(QuoteChoice.none)
+                        if let custom = customQuote {
+                            Text(DialectGlyph.quoteName(custom)).tag(QuoteChoice.byte(custom))
+                        }
+                        Text("Custom…").tag(QuoteChoice.custom)
                     }
-                    Text("Custom…").tag(QuoteChoice.custom)
-                }
-                if showQuoteCustom {
-                    customCharField(text: $quoteCustomText, field: .quote) { byte in
-                        if model.applyDialectChange(.quote(byte)) { showQuoteCustom = false }
-                        quoteCustomText = ""
+                    if showQuoteCustom {
+                        customCharField(text: $quoteCustomText, field: .quote) { byte in
+                            if model.applyDialectChange(.quote(byte)) { showQuoteCustom = false }
+                            quoteCustomText = ""
+                        }
                     }
-                }
 
-                // `EncodingOverride` (Contracts) isn't Hashable, so the picker
-                // binds an INDEX into the pinned `EncodingPicker.options` order
-                // rather than the enum itself; the labels + re-open semantics
-                // still come straight from the Contracts view-model.
-                Picker("Text encoding", selection: encodingIndexBinding) {
-                    ForEach(Array(EncodingPicker.options.enumerated()), id: \.offset) { index, option in
-                        Text(DialectGlyph.encodingOptionLabel(option, detected: detectedEncoding)).tag(index)
+                    // `EncodingOverride` (Contracts) isn't Hashable, so the picker
+                    // binds an INDEX into the pinned `EncodingPicker.options` order
+                    // rather than the enum itself; the labels + re-open semantics
+                    // still come straight from the Contracts view-model.
+                    Picker("Text encoding", selection: encodingIndexBinding) {
+                        ForEach(Array(EncodingPicker.options.enumerated()), id: \.offset) { index, option in
+                            Text(DialectGlyph.encodingOptionLabel(option, detected: detectedEncoding)).tag(index)
+                        }
                     }
                 }
+                .background(SettingsProbeMarker(name: "parsing"))
             }
+            .formStyle(.grouped)
+            .frame(height: (showSeparatorCustom || showQuoteCustom) ? 285 : 235)
 
-            if model.columnCount > 0 {
-                Section("Columns") {
-                    Button("Configure Columns…") { model.presentColumnPanel() }
-                }
-            }
+            Divider()
+            ColumnSettingsSection(model: model)
         }
-        .formStyle(.grouped)
-        .frame(minWidth: 340, minHeight: 320)
+        .frame(minWidth: 720, minHeight: 620)
     }
 
     // MARK: Parse-parameter bindings (write == a dialect re-open)

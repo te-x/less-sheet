@@ -1191,11 +1191,33 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
         refreshSelectionDisplay()
     }
 
-    /// Header context-menu entry into the same per-session column panel used
-    /// by Settings, deep-linked to the clicked absolute column.
+    /// Header context-menu entry into the sole Settings surface, deep-linked
+    /// to the clicked absolute column.
     func configureColumnFromHeader(atX x: CGFloat) {
         guard let index = windowColumnIndex(atX: x), index < absoluteColumns.count else { return }
-        model.presentColumnPanel(selecting: absoluteColumns[index])
+        AppDelegate.shared?.presentSettings(selecting: absoluteColumns[index])
+    }
+
+    /// Opt-in probe adapter: horizontally reveals the requested real header,
+    /// then invokes the same coordinate hit route as its context-menu action.
+    /// Returns false if no rendered header can represent the requested column.
+    func configureColumnFromHeaderForProbe(_ column: Int) -> Bool {
+        guard ProcessInfo.processInfo.environment["LESSSHEET_SETTINGS_HEADER_LINK"] != nil else { return false }
+        let columns = model.visibleColumns
+        let allWidths = model.visibleWidths()
+        guard let position = columns.firstIndex(of: column), allWidths.indices.contains(position) else { return false }
+
+        let targetX = allWidths.prefix(position).reduce(0, +) + allWidths[position] / 2
+        let clip = scroll.contentView
+        let revealX = max(0, targetX - clip.bounds.width / 2)
+        clip.scroll(to: NSPoint(x: revealX, y: clip.bounds.origin.y))
+        scroll.reflectScrolledClipView(clip)
+        refreshColumnWindow()
+        header.contentOffsetX = clip.bounds.origin.x
+
+        guard absoluteColumns.contains(column) else { return false }
+        configureColumnFromHeader(atX: targetX)
+        return true
     }
 
     /// Arrow / shift-arrow (via `SheetTableView`'s `NSStandardKeyBindingResponding`

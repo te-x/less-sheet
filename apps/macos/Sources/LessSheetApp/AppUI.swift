@@ -1,5 +1,6 @@
 import AppKit
 import Contracts
+import Foundation
 import LessSheetKit
 import Observation
 import SwiftUI
@@ -75,6 +76,18 @@ func launchForcedOverride() -> DialectOverride {
 }
 
 // MARK: - App delegate (deterministic single window + open routing + Settings)
+
+struct SettingsProbeSnapshot {
+    let configureColumnsCommand: Bool
+    let columnSheet: Bool
+    let parsingAbove: Bool
+    let listPresent: Bool
+    let inspectorPresent: Bool
+    let searchField: Bool
+    let discoveryRows: Int
+    let requestIDs: Int
+    let raised: Bool
+}
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -184,28 +197,124 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// The Settings gear opens a separate, normal titled window bound to the
-    /// same document state (ARCH req 9).
-    func presentSettings() {
+    /// Raises the sole normal Settings surface, optionally deep-linked from a
+    /// grid header to one logical column.
+    func presentSettings(selecting column: Int? = nil) {
+        DocumentModel.shared.beginSettings(selecting: column)
         if let window = settingsWindow {
-            DocumentModel.shared.settingsOpen = true
             window.makeKeyAndOrderFront(nil)
             return
         }
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 380, height: 420),
-            styleMask: [.titled, .closable],
+            contentRect: NSRect(x: 0, y: 0, width: 780, height: 680),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
         window.title = "Settings"
         window.isReleasedWhenClosed = false
+        window.contentMinSize = NSSize(width: 720, height: 620)
         window.contentView = NSHostingView(rootView: SettingsView(model: .shared))
         window.center()
         window.delegate = SettingsWindowObserver.shared
-        DocumentModel.shared.settingsOpen = true
         window.makeKeyAndOrderFront(nil)
         settingsWindow = window
+    }
+
+    /// Reads acceptance facts from the live Settings/AppKit hierarchy and the
+    /// discovery model state that hierarchy renders. Missing markers are false,
+    /// so a composition regression cannot be hidden by the probe.
+    func settingsProbeSnapshot(model: DocumentModel) -> SettingsProbeSnapshot {
+        settingsWindow?.contentView?.layoutSubtreeIfNeeded()
+        settingsWindow?.contentView?.displayIfNeeded()
+        guard let root = settingsWindow?.contentView else {
+            return SettingsProbeSnapshot(
+                configureColumnsCommand: containsConfigureColumnsMenuItem(NSApp.mainMenu),
+                columnSheet: mainWindow?.attachedSheet != nil,
+                parsingAbove: false, listPresent: false, inspectorPresent: false,
+                searchField: false, discoveryRows: model.settingsDiscoveryRowCount,
+                requestIDs: model.settingsRequestIDCount, raised: false
+            )
+        }
+
+        let views = descendantViews(root)
+        let parsing = marker("parsing", in: views)
+        let discovery = marker("discovery", in: views)
+        let inspector = marker("inspector", in: views)
+        let parsingAbove: Bool
+        if let parsing, let discovery, let inspector {
+            let parsingY = parsing.convert(parsing.bounds, to: root).midY
+            let lowerY = [discovery, inspector].map { $0.convert($0.bounds, to: root).midY }
+            parsingAbove = root.isFlipped ? lowerY.allSatisfy { parsingY < $0 }
+                : lowerY.allSatisfy { parsingY > $0 }
+        } else {
+            parsingAbove = false
+        }
+
+        let configureButton = views.compactMap { $0 as? NSButton }
+            .contains { $0.title.hasPrefix("Configure Columns") }
+        let configureAccessibility = containsConfigureColumnsAccessibility(root)
+        return SettingsProbeSnapshot(
+            configureColumnsCommand: configureButton || configureAccessibility
+                || containsConfigureColumnsMenuItem(NSApp.mainMenu),
+            columnSheet: mainWindow?.attachedSheet != nil,
+            parsingAbove: parsingAbove,
+            listPresent: discovery != nil,
+            inspectorPresent: inspector != nil,
+            searchField: marker("search_field", in: views) != nil,
+            discoveryRows: model.settingsDiscoveryRowCount,
+            requestIDs: model.settingsRequestIDCount,
+            raised: settingsWindow?.isVisible == true
+        )
+    }
+
+    private func descendantViews(_ root: NSView) -> [NSView] {
+        [root] + root.subviews.flatMap(descendantViews)
+    }
+
+    private func marker(_ name: String, in views: [NSView]) -> NSView? {
+        let identifier = "lesssheet.settings.\(name)"
+        return views.first { $0.identifier?.rawValue == identifier }
+    }
+
+    private func containsConfigureColumnsMenuItem(_ menu: NSMenu?) -> Bool {
+        guard let menu else { return false }
+        return menu.items.contains { item in
+            item.title.hasPrefix("Configure Columns") || containsConfigureColumnsMenuItem(item.submenu)
+        }
+    }
+
+    private func containsConfigureColumnsAccessibility(_ element: Any, depth: Int = 0) -> Bool {
+        guard depth < 32 else { return false }
+        let label: String?
+        let title: String?
+        let children: [Any]
+        if let view = element as? NSView {
+            label = view.accessibilityLabel()
+            title = view.accessibilityTitle()
+            children = view.accessibilityChildren() ?? []
+        } else if let accessibilityElement = element as? NSAccessibilityElement {
+            label = accessibilityElement.accessibilityLabel()
+            title = accessibilityElement.accessibilityTitle()
+            children = accessibilityElement.accessibilityChildren() ?? []
+        } else {
+            return false
+        }
+        if label?.hasPrefix("Configure Columns") == true
+            || title?.hasPrefix("Configure Columns") == true { return true }
+        return children.contains { containsConfigureColumnsAccessibility($0, depth: depth + 1) }
+    }
+
+    /// Verification-only fallback for off-screen launches where SwiftUI may not
+    /// schedule the content `.task`: force the opened document view through its
+    /// first display pass before driving a Settings probe.
+    func runSettingsProbeAfterFirstPaint(model: DocumentModel) {
+        guard SettingsRedesignProbe.active else { return }
+        showMainWindow()
+        mainWindow?.contentView?.layoutSubtreeIfNeeded()
+        mainWindow?.contentView?.displayIfNeeded()
+        model.markFirstRowsVisible()
+        SettingsRedesignProbe.run(model: model)
     }
 }
 
@@ -215,7 +324,95 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 final class SettingsWindowObserver: NSObject, NSWindowDelegate {
     static let shared = SettingsWindowObserver()
     func windowWillClose(_ notification: Notification) {
-        DocumentModel.shared.settingsOpen = false
+        DocumentModel.shared.endSettings()
+    }
+}
+
+/// Opt-in end-to-end hooks for the frozen Settings redesign probes. The
+/// implementation lives in this existing promoted source file so it cannot be
+/// dropped as an untracked standalone file. Production is inert unless a pinned
+/// `LESSSHEET_SETTINGS_*` variable is present.
+@MainActor
+enum SettingsRedesignProbe {
+    private static let env = ProcessInfo.processInfo.environment
+    private static var started = false
+
+    static var active: Bool {
+        env["LESSSHEET_SETTINGS_COMPOSE"] != nil
+            || env["LESSSHEET_SETTINGS_DISCOVERY"] != nil
+            || env["LESSSHEET_SETTINGS_HEADER_LINK"] != nil
+            || env["LESSSHEET_SETTINGS_RESET"] != nil
+    }
+
+    static func run(model: DocumentModel) {
+        guard !started else { return }
+        started = true
+
+        if env["LESSSHEET_SETTINGS_COMPOSE"] != nil {
+            AppDelegate.shared?.presentSettings()
+            Task { @MainActor in
+                guard let observed = await settledSnapshot(model: model) else { return }
+                log("lesssheet.settings.compose configure_columns_command=\(observed.configureColumnsCommand) column_sheet=\(observed.columnSheet) parsing_above=\(observed.parsingAbove) list_present=\(observed.listPresent) inspector_present=\(observed.inspectorPresent)")
+                finish()
+            }
+            return
+        }
+
+        if env["LESSSHEET_SETTINGS_DISCOVERY"] != nil {
+            let began = Date()
+            AppDelegate.shared?.presentSettings()
+            Task { @MainActor in
+                guard let observed = await settledSnapshot(model: model) else { return }
+                let milliseconds = max(0, Int(Date().timeIntervalSince(began) * 1_000))
+                log("lesssheet.settings.discovery total_columns=\(model.columnCount) search_field=\(observed.searchField) unfiltered_rows=\(observed.discoveryRows) settings_request_ids=\(observed.requestIDs) open_ms=\(milliseconds)")
+                finish()
+            }
+            return
+        }
+
+        if let raw = env["LESSSHEET_SETTINGS_HEADER_LINK"], let requested = Int(raw) {
+            Task { @MainActor in
+                await settleLayout()
+                let droveHeader = NativeGridController.live?
+                    .configureColumnFromHeaderForProbe(requested - 1) ?? false
+                guard let observed = await settledSnapshot(model: model) else { return }
+                let selected = model.settingsLifecycle.selection ?? -1
+                log("lesssheet.settings.header_link requested_col_1based=\(requested) selected_col_0based=\(selected) raised=\(droveHeader && observed.raised)")
+                finish()
+            }
+            return
+        }
+
+        if let secondPath = env["LESSSHEET_SETTINGS_RESET"] {
+            AppDelegate.shared?.presentSettings()
+            model.selectSettingsColumn(model.columnCount > 1 ? 1 : 0)
+            model.setSettingsQuery("probe")
+            Task { @MainActor in
+                await model.open(path: secondPath)
+                let selected = model.settingsLifecycle.selection ?? -1
+                log("lesssheet.settings.reset selected_col_0based=\(selected) query_empty=\(model.settingsLifecycle.query.isEmpty)")
+                finish()
+            }
+        }
+    }
+
+    private static func settledSnapshot(model: DocumentModel) async -> SettingsProbeSnapshot? {
+        await settleLayout()
+        return AppDelegate.shared?.settingsProbeSnapshot(model: model)
+    }
+
+    private static func settleLayout() async {
+        await Task.yield()
+        try? await Task.sleep(for: .milliseconds(20))
+    }
+
+    private static func finish() {
+        guard env["LESSSHEET_DUMP_EXIT"] != nil else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { NSApp.terminate(nil) }
+    }
+
+    private static func log(_ line: String) {
+        FileHandle.standardError.write(Data((line + "\n").utf8))
     }
 }
 
@@ -257,11 +454,7 @@ struct ContentView: View {
     @Bindable var model: DocumentModel
 
     var body: some View {
-        content
-            .background(WindowConfigurator(title: windowTitle))
-            .sheet(isPresented: $model.columnPanelPresented) {
-                ColumnConfigurationPanel(model: model)
-            }
+        content.background(WindowConfigurator(title: windowTitle))
     }
 
     @ViewBuilder
@@ -329,7 +522,9 @@ struct ContentView: View {
             // discoverable, then dump the requested frame for verification.
             model.markFirstRowsVisible()
             model.revealOverlay()
-            if JumpProbe.active {
+            if SettingsRedesignProbe.active {
+                SettingsRedesignProbe.run(model: model)
+            } else if JumpProbe.active {
                 // Verification: drive the real jump path AFTER first paint. The
                 // arrival dumps + terminates itself, so skip the first-frame
                 // dump/terminate (which would quit before the jump completes).

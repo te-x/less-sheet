@@ -127,8 +127,8 @@ final class DocumentModel {
     }
     private var columnConfigurationEvents: [ColumnConfigurationEvent] = []
     private(set) var columnInferenceProgress: Double?
-    var columnPanelPresented = false
-    var columnPanelSelection: Int?
+    private(set) var settingsLifecycle = SettingsLifecycleState()
+    private var settingsDiscoveryRows: [Int] = []
     private(set) var dialect = DialectReport(
         separator: 0x2C, quote: 0x22, hasHeader: false,
         separatorForced: false, quoteForced: false, headerForced: false
@@ -191,7 +191,7 @@ final class DocumentModel {
     var expandedPill: PillKind?
     var jumpFieldActive = false
     var findFieldActive = false
-    var settingsOpen = false
+    private(set) var settingsOpen = false
     /// Bumped by the ⌘J command to ask the overlay to reveal + focus the jump
     /// field (the keyboard reveal path).
     private(set) var jumpFocusRequests = 0
@@ -335,6 +335,7 @@ final class DocumentModel {
         do {
             let candidate = try await opener.open(path: path, forcing: override)
             var replayAuthoredSettings = false
+            var reopenDecision: ColumnReopenDecision?
             if previous != nil, let oldSession {
                 let headerOnly = oldDialect.separator == candidate.dialect.separator
                     && oldDialect.quote == candidate.dialect.quote
@@ -342,10 +343,12 @@ final class DocumentModel {
                 let change: ColumnReopenChange = headerOnly ? .headerOnly : .separatorQuoteEncoding
                 let oldHeaders = change == .separatorQuoteEncoding ? Self.headerIdentities(oldSession) : nil
                 let newHeaders = change == .separatorQuoteEncoding ? Self.headerIdentities(candidate) : nil
-                replayAuthoredSettings = ColumnSessionModel().decide(
+                let decision = ColumnSessionModel().decide(
                     change: change, oldCount: oldSession.columnCount, newCount: candidate.columnCount,
                     oldHeaders: oldHeaders, newHeaders: newHeaders
-                ) == .replayOrdinally
+                )
+                reopenDecision = decision
+                replayAuthoredSettings = decision == .replayOrdinally
 
                 if replayAuthoredSettings, let core = candidate as? CoreDocumentSession {
                     var replaySucceeded = true
@@ -393,6 +396,17 @@ final class DocumentModel {
             self.columnPresentationRevision += 1
             self.rowCountInfo = session.rowCount()
             self.indexProgress = session.indexProgress()
+            if let reopenDecision {
+                self.settingsLifecycle = SettingsLifecycleReducer().parsingReopened(
+                    self.settingsLifecycle, decision: reopenDecision, columnCount: session.columnCount
+                )
+            } else {
+                self.settingsLifecycle = SettingsLifecycleReducer().documentOpened(columnCount: session.columnCount)
+            }
+            self.settingsDiscoveryRows = []
+            if self.settingsOpen {
+                self.panelSelectedColumn = self.settingsLifecycle.selection.flatMap(UInt32.init(exactly:))
+            }
 
             // Hidden-column state: carry across a re-open when the column count
             // is unchanged, else reset to all-visible (ARCH req. 10).
@@ -470,6 +484,11 @@ final class DocumentModel {
             }
         }
         openGeneration += 1
+        if SettingsRedesignProbe.active {
+            DispatchQueue.main.async {
+                AppDelegate.shared?.runSettingsProbeAfterFirstPaint(model: self)
+            }
+        }
     }
 
     /// Ordered decoded identities for the strict dialect/encoding re-open
@@ -1695,10 +1714,64 @@ final class DocumentModel {
         columnPresentationRevision += 1
     }
 
-    func presentColumnPanel(selecting column: Int? = nil) {
-        columnPanelSelection = column
-        columnPanelPresented = true
+    func beginSettings(selecting target: Int? = nil) {
+        let reducer = SettingsLifecycleReducer()
+        if !settingsOpen {
+            settingsLifecycle = reducer.opened(
+                columnCount: columnCount, restoring: settingsLifecycle.selection
+            )
+            settingsDiscoveryRows = []
+        }
+        settingsOpen = true
+        if let target {
+            let targetInCurrentRows = ColumnDiscovery().mode(columnCount: columnCount) == .fullList
+                || settingsDiscoveryRows.contains(target)
+            settingsLifecycle = reducer.headerAction(
+                settingsLifecycle, target: target, columnCount: columnCount,
+                targetInCurrentRows: targetInCurrentRows
+            )
+        }
+        setPanelSelection(settingsLifecycle.selection)
     }
+
+    func endSettings() {
+        guard settingsOpen else { return }
+        settingsLifecycle = SettingsLifecycleReducer().closed(settingsLifecycle)
+        settingsDiscoveryRows = []
+        settingsOpen = false
+        closeColumnPanel()
+    }
+
+    func setSettingsQuery(_ query: String) {
+        guard settingsLifecycle.query != query else { return }
+        settingsLifecycle.query = query
+        settingsDiscoveryRows = []
+    }
+
+    func selectSettingsColumn(_ column: Int?) {
+        settingsLifecycle = SettingsLifecycleReducer().columnSelected(
+            settingsLifecycle, column: column
+        )
+        setPanelSelection(column)
+    }
+
+    func setSettingsDisclosure(_ disclosure: SettingsDisclosure, expanded: Bool) {
+        settingsLifecycle = SettingsLifecycleReducer().disclosureSet(
+            settingsLifecycle, disclosure, expanded: expanded
+        )
+    }
+
+    func setSettingsDiscoveryRows(_ rows: [Int]) {
+        settingsDiscoveryRows = Array(rows.prefix(columnDiscoveryResultMax))
+    }
+
+    var settingsRequestIDCount: Int {
+        var ids = Set(panelInferenceIDs)
+        if let panelSelectedColumn { ids.insert(panelSelectedColumn) }
+        return ids.count
+    }
+
+    var settingsDiscoveryRowCount: Int { settingsDiscoveryRows.count }
 
     func columnPanelCore() -> CoreDocumentSession? { session as? CoreDocumentSession }
 
