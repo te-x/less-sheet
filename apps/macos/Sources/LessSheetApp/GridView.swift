@@ -99,24 +99,36 @@ struct SheetRow: View {
         index < highlights.count ? highlights[index] : .none
     }
 
-    /// Find highlight fill (semantic accent, legible in light/dark and over the
-    /// glass band): a subtle wash on every matching visible cell, a stronger one
-    /// on the current match.
+    /// Find highlight fill (accent chips — legible in light/dark and over the
+    /// glass band): a rounded, slightly-inset chip rather than a full-bleed
+    /// painted cell, subtle on every matching visible cell and stronger on the
+    /// current match. Accent like the selection overlay (the author's pick over
+    /// the find-yellow idiom); the two stay distinguishable by GEOMETRY — a
+    /// match is a rounded inset chip, a selection is a full-cell wash inside
+    /// a 2 pt marquee.
     @ViewBuilder
     private func highlightFill(at index: Int) -> some View {
         switch highlight(at: index) {
         case .none: Color.clear
-        case .subtle: Color.accentColor.opacity(0.20)
-        case .strong: Color.accentColor.opacity(0.42)
+        case .subtle:
+            RoundedRectangle(cornerRadius: FindHighlightStyle.cornerRadius)
+                .fill(Color.accentColor.opacity(FindHighlightStyle.subtleAlpha))
+                .padding(FindHighlightStyle.inset)
+        case .strong:
+            RoundedRectangle(cornerRadius: FindHighlightStyle.cornerRadius)
+                .fill(Color.accentColor.opacity(FindHighlightStyle.strongAlpha))
+                .padding(FindHighlightStyle.inset)
         }
     }
 
-    /// The current match gets a distinct accent border so it reads apart from
-    /// the other (subtle) matches.
+    /// The current match gets a distinct full-strength accent border so it
+    /// reads apart from the other (subtle) matches.
     @ViewBuilder
     private func highlightBorder(at index: Int) -> some View {
         if highlight(at: index) == .strong {
-            Rectangle().strokeBorder(Color.accentColor, lineWidth: 1.5)
+            RoundedRectangle(cornerRadius: FindHighlightStyle.cornerRadius)
+                .strokeBorder(Color.accentColor, lineWidth: FindHighlightStyle.borderWidth)
+                .padding(FindHighlightStyle.inset)
         }
     }
 
@@ -145,6 +157,22 @@ enum SheetCellHighlight: Equatable {
     case subtle
     /// The current match (the strong, focused highlight).
     case strong
+}
+
+/// Shared styling constants for the find-highlight chips — read by BOTH the
+/// live AppKit draw (`SheetRowView.draw`) and this SwiftUI dump mirror
+/// (`SheetRow`), so the two renderings stay identical. Accent washes, chip
+/// geometry: a match reads as a rounded inset chip ON the cell, while a
+/// selection (same accent — ARCH-select-copy AC1) reads as a full-cell wash
+/// inside a 2 pt marquee, so the two never blur despite the shared color.
+enum FindHighlightStyle {
+    static let cornerRadius: CGFloat = 4
+    /// The chip's inset from the cell bounds (clears the hairlines, so a chip
+    /// reads as a highlight ON the cell rather than a repainted cell).
+    static let inset: CGFloat = 1.5
+    static let subtleAlpha: CGFloat = 0.18
+    static let strongAlpha: CGFloat = 0.35
+    static let borderWidth: CGFloat = 1.5
 }
 
 /// One cell's selection-overlay state (ARCH-select-copy AC1): whether it is

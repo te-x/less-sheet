@@ -8,11 +8,15 @@ import SwiftUI
 //
 // - Header (req. 4): NO popup — a click toggles the header on/off immediately;
 //   the glyph swaps "H" ↔ "H with a slash"; the tooltip (also the VoiceOver
-//   hint) reads "File contains header" / "File contains no header".
-// - Separator / Quote (req. 5): a click opens a small pill-shaped popup the same
-//   width as the button, expanding UPWARD — a vertical stack of candidate glyphs
-//   (plus Custom…), the current one marked. Selecting one applies immediately
-//   through the existing re-open flow; Esc / click-away dismisses.
+//   hint) reads "File contains header" / "File contains no header". The toggle
+//   also raises a brief auto-fading notice ("First row is now a header/data")
+//   through the model, since the glyph swap alone is easy to miss.
+// - Separator / Quote (req. 5): a click opens a HORIZONTAL labeled panel that
+//   floats above the button (right-aligned to it, growing leftward): the
+//   control's name ("Separator" / "Quote character") followed by the candidate
+//   glyphs in a row (plus Custom…), the current one marked. Selecting one
+//   applies immediately through the existing re-open flow; Esc / click-away
+//   dismisses.
 //
 // Shared vocabulary with the Settings window is pinned in `DialectGlyph`
 // ("First row is header", "Separator", "Quote character").
@@ -115,13 +119,15 @@ struct DialectPopupButton: View {
                 Circle().strokeBorder(Color.secondary, lineWidth: 1.5)
             }
         }
-        .overlay(alignment: .top) {
+        .overlay(alignment: .topTrailing) {
             if isOpen {
                 DialectPopup(kind: kind, model: model)
                     .fixedSize()   // size to content, not the button's frame
-                    // Float the popup fully above the button — it expands upward
-                    // (offset, so it never disturbs the button-row layout).
-                    .offset(y: -(DialectPopup.height(for: kind) + OverlayMetrics.popupGap))
+                    // Float the panel fully above the button — trailing-aligned
+                    // so the wide horizontal panel grows LEFT into the window,
+                    // never past its right edge (offset, so it never disturbs
+                    // the button-row layout).
+                    .offset(y: -(DialectPopup.height + OverlayMetrics.popupGap))
             }
         }
         .help(DialectGlyph.pillTooltip(kind))
@@ -131,8 +137,9 @@ struct DialectPopupButton: View {
     }
 }
 
-/// The narrow (button-width) pill of candidate values for a separator / quote
-/// control, stacked vertically and expanding upward. The current value is
+/// The labeled HORIZONTAL panel of candidate values for a separator / quote
+/// control — a rounded rectangle carrying the control's name ("Separator" /
+/// "Quote character") and the candidates in a row. The current value is
 /// marked; selecting one applies immediately (a dialect re-open). Esc dismisses.
 struct DialectPopup: View {
     let kind: PillKind
@@ -141,24 +148,21 @@ struct DialectPopup: View {
     @State private var custom = ""
     @FocusState private var customFocused: Bool
 
-    /// The popup's exact rendered height, so the button can float it a fixed
-    /// distance above itself (no measure-then-reflow). Kept in step with the
-    /// body's row count, `optionSize`, VStack spacing (4) and padding (4).
-    static func height(for kind: PillKind) -> CGFloat {
-        let rows: Int
-        switch kind {
-        case .separator: rows = DialectCandidates.separators.count + 1  // candidates + Custom
-        case .quote: rows = DialectCandidates.quotes.count + 2           // candidates + None + Custom
-        case .header: rows = 0
-        }
-        guard rows > 0 else { return 0 }
-        return CGFloat(rows) * OverlayMetrics.optionSize
-            + CGFloat(rows - 1) * 4   // inter-row spacing
-            + 2 * 4                   // top + bottom padding
-    }
+    /// The panel's exact rendered height (one option row + padding), so the
+    /// button can float it a fixed distance above itself (no measure-then-
+    /// reflow). Kept in step with the body's `optionSize` and padding (6).
+    static let height: CGFloat = OverlayMetrics.optionSize + 2 * 6
 
     var body: some View {
-        VStack(spacing: 4) {
+        HStack(spacing: 6) {
+            Text(DialectGlyph.pillLabel(kind))
+                .font(.caption.weight(.medium))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .padding(.leading, 8)
+                .padding(.trailing, 2)
+                .accessibilityHidden(true)   // the container carries the label
+
             switch kind {
             case .separator:
                 ForEach(DialectCandidates.separators, id: \.self) { byte in
@@ -181,9 +185,8 @@ struct DialectPopup: View {
                 EmptyView()
             }
         }
-        .padding(4)
-        .frame(width: OverlayMetrics.controlSize)
-        .glassChrome(.regular, in: RoundedRectangle(cornerRadius: OverlayMetrics.controlSize / 2, style: .continuous))
+        .padding(6)
+        .glassChrome(.regular, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         .onExitCommand { model.dismissPopups() }        // Esc dismisses
         .accessibilityElement(children: .contain)
         .accessibilityLabel("\(DialectGlyph.pillLabel(kind)) options")
