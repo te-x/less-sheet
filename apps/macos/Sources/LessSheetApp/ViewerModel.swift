@@ -354,41 +354,15 @@ final class DocumentModel {
 
         do {
             let candidate = try await opener.open(path: path, forcing: override)
-            var replayAuthoredSettings = false
-            var reopenDecision: ColumnReopenDecision?
-            if previous != nil, let oldSession {
-                let headerOnly = oldDialect.separator == candidate.dialect.separator
-                    && oldDialect.quote == candidate.dialect.quote
-                    && oldDialect.encoding == candidate.dialect.encoding
-                let change: ColumnReopenChange = headerOnly ? .headerOnly : .separatorQuoteEncoding
-                let oldHeaders = change == .separatorQuoteEncoding ? Self.headerIdentities(oldSession) : nil
-                let newHeaders = change == .separatorQuoteEncoding ? Self.headerIdentities(candidate) : nil
-                let decision = ColumnSessionModel().decide(
-                    change: change, oldCount: oldSession.columnCount, newCount: candidate.columnCount,
-                    oldHeaders: oldHeaders, newHeaders: newHeaders
-                )
-                reopenDecision = decision
-                replayAuthoredSettings = decision == .replayOrdinally
-
-                if replayAuthoredSettings, let core = candidate as? CoreDocumentSession {
-                    var replaySucceeded = true
-                    for (column, setting) in authoredSettings {
-                        guard let id = UInt32(exactly: column),
-                              core.setColumnOverride(setting.overrideType, column: id),
-                              core.setColumnNullSentinel(setting.nullSentinel, column: id) else {
-                            replaySucceeded = false
-                            break
-                        }
-                    }
-                    if !replaySucceeded {
-                        candidate.close()
-                        startPolling()
-                        return
-                    }
-                }
+            guard let resolved = resolveReopen(
+                candidate: candidate, oldSession: oldSession, oldDialect: oldDialect,
+                previous: previous, authoredSettings: authoredSettings
+            ) else {
+                candidate.close()
+                startPolling()
+                return
             }
-
-            adoptSession(candidate, path: path, kind: .local, previous: previous, replayAuthoredSettings: replayAuthoredSettings, reopenDecision: reopenDecision, oldSession: oldSession, authoredSettings: authoredSettings, authoredManualWidths: authoredManualWidths)
+            adoptSession(candidate, path: path, kind: .local, previous: previous, replayAuthoredSettings: resolved.replayAuthoredSettings, reopenDecision: resolved.reopenDecision, oldSession: oldSession, authoredSettings: authoredSettings, authoredManualWidths: authoredManualWidths)
         } catch {
             if previous != nil, oldSession != nil {
                 self.session = oldSession
@@ -420,16 +394,58 @@ final class DocumentModel {
     /// check. This path runs only for an explicit Parsing change, never cold
     /// open; the core copy itself stays in ABI-bounded batches.
 
+    /// Decides how a re-open (dialect change) should treat the PRIOR session's
+    /// column settings — shared by the local `open(path:)` and network
+    /// `openURL(_:)` funnels so a separator/quote/header/encoding change
+    /// behaves identically regardless of document kind. Returns nil when the
+    /// authored-settings replay itself failed (the caller must restore the
+    /// OLD session and abort the re-open, exactly as `open(path:)` did inline
+    /// before this was extracted).
+    private func resolveReopen(
+        candidate: any DocumentSession, oldSession: (any DocumentSession)?, oldDialect: DialectReport,
+        previous: ColumnVisibility?, authoredSettings: [Int: ColumnUserSettings]
+    ) -> (replayAuthoredSettings: Bool, reopenDecision: ColumnReopenDecision?)? {
+        guard previous != nil, let oldSession else { return (false, nil) }
+        let headerOnly = oldDialect.separator == candidate.dialect.separator
+            && oldDialect.quote == candidate.dialect.quote
+            && oldDialect.encoding == candidate.dialect.encoding
+        let change: ColumnReopenChange = headerOnly ? .headerOnly : .separatorQuoteEncoding
+        let oldHeaders = change == .separatorQuoteEncoding ? Self.headerIdentities(oldSession) : nil
+        let newHeaders = change == .separatorQuoteEncoding ? Self.headerIdentities(candidate) : nil
+        let decision = ColumnSessionModel().decide(
+            change: change, oldCount: oldSession.columnCount, newCount: candidate.columnCount,
+            oldHeaders: oldHeaders, newHeaders: newHeaders
+        )
+        let replayAuthoredSettings = decision == .replayOrdinally
+
+        if replayAuthoredSettings, let core = candidate as? CoreDocumentSession {
+            for (column, setting) in authoredSettings {
+                guard let id = UInt32(exactly: column),
+                      core.setColumnOverride(setting.overrideType, column: id),
+                      core.setColumnNullSentinel(setting.nullSentinel, column: id) else {
+                    return nil
+                }
+            }
+        }
+        return (replayAuthoredSettings, decision)
+    }
+
     /// Open a CSV / .csv.gz served over HTTP(S) (ARCH-network-source req 9) —
     /// the network analog of `open(path:)`, parallel and additive. Drives the
     /// core's async open-job via `DocumentSessionOpening.openURL`, shows the URL
     /// as-is in the title with no recents entry, and never emits the cold-start
     /// marker (AC10 — `currentOpenKind == .network`). A disallowed scheme is
-    /// rejected synchronously as `.invalidArgument`, no network.
-    func openURL(_ url: String, forcing override: DialectOverride = .sniffAll) async {
+    /// rejected synchronously as `.invalidArgument`, no network. `carrying`
+    /// mirrors `open(path:forcing:carrying:)`'s column-visibility carry-over —
+    /// a dialect change (separator/quote/header/encoding) on a network document
+    /// re-opens the SAME url through this same funnel, not the local one.
+    func openURL(_ url: String, forcing override: DialectOverride = .sniffAll, carrying previous: ColumnVisibility? = nil) async {
         await stopPolling()
         cancelCopy()
         let oldSession = session
+        let oldDialect = dialect
+        let authoredSettings = columnUserSettings
+        let authoredManualWidths = manualColumnWidths
         networkOpenError = nil
         networkOpenProgress = NetworkOpenProgress(state: .pending, fraction: nil, bytesFetched: 0, bytesTotal: 0, error: nil)
         currentOpenKind = .network
@@ -455,11 +471,29 @@ final class DocumentModel {
             }
             networkOpenProgress = nil
             networkCancelToken = nil
-            adoptSession(candidate, path: url, kind: .network, previous: nil, replayAuthoredSettings: false, reopenDecision: nil, oldSession: oldSession, authoredSettings: [:], authoredManualWidths: [:])
+            guard let resolved = resolveReopen(
+                candidate: candidate, oldSession: oldSession, oldDialect: oldDialect,
+                previous: previous, authoredSettings: authoredSettings
+            ) else {
+                candidate.close()
+                startPolling()
+                return
+            }
+            adoptSession(candidate, path: url, kind: .network, previous: previous, replayAuthoredSettings: resolved.replayAuthoredSettings, reopenDecision: resolved.reopenDecision, oldSession: oldSession, authoredSettings: authoredSettings, authoredManualWidths: authoredManualWidths)
         } catch {
             // `openURL` is a typed throw (NetworkOpenError only).
             networkOpenProgress = nil
             networkCancelToken = nil
+            if previous != nil, oldSession != nil {
+                // Mirror open(path:)'s carry-over failure handling: keep the
+                // old session alive rather than tearing down a working
+                // document just because a dialect re-open over the network
+                // failed (transient network error, server hiccup, etc.).
+                self.session = oldSession
+                self.currentOpenKind = .network
+                startPolling()
+                return
+            }
             networkOpenError = error
             oldSession?.close()
             self.session = nil
@@ -635,7 +669,16 @@ final class DocumentModel {
         } else {
             pendingHeaderShift = nil
         }
-        Task { await self.open(path: path, forcing: override, carrying: carried) }
+        // A network document must re-open through the SAME (network) funnel:
+        // `path` holds its URL, not a filesystem path, so routing it through
+        // `open(path:)` would try to ls_open the URL string as a local file
+        // and silently fail back to the old session — this was a real bug
+        // (separator/quote/header changes on a network doc did nothing).
+        if currentOpenKind == .network {
+            Task { await self.openURL(path, forcing: override, carrying: carried) }
+        } else {
+            Task { await self.open(path: path, forcing: override, carrying: carried) }
+        }
         return true
     }
 
