@@ -4481,6 +4481,40 @@ test "gz_ac2: gzip opens by MAGIC not name; plain named .csv.gz stays plain" {
     }
 }
 
+// Regression (found live 2026-07-15 via the network-source feature, opening a
+// real-world CSV with no trailing newline over HTTP): the LAST row of a
+// STREAMED source (gzip or http_range) with no trailing newline was wrongly
+// flagged ls_row_oversized — a false positive never seen locally (mmap) since
+// the whole file is small. Root cause: `Cursor.atLimit()` treated "hit the
+// row-scan-budget limit" as always meaning "capped/truncated", even when that
+// limit happened to coincide EXACTLY with the source's own true end (which it
+// always does for the last row of a document smaller than the scan budget,
+// since `posAtByteBudget` clamps to `source.knownEnd()`). The mmap path
+// already got this right (`lexer.recordBounds`'s `capped = limit != content.len`);
+// `atLimit()` now makes the same "limit == the source's true end -> not a cap"
+// distinction, fixing gzip and http_range identically at their one shared seam.
+test "gz_regression: last row with no trailing newline is never falsely oversized" {
+    const gpa = std.testing.allocator;
+    // No trailing "\n" after the final field — the exact trigger condition:
+    // streamUnit hits genuine EOF (not a separator/terminator) while decoding
+    // the last row, so `capped` is decided by the (buggy) atLimit() check.
+    const plain = "name,country\nAlice,US\nBob,UK\nZoe,ZW";
+    const g = try gz(gpa, plain);
+    defer gpa.free(g);
+
+    var od = try openNamed(g, "data.csv.gz", manual);
+    defer od.deinit();
+    try expectDims(od.doc, 3, 2);
+    winAll(od.doc);
+    try expectCell(od.doc, 2, 0, "Zoe");
+    try expectCell(od.doc, 2, 1, "ZW");
+    // The regression: the last row must NOT be reported oversized merely
+    // because it lacks a trailing newline. Every row here is tiny.
+    try std.testing.expectEqual(false, api.ls_row_oversized(od.doc, 0));
+    try std.testing.expectEqual(false, api.ls_row_oversized(od.doc, 1));
+    try std.testing.expectEqual(false, api.ls_row_oversized(od.doc, 2));
+}
+
 test "gz_ac3: plain/gzip equivalence across the encoding/dialect/quote matrix (single, multi-member, BGZF)" {
     const gpa = std.testing.allocator;
     // A representative logical CSV: header, quotes + doubled quotes, embedded
