@@ -60,6 +60,25 @@
 //      transparent scrim swallowed them. Event-free of TCC (a synthesized NSEvent handed
 //      straight to the scrim's handler, never posted). LESSSHEET_FIND (a known match)
 //      arms FindProbe; LESSSHEET_DUMP_EXIT quits after the probe's terminal line.
+//   7. columnConfigEditRepaintsGridWithoutInteraction — LESSSHEET_CONFIG_REPAINT
+//      (cc-macos config-repaint defect-pass regression-LOCK). After first paint the probe
+//      drives ONE real model-side column-config edit — setColumnFormat(grouping: true) on
+//      people.csv's "age" column (0-based col 1, integer), the SAME model entry point the
+//      Settings inspector's Thousands-grouping toggle calls — then, WITHOUT ever calling
+//      apply() itself, reports the model's current columnConfigurationRevision vs the live
+//      grid controller's APPLIED revision. The single lesssheet.configrepaint.result line
+//      must report applied=true, model_rev > 0 (a real edit happened), and model_rev ==
+//      controller_applied_rev (the grid caught up). MATERIALIZATION-INDEPENDENT: it compares
+//      two ints, never a paged NSTableView row view, so — unlike the selection-repaint
+//      content check below — it IS gateable off-screen. RED WITHOUT THE POKE: a headless
+//      window gets no implicit updateNSView (see HeaderToggleProbe), so if the model's
+//      config mutators do NOT explicitly poke NativeGridController.live?.apply() after
+//      bumping the revision (the original "stale until interaction" defect, or any
+//      regression of its fix), nothing applies the edit — controller_applied_rev LAGS
+//      model_rev, applied=false. With the poke, apply() syncs the controller to the model's
+//      current revision, so they match. The edit is fully synchronous (the probe reads both
+//      revisions in the SAME main-actor turn), so this is an exactness lock — no timing/
+//      flaky assert.
 //
 // REVIEWER-MEASURED (deliberately not gated — flaky gates are worse than reviewer
 // enforcement):
@@ -568,5 +587,70 @@ struct NativeGridProbeTests {
             }
         }
         #expect(Bool(false), Comment(rawValue: failure ?? "layout probe produced no verdict"))
+    }
+
+    // Config-repaint lock (cc-macos config-repaint defect pass): after a model-side
+    // column-configuration edit made from the SEPARATE (key) Settings window, the
+    // already-visible grid must update WITHOUT the user first clicking or scrolling
+    // it — "stale until interaction" was the reported bug. The gateable, materialization-
+    // INDEPENDENT seam this pins: the live grid controller's APPLIED column-configuration
+    // revision must equal the model's current columnConfigurationRevision — proven
+    // WITHOUT the probe ever calling apply() itself.
+    //
+    // WHY this is a true RED/GREEN lock (not merely a green regression guard): a headless
+    // window gets NO implicit updateNSView (documented in HeaderToggleProbe), so the ONLY
+    // thing that can call apply() after the edit is the fix's explicit
+    // NativeGridController.live?.apply() poke inside the model's config mutators
+    // (refreshAfterColumnConfiguration — setColumnFormat/setColumnOverride/
+    // setColumnNullSentinel — plus toggleColumn / showAllColumns). WITHOUT that poke (the
+    // original defect, or any regression of the fix) nothing applies the edit: the
+    // controller's applied revision LAGS the model's -> applied=false -> RED. WITH the
+    // poke, apply() unconditionally syncs lastColumnConfigurationRevision to the model's
+    // current revision -> they match -> GREEN.
+    //
+    // MATERIALIZATION-INDEPENDENT: the probe compares two integers, never a paged
+    // NSTableView row view, so it does NOT depend on any row being on-screen. That is
+    // exactly why THIS repaint lock is gated while the sibling selection-repaint content
+    // check (SelectCopyProbe's content_preserved) stays a human/reviewer pass — see
+    // REVIEWER-MEASURED — an off-screen headless run never materializes a paged row view.
+    //
+    // The probe drives setColumnFormat(grouping: true) on people.csv's "age" column
+    // (0-based column 1, integer) — the SAME model entry point the Settings inspector's
+    // Thousands-grouping toggle calls — then reads both revisions in ONE synchronous
+    // main-actor turn (the edit, incl. the poke, is fully synchronous), so this is an
+    // exactness lock with no timing/flaky assert. model_rev > 0 pins that a real edit
+    // happened (a vacuous 0 == 0 cannot pass); model_rev == controller_applied_rev is the
+    // repaint. Retries only a MALFORMED run (terminal line absent = infra); a
+    // present-but-wrong value fails immediately.
+    @Test func columnConfigEditRepaintsGridWithoutInteraction() throws {
+        let fixtureURL = try #require(
+            Bundle.module.url(forResource: "people", withExtension: "csv", subdirectory: "Fixtures"),
+            "missing fixture people.csv"
+        )
+        let env = ["LESSSHEET_CONFIG_REPAINT": "1", "LESSSHEET_DUMP_EXIT": "1"]
+
+        var log = ""
+        for _ in 1...2 { // relaunch only when the probe never reached its terminal line
+            log = try AppProbe.launchOnce(fixture: fixtureURL.path(percentEncoded: false), env: env, timeout: 60)
+            if !probeLines(log, prefix: "lesssheet.configrepaint.result ").isEmpty { break }
+        }
+
+        let line = probeLines(log, prefix: "lesssheet.configrepaint.result ").first
+        #expect(line != nil,
+                "config-repaint probe emitted no terminal line (LESSSHEET_CONFIG_REPAINT not wired):\n\(logTail(log))")
+
+        let modelRev = line.flatMap { intField($0, "model_rev") }
+        let controllerRev = line.flatMap { intField($0, "controller_applied_rev") }
+
+        #expect(line.flatMap { boolField($0, "applied") } == true,
+                Comment(rawValue: "after a model-side column-config edit, the live grid controller must have "
+                    + "APPLIED the model's current columnConfigurationRevision with no interaction (no scroll/click, "
+                    + "and the probe never calls apply()):\n\(logTail(log))"))
+        #expect((modelRev ?? 0) > 0,
+                "the probe must drive a real config edit that bumps the revision (model_rev > 0):\n\(logTail(log))")
+        #expect(modelRev != nil && modelRev == controllerRev,
+                Comment(rawValue: "the grid controller's APPLIED config revision must equal the model's current "
+                    + "revision (model_rev=\(modelRev.map(String.init) ?? "nil") "
+                    + "controller_applied_rev=\(controllerRev.map(String.init) ?? "nil")):\n\(logTail(log))"))
     }
 }
