@@ -1702,6 +1702,10 @@ final class DocumentModel {
         var settings = columnUserSettings[column] ?? .default
         settings.hidden = visibility.isHidden(column)
         storeColumnSettings(settings, column: column)
+        // See the matching poke + comment in `refreshAfterColumnConfiguration`:
+        // a visibility edit from the Settings window hits the same unreliable
+        // cross-window SwiftUI bridge.
+        NativeGridController.live?.apply()
     }
 
     func showAllColumns() {
@@ -1712,6 +1716,7 @@ final class DocumentModel {
             storeColumnSettings(settings, column: column)
         }
         columnPresentationRevision += 1
+        NativeGridController.live?.apply()
     }
 
     func beginSettings(selecting target: Int? = nil) {
@@ -1810,6 +1815,13 @@ final class DocumentModel {
         markLayoutWidthsStale()
         columnWidthRevision += 1
         columnPanelRevision += 1
+        // Cross-window poke (same bridge as toggleColumn / showAllColumns /
+        // refreshAfterColumnConfiguration): this width edit originates in the
+        // separate (key) Settings window, where the @Observable -> updateNSView
+        // -> apply() bridge does not reliably re-fire, so the grid would keep its
+        // stale width until a click/scroll. apply()'s columnWidthRevision branch
+        // handles the reflow; it just needs invoking. Idempotent and O(viewport).
+        NativeGridController.live?.apply()
     }
 
     func autoFitPanelColumn(_ column: Int) {
@@ -1826,6 +1838,13 @@ final class DocumentModel {
         markLayoutWidthsStale()
         columnWidthRevision += 1
         columnPanelRevision += 1
+        // Cross-window poke (same bridge as toggleColumn / showAllColumns /
+        // refreshAfterColumnConfiguration): auto-fit invoked from the separate
+        // (key) Settings window would otherwise leave the grid at its stale
+        // width until a click/scroll (the @Observable -> updateNSView bridge does
+        // not reliably re-fire cross-window). apply()'s columnWidthRevision branch
+        // does the reflow. Idempotent and O(viewport).
+        NativeGridController.live?.apply()
     }
 
     func setColumnOverride(_ type: ColumnType?, column: Int) {
@@ -1866,6 +1885,16 @@ final class DocumentModel {
         if remeasure { remeasureConfiguredColumn(column) }
         requestColumnConfigurationRedraw([column])
         startPolling()
+        // The revision bump above is an `@Observable` write meant to reach the
+        // grid via GridView.body -> updateNSView -> apply(). That SwiftUI bridge
+        // does NOT reliably re-fire when the mutation originates in the separate
+        // (key) Settings window: apply() went uncalled after the edit, so
+        // already-visible rows kept their stale formatted text until something
+        // else (e.g. a scroll that recycles the row) forced a fresh pull. Poke
+        // the live controller directly — the same explicit bridge every other
+        // cross-window mutation in this app already uses (jump / find / header
+        // toggle). apply() is idempotent and O(viewport).
+        NativeGridController.live?.apply()
     }
 
     /// Bounded revision log for targeted logical-column redraws. A consumer

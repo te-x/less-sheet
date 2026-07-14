@@ -154,6 +154,11 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
     private var lastColumnPresentationRevision = -1
     private var lastColumnWidthRevision = -1
     private var lastColumnConfigurationRevision = -1
+    /// Verification-only, read-only accessor (config-repaint probe): the column-
+    /// configuration revision the controller has actually APPLIED. Lets a headless
+    /// probe compare the applied revision against the model's current one WITHOUT
+    /// calling apply() itself.
+    var appliedColumnConfigurationRevision: Int { lastColumnConfigurationRevision }
     private var lastIsFiltered = false
     private var built = false
     private var landingApplyScheduled = false

@@ -545,6 +545,11 @@ struct ContentView: View {
                 // Verification: drive selection/copy/resize directly against the
                 // model (ARCH-select-copy) — logs + terminates itself.
                 SelectCopyProbe.run(model: model)
+            } else if ConfigRepaintProbe.active {
+                // Verification: drive one real model-side column-config edit and
+                // prove the live grid controller applied it with no interaction
+                // (config-repaint lock) — logs + terminates itself.
+                ConfigRepaintProbe.run(model: model)
             } else if FrameDump.liveGridInitialDumpPath == nil {
                 // Overlay / find / settings / overscroll etc. render off a SwiftUI
                 // mirror here; the plain grid-content scene instead self-captures
