@@ -62,8 +62,13 @@ struct AmendmentContractGuardTests {
     // AC23 — the frozen C ABI is byte-identical: no additive block, no edit to any
     // existing symbol/layout/prototype for this UI amendment.
     @Test func frozenCAbiHeaderHasEmptyDiff() {
+        // Baseline bumped for the ARCH-network-source additive extension (the
+        // NETWORK SOURCE EXTENSION block: ls_open_url_* + ls_net_* — purely
+        // additive, every prior symbol byte-identical). Updated by the planner
+        // through the change-authority process, exactly as this guard's contract
+        // provides for an architect-approved header extension.
         expectEmptyDiff("api/lesssheet.h",
-                        baseline: "ac2613595a3013f748e35ff990f393eb2740f593d8f8034205655359f7e44694")
+                        baseline: "3e3a929215f807a62f91a90c9bde6429acd1ae9dee7bb37170541b4e7995c4d4")
     }
 
     // AC23 — the public Swift search/layout contracts are byte-identical:

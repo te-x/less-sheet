@@ -26,7 +26,7 @@ in seconds and choke on large files; for less-sheet, **time-to-first-rows is the
   `api/` headers.
 - **Dependencies & binary size**: the distributed app stays **single-digit MB**. A dependency is
   admissible only if it serves the windowed data flow AND fits the size budget. Expected: the CSV
-  path is a DIY mmap lexer (Zig std only); XLSX/Parquet library-vs-DIY decided at their slices
+  path is a DIY mmap lexer (Zig std only); ODS/Parquet library-vs-DIY decided at their slices
   (Arrow/DuckDB-class readers are excluded by the budget).
 - **Build & gate**: `zig build` / `zig build test` (core), `swift build` / `swift test` (macOS).
   Per-component `.aidev/gate.sh`, chained by the workspace root gate.
@@ -49,7 +49,7 @@ in seconds and choke on large files; for less-sheet, **time-to-first-rows is the
   scanned feeds the sparse row index, so the cost is paid once, and everything behind the scan
   frontier is permanently instant (backward navigation never blocks).
 - **Read-only core**: source files are never modified, locked, or copied.
-- **Formats**: CSV first; XLSX and Parquet later — the core's public surface must not bake in
+- **Formats**: CSV first; ODS and Parquet later — the core's public surface must not bake in
   "a document is a text file".
 - **Maniacal perf & memory discipline**: every slice is designed and reviewed against speed and
   low memory consumption. ARCH docs state measurable targets; the reviewer verifies them by
@@ -87,7 +87,8 @@ in seconds and choke on large files; for less-sheet, **time-to-first-rows is the
 4. **Find & seek** — incremental streaming search with progress over not-yet-indexed regions:
    plain-text match and typed column predicates (jump to next/first row where col == X).
 5. **Column ergonomics** — widths, alignment, sticky header, type-aware rendering.
-6. **XLSX** (read-only). 7. **Parquet**. 8. **Linux frontend** (research spike first).
+6. **ODS** (OpenDocument Spreadsheet, read-only; replaces the earlier XLSX plan per the
+   network-source ARCH interview, 2026-07-14). 7. **Parquet**. 8. **Linux frontend** (research spike first).
 9. **Viewer utilities (future)** — display formatting (e.g. decimal precision), hidden columns,
    quick column stats (sum, avg, …). Architectural givens: value typing/inference lives in the
    core (shared by all frontends); these are view-layer transforms over immutable source; column
@@ -103,4 +104,4 @@ in seconds and choke on large files; for less-sheet, **time-to-first-rows is the
 - Linux frontend toolkit (GTK4? Qt? TUI first?) — research before slice 8.
 - Distribution: notarized DMG vs Homebrew cask vs App Store (sandbox entitlements vs mmap of
   arbitrary user paths) — decide before first release.
-- XLSX/Parquet: pure-Zig readers vs vendored C libraries — decide at those slices.
+- ODS/Parquet: pure-Zig readers vs vendored C libraries — decide at those slices.

@@ -465,6 +465,30 @@ pub const Document = struct {
     nav_charge_active: bool = false,
     nav_gen: u64 = 0, // replacement/cancel guard for off-main filtered navigation
 
+    // --- network-source instrumentation state (ARCH-network-source) ---------
+    // DEFAULTED (like gz_* / window-budget above) so openWithAllocator's literal
+    // need not mention them AND a non-network document reports zeros. Read ONLY
+    // via contracts/api.zig's Zig-only seams (netRangeMode / netFetchCount /
+    // netResidentBytes / netSpoolStore / netForceCacheBytes -> root.zig), NEVER
+    // the C ABI. The implementer populates these from the http_range Source it
+    // adds (peer to mmap/gzip in source.zig): net_range_mode when the probe
+    // resolves, net_fetch_count per network fetch issued, net_resident_bytes to
+    // the Source's live resident RAM (bound 16 MiB), and the spool fields from
+    // the private spool file. In the SEED they stay zero, which makes every
+    // network-source quantitative AC RED until the Source is built + wired
+    // (mirroring the gz_* seed).
+    net_range_mode: u8 = 0, // AC3/AC4: 0 unknown, 1 random-access, 2 sequential-fallback
+    net_fetch_count: u64 = 0, // AC6/AC13: network fetches issued by this doc's Source
+    net_resident_bytes: u64 = 0, // AC15: network Source resident RAM (bound 16 MiB)
+    net_spool_present: bool = false, // AC14: a private spool file exists
+    net_spool_bytes: u64 = 0, // AC14: its size
+    net_spool_mode: u32 = 0, // AC14: its permission bits (must be 0o600)
+    net_spool_unlinked: bool = false, // AC14: already unlinked while open
+    // AC6 test control: cap the resident RAM cache to N bytes (0 == evict all);
+    // maxInt == no cap (the default / natural behavior, mirroring the
+    // gz_ckpt_fail_after "maxInt == never" idiom).
+    net_force_cache_bytes: u64 = std.math.maxInt(u64),
+
     // ARCH-column-config: entirely empty at open. Dynamic storage remains
     // sparse and is first allocated only by an explicit column request or
     // configuration mutation.

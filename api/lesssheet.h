@@ -1816,6 +1816,233 @@ ls_column_result ls_column_conflict_example_copy(const ls_doc *doc, uint32_t col
 
 #undef LS_COLUMN_STATIC_ASSERT
 
+/* =========================================================================
+ * NETWORK SOURCE EXTENSION (network-source slice) — ADDITIVE: open a URL
+ * =========================================================================
+ * Everything below this line is a single append-only extension block. It adds
+ * an ASYNCHRONOUS, POLLABLE, CANCELLABLE open of a CSV / .csv.gz served over
+ * HTTP(S) — a NEW entry-point family (ls_open_url_*) PARALLEL to (never
+ * replacing) ls_open — plus the network error taxonomy and the job-status
+ * snapshot it needs. It adds NO symbol above this line and changes NOTHING
+ * existing: every constant, enum, struct, prototype, layout, allocation rule,
+ * threading lane, and borrow lifetime defined before this block keeps its exact
+ * value and meaning, so a client compiled against the pre-network header links
+ * and behaves identically. See docs/architecture/ARCH-network-source.md.
+ *
+ * WHY A NEW ENTRY POINT (not ls_open). A network open is never instant: bytes
+ * must be fetched, latency is unbounded, and a transfer can stall or fail
+ * mid-flight. ls_open's single blocking "return an ls_doc" shape cannot express
+ * that. ls_open_url_* therefore mirrors the existing async-job idiom
+ * (ls_jump_start / _poll / _cancel), plus an explicit _release: unlike a jump,
+ * the job handle is not owned by an existing document.
+ *
+ * WHAT A NETWORK DOCUMENT IS. Once a job reaches LS_NET_OPEN_DONE its `doc` is
+ * a fully-formed ls_doc*, usable through EVERY existing accessor — window, cell,
+ * index, row count, jump, search, filter, full-cell copy, column metadata —
+ * exactly like a local open of the SAME bytes, with IDENTICAL dialect / header /
+ * encoding / row-count semantics (the O(head) determinism pin is measured
+ * against the fetched head rather than an mmap'd head). The CSV/gzip Reader is
+ * completely unaware its bytes arrived over the network: this is the payoff of
+ * the format-agnostic Source seam. .csv.gz over the network falls out for free
+ * (gzip is selected by the 1f 8b magic on the fetched bytes, exactly as for a
+ * local file — see the header's FORMAT NEUTRALITY and ARCH-csv-gz).
+ *
+ * THE ACCESS MODEL (behind the ABI; see ARCH-network-source "Exact access
+ * model"). If the server honors ranges (a 206 / Content-Range answer to the
+ * probe) the document runs in TRUE random-access mode: any [start,end) byte
+ * range is fetched on demand and, once fetched, is mirrored into a private local
+ * spool file and forever after served from local disk — never re-fetched. If
+ * the server ignores Range (200 OK) or advertises no usable total length, the
+ * open falls back to a full sequential download into the same spool, then opens
+ * that completed file exactly like a local mmap document — correct either way.
+ * A first-time fetch of a never-before-seen range is latency-unbounded BY DESIGN
+ * and only ever happens from an async, progress-polled, cancellable path (the
+ * initial head fetch here, or the existing jump-scan machinery once open) —
+ * NEVER from a "zero-alloc, never blocks" accessor. The scan-frontier promise is
+ * unchanged; only the frontier's cost model differs (network latency vs. a page
+ * fault). Steady-state resident RAM for the network Source stays bounded (the
+ * spool is disk-resident, not RAM-resident).
+ *
+ * LIFECYCLE & OWNERSHIP. ls_open_url_start returns a job handle immediately
+ * (NULL only if the handle itself could not be allocated). An invalid URL /
+ * scheme / option is NOT a NULL return — it is a valid job that polls
+ * LS_NET_OPEN_FAILED with LS_NET_ERROR_INVALID_ARGUMENT, touching no network.
+ * The caller polls ls_net_open_poll until a terminal state, may
+ * ls_net_open_cancel at any time, and MUST ls_net_open_release the handle
+ * exactly once when done with it (in flight or terminal). Releasing the job does
+ * NOT close a DONE job's `doc`: that ls_doc follows the normal, independent
+ * ls_close lifecycle like any other document. Closing the doc and releasing the
+ * job are independent operations in either order.
+ *
+ * READ-ONLY, PRIVATE, EPHEMERAL. The remote resource is only ever GET (never
+ * written). The local spool file is created mode 0600, unlinked immediately
+ * (never visible in its directory while open), never a persistent cache, never
+ * reused across opens, and fully gone after ls_close / process exit — the same
+ * discipline as the gzip checkpoint spill file (see ARCH-csv-gz). Re-opening the
+ * same URL always re-fetches from scratch.
+ *
+ * SECURITY POSTURE (deliberate choices, not silent defaults). BOTH http:// and
+ * https:// are allowed (LAN/test servers without TLS are a supported use). NO
+ * authentication (no credential prompt, no cookie jar): a URL requiring auth
+ * surfaces as LS_NET_ERROR_HTTP_STATUS (401/403). NO URL scheme beyond
+ * http/https is accepted (ftp://, file://, … reject synchronously as
+ * LS_NET_ERROR_INVALID_ARGUMENT, untouched). Redirects are followed up to a
+ * small fixed cap (no user-facing configuration; exceeding it is
+ * LS_NET_ERROR_TOO_MANY_REDIRECTS).
+ *
+ * NO COLD-START BUDGET. The <500 ms cold-start budget and its
+ * first_rows_visible_ms marker explicitly DO NOT apply to a network open; the
+ * open's own always-visible progress affordance is its "we're working" signal
+ * instead (see ARCH-network-source Non-functional constraints).
+ *
+ * DEPENDENCIES. Zig standard library only (std.http.Client, std.crypto.tls for
+ * HTTPS) — no new runtime dependency; the assembled app stays single-digit MB.
+ *
+ * THREADING. ls_open_url_start spawns the background fetch. ls_net_open_poll is
+ * ZERO allocation, total, and never blocks — safe from any thread at any time.
+ * ls_net_open_cancel / ls_net_open_release are safe from any thread, but the
+ * caller must not race two control calls on the SAME job concurrently, and must
+ * not poll or control a job after releasing it. The background fetch never
+ * blocks the caller's poll/control lane.
+ */
+
+/* ls_net_open_status.progress sentinel: the total resource length is unknown,
+ * so the fetch fraction is indeterminate — the frontend shows an indeterminate
+ * spinner plus the live bytes_fetched counter instead of a percentage. */
+#define LS_NET_PROGRESS_UNKNOWN (-1.0)
+
+/*
+ * Network open outcome (ls_net_open_status.error). DISTINCT from ls_status:
+ * network failures are a materially different taxonomy from local-file
+ * failures. Distinct, stable values; meaningful only when the job state is
+ * LS_NET_OPEN_FAILED. No two causes collapse into one code.
+ */
+typedef enum ls_net_status {
+    /* No error (the job is not in a failed state). */
+    LS_NET_OK = 0,
+    /* The URL scheme is not http/https, the URL is malformed, or an
+     * ls_open_options field is outside its documented domain. Rejected
+     * SYNCHRONOUSLY by ls_open_url_start; no network is touched. Mirrors
+     * ls_open's LS_ERROR_INVALID_ARGUMENT. */
+    LS_NET_ERROR_INVALID_ARGUMENT = 1,
+    /* DNS resolution or TCP/TLS connection failure — the host could not be
+     * reached (a TLS handshake failure is a connection failure). */
+    LS_NET_ERROR_UNREACHABLE = 2,
+    /* No forward progress within the implementation's connect/read timeout. */
+    LS_NET_ERROR_TIMEOUT = 3,
+    /* The server returned a non-2xx status after following redirects. The
+     * numeric status is carried in ls_net_open_status.http_status (e.g. 404,
+     * 401, 403) for the frontend to render. */
+    LS_NET_ERROR_HTTP_STATUS = 4,
+    /* A redirect chain exceeded the fixed redirect cap. */
+    LS_NET_ERROR_TOO_MANY_REDIRECTS = 5,
+    /* Local spool-file creation/write failure (mirrors ls_open's LS_ERROR_IO).
+     * The spool is load-bearing — not a mere optimization — so its failure
+     * fails the open rather than silently corrupting or degrading state. */
+    LS_NET_ERROR_IO = 6,
+    /* The job was cancelled (ls_net_open_cancel) before reaching DONE. */
+    LS_NET_ERROR_CANCELLED = 7,
+} ls_net_status;
+
+/* State of an ls_open_url_* job (ls_net_open_status.state). */
+typedef enum ls_net_open_state {
+    /* Probing range support: the initial Range GET is in flight. */
+    LS_NET_OPEN_PENDING = 0,
+    /* Head bytes are being fetched (range mode) or the resource is being
+     * downloaded sequentially (fallback mode). */
+    LS_NET_OPEN_FETCHING = 1,
+    /* The document is open: `doc` is a valid ls_doc*. Terminal (persists until
+     * ls_net_open_release). */
+    LS_NET_OPEN_DONE = 2,
+    /* The open failed: `error` (and, for LS_NET_ERROR_HTTP_STATUS,
+     * `http_status`) say why; `doc` is NULL. Terminal. */
+    LS_NET_OPEN_FAILED = 3,
+    /* The job was cancelled before reaching DONE; all resources (spool file
+     * included) are released and `doc` is NULL. Terminal. */
+    LS_NET_OPEN_CANCELLED = 4,
+} ls_net_open_state;
+
+/*
+ * Opaque async open-job handle. Core-owned; released exactly once by
+ * ls_net_open_release. DISTINCT from ls_doc: a DONE job PRODUCES an ls_doc that
+ * outlives the job (released/closed independently).
+ */
+typedef struct ls_net_open_job ls_net_open_job;
+
+/*
+ * A network open's progress/result snapshot (ls_net_open_poll). Field validity:
+ *   progress      — fraction in [0.0, 1.0] of the head fetch when the total
+ *                   length is known; the sentinel LS_NET_PROGRESS_UNKNOWN
+ *                   (-1.0) when it is not. Meaningful while PENDING/FETCHING;
+ *                   exactly 1.0 at LS_NET_OPEN_DONE.
+ *   bytes_fetched — bytes fetched so far (monotone non-decreasing within a job).
+ *   bytes_total   — total resource length in bytes, or 0 when unknown.
+ *   doc           — a valid ls_doc* ONLY when state == LS_NET_OPEN_DONE; NULL
+ *                   otherwise. Usable through every existing accessor; closed
+ *                   with ls_close, independently of ls_net_open_release.
+ *   state         — the job state (see ls_net_open_state).
+ *   error         — an ls_net_status; LS_NET_OK unless state ==
+ *                   LS_NET_OPEN_FAILED.
+ *   http_status   — the numeric HTTP status when error ==
+ *                   LS_NET_ERROR_HTTP_STATUS (e.g. 404); 0 otherwise.
+ *   reserved      — zero.
+ */
+typedef struct ls_net_open_status {
+    double progress;
+    uint64_t bytes_fetched;
+    uint64_t bytes_total;
+    ls_doc *doc;
+    ls_net_open_state state;
+    ls_net_status error;
+    int32_t http_status;
+    int32_t reserved;
+} ls_net_open_status;
+
+/*
+ * Start an ASYNCHRONOUS open of the CSV / .csv.gz at `url` (`url_len` bytes; NOT
+ * required to be NUL-terminated). `options` is the SAME ls_open_options ls_open
+ * takes (forced separator / quote / header / encoding / index_mode); it may be
+ * NULL, meaning all-LS_SNIFF + LS_INDEX_AUTO. The struct is copied; the caller
+ * keeps ownership of it and of `url`.
+ *
+ * Returns a job handle immediately, or NULL only if the handle itself could not
+ * be allocated. The URL scheme / shape and the options are validated
+ * SYNCHRONOUSLY: a scheme other than http/https, a malformed URL, or an
+ * out-of-domain ls_open_options field is NOT a NULL return — it is a valid job
+ * that immediately polls LS_NET_OPEN_FAILED with LS_NET_ERROR_INVALID_ARGUMENT
+ * and touches no network. Every other outcome is reported ASYNCHRONOUSLY via
+ * ls_net_open_poll. The caller MUST eventually ls_net_open_release the returned
+ * handle (whether or not it reached DONE).
+ */
+ls_net_open_job *ls_open_url_start(const char *url, size_t url_len, const ls_open_options *options);
+
+/*
+ * Current snapshot of `job` (see ls_net_open_status). ZERO allocation; total;
+ * never blocks; safe from any thread. After a terminal state
+ * (DONE / FAILED / CANCELLED) the snapshot is stable until ls_net_open_release.
+ */
+ls_net_open_status ls_net_open_poll(const ls_net_open_job *job);
+
+/*
+ * Request cancellation of an in-flight open (no-op once terminal). The fetch
+ * stops at its next bounded chunk boundary (exactly like ls_close stopping a
+ * gzip inflate) and ALL resources — the spool file included — are released; the
+ * job then polls LS_NET_OPEN_CANCELLED (with `doc` NULL — no dangling document).
+ * Does not block. Safe from any thread (but do not race two control calls on
+ * the same job).
+ */
+void ls_net_open_cancel(ls_net_open_job *job);
+
+/*
+ * Release the job handle. Must be called exactly once per handle; the handle is
+ * invalid afterward (do not poll or control it again). If the job is still in
+ * flight this first cancels and joins the background fetch (like ls_close on a
+ * scanning document). This does NOT close the ls_doc a DONE job produced — that
+ * doc follows the normal, independent ls_close lifecycle. Releasing the job and
+ * closing its doc are independent, in either order.
+ */
+void ls_net_open_release(ls_net_open_job *job);
+
 #ifdef __cplusplus
 }
 #endif

@@ -1054,3 +1054,225 @@ comptime {
     if (@TypeOf(core.ls_column_conflict_example_copy) != fn (*const Doc, u32, ?[*]u8, usize, *usize) callconv(.c) ColumnResult)
         @compileError("signature drift: ls_column_conflict_example_copy");
 }
+
+// ===========================================================================
+// network-source slice (ARCH-network-source) — additive network-open C ABI +
+// Zig-only test seams. Mirrors api/lesssheet.h "NETWORK SOURCE EXTENSION"
+// EXACTLY: the new error taxonomy, job-state enum, the opaque job handle, the
+// job-status snapshot struct, and the four ls_open_url_* / ls_net_open_*
+// export fns. api/lesssheet.h is byte-identical ABOVE its appended block (AC2);
+// this section + the comptime pins at the bottom freeze the additive surface.
+// Planner-owned; amended only with the C header.
+//
+// TEST VEHICLE (planner decision, ARCH-sanctioned). The ARCH delegated the
+// choice of "fixture HTTP server OR injectable transport seam, whichever fits
+// std.http.Client testability best." We freeze an INJECTABLE TRANSPORT seam:
+// std.http.Client in Zig 0.16 is Io-coupled and awkward to point at an
+// in-process server hermetically (TLS certs, ephemeral ports, timeout/hang and
+// DNS/redirect simulation are all flaky or infeasible in a unit test), whereas
+// the GENUINELY NOVEL logic of this slice — the async job lifecycle, the
+// range-probe/fallback decision, the persist-once spool (never-refetch, 0600,
+// unlinked), the bounded RAM cache, and the error-taxonomy mapping — is exactly
+// what an injected transport exercises deterministically. std.http.Client's own
+// job (real DNS/TCP/TLS/redirects) is std's responsibility; its faithful
+// mapping to this taxonomy over a real localhost http:// AND https:// server is
+// a REVIEWER/human target-host probe (mirroring this repo's StreamCopyWallClock
+// and "heavy cases stay out of the gate" precedents), NOT a hermetic gate test.
+//
+// The seams below mirror the gz*/openWithAllocator precedent (Zig-only, NEVER
+// the C ABI, so api/lesssheet.h stays BYTE-IDENTICAL): tests build a NetFixture
+// value describing the server/transport behavior and start a job through
+// `openUrlStartFake` (the injected-transport twin of the real ls_open_url_start,
+// exactly as openWithAllocator twins ls_open); instrumentation seams
+// (netRangeMode / netFetchCount / netResidentBytes / netSpoolStore /
+// netForceCacheBytes on a DONE doc; netJobProbe on the job) read
+// implementer-owned base.Document / job state DEFAULTED to zero, so the SEED
+// reports zero/unwired and every transport-dependent AC is RED until the
+// http_range Source + real transport are built + wired. The http_range Source
+// TYPE INTERNALS stay implementer-owned in src/ (the af83db9 reader-interface
+// ownership boundary / csv-gz Decision 1-C): tests bind only to this frozen
+// vocabulary + the C ABI, never to a SourceKind variant or transport vtable.
+// ===========================================================================
+
+/// Mirrors LS_NET_PROGRESS_UNKNOWN: ls_net_open_status.progress sentinel for an
+/// unknown total length (frontend shows an indeterminate spinner + byte count).
+pub const net_progress_unknown: f64 = -1.0;
+
+/// Mirrors `ls_net_status`. Distinct, stable values; meaningful only when the
+/// job state is `.failed`. `unreachable_` mirrors LS_NET_ERROR_UNREACHABLE
+/// (`unreachable` is a Zig keyword — the trailing underscore is a Zig-side name
+/// only; the enum VALUE (2) is what crosses the ABI).
+pub const NetStatus = enum(c_int) {
+    ok = 0,
+    invalid_argument = 1,
+    unreachable_ = 2,
+    timeout = 3,
+    http_status = 4,
+    too_many_redirects = 5,
+    io = 6,
+    cancelled = 7,
+};
+
+/// Mirrors `ls_net_open_state`: the async open-job state.
+pub const NetOpenState = enum(c_int) {
+    pending = 0,
+    fetching = 1,
+    done = 2,
+    failed = 3,
+    cancelled = 4,
+};
+
+/// Mirrors `ls_net_open_job`: opaque async open-job handle, core-owned. Distinct
+/// from `Doc` — a `.done` job PRODUCES a `Doc` that outlives the job.
+pub const NetOpenJob = opaque {};
+
+/// Mirrors `ls_net_open_status` (poll snapshot). Field order matches the C
+/// struct exactly (all 8-byte members first, then the two enums + http_status +
+/// reserved). `err` mirrors C `error` (`error` is a Zig keyword; the field name
+/// does not cross the ABI). See api/lesssheet.h for every field's validity rule.
+pub const NetOpenStatus = extern struct {
+    progress: f64,
+    bytes_fetched: u64,
+    bytes_total: u64,
+    doc: ?*Doc,
+    state: NetOpenState,
+    err: NetStatus,
+    http_status: i32,
+    reserved: i32,
+};
+
+// --- Zig-only test-seam VALUE types (NEVER the C ABI) -----------------------
+
+/// A transport/server FAULT the injected fake transport simulates (NetFixture.
+/// fault), each mapping to one terminal NetStatus so the error taxonomy (AC7)
+/// is reproducible hermetically:
+///   none    — serve normally.
+///   connect — DNS/TCP/TLS connection failure -> `.unreachable_`.
+///   timeout — no forward progress within the timeout -> `.timeout`.
+///   io      — local spool create/write failure -> `.io`.
+pub const NetFault = enum(u8) {
+    none = 0,
+    connect = 1,
+    timeout = 2,
+    io = 3,
+};
+
+/// The Source's resolved access mode (netRangeMode), proving AC3 vs AC4:
+///   unknown             — not yet resolved / not a network doc.
+///   random_access       — the server honored Range (206/Content-Range).
+///   sequential_fallback — the server ignored Range / gave no usable length, so
+///                         the whole resource was downloaded then opened as a
+///                         local mmap document.
+pub const NetRangeMode = enum(u8) {
+    unknown = 0,
+    random_access = 1,
+    sequential_fallback = 2,
+};
+
+/// The fake transport / server description a test builds and hands to
+/// `openUrlStartFake`. Borrowed only for that call (the job copies what it
+/// keeps — `body` included, exactly like ls_search_start copies its request).
+/// Defaults describe a well-behaved range server that serves `body`.
+///   body            — the full resource bytes the "server" holds.
+///   honor_ranges    — true: answer the probe with 206 + Content-Range (random
+///                     access); false: ignore Range and answer 200 (fallback).
+///   advertise_length— whether a usable Content-Length/Content-Range total is
+///                     present (false forces the fallback path even with 206).
+///   http_status     — the status to return (200/206 success; 404/401/403/… ->
+///                     LS_NET_ERROR_HTTP_STATUS carrying this number).
+///   redirect_hops   — redirect responses to emit before serving (exercises the
+///                     cap / LS_NET_ERROR_TOO_MANY_REDIRECTS).
+///   fault           — a transport fault to inject (see NetFault).
+///   stall           — never complete the fetch until cancelled (for the cancel
+///                     AC — lets a test observe a mid-flight FETCHING job).
+pub const NetFixture = struct {
+    body: []const u8 = &.{},
+    honor_ranges: bool = true,
+    advertise_length: bool = true,
+    http_status: u16 = 200,
+    redirect_hops: u32 = 0,
+    fault: NetFault = .none,
+    stall: bool = false,
+};
+
+/// netSpoolStore result: the private local spool file's state (AC14 spool
+/// hygiene). Mirrors the gzip CheckpointStore seam shape. `present == false`
+/// means no spool file exists (not a network doc, or already released).
+pub const NetSpoolStore = struct {
+    present: bool,
+    bytes: u64,
+    mode: u32,
+    unlinked: bool,
+};
+
+/// netJobProbe result: an in-flight/cancelled JOB's resource state (AC8), read
+/// directly off the job (the cancel path never produces a doc). After a
+/// cancelled job settles, `spool_present` is false (all resources released).
+pub const NetJobProbe = struct {
+    spool_present: bool,
+    fetch_count: u64,
+};
+
+// --- C ABI re-exports (see api/lesssheet.h NETWORK SOURCE EXTENSION) ---------
+pub const ls_open_url_start = core.ls_open_url_start;
+pub const ls_net_open_poll = core.ls_net_open_poll;
+pub const ls_net_open_cancel = core.ls_net_open_cancel;
+pub const ls_net_open_release = core.ls_net_open_release;
+
+// --- Zig-only test seams (NOT the C ABI — like openWithAllocator / gz*) ------
+
+/// Injected-transport twin of `ls_open_url_start` (production uses the real
+/// std.http.Client transport; tests use the NetFixture-described fake). Same
+/// job handle, same lifecycle, same synchronous scheme/option validation; only
+/// the byte provider differs. The fixture (and its body) is borrowed only for
+/// this call. SEED: no transport is wired, so a valid-scheme open fails
+/// `.unreachable_` and ignores the fixture -> every transport-dependent AC RED.
+pub const openUrlStartFake = core.openUrlStartFake;
+
+/// AC3/AC4: the DONE doc's resolved network access mode. `.unknown` for a
+/// non-network doc. SEED: `.unknown`.
+pub const netRangeMode = core.netRangeMode;
+/// AC6/AC13: cumulative network fetches this doc's Source issued (never-refetch
+/// and no-cross-open-cache proofs count these). 0 for a non-network doc. SEED: 0.
+pub const netFetchCount = core.netFetchCount;
+/// AC15: the network Source's current resident RAM state for this doc (bound:
+/// 16 MiB; the spool is disk-resident, not counted). 0 for a non-network doc.
+pub const netResidentBytes = core.netResidentBytes;
+/// AC14: the private spool file's present/bytes/mode/unlinked state (see
+/// NetSpoolStore). SEED: {false,0,0,false}.
+pub const netSpoolStore = core.netSpoolStore;
+/// AC6: cap the network Source's resident RAM cache to `n` bytes (0 == force
+/// full eviction) so a test can prove a re-access after eviction is served from
+/// the spool with zero new fetches. SEED: stored, unused.
+pub const netForceCacheBytes = core.netForceCacheBytes;
+/// AC8: an in-flight/cancelled JOB's resource state (see NetJobProbe), read off
+/// the job (cancel produces no doc). SEED: {false,0}.
+pub const netJobProbe = core.netJobProbe;
+
+comptime {
+    // --- C-ABI signature pins: drift in src/ fails `zig build` right here. ----
+    if (@TypeOf(core.ls_open_url_start) != fn ([*]const u8, usize, ?*const OpenOptions) callconv(.c) ?*NetOpenJob)
+        @compileError("signature drift: ls_open_url_start");
+    if (@TypeOf(core.ls_net_open_poll) != fn (*const NetOpenJob) callconv(.c) NetOpenStatus)
+        @compileError("signature drift: ls_net_open_poll");
+    if (@TypeOf(core.ls_net_open_cancel) != fn (*NetOpenJob) callconv(.c) void)
+        @compileError("signature drift: ls_net_open_cancel");
+    if (@TypeOf(core.ls_net_open_release) != fn (*NetOpenJob) callconv(.c) void)
+        @compileError("signature drift: ls_net_open_release");
+
+    // --- Zig-only test-seam signature pins (no callconv). --------------------
+    if (@TypeOf(core.openUrlStartFake) != fn (*const NetFixture, [*]const u8, usize, ?*const OpenOptions) ?*NetOpenJob)
+        @compileError("signature drift: openUrlStartFake");
+    if (@TypeOf(core.netRangeMode) != fn (*const Doc) NetRangeMode)
+        @compileError("signature drift: netRangeMode");
+    if (@TypeOf(core.netFetchCount) != fn (*const Doc) u64)
+        @compileError("signature drift: netFetchCount");
+    if (@TypeOf(core.netResidentBytes) != fn (*const Doc) u64)
+        @compileError("signature drift: netResidentBytes");
+    if (@TypeOf(core.netSpoolStore) != fn (*const Doc) NetSpoolStore)
+        @compileError("signature drift: netSpoolStore");
+    if (@TypeOf(core.netForceCacheBytes) != fn (*Doc, u64) void)
+        @compileError("signature drift: netForceCacheBytes");
+    if (@TypeOf(core.netJobProbe) != fn (*const NetOpenJob) NetJobProbe)
+        @compileError("signature drift: netJobProbe");
+}

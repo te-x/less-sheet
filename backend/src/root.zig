@@ -939,3 +939,78 @@ pub export fn ls_column_null_sentinel_copy(doc: *const api.Doc, col: u32, buf: ?
 pub export fn ls_column_conflict_example_copy(doc: *const api.Doc, col: u32, buf: ?[*]u8, buf_capacity: usize, out_required: *usize) callconv(.c) api.ColumnResult {
     return column.conflictExampleCopy(asDocMut(doc), col, buf, buf_capacity, out_required);
 }
+
+// ===========================================================================
+// network-source slice (ARCH-network-source) — additive network-open C ABI
+// (ls_open_url_start / ls_net_open_poll / ls_net_open_cancel /
+// ls_net_open_release) + Zig-only test seams. See api/lesssheet.h "NETWORK
+// SOURCE EXTENSION" and src/net.zig. The C exports and Zig seams below are the
+// FROZEN entry points contracts/api.zig pins as `core.*`; src/net.zig holds the
+// job logic (SEED: validates scheme/options, then fails UNREACHABLE — no
+// transport wired). The instrumentation seams read DEFAULTED base.Document
+// net_* state, so a non-network document reports zero/false and every
+// transport-dependent AC is RED until the http_range Source is built + wired.
+// api/lesssheet.h is byte-identical above its appended block (AC2).
+// ===========================================================================
+
+const net = @import("net.zig");
+
+/// See api/lesssheet.h `ls_open_url_start`. Returns NULL only on handle-alloc
+/// failure; an invalid scheme/URL/option is a valid job that polls FAILED with
+/// LS_NET_ERROR_INVALID_ARGUMENT (net.startJob).
+pub export fn ls_open_url_start(url: [*]const u8, url_len: usize, options: ?*const api.OpenOptions) callconv(.c) ?*api.NetOpenJob {
+    const job = net.startJob(default_gpa, url, url_len, options, null) orelse return null;
+    return @ptrCast(job);
+}
+
+/// See api/lesssheet.h `ls_net_open_poll`. Zero-alloc; total; never blocks.
+pub export fn ls_net_open_poll(job: *const api.NetOpenJob) callconv(.c) api.NetOpenStatus {
+    return net.poll(@ptrCast(@alignCast(job)));
+}
+
+/// See api/lesssheet.h `ls_net_open_cancel`.
+pub export fn ls_net_open_cancel(job: *api.NetOpenJob) callconv(.c) void {
+    net.cancel(@ptrCast(@alignCast(job)));
+}
+
+/// See api/lesssheet.h `ls_net_open_release`.
+pub export fn ls_net_open_release(job: *api.NetOpenJob) callconv(.c) void {
+    net.release(@ptrCast(@alignCast(job)));
+}
+
+// --- Zig-only test seams (NOT the C ABI — like openWithAllocator / gz*), so
+// api/lesssheet.h stays BYTE-IDENTICAL. See contracts/api.zig for each. --------
+
+/// See contracts/api.zig `openUrlStartFake`: the injected-transport twin of
+/// ls_open_url_start (production uses std.http.Client; tests describe the
+/// transport with a NetFixture). SEED: ignores the fixture, fails UNREACHABLE.
+pub fn openUrlStartFake(fixture: *const api.NetFixture, url: [*]const u8, url_len: usize, options: ?*const api.OpenOptions) ?*api.NetOpenJob {
+    const job = net.startJob(default_gpa, url, url_len, options, fixture) orelse return null;
+    return @ptrCast(job);
+}
+
+/// See contracts/api.zig `netRangeMode` (AC3/AC4).
+pub fn netRangeMode(doc: *const api.Doc) api.NetRangeMode {
+    return @enumFromInt(asDoc(doc).net_range_mode);
+}
+/// See contracts/api.zig `netFetchCount` (AC6/AC13).
+pub fn netFetchCount(doc: *const api.Doc) u64 {
+    return asDoc(doc).net_fetch_count;
+}
+/// See contracts/api.zig `netResidentBytes` (AC15).
+pub fn netResidentBytes(doc: *const api.Doc) u64 {
+    return asDoc(doc).net_resident_bytes;
+}
+/// See contracts/api.zig `netSpoolStore` (AC14).
+pub fn netSpoolStore(doc: *const api.Doc) api.NetSpoolStore {
+    const d = asDoc(doc);
+    return .{ .present = d.net_spool_present, .bytes = d.net_spool_bytes, .mode = d.net_spool_mode, .unlinked = d.net_spool_unlinked };
+}
+/// See contracts/api.zig `netForceCacheBytes` (AC6).
+pub fn netForceCacheBytes(doc: *api.Doc, n: u64) void {
+    asDocMut(doc).net_force_cache_bytes = n;
+}
+/// See contracts/api.zig `netJobProbe` (AC8).
+pub fn netJobProbe(job: *const api.NetOpenJob) api.NetJobProbe {
+    return net.jobProbe(@ptrCast(@alignCast(job)));
+}

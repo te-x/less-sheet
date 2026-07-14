@@ -6498,3 +6498,412 @@ test "cc_ac19_reopen_is_fresh: a new handle begins at generation 0 with no state
     try std.testing.expectEqual(api.ColumnTypeKind.unknown, m.effective.kind);
     try std.testing.expectEqual(api.ColumnNullPolicyKind.none, m.null_policy);
 }
+
+// ===========================================================================
+// network-source slice (ARCH-network-source) — frozen behavior tests
+// (planner-owned). Each of the ARCH's 17 acceptance criteria maps to >=1 test;
+// the backend covers AC1-AC9, AC11-AC16 (AC10 "no cold-start marker" and AC17
+// "frontend entry point" are macOS-side; AC9's visible-affordance UI half is
+// macOS, its poll-surface half is here). Hermetic + deterministic: NO live
+// network. A well-behaved / faulty / range-honoring / range-ignoring SERVER is
+// modelled by an INJECTED TRANSPORT the tests configure with an api.NetFixture
+// and start through api.openUrlStartFake (the twin of ls_open_url_start;
+// production uses the real std.http.Client). The real-client mapping of real
+// DNS/TCP/TLS/redirects over a live localhost http:// AND https:// server is a
+// REVIEWER/human target-host probe (see contracts/api.zig NETWORK notes), not a
+// hermetic gate test. SEED: openUrlStartFake ignores the fixture and fails
+// UNREACHABLE, so every transport-dependent AC below is RED until the http_range
+// Source + transport are built + wired; the additive-boundary and scheme-
+// rejection guards are green from the seed.
+
+const net_url: []const u8 = "http://fixture.test/data.csv";
+
+/// Poll a job to a terminal state (<= 15 s guard); never blocks the seed (seed
+/// jobs are terminal on the first poll).
+fn pollNetTerminal(job: *api.NetOpenJob) !api.NetOpenStatus {
+    const io = std.testing.io;
+    const t0: std.Io.Clock.Timestamp = .now(io, .awake);
+    while (true) {
+        const s = api.ls_net_open_poll(job);
+        switch (s.state) {
+            .done, .failed, .cancelled => return s,
+            .pending, .fetching => {},
+        }
+        if (elapsedMs(t0) > 15_000) return error.NetOpenTimeout;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+}
+
+/// Start a fake-transport open and require it to reach DONE with a valid doc.
+/// The caller owns the returned doc (ls_close it); the job is released here
+/// (releasing a job never closes its doc). RED in the seed (reaches FAILED).
+fn openFakeToDone(fixture: *const api.NetFixture) !*api.Doc {
+    const job = api.openUrlStartFake(fixture, net_url.ptr, net_url.len, null) orelse return error.NetJobAllocFailed;
+    defer api.ls_net_open_release(job);
+    const s = try pollNetTerminal(job);
+    try std.testing.expectEqual(api.NetOpenState.done, s.state);
+    try std.testing.expect(s.doc != null);
+    return s.doc.?;
+}
+
+// Public C ABI: the network-open symbols are callable through extern linkage,
+// and the enum values are pinned to the header (green from seed).
+const c_linked_net = struct {
+    extern fn ls_open_url_start(url: [*]const u8, url_len: usize, options: ?*const api.OpenOptions) ?*api.NetOpenJob;
+    extern fn ls_net_open_poll(job: *const api.NetOpenJob) api.NetOpenStatus;
+    extern fn ls_net_open_cancel(job: *api.NetOpenJob) void;
+    extern fn ls_net_open_release(job: *api.NetOpenJob) void;
+};
+
+test "abi: the network-open C symbols are callable through extern linkage; enum values pinned" {
+    // ls_net_status
+    try std.testing.expectEqual(@as(c_int, 0), @intFromEnum(api.NetStatus.ok));
+    try std.testing.expectEqual(@as(c_int, 1), @intFromEnum(api.NetStatus.invalid_argument));
+    try std.testing.expectEqual(@as(c_int, 2), @intFromEnum(api.NetStatus.unreachable_));
+    try std.testing.expectEqual(@as(c_int, 3), @intFromEnum(api.NetStatus.timeout));
+    try std.testing.expectEqual(@as(c_int, 4), @intFromEnum(api.NetStatus.http_status));
+    try std.testing.expectEqual(@as(c_int, 5), @intFromEnum(api.NetStatus.too_many_redirects));
+    try std.testing.expectEqual(@as(c_int, 6), @intFromEnum(api.NetStatus.io));
+    try std.testing.expectEqual(@as(c_int, 7), @intFromEnum(api.NetStatus.cancelled));
+    // ls_net_open_state
+    try std.testing.expectEqual(@as(c_int, 0), @intFromEnum(api.NetOpenState.pending));
+    try std.testing.expectEqual(@as(c_int, 1), @intFromEnum(api.NetOpenState.fetching));
+    try std.testing.expectEqual(@as(c_int, 2), @intFromEnum(api.NetOpenState.done));
+    try std.testing.expectEqual(@as(c_int, 3), @intFromEnum(api.NetOpenState.failed));
+    try std.testing.expectEqual(@as(c_int, 4), @intFromEnum(api.NetOpenState.cancelled));
+    try std.testing.expectEqual(@as(f64, -1.0), api.net_progress_unknown);
+
+    // A disallowed scheme is rejected synchronously through the real C symbol —
+    // no network — and released cleanly. (Green from seed.)
+    const bad: []const u8 = "ftp://example.test/x.csv";
+    const job = c_linked_net.ls_open_url_start(bad.ptr, bad.len, null) orelse return error.NetJobAllocFailed;
+    const s = c_linked_net.ls_net_open_poll(job);
+    try std.testing.expectEqual(api.NetOpenState.failed, s.state);
+    try std.testing.expectEqual(api.NetStatus.invalid_argument, s.err);
+    c_linked_net.ls_net_open_release(job);
+}
+
+test "net_ac1: on-paper Parquet/ODS Source-shape proof is a review criterion; the ABI is arbitrary-range" {
+    // AC1 is a DESIGN-REVIEW criterion: docs/architecture/ARCH-network-source.md
+    // carries the on-paper proof that this exact Source shape serves Parquet's
+    // footer-first and ODS's ZIP-central-directory access with NO Source/interface
+    // change (both are just [start,end) range requests — the same primitive CSV's
+    // scan-frontier already uses). It is verified by the architect/human, not by
+    // a byte assertion here. This guard pins the OBSERVABLE consequence: the new
+    // open surface is ADDITIVE and job-based (arbitrary async range fetch), and a
+    // non-network document is entirely unaffected by it.
+    var od = try openBytes("a,b\n1,2\n");
+    defer od.deinit();
+    try std.testing.expectEqual(api.NetRangeMode.unknown, api.netRangeMode(od.doc));
+    try std.testing.expectEqual(@as(u64, 0), api.netFetchCount(od.doc));
+}
+
+test "net_ac2: frozen boundary is additive — a local document is unaffected by the network surface" {
+    // AC2 (GUARD): api/lesssheet.h byte-identity is enforced by the ROOT gate's
+    // frozen api/ integrity (and the macOS AmendmentContractGuard hash). Here we
+    // assert the network feature is entirely behind the new additive ABI + Zig
+    // seams: a plain mmap document reports zero/absent network state and its every
+    // existing behavior is unchanged.
+    var od = try openBytes("name,age\nAlice,30\nBob,25\n");
+    defer od.deinit();
+    winAll(od.doc);
+    try expectCell(od.doc, 0, 0, "Alice");
+    try std.testing.expectEqual(@as(u64, 0), api.netResidentBytes(od.doc));
+    try std.testing.expectEqual(@as(u64, 0), api.netFetchCount(od.doc));
+    const sp = api.netSpoolStore(od.doc);
+    try std.testing.expectEqual(false, sp.present);
+    try std.testing.expectEqual(api.NetRangeMode.unknown, api.netRangeMode(od.doc));
+}
+
+test "net_ac3: range-support path — head rows are servable before the whole resource is fetched" {
+    // A server that honors Range: the open runs in true random-access mode and the
+    // first window is servable without downloading the whole file. RED in seed.
+    const gpa = std.testing.allocator;
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(gpa);
+    try body.appendSlice(gpa, "name,age\n");
+    {
+        var line: [64]u8 = undefined;
+        for (0..5000) |i| try body.appendSlice(gpa, try std.fmt.bufPrint(&line, "row{d},{d}\n", .{ i, i }));
+    }
+
+    var fx: api.NetFixture = .{ .body = body.items, .honor_ranges = true, .advertise_length = true };
+    const doc = try openFakeToDone(&fx);
+    defer api.ls_close(doc);
+    try std.testing.expectEqual(api.NetRangeMode.random_access, api.netRangeMode(doc));
+    winAll(doc);
+    try expectCell(doc, 0, 0, "row0");
+    // A jump near EOF completes WITHOUT the whole resource having been fetched
+    // (true partial access, not full-download-first).
+    try scanToEnd(doc);
+    try std.testing.expect(api.netFetchCount(doc) > 0);
+    try std.testing.expect(api.netResidentBytes(doc) <= 16 * 1024 * 1024);
+}
+
+test "net_ac4: fallback path — a server that ignores Range downloads sequentially, opens correctly" {
+    // 200-only (Range ignored) OR no usable length -> sequential download -> spool
+    // -> open exactly like a local file, with correct rows/dialect/counts. RED.
+    const plain = "id,name\n1,Alice\n2,Bob\n3,Carol\n";
+    inline for (.{
+        api.NetFixture{ .body = plain, .honor_ranges = false, .advertise_length = false },
+        api.NetFixture{ .body = plain, .honor_ranges = true, .advertise_length = false },
+    }) |fixture| {
+        var fx = fixture;
+        const doc = try openFakeToDone(&fx);
+        defer api.ls_close(doc);
+        try std.testing.expectEqual(api.NetRangeMode.sequential_fallback, api.netRangeMode(doc));
+        try std.testing.expectEqual(@as(u32, 2), api.ls_column_count(doc));
+        winAll(doc);
+        try expectCell(doc, 0, 1, "Alice");
+        try expectCell(doc, 2, 1, "Carol");
+    }
+}
+
+test "net_ac5: .csv.gz over the network opens through the gzip Source (range and fallback)" {
+    // A gzip-compressed CSV served over either path opens through the same gzip
+    // Source wrapping logic as a local .csv.gz — byte-identical dialect/rows. RED.
+    const gpa = std.testing.allocator;
+    const plain = "name,age\nAlice,30\nBob,25\n";
+    const g = try gz(gpa, plain);
+    defer gpa.free(g);
+
+    var ref = try openWith(plain, manual);
+    defer ref.deinit();
+
+    inline for (.{ true, false }) |honor| {
+        var fx: api.NetFixture = .{ .body = g, .honor_ranges = honor, .advertise_length = honor };
+        const doc = try openFakeToDone(&fx);
+        defer api.ls_close(doc);
+        try std.testing.expectEqual(api.ls_column_count(ref.doc), api.ls_column_count(doc));
+        const rc = api.ls_row_count_get(doc);
+        try std.testing.expectEqual(@as(u64, 2), rc.count);
+        winAll(doc);
+        try expectCell(doc, 0, 0, "Alice");
+        try expectCell(doc, 1, 1, "25");
+    }
+}
+
+test "net_ac6: never-re-fetch — a re-access after RAM-cache eviction is served from the spool" {
+    // Once a byte range has been fetched it is served from the local spool
+    // forever after, with ZERO additional network requests — even after the RAM
+    // cache is evicted. RED.
+    const gpa = std.testing.allocator;
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(gpa);
+    try body.appendSlice(gpa, "k,v\n");
+    {
+        var line: [64]u8 = undefined;
+        for (0..2000) |i| try body.appendSlice(gpa, try std.fmt.bufPrint(&line, "{d},{d}\n", .{ i, i }));
+    }
+
+    var fx: api.NetFixture = .{ .body = body.items, .honor_ranges = true, .advertise_length = true };
+    const doc = try openFakeToDone(&fx);
+    defer api.ls_close(doc);
+    winAll(doc);
+    _ = api.ls_window_set(doc, 0, 64); // fetch the head range
+    const after_first = api.netFetchCount(doc);
+    try std.testing.expect(after_first > 0);
+
+    api.netForceCacheBytes(doc, 0); // evict the resident RAM cache entirely
+    _ = api.ls_window_set(doc, 0, 64); // re-access the SAME range
+    try std.testing.expectEqual(after_first, api.netFetchCount(doc)); // served from spool: no new fetch
+}
+
+test "net_ac7: error taxonomy — each cause surfaces its own distinct NetStatus" {
+    // Every ls_net_status value is independently reproducible; none collapses into
+    // another. The scheme-rejection case is hermetic + green from seed; the
+    // transport faults are RED until the transport maps them.
+    const body = "a,b\n1,2\n";
+    const cases = .{
+        .{ api.NetFixture{ .body = body, .fault = .connect }, api.NetStatus.unreachable_ },
+        .{ api.NetFixture{ .body = body, .fault = .timeout }, api.NetStatus.timeout },
+        .{ api.NetFixture{ .body = body, .fault = .io }, api.NetStatus.io },
+        .{ api.NetFixture{ .body = "", .http_status = 404 }, api.NetStatus.http_status },
+        .{ api.NetFixture{ .body = body, .redirect_hops = 1000 }, api.NetStatus.too_many_redirects },
+    };
+    inline for (cases) |case| {
+        var fx = case[0];
+        const job = api.openUrlStartFake(&fx, net_url.ptr, net_url.len, null) orelse return error.NetJobAllocFailed;
+        defer api.ls_net_open_release(job);
+        const s = try pollNetTerminal(job);
+        try std.testing.expectEqual(api.NetOpenState.failed, s.state);
+        try std.testing.expectEqual(case[1], s.err);
+        if (case[1] == .http_status) try std.testing.expectEqual(@as(i32, 404), s.http_status);
+    }
+    // Disallowed / malformed schemes reject SYNCHRONOUSLY with no network. (Green.)
+    inline for (.{ "ftp://x/y.csv", "file:///etc/passwd", "notaurl", "" }) |bad_s| {
+        const bad: []const u8 = bad_s;
+        const job = api.ls_open_url_start(bad.ptr, bad.len, null) orelse return error.NetJobAllocFailed;
+        defer api.ls_net_open_release(job);
+        const s = api.ls_net_open_poll(job);
+        try std.testing.expectEqual(api.NetOpenState.failed, s.state);
+        try std.testing.expectEqual(api.NetStatus.invalid_argument, s.err);
+    }
+}
+
+test "net_ac8: cancellation mid-open stops the fetch, releases resources, leaves no dangling doc" {
+    // A stall fixture keeps the job in flight; cancel stops it within a chunk
+    // boundary, releases all resources (spool included), and produces no doc. RED
+    // in seed (the seed job is already terminal, so cancel is a no-op).
+    const body = "a,b\n1,2\n3,4\n";
+    var fx: api.NetFixture = .{ .body = body, .honor_ranges = true, .advertise_length = true, .stall = true };
+    const job = api.openUrlStartFake(&fx, net_url.ptr, net_url.len, null) orelse return error.NetJobAllocFailed;
+    defer api.ls_net_open_release(job);
+
+    // The affordance is live from t0: the first poll is NON-terminal for a
+    // stalled open (no silent stall; poll never blocks).
+    const first = api.ls_net_open_poll(job);
+    try std.testing.expect(first.state == .pending or first.state == .fetching);
+
+    api.ls_net_open_cancel(job);
+    const s = try pollNetTerminal(job);
+    try std.testing.expectEqual(api.NetOpenState.cancelled, s.state);
+    try std.testing.expect(s.doc == null); // no dangling document
+    try std.testing.expectEqual(false, api.netJobProbe(job).spool_present); // spool released
+}
+
+test "net_ac9: no silent stalls — poll reports a live snapshot from t0 and never blocks (backend half)" {
+    // The backend-observable half of AC9: from the instant the open starts, poll
+    // returns a valid live snapshot without blocking, with progress either a
+    // determinate fraction in [0,1] or the LS_NET_PROGRESS_UNKNOWN sentinel — and
+    // it is non-terminal while the fetch is stalled. (The always-visible UI
+    // affordance itself is the macOS AC9 half.) RED in seed.
+    const body = "a,b\n1,2\n";
+    var fx: api.NetFixture = .{ .body = body, .stall = true, .advertise_length = false };
+    const job = api.openUrlStartFake(&fx, net_url.ptr, net_url.len, null) orelse return error.NetJobAllocFailed;
+    defer api.ls_net_open_release(job);
+    defer api.ls_net_open_cancel(job); // don't leave the fetch running
+
+    const s = api.ls_net_open_poll(job);
+    try std.testing.expect(s.state == .pending or s.state == .fetching); // non-terminal: still working
+    const determinate = s.progress >= 0.0 and s.progress <= 1.0;
+    const unknown = s.progress == api.net_progress_unknown;
+    try std.testing.expect(determinate or unknown);
+}
+
+test "net_ac11: scheme allowlist — http/https open; ftp/file/malformed reject with no network" {
+    // The rejection half is hermetic + green from seed (see net_ac7). The success
+    // half (a valid http/https URL opens) is RED until the transport is wired; the
+    // REAL http:// and https:// round-trip is a reviewer target-host probe.
+    const plain = "x\n1\n2\n";
+    var fx: api.NetFixture = .{ .body = plain, .honor_ranges = true, .advertise_length = true };
+    const doc = try openFakeToDone(&fx); // RED in seed
+    defer api.ls_close(doc);
+    try std.testing.expectEqual(@as(u32, 1), api.ls_column_count(doc));
+
+    // Rejections touch no network (synchronous FAILED/INVALID_ARGUMENT).
+    inline for (.{ "ftp://h/x", "file:///x", "gopher://h" }) |bad_s| {
+        const bad: []const u8 = bad_s;
+        const job = api.ls_open_url_start(bad.ptr, bad.len, null) orelse return error.NetJobAllocFailed;
+        defer api.ls_net_open_release(job);
+        try std.testing.expectEqual(api.NetStatus.invalid_argument, api.ls_net_open_poll(job).err);
+    }
+}
+
+test "net_ac12: no auth (401/403 -> HTTP_STATUS); redirects bounded (within cap DONE, over cap error)" {
+    const body = "a\n1\n";
+    // Auth required -> HTTP_STATUS carrying the numeric code (no credential path).
+    inline for (.{ 401, 403 }) |code| {
+        var fx: api.NetFixture = .{ .body = "", .http_status = code };
+        const job = api.openUrlStartFake(&fx, net_url.ptr, net_url.len, null) orelse return error.NetJobAllocFailed;
+        defer api.ls_net_open_release(job);
+        const s = try pollNetTerminal(job);
+        try std.testing.expectEqual(api.NetStatus.http_status, s.err);
+        try std.testing.expectEqual(@as(i32, code), s.http_status);
+    }
+    // A short redirect chain within the cap succeeds; one past it fails.
+    {
+        var ok_fx: api.NetFixture = .{ .body = body, .redirect_hops = 1, .honor_ranges = true, .advertise_length = true };
+        const doc = try openFakeToDone(&ok_fx);
+        defer api.ls_close(doc);
+        try std.testing.expectEqual(@as(u32, 1), api.ls_column_count(doc));
+    }
+    {
+        var over_fx: api.NetFixture = .{ .body = body, .redirect_hops = 1000 };
+        const job = api.openUrlStartFake(&over_fx, net_url.ptr, net_url.len, null) orelse return error.NetJobAllocFailed;
+        defer api.ls_net_open_release(job);
+        try std.testing.expectEqual(api.NetStatus.too_many_redirects, (try pollNetTerminal(job)).err);
+    }
+}
+
+test "net_ac13: no cross-open caching — re-opening the same URL re-fetches from scratch" {
+    // Re-opening after close always re-fetches: the second open's Source issues
+    // its own fetches (no reuse of a prior open's spool). RED.
+    const plain = "k,v\na,1\nb,2\n";
+    var fx1: api.NetFixture = .{ .body = plain, .honor_ranges = true, .advertise_length = true };
+    const doc1 = try openFakeToDone(&fx1);
+    winAll(doc1);
+    _ = api.ls_window_set(doc1, 0, 8);
+    try std.testing.expect(api.netFetchCount(doc1) > 0);
+    api.ls_close(doc1);
+
+    var fx2: api.NetFixture = .{ .body = plain, .honor_ranges = true, .advertise_length = true };
+    const doc2 = try openFakeToDone(&fx2);
+    defer api.ls_close(doc2);
+    winAll(doc2);
+    _ = api.ls_window_set(doc2, 0, 8);
+    try std.testing.expect(api.netFetchCount(doc2) > 0); // fresh fetch, not a reused cache
+}
+
+test "net_ac14: spool file hygiene — 0600, unlinked while open, bounded, present only while live" {
+    // The private spool is created mode 0600 and unlinked immediately (never
+    // visible in its directory while open). RED.
+    const gpa = std.testing.allocator;
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(gpa);
+    try body.appendSlice(gpa, "n\n");
+    {
+        var line: [64]u8 = undefined;
+        for (0..3000) |i| try body.appendSlice(gpa, try std.fmt.bufPrint(&line, "{d}\n", .{i}));
+    }
+
+    var fx: api.NetFixture = .{ .body = body.items, .honor_ranges = true, .advertise_length = true };
+    const doc = try openFakeToDone(&fx);
+    defer api.ls_close(doc);
+    try scanToEnd(doc); // materialize enough that the spool is non-empty
+    const sp = api.netSpoolStore(doc);
+    try std.testing.expectEqual(true, sp.present);
+    try std.testing.expectEqual(@as(u32, 0o600), sp.mode);
+    try std.testing.expectEqual(true, sp.unlinked);
+    try std.testing.expect(sp.bytes > 0);
+}
+
+test "net_ac15: memory bound — network Source resident RAM stays <= 16 MiB across scroll/jump" {
+    // Steady-state resident RAM does not grow unbounded with spool size (the spool
+    // is disk-resident). RED.
+    const gpa = std.testing.allocator;
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(gpa);
+    try body.appendSlice(gpa, "a,b,c\n");
+    {
+        var line: [64]u8 = undefined;
+        for (0..20000) |i| try body.appendSlice(gpa, try std.fmt.bufPrint(&line, "{d},{d},{d}\n", .{ i, i * 2, i * 3 }));
+    }
+
+    var fx: api.NetFixture = .{ .body = body.items, .honor_ranges = true, .advertise_length = true };
+    const doc = try openFakeToDone(&fx);
+    defer api.ls_close(doc);
+    // A sustained scroll/jump exercise.
+    var r: u64 = 0;
+    while (r < 20000) : (r += 4096) {
+        api.ls_jump_start(doc, r);
+        _ = try waitJumpDone(doc);
+        _ = api.ls_window_set(doc, r, 256);
+        try std.testing.expect(api.netResidentBytes(doc) <= 16 * 1024 * 1024);
+    }
+    try std.testing.expect(api.netResidentBytes(doc) > 0);
+}
+
+test "net_ac16: dependencies & size — Zig std only (std.http.Client / std.crypto.tls) (GUARD)" {
+    // AC16 (GUARD): no new RUNTIME dependency. The real enforcement is the frozen
+    // build.zig (stdlib-only; no build.zig.zon) under the component's
+    // DEPENDENCY_PATHS + the header's DEPENDENCIES note; the app stays
+    // single-digit MB (a reviewer size measurement). This compile-time reference
+    // pins that the approved networking primitives are the STD ones.
+    _ = std.http.Client;
+    _ = std.crypto.tls.Client;
+    // A plain document remains fully functional (no dependency regression).
+    var od = try openBytes("a,b\n1,2\n");
+    defer od.deinit();
+    try expectDims(od.doc, 1, 2);
+}
