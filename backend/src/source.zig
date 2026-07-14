@@ -721,7 +721,19 @@ pub const Cursor = struct {
     }
 
     pub fn atLimit(self: *const Cursor) bool {
-        if (self.limit) |lim| if (self.logical >= lim) return true;
+        if (self.limit) |lim| if (self.logical >= lim) {
+            // A logical limit that coincides with the source's OWN true end
+            // (source.knownEnd()) is not a truncation — it is simply where
+            // the content legitimately ends. Only a limit STRICTLY before the
+            // true end is a genuine artificial cap (e.g. a per-row/window
+            // scan budget). Without this check, the last record of any
+            // streamed source (gzip/http_range) whose scan-budget limit
+            // happens to equal the source's total length is misreported as
+            // oversized/truncated/budget-stopped — the mmap path already
+            // gets this right (lexer.recordBounds's `capped = limit != content.len`).
+            if (self.source) |src| if (src.knownEnd()) |known_end| if (lim >= known_end) return false;
+            return true;
+        };
         if (self.hitPhysicalLimit()) return true;
         return switch (self.source.?) {
             .mmap => false,
