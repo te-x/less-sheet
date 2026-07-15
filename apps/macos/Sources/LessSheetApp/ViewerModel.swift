@@ -2298,6 +2298,12 @@ final class DocumentModel {
             session.navigateSearch(.fromTop)          // "first match in the file"
             foldSearch(session.searchStatus())        // fold the (possibly instant) result
             startPolling()
+            // Repaint the new highlights NOW. A FOUND first match lands (async
+            // apply via foldSearch), but a query with NO match has no landing to
+            // carry the repaint that must ERASE the prior search's highlights —
+            // they would otherwise linger until the next scroll (same family as
+            // closeFind / the filter toggle). Idempotent alongside the landing.
+            NativeGridController.live?.apply()
         }
     }
 
@@ -2340,6 +2346,12 @@ final class DocumentModel {
         findSession = findControl.closed(findSession)
         findFieldActive = false
         searchNavDirection = .forward
+        // Clear the match highlights NOW. Closing find only nils the request
+        // (an observed key) with no scroll/landing, so — like the filter toggle
+        // — the SwiftUI-observation repaint defers to the next event and the blue
+        // highlights linger until the user scrolls. The explicit synchronous
+        // poke repaints this turn (RepaintAuditProbe: closeFind delta 0 -> 1).
+        NativeGridController.live?.apply()
     }
 
     /// Fold one search poll into the display; when a wrap notice appears, hold

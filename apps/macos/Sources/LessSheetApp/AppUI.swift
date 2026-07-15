@@ -619,6 +619,11 @@ struct ContentView: View {
                 // and prove the find popup closes + clears (search-escape lock)
                 // — logs + terminates itself.
                 FindEscapeProbe.run(model: model)
+            } else if RepaintAuditProbe.active {
+                // Audit: measure the apply-tick delta across each cell-painting
+                // mutation to classify instant vs defer-to-scroll — logs +
+                // terminates itself.
+                RepaintAuditProbe.run(model: model)
             } else if FrameDump.liveGridInitialDumpPath == nil {
                 // Overlay / find / settings / overscroll etc. render off a SwiftUI
                 // mirror here; the plain grid-content scene instead self-captures

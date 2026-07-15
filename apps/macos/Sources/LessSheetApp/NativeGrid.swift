@@ -165,6 +165,12 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
     /// FilterRepaintProbe regression seam, mirroring
     /// `appliedColumnConfigurationRevision`.
     var appliedFilterState: Bool { lastIsFiltered }
+    /// Increments each time `apply()` actually runs its repaint body (past the
+    /// built/window guard). A probe reads the DELTA across a single synchronous
+    /// model mutation to prove that mutation drove a repaint itself (a poke)
+    /// rather than deferring to the next event — the audit seam for the
+    /// repaint-family bugs.
+    private(set) var applyTick = 0
     private var lastIsFiltered = false
     private var built = false
     private var landingApplyScheduled = false
@@ -446,6 +452,7 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
     /// O(viewport)/O(1).
     func apply() {
         guard built, container.window != nil else { return }
+        applyTick &+= 1
 
         // Re-open / dialect re-open: columns + widths reset; reload from the top.
         if model.openGeneration != lastOpenGeneration {
