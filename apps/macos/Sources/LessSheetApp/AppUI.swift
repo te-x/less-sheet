@@ -115,11 +115,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         showMainWindow()
         NSApp.activate(ignoringOtherApps: true)
 
-        // No document on launch: immediately present the native open panel; a
-        // cancel leaves the empty window with the menu bar available (ARCH req 3).
-        if !routedLaunchOpen {
-            DispatchQueue.main.async { AppDelegate.openViaPanel() }
-        }
+        // No document on launch: rest on the launch state (LaunchStateView),
+        // which spells out both entry points (⌘O local file, ⌘⇧O Open URL).
+        // Auto-popping the open panel predated network support and now wrongly
+        // assumes "open" means a local file — the user picks the entry point.
     }
 
     // `open -a LessSheet file.csv`, Finder double-click, drag-onto-icon.
@@ -499,7 +498,7 @@ struct ContentView: View {
     private var content: some View {
         switch model.phase {
         case .launch:
-            EmptyStateView(line: "Open a file to view it — ⌘O")
+            LaunchStateView()
 
         case .document:
             if model.columnCount == 0 {
@@ -636,7 +635,7 @@ struct ContentView: View {
     }
 }
 
-/// A single quiet line, centered — the launch prompt and the empty-file state.
+/// A single quiet line, centered — used for the empty-file state.
 struct EmptyStateView: View {
     let line: String
 
@@ -646,6 +645,40 @@ struct EmptyStateView: View {
             .foregroundStyle(.secondary)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(Color(nsColor: .textBackgroundColor))
+    }
+}
+
+/// The blank launch screen shown when the app starts with no document (i.e. not
+/// via a Finder open / argv). It spells out the two ways to open something —
+/// a local file (⌘O) and a network URL (⌘⇧O) — instead of the old behavior of
+/// immediately popping the file panel, which predated network support and
+/// wrongly assumed "open" meant a local file. Same quiet, centered aesthetic as
+/// the empty-file state.
+struct LaunchStateView: View {
+    var body: some View {
+        VStack(spacing: 14) {
+            Text("Open a spreadsheet to view it")
+                .font(.title3)
+                .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 6) {
+                shortcut("⌘O", "Open a local file")
+                shortcut("⌘⇧O", "Open a URL")
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color(nsColor: .textBackgroundColor))
+    }
+
+    private func shortcut(_ keys: String, _ label: String) -> some View {
+        HStack(spacing: 10) {
+            Text(keys)
+                .font(.body.monospaced())
+                .foregroundStyle(.primary)
+                .frame(minWidth: 44, alignment: .trailing)
+            Text(label)
+                .font(.body)
+                .foregroundStyle(.secondary)
+        }
     }
 }
 
