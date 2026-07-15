@@ -664,6 +664,17 @@ typedef struct ls_row_range {
  * across cancelled jobs); bytes_total is the file size. complete is true
  * iff every record is indexed (bytes_scanned == bytes_total) — from then on
  * ls_row_count_get reports exact. Empty file: {0, 0, true}.
+ *
+ * NETWORK (never-full-download-streaming slice — see NEVER-FULL-DOWNLOAD
+ * STREAMING EXTENSION at the end of this header): for a network-sourced
+ * document (any ls_open_url_* open) the frontier is DEMAND-DRIVEN and no
+ * background scan advances it. bytes_scanned is the fetched/indexed
+ * high-water; bytes_total is the known resource size, or
+ * LS_BYTES_TOTAL_UNKNOWN (== UINT64_MAX) for an unknown-length stream (total
+ * not yet known — disambiguated from the empty-file {0, 0, true}); complete
+ * becomes true only when navigation has reached EOF (or a small resource was
+ * fully fetched at open). LOCAL (mmap / gzip) documents follow the rule above
+ * byte-identically.
  */
 typedef struct ls_scan_progress {
     uint64_t bytes_scanned;
@@ -2042,6 +2053,87 @@ void ls_net_open_cancel(ls_net_open_job *job);
  * closing its doc are independent, in either order.
  */
 void ls_net_open_release(ls_net_open_job *job);
+
+/* =========================================================================
+ * NEVER-FULL-DOWNLOAD STREAMING (lazy / demand-driven network) EXTENSION
+ * =========================================================================
+ * (never-full-download-streaming slice — THREE documentation / sentinel
+ * amendments; struct/enum/signature LAYOUT is BYTE-IDENTICAL to every prior
+ * revision of this header. Two-key root-planner freeze; the author's sign-off
+ * relayed 2026-07-15. See docs/architecture/ARCH-never-full-download-streaming.md.)
+ *
+ * This block adds exactly ONE new sentinel #define (LS_BYTES_TOTAL_UNKNOWN)
+ * plus documentation of how the EXISTING network surface (NETWORK SOURCE
+ * EXTENSION above — ls_open_url_* / ls_net_* / ls_index_poll / ls_row_count /
+ * ls_search_*) behaves under the lazy access model. No enum, struct, or function
+ * prototype changes shape or value, so a client compiled against any prior
+ * header links and behaves identically.
+ *
+ * THE MODEL (the spine). A network-sourced document is STRICTLY lazy: it fetches
+ * ONLY what a concrete user action needs — the head at open, a viewport plus a
+ * small scroll buffer on scroll, up to the next match on search, and a deep jump
+ * / wrap-to-start / find-last only on the user's explicit request — and NEVER
+ * runs a background network scan of any kind. Inspecting a 100 GB resource's
+ * columns fetches a few MB, not the file. Fetch-free accessors (ls_window_set,
+ * ls_cell, ls_cell_copy, column inference) serve only bytes already behind the
+ * frontier; a read at/beyond the frontier returns the existing not-yet-servable
+ * value (empty cell / LS_COPY_PENDING) — the frontend jumps first. The frontier
+ * advances ONLY through demand jumps, search navigations, and filter demands —
+ * all on the async, progress-polled, cancellable paths (ls_jump_* / ls_search_*
+ * / ls_filter_*), never the "never blocks" window lane.
+ *
+ * BEST-EFFORT NETWORK / STRICT LOCAL. Every LOCAL (mmap / gzip) behavior,
+ * timing, and budget is UNCHANGED and regression-guarded — the lazy gate keys on
+ * source kind (a local document's AUTO background indexer still advances the
+ * frontier to EOF). Network operations carry NO wall-clock / latency guarantee;
+ * they are judged only by correctness and fetch-minimality (how few bytes a
+ * demand fetches), never speed.
+ *
+ * (a) UNKNOWN-TOTAL SENTINEL — ls_scan_progress.bytes_total.
+ *     LS_BYTES_TOTAL_UNKNOWN (== UINT64_MAX) reported by ls_index_poll means an
+ *     unknown-length network stream whose total is not yet known (no
+ *     Content-Length, a chunked transfer, or a 206 without a usable
+ *     Content-Range total). While it holds, ls_index_poll.complete stays false
+ *     and bytes_scanned is the fetched/indexed high-water; at stream EOF
+ *     bytes_total becomes the final size and complete follows the normal rule.
+ *     It is DISTINCT from a genuinely empty resource, which is the ordinary
+ *     empty document {0, 0, true} (a Content-Length: 0, or a stream that drains
+ *     to empty). A LOCAL document never reports this sentinel.
+ *
+ * (b) NETWORK DEMAND-DRIVEN — ls_index_poll / ls_row_count under LS_INDEX_AUTO.
+ *     For a network-sourced document LS_INDEX_AUTO does NOT background-advance
+ *     the frontier over the wire (unlike a local document, whose AUTO indexer
+ *     drives to EOF): the frontier advances only via viewport jumps, searches,
+ *     and filters. Consequently ls_row_count is a CONVERGING LOWER BOUND for an
+ *     unknown-total stream (count == the rows discovered so far, exact == false)
+ *     or a FREE PROJECTION for a known-total resource (the existing byte-ratio
+ *     estimate, exact == false) — neither fetches to produce the estimate, and
+ *     both firm ONLY as the user navigates. ls_index_poll.complete and
+ *     ls_row_count.exact become true ONLY if navigation reaches EOF (or a small
+ *     resource was fully fetched at open — the determinism pin, measured against
+ *     the fetched head rather than a mapped file).
+ *
+ * (c) NETWORK SEARCH DEMAND-BOUNDED — ls_search_start / ls_search_nav /
+ *     ls_search_status. On a network source the match-scan is demand-bounded:
+ *     ls_search_start starts NO background match-scan; each ls_search_nav scans
+ *     forward only to the next match (fetching on demand, with progress), then
+ *     the search PARKS at LS_SEARCH_CANCELLED (reusing the existing
+ *     CANCELLED->resume state machine verbatim — no new states); "Next" resumes
+ *     it. ls_search_status.total is the count over the SCANNED PREFIX (exact for
+ *     that prefix, monotone) and total_exact becomes true ONLY if a navigation
+ *     reaches EOF; the full match total M is never computed in the background.
+ *     A network FILTER (ls_filter_*) is likewise demand-bounded: its filter-scan
+ *     advances only while serving a demand, then parks LS_FILTER_CANCELLED (the
+ *     view stays filtered; counts firm only as the user navigates).
+ */
+
+/*
+ * Sentinel for ls_scan_progress.bytes_total (ls_index_poll): an unknown-length
+ * network stream whose total size is not yet known. See amendment (a) above and
+ * the ls_scan_progress documentation. Network-only; a local document never
+ * reports it (its bytes_total is always the file size).
+ */
+#define LS_BYTES_TOTAL_UNKNOWN (UINT64_MAX)
 
 #ifdef __cplusplus
 }

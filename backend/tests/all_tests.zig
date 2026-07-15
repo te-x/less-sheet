@@ -6941,3 +6941,601 @@ test "net_ac16: dependencies & size — Zig std only (std.http.Client / std.cryp
     defer od.deinit();
     try expectDims(od.doc, 1, 2);
 }
+
+
+// ===========================================================================
+// never-full-download-streaming slice (ARCH-never-full-download-streaming) —
+// frozen behavior tests (planner-owned). Each of the ARCH's 24 acceptance
+// criteria maps to a `nfd_acN` test below. A network document must be STRICTLY
+// lazy: it fetches only what open / scroll / search / a deep jump needs, with
+// NO background network scan (the shipped slice's `buildDownloadAll` +
+// background AUTO indexer over the wire is the bug this corrects). Hermetic +
+// deterministic: the injected fake transport (api.NetFixture -> openUrlStartFake)
+// models range / no-range, known / unknown length, withhold-then-release, and
+// post-open drop; fetch-minimality is proven by `netFetchCount`, never latency.
+//
+// SEED (RED): the current impl keeps `buildDownloadAll` (sequential + gzip
+// download the whole resource -> netFetchCount 0, netRangeMode sequential_fallback)
+// and spawns the AUTO frontier indexer for network docs (it drives the frontier
+// to EOF over the wire -> ls_index_poll.complete / ls_row_count.exact firm
+// unbidden, netFetchCount covers the whole body); decideProbe still forces
+// range=!is_gz and never reports an unknown-length stream. So every fetch-
+// minimality / streaming / sentinel AC below is RED until the lazy model +
+// sequential fill + gzip-over-spool + net gate are built and wired. The
+// frozen-boundary / on-paper-proof / deps / local-non-regression guards are
+// GREEN from the seed (and AC21 must STAY green — the lazy gate keys on source
+// kind: LOCAL docs are byte-identical).
+//
+// LOCAL is strict, NETWORK is best-effort: these tests assert correctness +
+// fetch-minimality only. Wall-clock/latency and the real std.http.Client round-
+// trip remain human target-host probes (see contracts/api.zig NETWORK notes).
+
+const net_chunk: u64 = 256 * 1024; // net_source.chunk_bytes
+const net_head_chunks: u64 = 16; // open_head_max_bytes (4 MiB) / 256 KiB
+
+/// Let any AUTO background index work run to a stable point: poll ls_index_poll
+/// until complete OR `budget_ms` elapse; return the final snapshot. On the
+/// current (non-lazy) SEED an AUTO network doc's background indexer drives the
+/// frontier to EOF over the wire, so this returns complete==true with a grown
+/// netFetchCount (the over-fetch the lazy model eliminates); once the net gate
+/// is built it returns at the budget with complete==false and a head-only count.
+fn settleIndex(doc: *api.Doc, budget_ms: i64) api.ScanProgress {
+    const io = std.testing.io;
+    const t0: std.Io.Clock.Timestamp = .now(io, .awake);
+    while (true) {
+        const s = api.ls_index_poll(doc);
+        if (s.complete) return s;
+        if (elapsedMs(t0) > budget_ms) return s;
+        io.sleep(.fromMilliseconds(2), .awake) catch return s;
+    }
+}
+
+/// Busy-wait `ms` milliseconds while the background lane (if any) runs.
+fn netWait(ms: i64) void {
+    const io = std.testing.io;
+    const t0: std.Io.Clock.Timestamp = .now(io, .awake);
+    while (elapsedMs(t0) < ms) io.sleep(.fromMilliseconds(5), .awake) catch return;
+}
+
+test "nfd_ac1: frozen boundary + amendments — sentinel present; local docs unaffected (GUARD)" {
+    // Layout byte-identity of api/lesssheet.h is enforced by the root gate's
+    // frozen-api integrity + the macOS AmendmentContractGuard hash; here we pin
+    // the observable amendments: the unknown-total sentinel exists, and a LOCAL
+    // document never reports it (its AUTO indexer still drives to EOF). GREEN.
+    try std.testing.expectEqual(std.math.maxInt(u64), api.bytes_total_unknown);
+    var od = try openWith("a,b\n1,2\n3,4\n", .{}); // AUTO local
+    defer od.deinit();
+    const ip = settleIndex(od.doc, 2000);
+    try std.testing.expectEqual(true, ip.complete);
+    try std.testing.expect(ip.bytes_total != api.bytes_total_unknown);
+    try std.testing.expectEqual(api.NetRangeMode.unknown, api.netRangeMode(od.doc));
+}
+
+test "nfd_ac2: no full download — plain CSV, no-range server streams sequentially" {
+    const gpa = std.testing.allocator;
+    const body = try genFixedRows(gpa, 600_000); // ~10.8 MiB >> 4 MiB head
+    defer gpa.free(body);
+    var fx: api.NetFixture = .{ .body = body, .honor_ranges = false, .advertise_length = true };
+    const doc = try openFakeToDone(&fx);
+    defer api.ls_close(doc);
+    try std.testing.expectEqual(api.NetRangeMode.sequential_fallback, api.netRangeMode(doc));
+    winAll(doc);
+    var b: [8]u8 = undefined;
+    try expectCell(doc, 0, 0, fixedCell(&b, 0)); // first window servable
+    // STREAMED, not downloaded: the Source issued demand fetches (RED: the seed's
+    // buildDownloadAll issues none -> netFetchCount 0), bounded to ~the head, and
+    // after AUTO settles the whole body is NOT fetched and the index is NOT
+    // complete (RED: the seed downloads + indexes everything).
+    const ip = settleIndex(doc, 400);
+    try std.testing.expect(api.netFetchCount(doc) > 0);
+    try std.testing.expect(api.netFetchCount(doc) <= net_head_chunks + 8);
+    try std.testing.expectEqual(false, ip.complete);
+}
+
+test "nfd_ac3: no full download — .csv.gz streams compressed bytes on demand (range + no-range)" {
+    const gpa = std.testing.allocator;
+    const plain = try genFixedRows(gpa, 600_000);
+    defer gpa.free(plain);
+    const g = try gz(gpa, plain);
+    defer gpa.free(g);
+    inline for (.{ true, false }) |honor| {
+        var fx: api.NetFixture = .{ .body = g, .honor_ranges = honor, .advertise_length = honor };
+        const doc = try openFakeToDone(&fx);
+        defer api.ls_close(doc);
+        winAll(doc);
+        var b: [8]u8 = undefined;
+        try expectCell(doc, 0, 0, fixedCell(&b, 0));
+        // Compressed bytes are fetched via the streaming http_range Source (RED:
+        // the seed forces gzip down buildDownloadAll -> netFetchCount 0); the whole
+        // compressed body is not fetched and the doc is not fully inflated at open.
+        const ip = settleIndex(doc, 400);
+        try std.testing.expect(api.netFetchCount(doc) > 0);
+        try std.testing.expectEqual(false, ip.complete);
+    }
+}
+
+test "nfd_ac4: no background growth — netFetchCount + frontier flat across poll-wait-poll" {
+    const gpa = std.testing.allocator;
+    const body = try genFixedRows(gpa, 600_000);
+    defer gpa.free(body);
+    const g = try gz(gpa, body);
+    defer gpa.free(g);
+    const cases = [_]api.NetFixture{
+        .{ .body = body, .honor_ranges = true, .advertise_length = true }, // random
+        .{ .body = body, .honor_ranges = false, .advertise_length = true }, // sequential
+        .{ .body = g, .honor_ranges = true, .advertise_length = true }, // gzip
+    };
+    for (cases) |fixture| {
+        var fx = fixture;
+        const doc = try openFakeToDone(&fx);
+        defer api.ls_close(doc);
+        const c0 = api.netFetchCount(doc);
+        const f0 = api.ls_index_poll(doc).bytes_scanned;
+        netWait(300); // a background scan (the bug) would grow both / complete the index
+        try std.testing.expectEqual(c0, api.netFetchCount(doc)); // no background fetch
+        try std.testing.expectEqual(f0, api.ls_index_poll(doc).bytes_scanned); // frontier frozen
+        try std.testing.expectEqual(false, api.ls_index_poll(doc).complete);
+        try std.testing.expectEqual(false, api.ls_row_count_get(doc).exact);
+    }
+}
+
+test "nfd_ac5: scroll advances the frontier by a bounded amount, never to EOF" {
+    const gpa = std.testing.allocator;
+    const body = try genFixedRows(gpa, 600_000); // ~44 chunks; head ~= 233k rows
+    defer gpa.free(body);
+    var fx: api.NetFixture = .{ .body = body, .honor_ranges = true, .advertise_length = true };
+    const doc = try openFakeToDone(&fx);
+    defer api.ls_close(doc);
+    _ = settleIndex(doc, 200);
+    // A scroll-driven jump toward bottom_visible + buffer (row 300k, past the head
+    // frontier but NOT EOF).
+    api.ls_jump_start(doc, 300_000);
+    _ = try waitJumpDone(doc);
+    _ = api.ls_window_set(doc, 300_000, 64);
+    var b: [8]u8 = undefined;
+    try expectCell(doc, 300_000, 0, fixedCell(&b, 300_000)); // newly visible rows correct
+    // Bounded: the frontier advanced toward the target, NOT to EOF (RED: the
+    // seed's AUTO indexer fetched the whole ~44-chunk body + completed).
+    try std.testing.expect(api.netFetchCount(doc) < 30);
+    try std.testing.expectEqual(false, api.ls_index_poll(doc).complete);
+}
+
+test "nfd_ac6: search fetches up to the next match then parks CANCELLED" {
+    const gpa = std.testing.allocator;
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(gpa);
+    {
+        var line: [48]u8 = undefined;
+        for (0..600_000) |i| {
+            if (i == 300_000) {
+                try body.appendSlice(gpa, "NEEDLE,x\n");
+            } else try body.appendSlice(gpa, try std.fmt.bufPrint(&line, "{d:0>8},{d:0>8}\n", .{ i, 2 * i }));
+        }
+    }
+    var fx: api.NetFixture = .{ .body = body.items, .honor_ranges = true, .advertise_length = true };
+    const doc = try openFakeToDone(&fx);
+    defer api.ls_close(doc);
+    try startSearch(doc, textReq("NEEDLE"));
+    const s = try navAndWait(doc, 0, .forward);
+    try std.testing.expectEqual(api.SearchNavState.found, s.nav);
+    try std.testing.expectEqual(@as(u64, 300_000), s.found_row);
+    // Demand-bounded: total counts only the scanned prefix (== position), NOT
+    // exact, and the search PARKS at CANCELLED (RED: the seed drives the match-
+    // scan to EOF -> state DONE / total_exact, and fetches the whole body).
+    try std.testing.expectEqual(s.position, s.total);
+    try std.testing.expectEqual(false, s.total_exact);
+    try std.testing.expectEqual(api.SearchState.cancelled, api.ls_search_poll(doc).state);
+    try std.testing.expect(api.netFetchCount(doc) < 30);
+}
+
+test "nfd_ac7: deep jump pays on demand; cancel freezes the frontier, no further fetch" {
+    const gpa = std.testing.allocator;
+    const body = try genFixedRows(gpa, 900_000); // ~64 chunks
+    defer gpa.free(body);
+    var fx: api.NetFixture = .{ .body = body, .honor_ranges = true, .advertise_length = true };
+    const doc = try openFakeToDone(&fx);
+    defer api.ls_close(doc);
+    _ = settleIndex(doc, 200);
+    // A deep jump toward a far row; cancel it, then prove the frontier froze and
+    // no more bytes were fetched afterward (RED: the seed's AUTO indexer keeps
+    // fetching in the background regardless of the jump cancel, and reaches EOF).
+    api.ls_jump_start(doc, 850_000);
+    api.ls_jump_cancel(doc);
+    const c_after_cancel = api.netFetchCount(doc);
+    netWait(250);
+    try std.testing.expectEqual(c_after_cancel, api.netFetchCount(doc)); // no further fetch
+    try std.testing.expectEqual(false, api.ls_index_poll(doc).complete); // not driven to EOF
+    try std.testing.expect(api.netFetchCount(doc) < 60);
+}
+
+test "nfd_ac8: find-last / wrap runs as an explicit on-demand scan (not eager)" {
+    const gpa = std.testing.allocator;
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(gpa);
+    {
+        var line: [48]u8 = undefined;
+        for (0..600_000) |i| {
+            if (i == 100_000 or i == 500_000) {
+                try body.appendSlice(gpa, "HIT,x\n");
+            } else try body.appendSlice(gpa, try std.fmt.bufPrint(&line, "{d:0>8},{d:0>8}\n", .{ i, 2 * i }));
+        }
+    }
+    var fx: api.NetFixture = .{ .body = body.items, .honor_ranges = true, .advertise_length = true };
+    const doc = try openFakeToDone(&fx);
+    defer api.ls_close(doc);
+    _ = settleIndex(doc, 200);
+    // NOT eager: before any demand, the background has not scanned to EOF (RED:
+    // the seed's AUTO indexer already did, over the wire).
+    try std.testing.expectEqual(false, api.ls_index_poll(doc).complete);
+    try std.testing.expect(api.netFetchCount(doc) <= net_head_chunks + 8);
+    // Explicit find-last: a backward nav from past-EOF reaches the LAST match.
+    try startSearch(doc, textReq("HIT"));
+    const s = try navAndWait(doc, std.math.maxInt(u64), .backward);
+    try std.testing.expectEqual(api.SearchNavState.found, s.nav);
+    try std.testing.expectEqual(@as(u64, 500_000), s.found_row);
+}
+
+test "nfd_ac9: range-server plain CSV stays random-access; only the background indexer is suppressed" {
+    const gpa = std.testing.allocator;
+    const body = try genFixedRows(gpa, 600_000);
+    defer gpa.free(body);
+    var fx: api.NetFixture = .{ .body = body, .honor_ranges = true, .advertise_length = true };
+    const doc = try openFakeToDone(&fx);
+    defer api.ls_close(doc);
+    try std.testing.expectEqual(api.NetRangeMode.random_access, api.netRangeMode(doc)); // unchanged
+    // The ONLY behavior change vs the shipped slice: the row count firms on
+    // demand, not in the background (RED: the seed's AUTO indexer completes the
+    // index + makes the count exact unbidden).
+    const ip = settleIndex(doc, 300);
+    try std.testing.expectEqual(false, ip.complete);
+    try std.testing.expectEqual(false, api.ls_row_count_get(doc).exact);
+    // A jump near EOF still lands via random access without a prior full fetch.
+    api.ls_jump_start(doc, 590_000);
+    _ = try waitJumpDone(doc);
+    _ = api.ls_window_set(doc, 590_000, 16);
+    var b: [8]u8 = undefined;
+    try expectCell(doc, 590_000, 0, fixedCell(&b, 590_000));
+    try std.testing.expect(api.netFetchCount(doc) < 44); // never the whole file
+}
+
+test "nfd_ac10: .csv.gz composes over the growing spool; backward landing zero new fetch" {
+    const gpa = std.testing.allocator;
+    const plain = try genFixedRows(gpa, 400_000);
+    defer gpa.free(plain);
+    const g = try gz(gpa, plain);
+    defer gpa.free(g);
+    var fx: api.NetFixture = .{ .body = g, .honor_ranges = true, .advertise_length = true };
+    const doc = try openFakeToDone(&fx);
+    defer api.ls_close(doc);
+    try std.testing.expectEqual(@as(u32, 2), api.ls_column_count(doc));
+    // Composed over the http_range Source (RED: the seed's buildDownloadAll path
+    // -> netRangeMode sequential_fallback + netFetchCount 0).
+    try std.testing.expectEqual(api.NetRangeMode.random_access, api.netRangeMode(doc));
+    try std.testing.expect(api.netFetchCount(doc) > 0);
+    // Fetch a mid region, then land backward and prove ZERO new network fetch
+    // (checkpoint replay into already-fetched compressed bytes).
+    api.ls_jump_start(doc, 200_000);
+    _ = try waitJumpDone(doc);
+    _ = api.ls_window_set(doc, 200_000, 32);
+    var b: [8]u8 = undefined;
+    try expectCell(doc, 200_000, 0, fixedCell(&b, 200_000));
+    const c_mid = api.netFetchCount(doc);
+    _ = api.ls_window_set(doc, 10, 32); // backward landing behind the frontier
+    try expectCell(doc, 10, 0, fixedCell(&b, 10));
+    try std.testing.expectEqual(c_mid, api.netFetchCount(doc)); // zero new fetch
+}
+
+test "nfd_ac11: known-total sequential — bytes_total is the known size; row count is a projection" {
+    const gpa = std.testing.allocator;
+    const body = try genFixedRows(gpa, 600_000);
+    defer gpa.free(body);
+    var fx: api.NetFixture = .{ .body = body, .honor_ranges = false, .advertise_length = true };
+    const doc = try openFakeToDone(&fx);
+    defer api.ls_close(doc);
+    try std.testing.expectEqual(api.NetRangeMode.sequential_fallback, api.netRangeMode(doc));
+    const ip = settleIndex(doc, 300);
+    try std.testing.expectEqual(@as(u64, body.len), ip.bytes_total); // known total
+    try std.testing.expect(ip.bytes_total != api.bytes_total_unknown);
+    try std.testing.expectEqual(false, ip.complete); // no background drive
+    const rc = api.ls_row_count_get(doc);
+    try std.testing.expectEqual(false, rc.exact); // free projection
+    try std.testing.expect(rc.count > 0);
+    try std.testing.expect(api.netFetchCount(doc) > 0); // streamed, not downloaded (RED)
+}
+
+test "nfd_ac12: unknown-length streaming — UINT64_MAX sentinel; nav to EOF firms it; empty distinct" {
+    const gpa = std.testing.allocator;
+    const body = try genFixedRows(gpa, 300_000); // ~5.4 MiB, unknown length
+    defer gpa.free(body);
+    // 200 with no usable Content-Length: an unknown-length stream.
+    var fx: api.NetFixture = .{ .body = body, .honor_ranges = false, .advertise_length = false };
+    const doc = try openFakeToDone(&fx);
+    defer api.ls_close(doc);
+    const ip = settleIndex(doc, 300);
+    try std.testing.expectEqual(api.bytes_total_unknown, ip.bytes_total); // UINT64_MAX sentinel (RED)
+    try std.testing.expectEqual(false, ip.complete);
+    try std.testing.expectEqual(false, api.ls_row_count_get(doc).exact); // discovered-rows lower bound
+    // Navigate to EOF -> the total firms, complete + exact.
+    try scanToEnd(doc);
+    const ip2 = api.ls_index_poll(doc);
+    try std.testing.expectEqual(true, ip2.complete);
+    try std.testing.expect(ip2.bytes_total != api.bytes_total_unknown);
+    try std.testing.expectEqual(true, api.ls_row_count_get(doc).exact);
+    // A Content-Length: 0 resource opens as the EMPTY document (distinct from unknown).
+    var efx: api.NetFixture = .{ .body = "", .honor_ranges = false, .advertise_length = true };
+    const edoc = try openFakeToDone(&efx);
+    defer api.ls_close(edoc);
+    const eip = api.ls_index_poll(edoc);
+    try std.testing.expectEqual(@as(u64, 0), eip.bytes_total); // {0,0,true}, NOT the sentinel
+    try std.testing.expectEqual(true, eip.complete);
+    try std.testing.expectEqual(@as(u64, 0), api.ls_row_count_get(edoc).count);
+}
+
+test "nfd_ac13: withhold-then-release — demand beyond released stays SCANNING, then advances" {
+    const gpa = std.testing.allocator;
+    const body = try genFixedRows(gpa, 600_000); // ~10.8 MiB
+    defer gpa.free(body);
+    // Release the first 5 MiB (covers the 4 MiB head); withhold the rest.
+    var gate: std.atomic.Value(u64) = .init(5 * 1024 * 1024);
+    var fx: api.NetFixture = .{ .body = body, .honor_ranges = false, .advertise_length = true, .withhold = &gate };
+    const doc = try openFakeToDone(&fx);
+    defer api.ls_close(doc);
+    // A demand jump PAST the released prefix stays SCANNING, fetching nothing past
+    // what is released (RED: the seed ignores `withhold` + downloads the whole
+    // body, so the jump completes immediately).
+    api.ls_jump_start(doc, 500_000); // byte ~9 MiB, past the 5 MiB release
+    netWait(150);
+    try std.testing.expectEqual(api.JumpState.scanning, api.ls_jump_poll(doc).state);
+    // Release the rest -> the demand advances to completion.
+    gate.store(body.len, .release);
+    const js = try waitJumpDone(doc);
+    try std.testing.expectEqual(@as(u64, 500_000), js.landed_row);
+    _ = api.ls_window_set(doc, 500_000, 16);
+    var b: [8]u8 = undefined;
+    try expectCell(doc, 500_000, 0, fixedCell(&b, 500_000));
+}
+
+test "nfd_ac14: never-re-fetch under streaming — re-access after cache eviction served from spool" {
+    const gpa = std.testing.allocator;
+    const plain = try genFixedRows(gpa, 300_000);
+    defer gpa.free(plain);
+    const g = try gz(gpa, plain);
+    defer gpa.free(g);
+    const cases = [_]api.NetFixture{
+        .{ .body = plain, .honor_ranges = true, .advertise_length = true }, // random
+        .{ .body = plain, .honor_ranges = false, .advertise_length = true }, // sequential
+        .{ .body = g, .honor_ranges = true, .advertise_length = true }, // gzip
+    };
+    for (cases) |fixture| {
+        var fx = fixture;
+        const doc = try openFakeToDone(&fx);
+        defer api.ls_close(doc);
+        winAll(doc);
+        _ = api.ls_window_set(doc, 0, 64);
+        const after_first = api.netFetchCount(doc);
+        try std.testing.expect(after_first > 0); // streamed (RED: seq/gzip seed download-all -> 0)
+        api.netForceCacheBytes(doc, 0); // evict the resident RAM cache entirely
+        _ = api.ls_window_set(doc, 0, 64); // re-access the SAME range
+        try std.testing.expectEqual(after_first, api.netFetchCount(doc)); // from spool, no new fetch
+    }
+}
+
+test "nfd_ac15: sequential fill only extends the prefix; backward landing reads spool, zero network" {
+    const gpa = std.testing.allocator;
+    const body = try genFixedRows(gpa, 500_000);
+    defer gpa.free(body);
+    var fx: api.NetFixture = .{ .body = body, .honor_ranges = false, .advertise_length = true };
+    const doc = try openFakeToDone(&fx);
+    defer api.ls_close(doc);
+    try std.testing.expectEqual(api.NetRangeMode.sequential_fallback, api.netRangeMode(doc));
+    // Drain forward to a mid row (extends the contiguous downloaded prefix).
+    api.ls_jump_start(doc, 300_000);
+    _ = try waitJumpDone(doc);
+    var b: [8]u8 = undefined;
+    _ = api.ls_window_set(doc, 300_000, 16);
+    try expectCell(doc, 300_000, 0, fixedCell(&b, 300_000));
+    const c_mid = api.netFetchCount(doc);
+    try std.testing.expect(c_mid > 0); // streamed (RED: seed download-all -> 0)
+    // Backward landing reads the already-downloaded spool prefix, zero network.
+    _ = api.ls_window_set(doc, 5, 16);
+    try expectCell(doc, 5, 0, fixedCell(&b, 5));
+    try std.testing.expectEqual(c_mid, api.netFetchCount(doc)); // zero new fetch backward
+    try std.testing.expectEqual(false, api.ls_index_poll(doc).complete); // not driven to EOF
+}
+
+test "nfd_ac16: post-open stream drop terminates the document at the received bytes" {
+    const gpa = std.testing.allocator;
+    const body = try genFixedRows(gpa, 600_000); // ~10.8 MiB nominal
+    defer gpa.free(body);
+    // The stream drops after ~6 MiB (~349k rows): the document ends at the
+    // received bytes (the gzip damaged-EOF analog).
+    var fx: api.NetFixture = .{ .body = body, .honor_ranges = false, .advertise_length = false, .drop_after = 6 * 1024 * 1024 };
+    const doc = try openFakeToDone(&fx);
+    defer api.ls_close(doc);
+    // Drive to the truncated EOF: index/search reach terminal states over the
+    // received prefix; the count is FEWER than the nominal full body (RED: the
+    // seed serves the whole body -> 600k rows).
+    try scanToEnd(doc);
+    const ip = api.ls_index_poll(doc);
+    try std.testing.expectEqual(true, ip.complete); // terminal over the received prefix
+    try std.testing.expect(ip.bytes_total != api.bytes_total_unknown); // firmed to received size
+    const rc = api.ls_row_count_get(doc);
+    try std.testing.expectEqual(true, rc.exact);
+    try std.testing.expect(rc.count < 600_000);
+    try std.testing.expect(rc.count > 0);
+    // Received rows are servable (row 300000 is within the ~349k received).
+    _ = api.ls_window_set(doc, 300_000, 16);
+    var b: [8]u8 = undefined;
+    try expectCell(doc, 300_000, 0, fixedCell(&b, 300_000));
+}
+
+test "nfd_ac17: decideProbe / parseContentRangeTotal units (streaming classification)" {
+    // parseContentRangeTotal: extract the resource total (or null for absent / *).
+    try std.testing.expectEqual(@as(?u64, 12345), api.parseContentRangeTotal("HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-99/12345\r\n\r\n"));
+    try std.testing.expectEqual(@as(?u64, null), api.parseContentRangeTotal("HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-99/*\r\n\r\n"));
+    try std.testing.expectEqual(@as(?u64, null), api.parseContentRangeTotal("HTTP/1.1 200 OK\r\nContent-Length: 500\r\n\r\n"));
+    // 206 + Content-Range total -> RANDOM fill / known.
+    {
+        const d = api.decideProbe(206, 100, 12345, false);
+        try std.testing.expectEqual(true, d.range);
+        try std.testing.expectEqual(@as(u64, 12345), d.total);
+        try std.testing.expectEqual(true, d.length_known);
+    }
+    // 200 + Content-Length -> SEQUENTIAL fill / known.
+    {
+        const d = api.decideProbe(200, 500, null, false);
+        try std.testing.expectEqual(false, d.range);
+        try std.testing.expectEqual(@as(u64, 500), d.total);
+        try std.testing.expectEqual(true, d.length_known);
+    }
+    // 200 with an ABSENT Content-Length (null) -> SEQUENTIAL fill / UNKNOWN length
+    // (RED: the seed always reports length_known = true).
+    {
+        const d = api.decideProbe(200, null, null, false);
+        try std.testing.expectEqual(false, d.range);
+        try std.testing.expectEqual(false, d.length_known);
+    }
+    // Content-Length: 0 (present zero) -> EMPTY, length_known (distinct from unknown).
+    {
+        const d = api.decideProbe(200, 0, null, false);
+        try std.testing.expectEqual(true, d.length_known);
+        try std.testing.expectEqual(@as(u64, 0), d.total);
+    }
+    // A gzip magic verdict no longer forces range=false on a range server (RED:
+    // the seed still forces range = !is_gz = false).
+    {
+        const d = api.decideProbe(206, 100, 12345, true);
+        try std.testing.expectEqual(true, d.range);
+        try std.testing.expectEqual(true, d.is_gz);
+    }
+}
+
+test "nfd_ac18: determinism pin — a small resource fitting the head is exact at open; a large one is not" {
+    const gpa = std.testing.allocator;
+    const small = "a,b\n1,2\n3,4\n5,6\n"; // << head; fully fetched at open
+    inline for (.{ true, false }) |known| { // known-length and unknown-length
+        var fx: api.NetFixture = .{ .body = small, .honor_ranges = false, .advertise_length = known };
+        const doc = try openFakeToDone(&fx);
+        defer api.ls_close(doc);
+        const rc = api.ls_row_count_get(doc);
+        try std.testing.expectEqual(true, rc.exact); // small -> exact at open
+        try std.testing.expectEqual(@as(u64, 3), rc.count);
+        try std.testing.expectEqual(true, api.ls_index_poll(doc).complete);
+        try std.testing.expect(api.netFetchCount(doc) > 0); // streamed (RED: seq seed download-all -> 0)
+    }
+    // A large one is NOT exact at open (no background drive).
+    const big = try genFixedRows(gpa, 600_000);
+    defer gpa.free(big);
+    var bfx: api.NetFixture = .{ .body = big, .honor_ranges = true, .advertise_length = true };
+    const bdoc = try openFakeToDone(&bfx);
+    defer api.ls_close(bdoc);
+    _ = settleIndex(bdoc, 300);
+    try std.testing.expectEqual(false, api.ls_row_count_get(bdoc).exact); // RED: seed AUTO makes it exact
+}
+
+test "nfd_ac19: memory bound — resident RAM within ceiling; streamed, not fully resident" {
+    const gpa = std.testing.allocator;
+    const plain = try genFixedRows(gpa, 600_000);
+    defer gpa.free(plain);
+    const g = try gz(gpa, plain);
+    defer gpa.free(g);
+    const cases = [_]api.NetFixture{
+        .{ .body = plain, .honor_ranges = true, .advertise_length = true }, // random
+        .{ .body = g, .honor_ranges = true, .advertise_length = true }, // gzip
+    };
+    for (cases) |fixture| {
+        var fx = fixture;
+        const doc = try openFakeToDone(&fx);
+        defer api.ls_close(doc);
+        var r: u64 = 0;
+        while (r < 550_000) : (r += 50_000) {
+            api.ls_jump_start(doc, r);
+            _ = try waitJumpDone(doc);
+            _ = api.ls_window_set(doc, r, 128);
+            try std.testing.expect(api.netResidentBytes(doc) <= 16 * 1024 * 1024);
+        }
+        try std.testing.expect(api.netFetchCount(doc) > 0); // streamed (RED: gzip seed -> 0)
+    }
+}
+
+test "nfd_ac20: spool hygiene incl. unknown-length growth (0600, unlinked, grows, present while live)" {
+    const gpa = std.testing.allocator;
+    const body = try genFixedRows(gpa, 400_000);
+    defer gpa.free(body);
+    // Unknown-length stream: the spool cannot be presized; it grows as the
+    // frontier advances (RED: the seed's buildDownloadAll doc has no http_range
+    // spool -> netSpoolStore.present is false).
+    var fx: api.NetFixture = .{ .body = body, .honor_ranges = false, .advertise_length = false };
+    const doc = try openFakeToDone(&fx);
+    defer api.ls_close(doc);
+    const sp0 = api.netSpoolStore(doc);
+    try std.testing.expectEqual(true, sp0.present);
+    try std.testing.expectEqual(@as(u32, 0o600), sp0.mode);
+    try std.testing.expectEqual(true, sp0.unlinked);
+    const bytes0 = sp0.bytes;
+    // Advance the frontier -> the unknown-length spool GROWS.
+    api.ls_jump_start(doc, 300_000);
+    _ = try waitJumpDone(doc);
+    const sp1 = api.netSpoolStore(doc);
+    try std.testing.expect(sp1.bytes > bytes0);
+    try std.testing.expect(api.netFetchCount(doc) > 0);
+}
+
+test "nfd_ac21: local non-regression — the AUTO background indexer still runs for local docs (GUARD)" {
+    const gpa = std.testing.allocator;
+    const body = try genFixedRows(gpa, 600_000); // > head: a local AUTO doc completes in the background
+    defer gpa.free(body);
+    var od = try openWith(body, .{}); // AUTO local
+    defer od.deinit();
+    // The lazy gate keys on SOURCE KIND: a LOCAL document's AUTO indexer still
+    // drives the frontier to EOF unbidden (the net gate must NOT suppress it).
+    // GREEN from the seed, and MUST STAY green after the fix.
+    const ip = settleIndex(od.doc, 8000);
+    try std.testing.expectEqual(true, ip.complete);
+    try std.testing.expectEqual(true, api.ls_row_count_get(od.doc).exact);
+    try std.testing.expect(ip.bytes_total != api.bytes_total_unknown);
+    try std.testing.expectEqual(api.NetRangeMode.unknown, api.netRangeMode(od.doc)); // not a network doc
+}
+
+test "nfd_ac22: cancellation — cancel mid-demand; close during a demand joins cleanly" {
+    const gpa = std.testing.allocator;
+    const body = try genFixedRows(gpa, 600_000);
+    defer gpa.free(body);
+    // Withhold beyond the head so a demand jump is genuinely in-flight (SCANNING)
+    // when we cancel it (RED: the seed serves the whole body, so the jump is never
+    // in-flight and the SCANNING assertion fails).
+    var gate: std.atomic.Value(u64) = .init(5 * 1024 * 1024);
+    var fx: api.NetFixture = .{ .body = body, .honor_ranges = false, .advertise_length = true, .withhold = &gate };
+    const doc = try openFakeToDone(&fx);
+    api.ls_jump_start(doc, 500_000); // past the released prefix -> in flight
+    netWait(120);
+    try std.testing.expectEqual(api.JumpState.scanning, api.ls_jump_poll(doc).state);
+    api.ls_jump_cancel(doc);
+    // ls_close while the (cancelled) demand is settling joins cleanly and unmaps
+    // once; the leak-checking test allocator + no hang are the proof.
+    api.ls_close(doc);
+}
+
+test "nfd_ac23: on-paper Parquet/ODS proof over the streaming byte source is a review criterion (GUARD)" {
+    // AC23 is a DESIGN-REVIEW criterion: ARCH-never-full-download-streaming.md
+    // carries the on-paper proof that random fill serves Parquet footer-first /
+    // ODS ZIP-central-directory reads, and sequential fill is CSV's degenerate
+    // case -- both the same "ask for any [start,end)" primitive, NO Source/
+    // interface change. Verified by the architect/human. The observable
+    // consequence pinned here: a non-network document is unaffected.
+    var od = try openBytes("a,b\n1,2\n");
+    defer od.deinit();
+    try std.testing.expectEqual(api.NetRangeMode.unknown, api.netRangeMode(od.doc));
+    try std.testing.expectEqual(@as(u64, 0), api.netFetchCount(od.doc));
+}
+
+test "nfd_ac24: dependencies & size — Zig std only (std.http.Client / std.crypto.tls) (GUARD)" {
+    // AC24 (GUARD): no new RUNTIME dependency (enforced by the frozen build.zig,
+    // stdlib-only, no build.zig.zon); the app stays single-digit MB (a reviewer
+    // size measurement). This pins that the approved networking primitives are std.
+    _ = std.http.Client;
+    _ = std.crypto.tls.Client;
+    var od = try openBytes("a,b\n1,2\n");
+    defer od.deinit();
+    try expectDims(od.doc, 1, 2);
+}

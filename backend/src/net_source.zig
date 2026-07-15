@@ -63,7 +63,7 @@ pub const Probe = struct {
 /// never-full-download streaming (see ARCH backlog) — when that lands, this +
 /// `decideProbe` should gain hermetic unit-test seams (they are the crux of
 /// two fixed real-transport bugs the fake-transport gate path can't reach).
-fn parseContentRangeTotal(head_bytes: []const u8) ?u64 {
+pub fn parseContentRangeTotal(head_bytes: []const u8) ?u64 {
     var lines = std.mem.splitSequence(u8, head_bytes, "\r\n");
     _ = lines.next(); // status line
     while (lines.next()) |line| {
@@ -97,14 +97,19 @@ fn parseContentRangeTotal(head_bytes: []const u8) ?u64 {
 ///      buildDownloadAll, which wraps the spool in a gzip Source). NOTE: this
 ///      whole-file download for gzip is the exact behavior the never-full-
 ///      download streaming redesign (ARCH backlog) will replace.
-fn decideProbe(status: i32, content_length: u64, content_range_total: ?u64, is_gz: bool) Probe {
-    const partial = status == 206;
-    if (!partial) return .{ .ok = true, .total = content_length, .range = false, .is_gz = is_gz };
+/// SEED (never-full-download-streaming AC17 RED): the OLD classification, now
+/// returning the frozen `api.ProbeDecision`. It still forces `range = !is_gz`
+/// for a gzip resource and always reports `length_known = true` (never an
+/// unknown-length stream), so the AC17 unit test is RED until the streaming
+/// model is built. `content_length` is now ?u64 (null == the header was
+/// absent) so the fix can split Content-Length: 0 (empty) from an absent
+/// length (unknown); the seed ignores that distinction.
+pub fn decideProbe(status: i32, content_length: ?u64, content_range_total: ?u64, is_gz: bool) api.ProbeDecision {
+    const cl = content_length orelse 0;
+    if (status != 206) return .{ .range = false, .total = cl, .length_known = true, .is_gz = is_gz };
     const total = content_range_total orelse 0;
-    if (total == 0) return .{ .ok = true, .total = content_length, .range = false, .is_gz = is_gz };
-    // A gzip resource is never random-access over the wire — force the
-    // download-and-decompress path regardless of range support.
-    return .{ .ok = true, .total = total, .range = !is_gz, .is_gz = is_gz };
+    if (total == 0) return .{ .range = false, .total = cl, .length_known = true, .is_gz = is_gz };
+    return .{ .range = !is_gz, .total = total, .length_known = true, .is_gz = is_gz };
 }
 
 /// One real host connection for the whole job's lifetime: ONE `std.http.Client`
@@ -167,7 +172,7 @@ pub const RealTransport = struct {
         // body can reuse/overwrite that same buffer, so any head-field slice
         // must be consumed first, never interleaved with body reads (an earlier
         // draft read Content-Range AFTER the body reader and segfaulted).
-        const content_length = response.head.content_length orelse 0;
+        const content_length: ?u64 = response.head.content_length;
         const range_total: ?u64 = if (code == 206) parseContentRangeTotal(response.head.bytes) else null;
         var magic: [2]u8 = .{ 0, 0 };
         var transfer_buf: [4096]u8 = undefined;
@@ -176,7 +181,8 @@ pub const RealTransport = struct {
         const is_gz = magic_len == 2 and magic[0] == 0x1f and magic[1] == 0x8b;
         // All the (bug-prone) classification now lives in the pure, unit-tested
         // decideProbe; probe() is just the I/O around it.
-        return decideProbe(code, content_length, range_total, is_gz);
+        const d = decideProbe(code, content_length, range_total, is_gz);
+        return .{ .ok = true, .total = d.total, .range = d.range, .is_gz = d.is_gz };
     }
 
     fn fetchInto(self: *RealTransport, dest: []u8, offset: u64) bool {

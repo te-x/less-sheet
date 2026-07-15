@@ -787,3 +787,10 @@ pub fn netForceCacheBytes(doc: *api.Doc, n: u64) void {
 pub fn netJobProbe(job: *const api.NetOpenJob) api.NetJobProbe {
     return net.jobProbe(@ptrCast(@alignCast(job)));
 }
+
+/// See contracts/api.zig `decideProbe` / `parseContentRangeTotal`
+/// (never-full-download-streaming AC17 unit seams). Re-exported from
+/// net_source so the pure probe classification is unit-testable without a
+/// live HTTP server.
+pub const decideProbe = net_source.decideProbe;
+pub const parseContentRangeTotal = net_source.parseContentRangeTotal;

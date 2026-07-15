@@ -1098,6 +1098,15 @@ comptime {
 /// unknown total length (frontend shows an indeterminate spinner + byte count).
 pub const net_progress_unknown: f64 = -1.0;
 
+/// Mirrors LS_BYTES_TOTAL_UNKNOWN (never-full-download-streaming amendment a):
+/// the ls_index_poll().bytes_total sentinel for an unknown-length network
+/// stream whose total size is not yet known. While it holds,
+/// ls_index_poll().complete stays false and bytes_scanned is the
+/// fetched/indexed high-water; at stream EOF bytes_total becomes the final
+/// size. DISTINCT from the empty document {0, 0, true}. Network-only. See
+/// api/lesssheet.h NEVER-FULL-DOWNLOAD STREAMING EXTENSION.
+pub const bytes_total_unknown: u64 = std.math.maxInt(u64);
+
 /// Mirrors `ls_net_status`. Distinct, stable values; meaningful only when the
 /// job state is `.failed`. `unreachable_` mirrors LS_NET_ERROR_UNREACHABLE
 /// (`unreachable` is a Zig keyword — the trailing underscore is a Zig-side name
@@ -1161,8 +1170,14 @@ pub const NetFault = enum(u8) {
 ///   unknown             — not yet resolved / not a network doc.
 ///   random_access       — the server honored Range (206/Content-Range).
 ///   sequential_fallback — the server ignored Range / gave no usable length, so
-///                         the whole resource was downloaded then opened as a
-///                         local mmap document.
+///                         the resource is STREAMED sequentially into the
+///                         spool on demand (a forward-draining GET, or the
+///                         gzip Source composed over that growing spool) and
+///                         is NEVER fully downloaded (never-full-download-
+///                         streaming slice re-documents this from the old
+///                         download-all meaning; the enum VALUE is unchanged).
+///                         Serves plain CSV over a no-range server and any
+///                         unknown-length stream.
 pub const NetRangeMode = enum(u8) {
     unknown = 0,
     random_access = 1,
@@ -1185,6 +1200,15 @@ pub const NetRangeMode = enum(u8) {
 ///   fault           — a transport fault to inject (see NetFault).
 ///   stall           — never complete the fetch until cancelled (for the cancel
 ///                     AC — lets a test observe a mid-flight FETCHING job).
+/// STREAMING SEMANTICS (never-full-download-streaming slice): honor_ranges +
+/// advertise_length select the FILL strategy, ALL streamed (never fully
+/// downloaded -- TD3/TD4): {honor_ranges=true, advertise_length=true} -> 206 +
+/// Content-Range total -> RANDOM fill (known total); {false, true} -> 200 +
+/// Content-Length -> SEQUENTIAL fill (known total); {*, advertise_length=false}
+/// -> no usable total -> SEQUENTIAL fill of an UNKNOWN-length stream
+/// (ls_index_poll().bytes_total == bytes_total_unknown until EOF). A genuinely
+/// EMPTY resource is {body="", advertise_length=true} (Content-Length: 0),
+/// DISTINCT from an unknown stream. `withhold` gates incremental delivery.
 pub const NetFixture = struct {
     body: []const u8 = &.{},
     honor_ranges: bool = true,
@@ -1193,6 +1217,23 @@ pub const NetFixture = struct {
     redirect_hops: u32 = 0,
     fault: NetFault = .none,
     stall: bool = false,
+    /// Withhold-then-release control (AC13): a released-byte high-water the
+    /// TEST raises to model a server that has streamed only a prefix so far.
+    /// When set, the (sequential) fake serves resource bytes only in
+    /// [0, withhold.load(.acquire)); a demand beyond it fetches nothing past
+    /// `released` and the frontier stays SCANNING (with visible progress)
+    /// until the test raises it (e.g. `gate.store(body.len, .release)`),
+    /// which advances the demand to completion. `null` == serve the whole
+    /// body immediately (the default). The pointee is borrowed for the job's
+    /// whole lifetime (the test owns it and must outlive the job). Zig-only.
+    withhold: ?*std.atomic.Value(u64) = null,
+    /// Post-open stream DROP (AC16, the gzip damaged-EOF analog — DISTINCT from
+    /// `withhold`, which WAITS for more): the (sequential) fake serves resource
+    /// bytes only in [0, drop_after) and then signals a hard stream END, so a
+    /// demand past it TERMINATES the document at the received bytes (received
+    /// rows stay servable; index/search/filter reach their terminal states over
+    /// the received prefix). `null` == the stream delivers the whole body.
+    drop_after: ?u64 = null,
 };
 
 /// netSpoolStore result: the private local spool file's state (AC14 spool
@@ -1211,6 +1252,28 @@ pub const NetSpoolStore = struct {
 pub const NetJobProbe = struct {
     spool_present: bool,
     fetch_count: u64,
+};
+
+/// `decideProbe` result (never-full-download-streaming AC17): the pure
+/// fill-strategy / length classification from a successful (2xx) probe's raw
+/// signals. Planner-owned Zig-only value type (like OpenBudget / NetSpoolStore
+/// -- never the C ABI). Replaces the old net_source-private `Probe` verdict at
+/// the seam: `range = !is_gz` is DROPPED (gzip composes over the spool, TD4)
+/// and `length_known` is ADDED (splits Content-Length: 0 from an absent
+/// length, TD5).
+pub const ProbeDecision = struct {
+    /// true -> RANDOM fill (206 + a usable Content-Range total); false ->
+    /// SEQUENTIAL fill (200, or a 206 without a usable total). No longer
+    /// forced false for a gzip resource.
+    range: bool,
+    /// The resource total when `length_known`; 0 / don't-care otherwise.
+    total: u64,
+    /// false -> an UNKNOWN-length stream (no Content-Length / chunked / a 206
+    /// without a usable Content-Range total): the total firms only at EOF.
+    /// A present Content-Length of 0 is length_known=true, total=0 (empty).
+    length_known: bool,
+    /// The leading-magic (1f 8b) verdict on the fetched head.
+    is_gz: bool,
 };
 
 // --- C ABI re-exports (see api/lesssheet.h NETWORK SOURCE EXTENSION) ---------
@@ -1249,6 +1312,18 @@ pub const netForceCacheBytes = core.netForceCacheBytes;
 /// the job (cancel produces no doc). SEED: {false,0}.
 pub const netJobProbe = core.netJobProbe;
 
+/// AC17 unit seam (never-full-download-streaming): the PURE fill-strategy /
+/// length classification from a probe's raw signals -- `status` (2xx),
+/// `content_length` (the 200 whole-resource length; null == header absent),
+/// `content_range_total` (the 206 total; null == absent / unusable / `*`),
+/// `is_gz` (1f 8b head magic). Exposed from net_source.zig so the two live
+/// bugs it encodes are unit-testable without a real HTTP server (ARCH TD12).
+/// SEED: the OLD logic (forces range=!is_gz; always length_known) -> RED.
+pub const decideProbe = core.decideProbe;
+/// AC17 unit seam: parses the resource's TRUE total out of a `Content-Range:
+/// bytes start-end/total` response header; null when absent or `*`. Pure.
+pub const parseContentRangeTotal = core.parseContentRangeTotal;
+
 comptime {
     // --- C-ABI signature pins: drift in src/ fails `zig build` right here. ----
     if (@TypeOf(core.ls_open_url_start) != fn ([*]const u8, usize, ?*const OpenOptions) callconv(.c) ?*NetOpenJob)
@@ -1275,4 +1350,12 @@ comptime {
         @compileError("signature drift: netForceCacheBytes");
     if (@TypeOf(core.netJobProbe) != fn (*const NetOpenJob) NetJobProbe)
         @compileError("signature drift: netJobProbe");
+
+    // never-full-download-streaming: decideProbe / parseContentRangeTotal
+    // exposed as pure Zig-only unit seams (AC17). content_length is ?u64 so
+    // decideProbe can split Content-Length: 0 (empty) from an absent length.
+    if (@TypeOf(core.decideProbe) != fn (i32, ?u64, ?u64, bool) ProbeDecision)
+        @compileError("signature drift: decideProbe");
+    if (@TypeOf(core.parseContentRangeTotal) != fn ([]const u8) ?u64)
+        @compileError("signature drift: parseContentRangeTotal");
 }
