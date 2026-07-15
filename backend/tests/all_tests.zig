@@ -7539,3 +7539,63 @@ test "nfd_ac24: dependencies & size — Zig std only (std.http.Client / std.cryp
     defer od.deinit();
     try expectDims(od.doc, 1, 2);
 }
+
+test "nfd_ac25: network filter parks CANCELLED and advances only on a filtered demand — no full download" {
+    // REGRESSION LOCK for the filter net-park (src/filter.zig setFilter `if (d.net)`)
+    // — the filtered twin of the search net-park (nfd_ac6). A NETWORK filtered view
+    // launches NO to-EOF filter scan: it PARKS immediately at CANCELLED (the filter
+    // MODE is active and the view IS filtered) and the frontier advances ONLY on a
+    // filtered demand, never as a background drive over the wire ("No full download,
+    // ever" applied to filtering). Without the guard, the degraded (worker == null)
+    // synchronous to-EOF loop / a background `.scanning` drive would fetch the whole
+    // resource — exactly the finding-1 regression this AC locks.
+    const gpa = std.testing.allocator;
+    const body = try genFixedRows(gpa, 600_000); // ~10.8 MiB (~42 chunks) >> 4 MiB head
+    defer gpa.free(body);
+    var fx: api.NetFixture = .{ .body = body, .honor_ranges = true, .advertise_length = true };
+    const doc = try openFakeToDone(&fx);
+    defer api.ls_close(doc);
+    _ = settleIndex(doc, 200); // let open's head work settle (no background drive on net)
+
+    // (1)+(2) The filter is SET (returns true; the mode is ACTIVE and the view IS
+    // filtered) but its to-EOF scan PARKS immediately at CANCELLED — NOT `.scanning`
+    // to EOF, NOT `.done` with an exact whole-file total (mirror nfd_ac6's search
+    // net-park `ls_search_poll(doc).state == .cancelled`). The predicate matches
+    // EVERY row, so a naive eager count would have to fetch the whole body.
+    try setFilter(doc, predReq(0, .ge, "00000000")); // col 0 >= 0: matches every row
+    try std.testing.expectEqual(api.FilterState.cancelled, api.ls_filter_poll(doc).state);
+    try std.testing.expectEqual(false, api.ls_row_count_get(doc).exact); // no whole-file total
+
+    // (3) HEADLINE — no full download / no background growth: the park fetched only
+    // ~the head, and both netFetchCount and the frontier stay FLAT across a
+    // poll-wait-poll (mirror nfd_ac4's capture-c0 / wait / expectEqual technique). A
+    // worker-driven or degraded to-EOF filter scan would grow both and complete the
+    // index over the wire.
+    const c0 = api.netFetchCount(doc);
+    try std.testing.expect(c0 <= net_head_chunks + 8); // head-only, not the whole body
+    const f0 = api.ls_index_poll(doc).bytes_scanned;
+    netWait(300);
+    try std.testing.expectEqual(c0, api.netFetchCount(doc)); // no background fetch
+    try std.testing.expectEqual(f0, api.ls_index_poll(doc).bytes_scanned); // frontier frozen
+    try std.testing.expectEqual(false, api.ls_index_poll(doc).complete);
+    try std.testing.expectEqual(false, api.ls_row_count_get(doc).exact);
+
+    // (4) ON-DEMAND — a filtered jump AFTER the park drives the filter-scan on the
+    // worker to advance the frontier toward the target by a BOUNDED amount, fetching
+    // only what is needed (never to EOF), then RE-PARKS at CANCELLED (mirror nfd_ac5's
+    // bounded scroll + the net-park re-entry). `target` is an ORIGINAL row; every row
+    // matches, so filtered index == original row (identity mapping).
+    api.ls_jump_start(doc, 300_000);
+    _ = try waitJumpDone(doc);
+    _ = api.ls_window_set(doc, 300_000, 64);
+    var b: [8]u8 = undefined;
+    try expectCell(doc, 300_000, 0, fixedCell(&b, 300_000)); // newly demanded row servable + correct
+    try std.testing.expectEqual(@as(u64, 300_000), api.ls_source_row(doc, 300_000)); // identity (all match)
+    try std.testing.expect(api.netFetchCount(doc) < 30); // advanced toward the target, NOT to EOF
+    try std.testing.expectEqual(false, api.ls_index_poll(doc).complete);
+    try std.testing.expectEqual(api.FilterState.cancelled, api.ls_filter_poll(doc).state); // re-parked
+
+    // (5) GUARD — local non-regression: a LOCAL filter (doc.net == false) still scans
+    // to DONE / exact. The fv2..fv15 series covers the full local filtered view and
+    // nfd_ac21 covers the local AUTO indexer staying live; not duplicated here.
+}
