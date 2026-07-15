@@ -156,6 +156,11 @@ pub fn buildDocument(
     };
     source_owned = false;
 
+    // never-full-download-streaming (TD1): the lazy-frontier gate keys strictly
+    // on source kind — true for a network Source (http_range, or gzip composed
+    // over http_range), false for every local mmap/gzip doc (byte-identical).
+    doc.net = source_mod.sourceIsNetwork(doc.source);
+
     if (is_gzip) switch (doc.source) {
         .gzip => |g| {
             doc.gz_physical_in = g.open_physical;

@@ -2469,6 +2469,13 @@ final class DocumentModel {
     /// (identity) `rowCountInfo` unchanged.
     var jumpRowCountInfo: RowCountInfo { isFiltered ? (filterDocumentRows ?? rowCountInfo) : rowCountInfo }
 
+    /// never-full-download-streaming (AC12): an UNKNOWN-length network stream
+    /// reports its row count as a converging LOWER BOUND — the frontend shows
+    /// "≥N rows" rather than the "~N rows, estimating…" projection — keyed on the
+    /// ls_index_poll UINT64_MAX bytes-total sentinel. Local docs and known-total
+    /// network docs (Content-Length / Content-Range) never set it.
+    var documentTotalUnknown: Bool { !isFiltered && indexProgress.bytesTotal == .max }
+
     /// Whether the current find draft composes into something filterable — the
     /// filter toggle is enabled to turn ON only when this is true (an empty
     /// draft yields `.ignored`). Pure check; same compose the apply path uses.

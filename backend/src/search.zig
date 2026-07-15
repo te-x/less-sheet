@@ -623,6 +623,18 @@ pub fn startSearch(d: *Document, request: *const api.SearchRequest) bool {
         d.unlock();
         return true;
     }
+    // never-full-download-streaming (TD7): a NETWORK search launches NO to-EOF
+    // match-scan. It parks immediately (CANCELLED, nothing scanned, to_eof
+    // false); each ls_search_nav then resumes it only as far as the next match
+    // via the existing CANCELLED-resume machinery, so the full match total M is
+    // never computed over the wire (total = the scanned-prefix count;
+    // total_exact only if a nav genuinely reaches EOF). LOCAL is unchanged.
+    if (d.net) {
+        d.search_state = .cancelled;
+        d.search_to_eof = false;
+        d.unlock();
+        return true;
+    }
     d.search_state = .scanning;
     if (d.worker != null) {
         d.wakeWorker();

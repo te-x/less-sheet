@@ -27,7 +27,6 @@ const default_gpa = std.heap.smp_allocator;
 const net_source = @import("net_source.zig");
 const open = @import("open.zig");
 const base = @import("base.zig");
-const source_mod = @import("source.zig");
 
 const redirect_cap: u32 = 3;
 
@@ -104,8 +103,13 @@ fn publish(job: *NetOpenJob, built: ?net_source.BuiltSource) void {
     job.lock();
     defer job.unlock();
     job.doc = @ptrCast(doc);
-    job.bytes_total = b.file_size;
-    job.bytes_fetched = b.file_size;
+    // Honest DONE (never-full-download-streaming): report the REAL head bytes
+    // fetched and the known total (0 when the length is unknown) — not the old
+    // fetched=total=file_size white lie, which for a streaming doc would falsely
+    // imply a full download. progress = 1.0 means "open complete", NOT
+    // "downloaded" (the ABI's LS_NET_OPEN_DONE semantics).
+    job.bytes_total = if (b.length_known) b.file_size else 0;
+    job.bytes_fetched = b.head_fetched;
     job.progress = 1.0;
     job.state = .done;
 }
@@ -149,16 +153,26 @@ fn runFake(job: *NetOpenJob, fx: *const api.NetFixture) void {
         job.state = .fetching;
         return;
     }
-    const total = fx.body.len;
+    // Fake classification (mirrors decideProbe over the fixture's server shape):
+    // honor_ranges + a usable length -> RANDOM fill (known); no usable length ->
+    // SEQUENTIAL fill of an UNKNOWN-length stream; otherwise SEQUENTIAL fill
+    // (known). gzip is detected on the fetched head inside buildNet and composes
+    // over the same spool (no longer forced down a whole-file download).
+    const known = fx.advertise_length;
     const range = fx.honor_ranges and fx.advertise_length;
-    const is_gz = total >= 2 and fx.body[0] == 0x1f and fx.body[1] == 0x8b;
-    const body_copy = job.gpa.dupe(u8, fx.body) catch return failLocked(job, .io);
-    const transport: net_source.Transport = .{ .fake = body_copy };
+    const total: u64 = if (known) fx.body.len else 0;
+    const fs = job.gpa.create(net_source.FakeServer) catch return failLocked(job, .io);
+    fs.* = .{
+        .body = job.gpa.dupe(u8, fx.body) catch {
+            job.gpa.destroy(fs);
+            return failLocked(job, .io);
+        },
+        .released = fx.withhold,
+        .drop_after = fx.drop_after,
+    };
+    const transport: net_source.Transport = .{ .fake = fs };
     const progress: net_source.Progress = .{ .ctx = job, .callback = onProgress };
-    const built = if (range and !is_gz)
-        net_source.buildRandom(job.gpa, transport, total, progress)
-    else
-        net_source.buildDownloadAll(job.gpa, transport, total, progress);
+    const built = net_source.buildNet(job.gpa, transport, .{ .range = range, .total_known = known, .total = total }, progress);
     publish(job, built);
 }
 
@@ -188,20 +202,17 @@ fn realWorker(job: *NetOpenJob) void {
     }
     job.lock();
     job.state = .fetching;
-    job.bytes_total = probe.total;
-    job.progress = if (probe.total > 0) 0.0 else api.net_progress_unknown;
+    job.bytes_total = if (probe.length_known) probe.total else 0;
+    job.progress = if (probe.length_known and probe.total > 0) 0.0 else api.net_progress_unknown;
     job.unlock();
 
     const transport: net_source.Transport = .{ .real = rt };
     const progress: net_source.Progress = .{ .ctx = job, .callback = onProgress };
-    // `probe.range` already excludes gzip (decideProbe forces range=false for a
-    // gzip resource — the raw http_range Source can only serve byte ranges of
-    // what's on the wire, never decompress them, so gzip always takes the
-    // download-then-wrap-in-gzip-Source path).
-    const built = if (probe.range)
-        net_source.buildRandom(job.gpa, transport, probe.total, progress)
-    else
-        net_source.buildDownloadAll(job.gpa, transport, probe.total, progress);
+    // Every case streams through the http_range Source now (never a full
+    // download): `probe.range` picks random vs sequential fill, and a gzip
+    // resource composes the gzip Source over that spool (TD4) — buildNet detects
+    // the magic on the fetched head.
+    const built = net_source.buildNet(job.gpa, transport, .{ .range = probe.range, .total_known = probe.length_known, .total = probe.total }, progress);
     publish(job, built);
 }
 

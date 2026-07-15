@@ -740,12 +740,11 @@ pub fn netRangeMode(doc: *const api.Doc) api.NetRangeMode {
     return @enumFromInt(asDoc(doc).net_range_mode);
 }
 /// See contracts/api.zig `netFetchCount` (AC6/AC13). Reads live off the
-/// http_range Source (like gzResidentBytes off the gzip Source); a non-network
-/// document reports 0.
+/// http_range provider (whether the Source IS the http_range or a gzip composed
+/// over it, TD4); a non-network document reports 0.
 pub fn netFetchCount(doc: *const api.Doc) u64 {
     const d = asDoc(doc);
-    if (d.source == .http_range) {
-        const hr = d.source.http_range;
+    if (source_mod.netProviderOf(d.source)) |hr| {
         hr.lock();
         defer hr.unlock();
         return hr.fetch_count;
@@ -755,8 +754,7 @@ pub fn netFetchCount(doc: *const api.Doc) u64 {
 /// See contracts/api.zig `netResidentBytes` (AC15).
 pub fn netResidentBytes(doc: *const api.Doc) u64 {
     const d = asDoc(doc);
-    if (d.source == .http_range) {
-        const hr = d.source.http_range;
+    if (source_mod.netProviderOf(d.source)) |hr| {
         hr.lock();
         defer hr.unlock();
         return hr.resident_bytes;
@@ -766,8 +764,7 @@ pub fn netResidentBytes(doc: *const api.Doc) u64 {
 /// See contracts/api.zig `netSpoolStore` (AC14).
 pub fn netSpoolStore(doc: *const api.Doc) api.NetSpoolStore {
     const d = asDoc(doc);
-    if (d.source == .http_range) {
-        const hr = d.source.http_range;
+    if (source_mod.netProviderOf(d.source)) |hr| {
         hr.lock();
         defer hr.unlock();
         return .{ .present = hr.spool_fd != null, .bytes = hr.spool_bytes, .mode = if (hr.spool_fd != null) 0o600 else 0, .unlinked = hr.spool_fd != null };
@@ -777,8 +774,8 @@ pub fn netSpoolStore(doc: *const api.Doc) api.NetSpoolStore {
 /// See contracts/api.zig `netForceCacheBytes` (AC6).
 pub fn netForceCacheBytes(doc: *api.Doc, n: u64) void {
     const d = asDocMut(doc);
-    if (d.source == .http_range) {
-        d.source.http_range.setCacheCap(n);
+    if (source_mod.netProviderOf(d.source)) |hr| {
+        hr.setCacheCap(n);
         return;
     }
     d.net_force_cache_bytes = n;

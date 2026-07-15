@@ -477,6 +477,14 @@ pub const Document = struct {
     // the private spool file. In the SEED they stay zero, which makes every
     // network-source quantitative AC RED until the Source is built + wired
     // (mirroring the gz_* seed).
+    // never-full-download-streaming (TD1): the lazy-frontier gate. True for a
+    // network-sourced document (http_range, or gzip composed over http_range);
+    // false for every LOCAL mmap/gzip doc, so local behavior is byte-identical.
+    // When set, the worker suppresses the AUTO background frontier indexer and
+    // the filter auto-drive-to-completion, and search starts parked — the
+    // frontier advances only on concrete demand (viewport jump / search nav /
+    // filter demand). Set in open.buildDocument, keyed strictly on source kind.
+    net: bool = false,
     net_range_mode: u8 = 0, // AC3/AC4: 0 unknown, 1 random-access, 2 sequential-fallback
     net_fetch_count: u64 = 0, // AC6/AC13: network fetches issued by this doc's Source
     net_resident_bytes: u64 = 0, // AC15: network Source resident RAM (bound 16 MiB)

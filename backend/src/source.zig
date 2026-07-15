@@ -91,6 +91,13 @@ const Checkpoint = struct {
 pub const Gzip = struct {
     gpa: std.mem.Allocator,
     mapping: []const u8,
+    /// never-full-download-streaming (TD4): the compressed-byte provider for a
+    /// NETWORK gzip. When set, `mapping` is the http_range spool's stable base;
+    /// the inflater fetches compressed bytes on demand via `provider` and its
+    /// physical end comes from the provider (present high-water = a resumable
+    /// budget stop; stream EOF = the clean/damaged terminal), NOT `mapping.len`.
+    /// null for a LOCAL gzip (mapping.len IS the end — byte-identical).
+    provider: ?*net_source.HttpRange = null,
     mutex: c.pthread_mutex_t = .{},
     cond: c.pthread_cond_t = .{},
     forward: *Session,
@@ -168,6 +175,37 @@ pub const Gzip = struct {
         return self;
     }
 
+    /// never-full-download-streaming (TD4): build a gzip Source that inflates the
+    /// COMPRESSED bytes served on demand by `provider` (an http_range spool). The
+    /// spool's stable base is the `mapping`; the physical end comes from the
+    /// provider, so `mapping.len` (a presized total, or the huge unknown-length
+    /// reservation) is NOT the terminal. `provider` is owned by the returned Gzip
+    /// on success (deinit frees it); on any failure the CALLER frees `provider`.
+    fn initProvider(gpa: std.mem.Allocator, provider: *net_source.HttpRange) !*Gzip {
+        const self = try gpa.create(Gzip);
+        errdefer gpa.destroy(self);
+        const f = try gpa.create(Session);
+        errdefer gpa.destroy(f);
+        const r = try gpa.create(Session);
+        errdefer gpa.destroy(r);
+        const r2 = try gpa.create(Session);
+        errdefer gpa.destroy(r2);
+        const spill_snapshot = try gpa.create(Checkpoint);
+        errdefer gpa.destroy(spill_snapshot);
+        const spill_snapshot2 = try gpa.create(Checkpoint);
+        errdefer gpa.destroy(spill_snapshot2);
+        const mapping = provider.spool;
+        self.* = .{ .gpa = gpa, .mapping = mapping, .provider = provider, .forward = f, .replay = r, .replay2 = r2, .spill_snapshot = spill_snapshot, .spill_snapshot2 = spill_snapshot2 };
+        // input.end starts at 0; `produce` refreshes it from the provider's
+        // present compressed high-water before every read (never past fetched).
+        f.init(mapping, 0);
+        r.init(mapping, 0);
+        r2.init(mapping, 0);
+        try self.head.ensureTotalCapacity(gpa, open_bytes);
+        try self.inflateOpenHead();
+        return self;
+    }
+
     fn deinit(self: *Gzip) void {
         for (self.checkpoints.items) |entry| if (entry.hot) |cp| self.gpa.destroy(cp);
         self.checkpoints.deinit(self.gpa);
@@ -180,7 +218,17 @@ pub const Gzip = struct {
         self.gpa.destroy(self.spill_snapshot2);
         _ = c.pthread_cond_destroy(&self.cond);
         _ = c.pthread_mutex_destroy(&self.mutex);
+        if (self.provider) |hr| hr.deinit(); // network gzip owns its compressed spool
         self.gpa.destroy(self);
+    }
+
+    /// The physical (compressed) END of the stream: the provider's known total
+    /// (or `maxInt` while an unknown-length stream has not hit EOF) for a network
+    /// gzip; `mapping.len` for a local one. Replaces `mapping.len`-as-end so a
+    /// growing/on-demand spool is never mistaken for the terminal (TD4).
+    fn physicalLen(self: *const Gzip) u64 {
+        if (self.provider) |hr| return hr.physicalTotal() orelse std.math.maxInt(u64);
+        return self.mapping.len;
     }
 
     fn physical(s: *const Session) u64 {
@@ -190,12 +238,13 @@ pub const Gzip = struct {
     fn nextMember(self: *Gzip, s: *Session) bool {
         s.member_count += 1;
         const at = s.input.seek;
-        if (at == self.mapping.len) {
+        const phys_len = self.physicalLen();
+        if (at == phys_len) {
             s.terminal = .clean;
             return false;
         }
         if (at + 2 > s.input.end) {
-            s.terminal = if (s.input.end < self.mapping.len) .budget else .damaged;
+            s.terminal = if (s.input.end < phys_len) .budget else .damaged;
             return false;
         }
         if (self.mapping[at] != 0x1f or self.mapping[at + 1] != 0x8b) {
@@ -212,6 +261,21 @@ pub const Gzip = struct {
     fn produce(self: *Gzip, s: *Session, out: []u8) usize {
         _ = self.inflate_ops.fetchAdd(1, .monotonic); // gz-filter-stream: count EVERY inflate op (0-byte spins included)
         if (out.len == 0 or self.shutdown.load(.acquire)) return 0;
+        // Network gzip (TD4): fetch compressed bytes ahead of the read cursor and
+        // lift a resumable budget stop when more arrived. The inflater consumes
+        // compressed bytes strictly forward; checkpoint replay only reads already-
+        // present bytes, so a single forward fetch high-water suffices.
+        if (self.provider) |hr| {
+            const fetched = hr.ensureCompressed(s.input.seek + chunk_bytes);
+            const new_end: usize = @intCast(@min(fetched, self.mapping.len));
+            if (new_end > s.input.end) {
+                s.input.end = new_end;
+                if (s.terminal == .budget) {
+                    s.dec.err = null;
+                    s.terminal = .inflating;
+                }
+            }
+        }
         var written: usize = 0;
         while (written < out.len and s.terminal == .inflating) {
             const n = s.dec.reader.readSliceShort(out[written..]) catch {
@@ -226,7 +290,7 @@ pub const Gzip = struct {
                     s.logical += take;
                     written += take;
                 }
-                if (s.input.end < self.mapping.len and s.input.seek >= s.input.end) {
+                if (s.input.end < self.physicalLen() and s.input.seek >= s.input.end) {
                     s.terminal = .budget;
                 } else {
                     s.terminal = .damaged;
@@ -288,8 +352,12 @@ pub const Gzip = struct {
         // fence, even when the inflated-output fence is reached first.  Once
         // all open-time parsing is complete the physical fence must always be
         // lifted; otherwise a high-expansion member eventually mistakes that
-        // artificial end for a damaged/terminal gzip end.
-        self.forward.input.end = self.mapping.len;
+        // artificial end for a damaged/terminal gzip end. For a NETWORK gzip the
+        // physical fence is the fetched compressed high-water (refreshed every
+        // `produce` from the provider) — never `mapping.len` (the presized total
+        // or the huge unknown-length reservation), which would read unfetched
+        // pages — so leave `input.end` at the fetched edge here (TD4).
+        if (self.provider == null) self.forward.input.end = self.mapping.len;
         if (self.forward.terminal == .budget) {
             self.forward.dec.err = null;
             self.forward.terminal = .inflating;
@@ -520,7 +588,10 @@ pub const Source = union(enum) {
         return switch (self) {
             .mmap => |m| m.bytes.len,
             .gzip => |g| g.terminalLogical(),
-            .http_range => |hr| hr.logicalLen(),
+            // null until the stream's total is known (mirrors gzip.terminalLogical):
+            // an unknown-length stream must NEVER report its fetched high-water as
+            // the end (that would falsely stop the reader at the head).
+            .http_range => |hr| hr.knownEnd(),
         };
     }
 
@@ -605,9 +676,15 @@ pub const Cursor = struct {
     fn peekHttp(self: *Cursor, n: usize) []const u8 {
         const hr = self.source.?.http_range;
         const max_n = @min(n, self.look.len);
-        const logical_end = if (self.limit) |lim| @min(lim, hr.logicalLen()) else hr.logicalLen();
-        if (self.logical >= logical_end) return self.look[0..0];
-        var avail: u64 = @min(@as(u64, max_n), logical_end - self.logical);
+        // Cap by an explicit logical limit and the source's TRUE end (null while
+        // an unknown-length stream has not hit EOF) — NEVER by the current
+        // fetched extent, so `ensureSlice` drives the sequential drain forward
+        // past the head instead of stopping at it.
+        var cap: ?u64 = self.limit;
+        if (hr.knownEnd()) |ke| cap = if (cap) |x| @min(x, ke) else ke;
+        if (cap) |x| if (self.logical >= x) return self.look[0..0];
+        var avail: u64 = max_n;
+        if (cap) |x| avail = @min(avail, x - self.logical);
         if (self.physical_limit) |pl| {
             const at = hr.physical_base +| self.logical;
             avail = @min(avail, pl -| at);
@@ -619,13 +696,17 @@ pub const Cursor = struct {
 
     fn spanHttp(self: *Cursor) []const u8 {
         const hr = self.source.?.http_range;
-        const logical_end = if (self.limit) |lim| @min(lim, hr.logicalLen()) else hr.logicalLen();
-        if (self.logical >= logical_end) return &.{};
+        var cap: ?u64 = self.limit;
+        if (hr.knownEnd()) |ke| cap = if (cap) |x| @min(x, ke) else ke;
+        if (cap) |x| if (self.logical >= x) return &.{};
         const internal = self.logical + hr.bom_len;
         // Bound to the next chunk boundary so each span triggers at most one
-        // fresh fetch (incremental, never fetch-the-whole-file).
+        // fresh fetch (incremental, never fetch-the-whole-file). `ensureSlice`
+        // drains forward as needed and returns the available (short at EOF)
+        // slice; empty means the stream ended (or shut down).
         const chunk_end_internal = ((internal / net_source.chunk_bytes) + 1) * net_source.chunk_bytes;
-        var end_logical = @min(logical_end, chunk_end_internal -| hr.bom_len);
+        var end_logical: u64 = chunk_end_internal -| hr.bom_len;
+        if (cap) |x| end_logical = @min(end_logical, x);
         if (self.physical_limit) |pl| end_logical = @min(end_logical, pl -| hr.physical_base);
         if (end_logical <= self.logical) return &.{};
         return hr.ensureSlice(internal, end_logical - self.logical);
@@ -813,9 +894,64 @@ pub fn sourceFromMappingAlloc(gpa: std.mem.Allocator, mapping: []const u8, kind:
 pub fn sourceShutdown(source: *Source) void {
     switch (source.*) {
         .mmap => {},
-        .gzip => |g| g.shutdown.store(true, .release),
+        .gzip => |g| {
+            g.shutdown.store(true, .release);
+            if (g.provider) |hr| hr.shutdown.store(true, .release); // network gzip: wake a stalled compressed drain
+        },
         .http_range => |hr| hr.shutdown.store(true, .release),
     }
+}
+
+// never-full-download-streaming: gzip-over-http_range construction + the
+// network-source predicates the index/poll/rowcount lanes key on.
+
+/// Compose a gzip Source over the compressed bytes served on demand by an
+/// http_range spool (TD4). On success the returned Gzip OWNS `provider` (its
+/// deinit frees it); on failure returns null and the CALLER frees `provider`.
+pub fn gzipOverProvider(gpa: std.mem.Allocator, provider: *HttpRange) ?*Gzip {
+    return Gzip.initProvider(gpa, provider) catch null;
+}
+
+/// Whether a freshly-composed provider gzip inflated a usable head.
+pub fn gzipUsablePtr(g: *Gzip) bool {
+    return g.openUsable();
+}
+
+/// Deinit a provider gzip (also frees its owned http_range provider).
+pub fn gzipDeinit(g: *Gzip) void {
+    g.deinit();
+}
+
+/// True iff this Source fetches over the network (http_range, or a gzip composed
+/// over an http_range) — the lazy-frontier gate keys strictly on this (TD1).
+pub fn sourceIsNetwork(source: Source) bool {
+    return switch (source) {
+        .mmap => false,
+        .gzip => |g| g.provider != null,
+        .http_range => true,
+    };
+}
+
+/// The network Source's http_range provider (for the net_* instrumentation
+/// seams), or null for a non-network / local Source.
+pub fn netProviderOf(source: Source) ?*HttpRange {
+    return switch (source) {
+        .mmap => null,
+        .gzip => |g| g.provider,
+        .http_range => |hr| hr,
+    };
+}
+
+/// The known PHYSICAL total of a network Source (Content-Length / Content-Range
+/// total, or the received size once an unknown-length stream hit EOF), or null
+/// while an unknown-length stream's total is not yet known (the UINT64_MAX
+/// sentinel case at the poll level). Non-network Sources return their byte size.
+pub fn netPhysicalTotal(source: Source) ?u64 {
+    return switch (source) {
+        .mmap => |m| m.bytes.len,
+        .gzip => |g| if (g.provider) |hr| hr.physicalTotal() else g.mapping.len,
+        .http_range => |hr| hr.physicalTotal(),
+    };
 }
 
 pub fn sourceFinishOpen(source: *Source) void {

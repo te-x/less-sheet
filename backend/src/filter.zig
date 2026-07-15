@@ -393,6 +393,22 @@ pub fn setFilter(d: *Document, request: *const api.SearchRequest) bool {
         d.unlock();
         return true;
     }
+    // never-full-download-streaming (TD1/TD7): a NETWORK filtered view launches
+    // NO to-EOF filter scan. It parks immediately (CANCELLED — the filter MODE is
+    // active and the view IS filtered; counts firm only as the user navigates),
+    // mirroring the startSearch net-park. The frontier then advances only on a
+    // filtered demand (a filtered ls_jump_start / scroll, which drives
+    // filterScanChunk via the worker's do_jump path and re-parks), never as a
+    // background drive over the wire. This guard sits BEFORE the `.scanning`
+    // assignment so it also bypasses the degraded (worker == null) synchronous
+    // to-completion loop below — which for a net doc would otherwise fetch and
+    // scan the whole resource ("No full download, ever"). LOCAL is byte-identical
+    // (doc.net == false; AC21).
+    if (d.net) {
+        d.filter_state = .cancelled;
+        d.unlock();
+        return true;
+    }
     d.filter_state = .scanning;
     if (d.worker != null) {
         d.wakeWorker();

@@ -16,6 +16,7 @@ const base = @import("base.zig");
 const filter = @import("filter.zig");
 const search = @import("search.zig");
 const column = @import("column.zig");
+const source_mod = @import("source.zig");
 
 const Document = base.Document;
 const Checkpoint = base.Checkpoint;
@@ -105,14 +106,20 @@ pub fn workerMain(doc: *Document) void {
         const do_nav = !do_jump and !do_search and doc.filter_state != .idle and
             doc.nav_pending and doc.search_nav == .searching and
             doc.search_state == .done and doc.filter_total_exact;
-        const do_filter = !do_jump and !do_search and !do_nav and
+        // never-full-download-streaming (TD1): a NETWORK document has NO
+        // background frontier drive — neither the AUTO indexer nor the filter's
+        // auto-drive-to-completion. The frontier advances only on concrete demand
+        // (viewport jump / search nav / filtered jump), all on this same worker
+        // but never as an unbidden to-EOF scan over the wire. LOCAL docs
+        // (doc.net == false) are byte-identical.
+        const do_filter = !do_jump and !do_search and !do_nav and !doc.net and
             (doc.filter_state == .scanning or (doc.filter_state == .cancelled and doc.auto));
         // Column inference is deliberately behind every interactive scan
         // owner, but ahead of the opportunistic AUTO frontier indexer. Its
         // bounded sampler only re-reads the already-known head.
         const do_column = !do_jump and !do_search and !do_nav and !do_filter and
             doc.column_store.job_state == .queued;
-        const do_index = !do_jump and !do_search and !do_nav and !do_filter and !do_column and doc.auto and !doc.complete;
+        const do_index = !do_jump and !do_search and !do_nav and !do_filter and !do_column and doc.auto and !doc.complete and !doc.net;
         const wanted_scan: base.MatchScanOwner = if (do_jump and doc.filter_state != .idle)
             .filter
         else if (do_search)
@@ -426,6 +433,12 @@ pub fn rowCount(d: *Document) api.RowCount {
     // converging lower bound that becomes exact at LS_FILTER_DONE).
     if (d.filter_state != .idle) return .{ .count = d.filter_total, .exact = d.filter_total_exact };
     if (d.complete) return .{ .count = d.total_rows, .exact = true };
+    // never-full-download-streaming (TD6): an UNKNOWN-length network stream has
+    // no total to project from, so it reports a discovered-rows LOWER BOUND
+    // (frontier_rows, exact=false) that firms only as the user navigates. A
+    // KNOWN-length network doc keeps the free projection below (no fetch).
+    if (d.net and source_mod.netPhysicalTotal(d.source) == null)
+        return .{ .count = d.frontier_rows, .exact = false };
     // Estimate = total data bytes / mean indexed row bytes. `bytesConsumed`
     // is the only place a position is turned back into a byte count here
     // (see reader.zig's module doc).
@@ -446,6 +459,24 @@ pub fn rowCount(d: *Document) api.RowCount {
 pub fn indexPoll(d: *Document) api.ScanProgress {
     d.lock();
     defer d.unlock();
+    // never-full-download-streaming (TD5): a network document's total comes from
+    // the Source (known length, or the received size once EOF firmed it), or the
+    // UINT64_MAX sentinel while an unknown-length stream's total is not yet
+    // known. bytes_scanned is the frontier's physical high-water. `complete` is
+    // true only when navigation has reached EOF (the lazy gate never drives it).
+    if (d.net) {
+        const frontier_phys = d.reader.physicalBytes(d.source, d.frontier_pos);
+        if (source_mod.netPhysicalTotal(d.source)) |phys_total| return .{
+            .bytes_scanned = if (d.complete) phys_total else @min(phys_total, frontier_phys),
+            .bytes_total = phys_total,
+            .complete = d.complete,
+        };
+        return .{
+            .bytes_scanned = frontier_phys,
+            .bytes_total = api.bytes_total_unknown,
+            .complete = d.complete,
+        };
+    }
     return .{
         .bytes_scanned = if (d.complete) d.file_size else @min(d.file_size, d.reader.physicalBytes(d.source, d.frontier_pos)),
         .bytes_total = d.file_size,

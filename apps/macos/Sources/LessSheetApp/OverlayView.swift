@@ -435,7 +435,7 @@ struct JumpControlView: View {
             // While filtered, the field takes ORIGINAL row numbers (ARCH
             // criterion 12/17), so the hint is scaled to the whole document
             // (`jumpRowCountInfo`), not the filtered row count.
-            Text(RowCountText.summary(model.jumpRowCountInfo))
+            Text(RowCountText.summary(model.jumpRowCountInfo, unknownTotal: model.documentTotalUnknown))
                 .font(.caption)
                 .foregroundStyle(rejected ? Color.red : Color.secondary)
                 .lineLimit(1)
@@ -445,7 +445,7 @@ struct JumpControlView: View {
         // Red blink on rejection (item 4): a red ring over the capsule.
         .overlay { if rejected { Capsule().strokeBorder(Color.red, lineWidth: 2) } }
         .onExitCommand(perform: onExit)               // Esc: dismiss (idle) or cancel (scanning)
-        .accessibilityLabel("Jump to row, \(RowCountText.summary(model.jumpRowCountInfo))")
+        .accessibilityLabel("Jump to row, \(RowCountText.summary(model.jumpRowCountInfo, unknownTotal: model.documentTotalUnknown))")
         .accessibilityValue(rejected ? "No such row. Enter a row from 1 to \(model.jumpRowCountInfo.count)." : "")
     }
 
@@ -590,12 +590,18 @@ struct SettingsButton: View {
     }
 }
 
-/// Row-count knowledge as overlay copy: exact "N rows" or the estimating form
-/// "~12.4M rows, estimating…" (ARCH req. 7). User vocabulary; sentence case.
+/// Row-count knowledge as overlay copy: exact "N rows"; the estimating form
+/// "~12.4M rows, estimating…" for a known-total doc still converging (ARCH
+/// req. 7); or the lower-bound form "≥N rows" for an UNKNOWN-length network
+/// stream whose total firms only at EOF (never-full-download-streaming AC12).
+/// User vocabulary; sentence case.
 enum RowCountText {
-    static func summary(_ info: RowCountInfo) -> String {
+    static func summary(_ info: RowCountInfo, unknownTotal: Bool = false) -> String {
         if info.isExact {
             return "\(info.count) row\(info.count == 1 ? "" : "s")"
+        }
+        if unknownTotal {
+            return "≥\(abbreviated(info.count)) rows"
         }
         return "~\(abbreviated(info.count)) rows, estimating…"
     }
