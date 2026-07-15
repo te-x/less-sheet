@@ -194,6 +194,10 @@ fn realWorker(job: *NetOpenJob) void {
 
     const transport: net_source.Transport = .{ .real = rt };
     const progress: net_source.Progress = .{ .ctx = job, .callback = onProgress };
+    // `probe.range` already excludes gzip (decideProbe forces range=false for a
+    // gzip resource — the raw http_range Source can only serve byte ranges of
+    // what's on the wire, never decompress them, so gzip always takes the
+    // download-then-wrap-in-gzip-Source path).
     const built = if (probe.range)
         net_source.buildRandom(job.gpa, transport, probe.total, progress)
     else

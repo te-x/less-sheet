@@ -48,9 +48,64 @@ pub const Probe = struct {
     ok: bool = false,
     total: u64 = 0,
     range: bool = false,
+    is_gz: bool = false,
     err: api.NetStatus = .ok,
     http_status: i32 = 0,
 };
+
+/// Parses the resource's TRUE total length out of a `Content-Range:
+/// bytes start-end/total` response header (raw head bytes, CRLF-separated).
+/// A 206 response's `Content-Length` is the size of THIS partial response
+/// only — for any range narrower than the full resource that is NOT the
+/// resource's total, so the total must come from Content-Range instead.
+/// Returns null when the header is absent or its total is `*` (unknown).
+/// Pure (no I/O). NOTE: the network-open strategy is slated to change to
+/// never-full-download streaming (see ARCH backlog) — when that lands, this +
+/// `decideProbe` should gain hermetic unit-test seams (they are the crux of
+/// two fixed real-transport bugs the fake-transport gate path can't reach).
+fn parseContentRangeTotal(head_bytes: []const u8) ?u64 {
+    var lines = std.mem.splitSequence(u8, head_bytes, "\r\n");
+    _ = lines.next(); // status line
+    while (lines.next()) |line| {
+        if (line.len == 0) break;
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        if (!std.ascii.eqlIgnoreCase(line[0..colon], "content-range")) continue;
+        const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+        const slash = std.mem.lastIndexOfScalar(u8, value, '/') orelse return null;
+        const total_str = value[slash + 1 ..];
+        if (std.mem.eql(u8, total_str, "*")) return null;
+        return std.fmt.parseInt(u64, total_str, 10) catch null;
+    }
+    return null;
+}
+
+/// The pure total/range/gzip decision from a SUCCESSFUL (2xx) probe's raw
+/// signals — extracted from `probe()` so the exact logic behind two live bugs
+/// is isolated and (once the streaming redesign adds a seam) unit-testable
+/// without a real HTTP server. `status` is 2xx; `content_length` is the response's Content-Length
+/// (the whole resource for 200, only the PARTIAL slice for 206);
+/// `content_range_total` is `parseContentRangeTotal` of the head (null unless a
+/// usable `Content-Range: …/total` was present); `is_gz` is the leading-magic
+/// (1f 8b) verdict on the body head. The two bugs this encodes:
+///   1. total: a 206's Content-Length is the partial slice, NOT the resource —
+///      the total must come from Content-Range (else a >4 MiB file truncated to
+///      the 4 MiB probe range); and when no usable Content-Range total exists,
+///      fall back exactly as if ranges were unsupported (ARCH probe/fallback §3).
+///   2. is_gz: a gzip resource must download-and-decompress even on a range
+///      host (range mode serves raw compressed bytes -> garbage cells), so a
+///      gzip verdict forces `range = false` (the caller routes that to
+///      buildDownloadAll, which wraps the spool in a gzip Source). NOTE: this
+///      whole-file download for gzip is the exact behavior the never-full-
+///      download streaming redesign (ARCH backlog) will replace.
+fn decideProbe(status: i32, content_length: u64, content_range_total: ?u64, is_gz: bool) Probe {
+    const partial = status == 206;
+    if (!partial) return .{ .ok = true, .total = content_length, .range = false, .is_gz = is_gz };
+    const total = content_range_total orelse 0;
+    if (total == 0) return .{ .ok = true, .total = content_length, .range = false, .is_gz = is_gz };
+    // A gzip resource is never random-access over the wire — force the
+    // download-and-decompress path regardless of range support.
+    return .{ .ok = true, .total = total, .range = !is_gz, .is_gz = is_gz };
+}
 
 /// One real host connection for the whole job's lifetime: ONE `std.http.Client`
 /// (and its `Io.Threaded` executor), constructed once and reused across the
@@ -83,7 +138,13 @@ pub const RealTransport = struct {
     }
 
     /// One ranged GET for the head bound. 206 + Content-Range total => random
-    /// access; 200 / no usable length => sequential fallback.
+    /// access; 200 / no usable length => sequential fallback. Also reads the
+    /// first 2 body bytes (already in flight on this same request/response —
+    /// no extra round-trip) to detect the `.csv.gz` magic, so the real
+    /// transport picks buildRandom/buildDownloadAll exactly like the fake
+    /// transport does in runFake — without this, a range-supporting host
+    /// serving a gzip resource took the raw random-access path and the CSV
+    /// reader parsed undecompressed gzip bytes as plain text (garbage cells).
     pub fn probe(self: *RealTransport) Probe {
         const uri = std.Uri.parse(self.url) catch return .{ .err = .invalid_argument };
         var range_buf: [64]u8 = undefined;
@@ -95,16 +156,27 @@ pub const RealTransport = struct {
         defer req.deinit();
         req.sendBodiless() catch return .{ .err = .unreachable_ };
         var redirect_buf: [8192]u8 = undefined;
-        const response = req.receiveHead(&redirect_buf) catch |err| return switch (err) {
+        var response = req.receiveHead(&redirect_buf) catch |err| return switch (err) {
             error.TooManyHttpRedirects => .{ .err = .too_many_redirects },
             else => .{ .err = .unreachable_ },
         };
         const code: i32 = @intCast(@intFromEnum(response.head.status));
         if (code < 200 or code >= 300) return .{ .err = .http_status, .http_status = code };
-        const partial = code == 206;
-        const total = response.head.content_length orelse 0;
-        if (!partial or total == 0) return .{ .ok = true, .total = total, .range = false };
-        return .{ .ok = true, .total = total, .range = true };
+        // Extract every needed field from `response.head` (a view into
+        // `redirect_buf`) BEFORE touching the body reader below — reading the
+        // body can reuse/overwrite that same buffer, so any head-field slice
+        // must be consumed first, never interleaved with body reads (an earlier
+        // draft read Content-Range AFTER the body reader and segfaulted).
+        const content_length = response.head.content_length orelse 0;
+        const range_total: ?u64 = if (code == 206) parseContentRangeTotal(response.head.bytes) else null;
+        var magic: [2]u8 = .{ 0, 0 };
+        var transfer_buf: [4096]u8 = undefined;
+        const body = response.reader(&transfer_buf);
+        const magic_len = body.readSliceShort(&magic) catch 0;
+        const is_gz = magic_len == 2 and magic[0] == 0x1f and magic[1] == 0x8b;
+        // All the (bug-prone) classification now lives in the pure, unit-tested
+        // decideProbe; probe() is just the I/O around it.
+        return decideProbe(code, content_length, range_total, is_gz);
     }
 
     fn fetchInto(self: *RealTransport, dest: []u8, offset: u64) bool {
