@@ -609,6 +609,16 @@ struct ContentView: View {
                 // prove the live grid controller applied it with no interaction
                 // (config-repaint lock) — logs + terminates itself.
                 ConfigRepaintProbe.run(model: model)
+            } else if FilterRepaintProbe.active {
+                // Verification: drive one real "Filter to matches" toggle and
+                // prove the live grid controller applied it with no interaction
+                // (filter-repaint lock) — logs + terminates itself.
+                FilterRepaintProbe.run(model: model)
+            } else if FindEscapeProbe.active {
+                // Verification: run a search, then drive the grid's Esc handler
+                // and prove the find popup closes + clears (search-escape lock)
+                // — logs + terminates itself.
+                FindEscapeProbe.run(model: model)
             } else if FrameDump.liveGridInitialDumpPath == nil {
                 // Overlay / find / settings / overscroll etc. render off a SwiftUI
                 // mirror here; the plain grid-content scene instead self-captures

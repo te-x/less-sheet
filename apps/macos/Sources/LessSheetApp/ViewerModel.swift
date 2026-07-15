@@ -2531,6 +2531,15 @@ final class DocumentModel {
             rowCountInfo = session.rowCount()
             landViewport(on: 0)
             startPolling()
+            // Repaint the filtered view NOW. `landViewport` only schedules an
+            // ASYNC landing apply; when the filter is applied while already at
+            // the top (target row 0 == current), that apply produces no scroll
+            // and AppKit defers the row/gutter redraw until the next event — the
+            // reported "filter shows only after a scroll". The explicit
+            // synchronous poke (the same fix the column-config mutators use) runs
+            // apply() + flushGridDisplay in THIS turn. Grid-attached-guarded, so
+            // it is a no-op headlessly-without-a-window / pre-first-paint.
+            NativeGridController.live?.apply()
         }
     }
 
@@ -2558,6 +2567,10 @@ final class DocumentModel {
         selection = nil   // the coordinate space just changed (ARCH-select-copy)
         landViewport(on: anchor)
         startPolling()
+        // Repaint the restored identity view NOW (see applyFindAsFilter): the
+        // re-anchor may land the same visible row, so the async landing apply
+        // alone can leave the filtered rows on screen until the next scroll.
+        NativeGridController.live?.apply()
     }
 
     // MARK: - Overlay reveal / fade

@@ -159,6 +159,12 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
     /// probe compare the applied revision against the model's current one WITHOUT
     /// calling apply() itself.
     var appliedColumnConfigurationRevision: Int { lastColumnConfigurationRevision }
+    /// The filtered/identity view state the controller has actually APPLIED (its
+    /// last-seen `model.isFiltered`). Lets a headless probe confirm a filter
+    /// toggle repainted the grid WITHOUT the probe calling apply() itself — the
+    /// FilterRepaintProbe regression seam, mirroring
+    /// `appliedColumnConfigurationRevision`.
+    var appliedFilterState: Bool { lastIsFiltered }
     private var lastIsFiltered = false
     private var built = false
     private var landingApplyScheduled = false
@@ -1282,6 +1288,24 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
         model.cancelCopy()
     }
 
+    /// Esc while the GRID itself is first responder (focus has left the find /
+    /// jump popup field — the common case once the user clicks a cell after
+    /// searching, or during a scan when the field never held focus). The primary
+    /// "escape from search": dismiss an open find / jump / dialect popup —
+    /// clearing an active search and its highlights, exactly like clicking the
+    /// dismiss scrim (`PopupDismissScrimView.mouseDown` → `dismissPopups`). With
+    /// no popup open it falls back to cancelling an in-flight copy (the prior
+    /// sole behavior of `SheetTableView.cancelOperation`). `anyPopupOpen`
+    /// excludes a scanning find field by design (scrim stays off mid-scan), so
+    /// `findFieldActive` is OR'd in to cover that case too.
+    func handleEscape() {
+        if model.findFieldActive || model.anyPopupOpen {
+            model.dismissPopups()
+        } else {
+            cancelCopy()
+        }
+    }
+
     /// Selection changes alter only overlay geometry. Recompute marks and
     /// repaint the recycled rows without calling `configure`: reconfiguration
     /// re-reads paging state and could transiently replace already-rendered
@@ -1688,9 +1712,10 @@ final class SheetTableView: NSTableView {
     // action (alongside `moveUp:`/`selectAll:` above) — the default key-binding
     // table maps Esc to it — so overriding it (ARCH-select-copy round 2, finding
     // 2) needs no key-code parsing or menu wiring either: Esc while the grid (not
-    // some other field/popup) is first responder now cancels an in-flight copy,
-    // same as the notice's own Cancel button.
-    override func cancelOperation(_ sender: Any?) { controller?.cancelCopy() }
+    // some other field/popup) is first responder dismisses an open find / jump /
+    // dialect popup (the "escape from search" path when focus has left the popup
+    // field), else cancels an in-flight copy — see `handleEscape`.
+    override func cancelOperation(_ sender: Any?) { controller?.handleEscape() }
 }
 
 // MARK: - Sticky header (drawn, scrolls horizontally with its columns)
