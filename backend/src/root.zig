@@ -352,6 +352,14 @@ pub export fn ls_cell_copy(doc: *const api.Doc, row: u64, col: u32, buf: ?[*]u8,
     return window.cellCopy(asDocMut(doc), row, col, buf, buf_len, out_len, out_truncated);
 }
 
+/// See api/lesssheet.h `ls_window_match_flags` (MATCH-FLAGS EXTENSION).
+/// Window lane; a const handle with interior-mutable memoization, exactly like
+/// ls_cell_copy (asDocMut). Delegates to window.zig, which reads the
+/// materialized window (win_buf/win_refs) + the active search request.
+pub export fn ls_window_match_flags(doc: *const api.Doc, first_col: u32, col_count: u32) callconv(.c) api.Str {
+    return window.matchFlags(asDocMut(doc), first_col, col_count);
+}
+
 // ===========================================================================
 // csv-gz internal-seam re-exports + instrumentation seams (ARCH-csv-gz).
 // The re-exports below let contracts/api.zig pin the enumerated Source/Reader

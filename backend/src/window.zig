@@ -336,6 +336,25 @@ pub fn cell(d: *const Document, row: u64, col: u32) api.Str {
     return .{ .ptr = d.win_buf.items.ptr + ref.start, .len = ref.len };
 }
 
+/// RED SEED (thin-frontend-shared-core Phase 1) — see api/lesssheet.h
+/// `ls_window_match_flags` (MATCH-FLAGS EXTENSION). The real impl computes
+/// ONE flag byte per cell over the materialized window (win_buf/win_refs, the
+/// same CellRefs `cell` above indexes) for the ACTIVE search request — the
+/// matcher.zig per-cell verdict (matchRecord's per-column result) over the
+/// requested column range [first_col, first_col + col_count), row-major,
+/// len == win_rows * col_count — memoized in interior state until the next
+/// window or search change and invalidated by the next windowSet/close.
+/// The seed returns the EMPTY Str, so the `mf*` behavior tests are RED at the
+/// VERDICT level (they expect a win_rows*col_count buffer of 1/0), never at
+/// compile/link. `d` is mutable because the real memoization latches interior
+/// state (like the copy cursor); the seed touches nothing.
+pub fn matchFlags(d: *Document, first_col: u32, col_count: u32) api.Str {
+    _ = d;
+    _ = first_col;
+    _ = col_count;
+    return empty_str;
+}
+
 /// See api/lesssheet.h `ls_header_cell`. Zero allocation; total function.
 pub fn headerCell(d: *const Document, col: u32) api.Str {
     if (!d.has_header or col >= d.column_count or col >= d.header_refs.len) return empty_str;

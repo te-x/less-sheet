@@ -252,6 +252,26 @@ public protocol DocumentSession: AnyObject, Sendable {
     /// per-cell cap (`CopyBudget.perCellMaxBytes`, ~1 MiB).
     func copyCell(row: UInt64, column: Int, maxBytes: Int) -> CopiedCell
 
+    /// Per-cell FIND / PREDICATE MATCH FLAGS over the current window for the
+    /// active search (ARCH-thin-frontend-shared-core Phase 1; mirrors
+    /// `ls_window_match_flags`). Returns ONE flag byte per visible cell —
+    /// 1 = the cell matches the active `startSearch` request, 0 = it does not —
+    /// ROW-MAJOR over the window last set by `setWindow` x the column range
+    /// `[firstColumn, firstColumn + columnCount)` (stride `columnCount`,
+    /// `count == windowRowCount * columnCount`), COPIED out of the core's
+    /// borrow immediately (the UTF-8-copy-out discipline). The verdict is the
+    /// SAME one the core's matcher computes for `startSearch`, byte-identical to
+    /// the frontend's former `CellMatcher`: TEXT smart-case over IN-SCOPE
+    /// columns, PREDICATE eq/ne byte-exact + exact-decimal ordering on the
+    /// target column; a FILTER changes only which rows the window holds, not
+    /// the verdict. Returns `[]` when no search is active, no window is
+    /// materialized, or the column range is empty / out of range. ADDITIVE:
+    /// the RED default below returns `[]` (no highlights) so existing
+    /// conformers compile; the real conformer OVERRIDES it to call
+    /// `ls_window_match_flags`. A frontend paints highlights by indexing this
+    /// array — with NO matcher of its own.
+    func windowMatchFlags(firstColumn: Int, columnCount: Int) -> [UInt8]
+
     /// Release the core handle. Idempotent; nothing else may be called
     /// afterwards.
     func close()
@@ -285,6 +305,18 @@ public extension DocumentSession {
     func copyCell(row: UInt64, column: Int, maxBytes: Int) -> CopiedCell {
         CopiedCell(status: .noCell, text: "", truncated: false)
     }
+
+    /// DEFAULT (RED seed) for the per-window match flags: returns `[]` — no
+    /// cell matches, so NOTHING highlights through it. Keeps existing conformers
+    /// compiling before the bridge lands (`windowMatchFlags` is a PROTOCOL
+    /// REQUIREMENT — declared in the body above, not only here — so a real
+    /// override is dispatched through `any DocumentSession` via the witness
+    /// table). A conformer wires highlights to the core by OVERRIDING this to
+    /// call `ls_window_match_flags` (copy the borrowed flag bytes into a
+    /// `[UInt8]`), which flips the golden bridge test from RED (this default:
+    /// `[]`) to GREEN (the real per-cell verdicts, byte-identical to the
+    /// deleted CellMatcher).
+    func windowMatchFlags(firstColumn: Int, columnCount: Int) -> [UInt8] { [] }
 }
 
 /// Opens document sessions through the core's C ABI. This is the ONLY entry

@@ -7599,3 +7599,256 @@ test "nfd_ac25: network filter parks CANCELLED and advances only on a filtered d
     // to DONE / exact. The fv2..fv15 series covers the full local filtered view and
     // nfd_ac21 covers the local AUTO indexer staying live; not duplicated here.
 }
+
+// ===========================================================================
+// thin-frontend-shared-core slice — Phase 1: per-window MATCH FLAGS
+// (ls_window_match_flags). Semantics pinned in api/lesssheet.h "MATCH-FLAGS
+// EXTENSION" and mirrored in contracts/api.zig. Tests exercise the PUBLIC C ABI
+// through @import("api") only, reusing the helpers above (openBytes/openWith,
+// winAll, textReq/textReqScoped/predReq/startSearch, setFilter/waitFilterDone,
+// fv_fixture). RED against the current seed (window.matchFlags returns the empty
+// Str): every verdict assertion expects a win_rows*col_count buffer of 1/0 and
+// fails on the empty buffer — a BEHAVIOR red, not a compile/link error.
+//
+// Naming maps to ARCH-thin-frontend-shared-core Phase-1 ACs: mf1-mf3 + mf8 ->
+// AC1 (byte-identical verdicts, incl. exact-decimal + the filter note); mf4 ->
+// AC2 (scope); mf5 -> AC3 (IDLE); mf6 -> AC4 (column-windowed & bounded);
+// mf7 -> AC5 (borrow discipline & recompute cadence).
+// Determinism: fixtures are far below the head budget (fully indexed at open),
+// so ls_window_match_flags is read RIGHT AFTER ls_search_start WITHOUT waiting
+// for the match-scan — the flags come from the active request + the already
+// materialized window, never the scan (a pinned property of the call).
+//
+// The golden 1/0 arrays were generated from the CURRENT frontend CellMatcher
+// (apps/macos/.../FindLogic.swift — the byte-identical duplicate Phase 1
+// deletes) over the same fixture cells, so "byte-identical to the matcher" is
+// locked from both sides (this backend suite + the macOS golden bridge test).
+// ===========================================================================
+
+fn matchFlags(doc: *const api.Doc, first_col: u32, col_count: u32) []const u8 {
+    return api.ls_window_match_flags(doc, first_col, col_count).slice();
+}
+
+/// A rows x cols delimited fixture (no header; header forced OFF at open) whose
+/// `hit_col` cell is "hit" and every other cell is "v" — for the AC4 wide-doc
+/// probe (column-windowed cost independent of ls_column_count).
+fn genWide(gpa: std.mem.Allocator, cols: u32, rows: u32, hit_col: u32) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(gpa);
+    for (0..rows) |_| {
+        for (0..cols) |c| {
+            if (c > 0) try buf.append(gpa, ',');
+            try buf.appendSlice(gpa, if (c == hit_col) "hit" else "v");
+        }
+        try buf.append(gpa, '\n');
+    }
+    return buf.toOwnedSlice(gpa);
+}
+
+// --- mf1..mf8 — the per-window match-flags companion call --------------------
+
+test "mf1: AC1 TEXT smart-case per-cell verdicts are byte-identical to the matcher" {
+    var od = try openBytes(fv_fixture);
+    defer od.deinit();
+    winAll(od.doc);
+
+    // Lowercase query folds ASCII case (no ASCII uppercase byte).
+    try startSearch(od.doc, textReq("needle"));
+    try std.testing.expectEqualSlices(u8, &.{
+        0, 0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1,
+    }, matchFlags(od.doc, 0, 3));
+
+    // One ASCII uppercase byte -> byte-exact: only "Needle point" (row 3, col 2).
+    try startSearch(od.doc, textReq("Needle"));
+    try std.testing.expectEqualSlices(u8, &.{
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    }, matchFlags(od.doc, 0, 3));
+
+    // Non-ASCII bytes always compare exactly: "café" hits only row 5, col 0
+    // (the col-2 "CAFÉ" folds only its ASCII bytes, so it does NOT match).
+    try startSearch(od.doc, textReq("café"));
+    try std.testing.expectEqualSlices(u8, &.{
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0,
+    }, matchFlags(od.doc, 0, 3));
+
+    // Dense single letter — broad coverage across all three columns.
+    try startSearch(od.doc, textReq("e"));
+    try std.testing.expectEqualSlices(u8, &.{
+        1, 0, 1, 1, 0, 1, 1, 0, 0, 1, 0, 1, 0, 1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 1,
+    }, matchFlags(od.doc, 0, 3));
+}
+
+test "mf2: AC1 PREDICATE eq/ne + numeric ordering per-cell verdicts (qty column)" {
+    var od = try openBytes(fv_fixture);
+    defer od.deinit();
+    winAll(od.doc);
+
+    // qty <= 2 : rows 0(2),2(2.0),3(-3),5(0.5).
+    try startSearch(od.doc, predReq(1, .le, "2"));
+    try std.testing.expectEqualSlices(u8, &.{
+        0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
+    }, matchFlags(od.doc, 0, 3));
+
+    // qty > 2 : rows 1(10),4(1e2=100),6(5.).
+    try startSearch(od.doc, predReq(1, .gt, "2"));
+    try std.testing.expectEqualSlices(u8, &.{
+        0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
+    }, matchFlags(od.doc, 0, 3));
+
+    // qty < 1e2 (== 100): everything numeric below 100 (rows 0,1,2,3,5,6).
+    try startSearch(od.doc, predReq(1, .lt, "1e2"));
+    try std.testing.expectEqualSlices(u8, &.{
+        0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0,
+    }, matchFlags(od.doc, 0, 3));
+
+    // qty == 2.0 is BYTE-EXACT: only the literal "2.0" (row 2); "2" does NOT.
+    try startSearch(od.doc, predReq(1, .eq, "2.0"));
+    try std.testing.expectEqualSlices(u8, &.{
+        0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    }, matchFlags(od.doc, 0, 3));
+
+    // qty != 10 is BYTE-EXACT: every row except the literal "10" (row 1).
+    try startSearch(od.doc, predReq(1, .ne, "10"));
+    try std.testing.expectEqualSlices(u8, &.{
+        0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0,
+    }, matchFlags(od.doc, 0, 3));
+}
+
+test "mf3: AC1 exact-decimal ordering edge cases (never through f64)" {
+    // header OFF -> record 1 ("2.0", numeric) is data row 0; 9 data rows, 1 col.
+    const dec_fixture =
+        "2.0\n2\n100\n1e2\n1e400\n1e399\n" ++
+        "1234567890123456789012345678901234567890\n" ++ // 40-digit A
+        "1234567890123456789012345678901234567891\n" ++ // 40-digit B = A + 1
+        "abc\n";
+    var od = try openWith(dec_fixture, .{ .header = api.header_off, .index_mode = api.index_manual });
+    defer od.deinit();
+    winAll(od.doc);
+
+    // == "2" is byte-exact: only the literal "2" (row 1); "2.0" does NOT.
+    try startSearch(od.doc, predReq(0, .eq, "2"));
+    try std.testing.expectEqualSlices(u8, &.{ 0, 1, 0, 0, 0, 0, 0, 0, 0 }, matchFlags(od.doc, 0, 1));
+
+    // >= 1e2 (== 100): 100, 1e2, 1e400, 1e399, and both 40-digit ints; "abc" no.
+    try startSearch(od.doc, predReq(0, .ge, "1e2"));
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 1, 1, 1, 1, 1, 1, 0 }, matchFlags(od.doc, 0, 1));
+
+    // > 1e399: only 1e400 (both overflow an f64 but order exactly).
+    try startSearch(od.doc, predReq(0, .gt, "1e399"));
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 1, 0, 0, 0, 0 }, matchFlags(od.doc, 0, 1));
+
+    // < the larger 40-digit int B: the small values + A, never the two 1e39x
+    // giants (both >> B) nor B itself nor "abc".
+    try startSearch(od.doc, predReq(0, .lt, "1234567890123456789012345678901234567891"));
+    try std.testing.expectEqualSlices(u8, &.{ 1, 1, 1, 1, 0, 0, 1, 0, 0 }, matchFlags(od.doc, 0, 1));
+
+    // != "100" is byte-exact: "1e2" (numerically 100) still differs BYTE-wise.
+    try startSearch(od.doc, predReq(0, .ne, "100"));
+    try std.testing.expectEqualSlices(u8, &.{ 1, 1, 0, 1, 1, 1, 1, 1, 1 }, matchFlags(od.doc, 0, 1));
+}
+
+test "mf4: AC2 scope is part of the verdict (TEXT in-scope cols; PREDICATE target col)" {
+    var od = try openBytes(fv_fixture);
+    defer od.deinit();
+    winAll(od.doc);
+
+    // TEXT scoped to columns {0, 2}: the qty column (1) is NEVER flagged even
+    // though "1e2" (row 4, col 1) contains 'e' — scope excludes it.
+    try startSearch(od.doc, textReqScoped("e", &.{ 0, 2 }));
+    try std.testing.expectEqualSlices(u8, &.{
+        1, 0, 1, 1, 0, 1, 1, 0, 0, 1, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 1,
+    }, matchFlags(od.doc, 0, 3));
+
+    // TEXT scoped to {0}: only the name column can be 1.
+    try startSearch(od.doc, textReqScoped("e", &.{0}));
+    try std.testing.expectEqualSlices(u8, &.{
+        1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    }, matchFlags(od.doc, 0, 3));
+
+    // PREDICATE flags ONLY its target column (1); columns 0 and 2 stay 0.
+    try startSearch(od.doc, predReq(1, .eq, "2"));
+    try std.testing.expectEqualSlices(u8, &.{
+        0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    }, matchFlags(od.doc, 0, 3));
+}
+
+test "mf5: AC3 IDLE returns the empty ls_str (no highlights)" {
+    var od = try openBytes(fv_fixture);
+    defer od.deinit();
+    winAll(od.doc);
+    // No search started since open -> LS_SEARCH_IDLE -> empty buffer.
+    try std.testing.expectEqual(api.SearchState.idle, api.ls_search_poll(od.doc).state);
+    try std.testing.expectEqual(@as(usize, 0), matchFlags(od.doc, 0, 3).len);
+    // A ptr is still valid (never NULL), just with len 0 — like an empty ls_cell.
+    try std.testing.expect(@intFromPtr(api.ls_window_match_flags(od.doc, 0, 3).ptr) != 0);
+}
+
+test "mf6: AC4 column-windowed & bounded (sub-range slices; out-of-range -> empty; O(cols))" {
+    var od = try openBytes(fv_fixture);
+    defer od.deinit();
+    winAll(od.doc);
+    try startSearch(od.doc, textReq("needle"));
+
+    // Full width [0,3): the 24-byte verdict.
+    try std.testing.expectEqual(@as(usize, 24), matchFlags(od.doc, 0, 3).len);
+    // Sub-range [2,1) — the note column only (stride 1).
+    try std.testing.expectEqualSlices(u8, &.{ 1, 0, 0, 1, 0, 0, 1, 1 }, matchFlags(od.doc, 2, 1));
+    // Sub-range [0,2) — name+qty only (stride 2), a slice of the full verdict.
+    try std.testing.expectEqualSlices(u8, &.{
+        0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    }, matchFlags(od.doc, 0, 2));
+    // Empty / out-of-range column ranges -> the empty ls_str (len 0).
+    try std.testing.expectEqual(@as(usize, 0), matchFlags(od.doc, 0, 0).len); // col_count 0
+    try std.testing.expectEqual(@as(usize, 0), matchFlags(od.doc, 3, 1).len); // first_col >= column_count
+    try std.testing.expectEqual(@as(usize, 0), matchFlags(od.doc, 2, 2).len); // range spills past column_count
+
+    // Wide-doc probe: the output (and work) is O(requested cols), NOT
+    // O(ls_column_count). 64 columns, 2 rows, "hit" only in column 5.
+    const gpa = std.testing.allocator;
+    const wide = try genWide(gpa, 64, 2, 5);
+    defer gpa.free(wide);
+    var wd = try openWith(wide, .{ .header = api.header_off, .index_mode = api.index_manual });
+    defer wd.deinit();
+    try std.testing.expectEqual(@as(u32, 64), api.ls_column_count(wd.doc));
+    winAll(wd.doc);
+    try startSearch(wd.doc, predReq(5, .eq, "hit"));
+    // Request only columns [4,7): 2 rows x 3 cols = 6 bytes (NOT 2 x 64), with
+    // the "hit" flag on column 5 (the middle slot) of each row.
+    try std.testing.expectEqualSlices(u8, &.{ 0, 1, 0, 0, 1, 0 }, matchFlags(wd.doc, 4, 3));
+}
+
+test "mf7: AC5 the buffer tracks the current window and search (recompute cadence)" {
+    var od = try openBytes(fv_fixture);
+    defer od.deinit();
+    winAll(od.doc);
+    try startSearch(od.doc, textReq("needle"));
+    try std.testing.expectEqual(@as(usize, 24), matchFlags(od.doc, 0, 3).len);
+
+    // A NEW window (rows 3..6) recomputes over the new rows only: the length
+    // shrinks to win_rows*col_count and the verdicts are those rows' (the
+    // previous buffer is invalidated by ls_window_set — the ls_cell borrow rule).
+    _ = api.ls_window_set(od.doc, 3, 3);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 1, 0, 0, 0, 0, 0, 0 }, matchFlags(od.doc, 0, 3));
+
+    // A NEW search over the SAME window recomputes the verdict WITHOUT a
+    // window_set (memoization is keyed on window OR search change): qty > 2 over
+    // rows 3(-3),4(100),5(0.5).
+    try startSearch(od.doc, predReq(1, .gt, "2"));
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 1, 0, 0, 0, 0 }, matchFlags(od.doc, 0, 3));
+}
+
+test "mf8: AC1 a filter changes WHICH rows the window holds, not the per-cell verdict" {
+    var od = try openBytes(fv_fixture);
+    defer od.deinit();
+    // Filter to rows with ANY cell containing "needle" -> sources 0,1,2,3,6,7.
+    try setFilter(od.doc, textReq("needle"));
+    _ = try waitFilterDone(od.doc);
+    winAll(od.doc); // materialize the 6 filtered rows
+    // Search the same predicate in FILTERED coordinates.
+    try startSearch(od.doc, textReq("needle"));
+    // The per-cell verdict is identical to mf1's needle case with rows 4,5 (the
+    // two rows that hold no "needle") simply absent from the filtered view.
+    try std.testing.expectEqualSlices(u8, &.{
+        0, 0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 1,
+    }, matchFlags(od.doc, 0, 3));
+}

@@ -2135,6 +2135,102 @@ void ls_net_open_release(ls_net_open_job *job);
  */
 #define LS_BYTES_TOTAL_UNKNOWN (UINT64_MAX)
 
+/* =========================================================================
+ * MATCH-FLAGS EXTENSION (thin-frontend-shared-core slice, Phase 1) — ADDITIVE
+ * =========================================================================
+ * (thin-frontend-shared-core slice — ONE additive, read-only entry point;
+ * struct / enum / signature / constant LAYOUT above this block is
+ * BYTE-IDENTICAL to every prior revision of this header. Two-key root-planner
+ * freeze; the author's sign-off relayed 2026-07-15. See
+ * docs/architecture/ARCH-thin-frontend-shared-core.md, Phase 1. The
+ * LS_BYTES_TOTAL_UNKNOWN amendment above is the additive-amendment precedent.)
+ *
+ * This block adds exactly ONE new function prototype (ls_window_match_flags)
+ * and NO new type, enum, struct, or constant. No existing symbol changes shape,
+ * value, allocation behavior, threading lane, or borrow lifetime, so a client
+ * compiled against any prior header links and behaves identically.
+ *
+ * WHY. Every frontend that paints find / predicate highlights needs, per
+ * visible cell, the SAME verdict the core's matcher already computes for
+ * ls_search_* (see SEARCH and ls_search_request). Re-deriving it in each
+ * frontend duplicates the smart-case substring + exact-decimal grammar
+ * byte-for-byte. This call hands the frontend that verdict for the current
+ * window as a borrowed byte array, so a frontend paints highlights with ZERO
+ * matching logic of its own and NO per-cell round-trip, and every future
+ * frontend reuses the one implementation.
+ */
+
+/*
+ * Per-cell MATCH FLAGS over the current window for the active search request:
+ * for the window last set by ls_window_set and the request last passed to
+ * ls_search_start, report which visible cells match — the same per-cell verdict
+ * the core's matcher computes for ls_search_* (see SEARCH / ls_search_request),
+ * so a frontend paints highlights with no matcher of its own.
+ *
+ * RETURN — a BORROWED buffer of one FLAG BYTE per cell (this is NOT UTF-8
+ * text): value 1 = the cell matches the active request, 0 = it does not. The
+ * bytes are ROW-MAJOR over the window's materialized data rows x the requested
+ * column range [first_col, first_col + col_count): the stride is col_count and
+ *     len == window_row_count * col_count,
+ * where window_row_count is the row_count field of the ls_row_range the LAST
+ * ls_window_set returned (the count of rows actually materialized). The flag for
+ * data row `row` (window_first_row <= row < window_first_row + window_row_count)
+ * and column `col` (first_col <= col < first_col + col_count) is at
+ *     flags[(row - window_first_row) * col_count + (col - first_col)].
+ * The buffer is carried in the ls_str {ptr, len}; ptr is never NULL, and an
+ * empty result has len 0 with a valid, must-not-be-read ptr, exactly like a
+ * ls_cell empty string.
+ *
+ * COLUMN WINDOW — first_col / col_count are the frontend's VISIBLE column window
+ * (the same subset it reads with ls_cell), so the call is O(window rows x
+ * col_count), NEVER O(ls_column_count): only the requested columns' cells are
+ * evaluated (the column-windowing discipline of ARCH-column-windowing). The
+ * requested range must be non-empty AND wholly in range; the EMPTY ls_str
+ * (len 0) is returned when col_count == 0, when first_col >= ls_column_count(),
+ * or when first_col + col_count > ls_column_count().
+ *
+ * PREDICATE & SCOPE — the verdict is the ACTIVE ls_search_request's, evaluated
+ * per cell exactly as SEARCH defines it, over the cell text AS MATERIALIZED IN
+ * THE WINDOW (the same bytes ls_cell serves — display-capped; a match lying past
+ * the display cap is not flagged, matching what the frontend can paint):
+ *   - LS_SEARCH_TEXT: a byte is 1 iff the column is IN SCOPE (a NULL scope_ptr
+ *     means all columns) AND the smart-case substring rule holds for that cell;
+ *     a cell in an out-of-scope column is always 0.
+ *   - LS_SEARCH_PREDICATE: a byte is 1 only on the request's target `column`
+ *     (every other column is 0), and there iff the cell satisfies the operator
+ *     (EQ / NE byte-exact; LT / GT / LE / GE the EXACT-decimal comparison — a
+ *     non-numeric cell never matches an ordering op; the empty value is legal).
+ * A FILTER changes only WHICH data rows the window holds (filtered coordinates,
+ * see FILTERED VIEWS), never the per-cell verdict: a materialized row's flags
+ * are computed from that row's cells regardless of the view mode. The effective
+ * header record is never a window data row and is never flagged.
+ *
+ * IDLE — when the search state is LS_SEARCH_IDLE (no search since open, or after
+ * a reset — see SEARCH and FILTERED VIEWS RESET) the call returns the EMPTY
+ * ls_str (len 0): no active request, no highlights. (The current-match strong
+ * highlight needs no flag; the frontend already has found_row / found_col from
+ * ls_search_poll.)
+ *
+ * OWNERSHIP, COST & LANE — BORROWED exactly like ls_cell: the buffer is
+ * core-owned and stays valid until the NEXT ls_window_set on this document or
+ * ls_close, whichever comes first; nothing else invalidates it. It is computed
+ * LAZILY on the first call after a window or search change and MEMOIZED, so
+ * repeated calls across repaints reuse it with ZERO further allocation; a call
+ * made after a search change recomputes the verdicts into the buffer (read the
+ * flags for the current window + request, and re-read after either changes).
+ * The call performs ZERO heap allocation beyond that one reused buffer, NEVER
+ * fails (out-of-range / no-window / no-search all return the empty ls_str), and
+ * NEVER scans — it evaluates only already-materialized window cells and never
+ * advances the frontier or touches the file. One byte per cell, NOT packed
+ * bits: the window is O(viewport) and bit-packing would only burden a C / GTK
+ * consumer. WINDOW LANE — like ls_cell / ls_window_set (it reads the
+ * materialized window and returns a window-tied borrow): one caller thread at a
+ * time, which the caller serializes with the other window-lane calls; safe
+ * concurrently with the core's background scanning. `doc` is const like ls_cell
+ * / ls_cell_copy — the memoization is interior state.
+ */
+ls_str ls_window_match_flags(const ls_doc *doc, uint32_t first_col, uint32_t col_count);
+
 #ifdef __cplusplus
 }
 #endif

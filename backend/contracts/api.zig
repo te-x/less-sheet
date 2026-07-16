@@ -1359,3 +1359,31 @@ comptime {
     if (@TypeOf(core.parseContentRangeTotal) != fn ([]const u8) ?u64)
         @compileError("signature drift: parseContentRangeTotal");
 }
+
+// ===========================================================================
+// thin-frontend-shared-core slice — Phase 1 (ARCH-thin-frontend-shared-core).
+// ADDITIVE: the batched per-window match-flags companion call. Mirrors the
+// appended api/lesssheet.h "MATCH-FLAGS EXTENSION" block EXACTLY (ONE read-only
+// C-ABI entry point; NO new type/enum/struct/constant, so every layout above is
+// byte-identical). Planner-owned; amended only with the C header. The observable
+// verdict is pinned by the `mf*` behavior tests (backend) + the macOS golden
+// bridge test; the impl lives in src/ (window.zig, reading win_buf).
+// ===========================================================================
+
+/// C ABI — per-cell MATCH FLAGS over the current window for the active search
+/// request: one borrowed FLAG BYTE per visible cell (1 = the cell matches the
+/// last ls_search_start's request, 0 = it does not), ROW-MAJOR over the window's
+/// materialized rows x [first_col, first_col + col_count) (stride col_count,
+/// len == window_row_count * col_count). The SAME per-cell verdict the matcher
+/// computes for ls_search_* (byte-identical), evaluated over the materialized
+/// window cells; the empty Str when the search is IDLE, no window is
+/// materialized, or the column range is empty / out of range. BORROWED like
+/// ls_cell (invalidated by the next ls_window_set / ls_close), memoized per
+/// window-or-search change, zero-alloc after the first compute, never scans.
+/// See api/lesssheet.h "MATCH-FLAGS EXTENSION".
+pub const ls_window_match_flags = core.ls_window_match_flags;
+
+comptime {
+    if (@TypeOf(core.ls_window_match_flags) != fn (*const Doc, u32, u32) callconv(.c) Str)
+        @compileError("signature drift: ls_window_match_flags");
+}
