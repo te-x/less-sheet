@@ -68,7 +68,6 @@ private let sampleRequest = SearchRequest.text(query: "x", scope: nil)
 
 @Test func findContractConformancePins() {
     let _: any FindControlling = FindControl()
-    let _: any CellMatching = CellMatcher()
 }
 
 // MARK: - ABI agreement: C header <-> Swift contract
@@ -435,54 +434,6 @@ private let sampleRequest = SearchRequest.text(query: "x", scope: nil)
     #expect(try await matchedRows(session, .text(query: "needle", scope: [2])) == [0, 3, 6, 7])
     #expect(try await matchedRows(session, .text(query: "needle", scope: [1])) == [])
     #expect(try await matchedRows(session, .text(query: "needle", scope: [0, 2])) == [0, 1, 2, 3, 6, 7])
-}
-
-/// ARCH criterion 8: the frontend matcher's verdicts are byte-identical to
-/// the core's over the fixture cell matrix. Core per-cell verdicts are
-/// obtained by isolating each column (scoped text / targeted predicate) and
-/// walking the match rows; the frontend evaluates the same isolated request
-/// over the materialized window cells.
-@Test func frontendMatcherVerdictsAreIdenticalToTheCore() async throws {
-    let session = try await openFindFixture()
-    defer { session.close() }
-    let window = session.setWindow(firstRow: 0, rowCount: 20)
-    try #require(window.rows.count == 8)
-    let matcher = CellMatcher()
-    let seeds: [SearchRequest] = [
-        .text(query: "needle", scope: nil), // smart-case fold
-        .text(query: "Needle", scope: nil), // uppercase byte -> exact
-        .text(query: "café", scope: nil), // non-ASCII bytes never fold
-        .text(query: "e", scope: nil), // dense single-letter coverage
-        .predicate(column: 1, op: .lessOrEqual, value: "2"),
-        .predicate(column: 1, op: .greaterThan, value: "2"),
-        .predicate(column: 1, op: .lessThan, value: "1e2"),
-        .predicate(column: 1, op: .equals, value: "2.0"),
-        .predicate(column: 1, op: .notEquals, value: "10"),
-        .predicate(column: 0, op: .equals, value: ""),
-    ]
-    for seed in seeds {
-        for column in 0..<3 {
-            // Isolate the column so a row verdict IS the cell verdict.
-            let isolated: SearchRequest = switch seed {
-            case let .text(query, _): .text(query: query, scope: [column])
-            case let .predicate(_, op, value): .predicate(column: column, op: op, value: value)
-            }
-            let coreVerdicts = try await matchedRows(session, isolated)
-            var frontendVerdicts: Set<UInt64> = []
-            for (i, row) in window.rows.enumerated()
-            where matcher.matches(cell: row[column], column: column, under: isolated) {
-                frontendVerdicts.insert(UInt64(i))
-            }
-            #expect(
-                coreVerdicts == frontendVerdicts,
-                "verdict mismatch for \(isolated) at column \(column)"
-            )
-        }
-    }
-    // Scope filtering itself is part of the matcher's verdict.
-    #expect(!matcher.matches(cell: "needle", column: 1, under: .text(query: "needle", scope: [0, 2])))
-    #expect(matcher.matches(cell: "needle", column: 2, under: .text(query: "needle", scope: [0, 2])))
-    #expect(!matcher.matches(cell: "5", column: 0, under: .predicate(column: 1, op: .equals, value: "5")))
 }
 
 @Test func aFreshOrReopenedSessionHasZeroSearchState() async throws {

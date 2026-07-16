@@ -183,27 +183,6 @@ public enum NumericGrammar {
     }
 }
 
-// MARK: - Frontend cell matcher (viewport highlights)
-
-/// The frontend twin of the core's per-cell matcher: the grid re-evaluates
-/// it over the materialized viewport cells to render highlights — O(viewport),
-/// zero core calls. PINNED: for valid-UTF-8 cell text its verdict is
-/// byte-identical to the core's per-cell verdict under the same request (the
-/// frozen bridge tests compare the two over a fixture cell matrix).
-/// Semantics (normative text in api/lesssheet.h `ls_search_request`):
-///   - .text: false when `scope` is non-nil and does not contain `column`;
-///     otherwise the smart-case substring rule over the cell's UTF-8 bytes.
-///   - .predicate: false when `column` differs from the request's column;
-///     equals/notEquals byte-exact; ordering true iff BOTH cell and value
-///     satisfy `NumericGrammar` and compare accordingly — by exact
-///     mathematical value.
-/// The empty cell text participates like any other cell (a padded ragged
-/// cell equals ""). Header cells are never passed in (they are never
-/// matched).
-public protocol CellMatching: Sendable {
-    func matches(cell: String, column: Int, under request: SearchRequest) -> Bool
-}
-
 // MARK: - The find popup's pure view-model
 
 /// What the user is editing in the popup: the mode and both modes' fields.
