@@ -1480,6 +1480,11 @@ final class SheetRowView: NSTableRowView {
         let h = bounds.height
         let grid = NSColor.gridColor
         let accent = NSColor.controlAccentColor
+        // Selection reads as a MUTED GRAY marquee (deliberately quieter than the
+        // accent), so a selected cell and an accent find-highlight are distinct
+        // by BOTH colour and geometry. Tunable — this one colour drives both the
+        // selection wash and its marquee (find highlights stay on `accent`).
+        let selectionColor = NSColor.systemGray
         // `c.widths` is only the current horizontal column WINDOW
         // (ARCH-column-windowing); start at its exact prefix-sum offset so an
         // in-window column lands at the SAME x a full, unwindowed draw would
@@ -1497,8 +1502,9 @@ final class SheetRowView: NSTableRowView {
             switch hl {
             // Accent find chips (see FindHighlightStyle): rounded + inset so
             // a match reads as a highlight ON the cell, never a repainted
-            // cell — distinguished from a SELECTED cell (also accent, below)
-            // by geometry: chip vs full-cell wash inside the 2 pt marquee.
+            // cell — distinguished from a SELECTED cell (muted gray, below) by
+            // BOTH colour (accent vs gray) and geometry (chip vs full-cell wash
+            // inside the 2 pt marquee).
             case .subtle:
                 accent.withAlphaComponent(FindHighlightStyle.subtleAlpha).setFill()
                 SheetRowView.highlightChipPath(in: cell).fill()
@@ -1507,12 +1513,12 @@ final class SheetRowView: NSTableRowView {
                 SheetRowView.highlightChipPath(in: cell).fill()
             case .none: break
             }
-            // ARCH-select-copy AC1: the selection overlay keeps the accent
+            // ARCH-select-copy AC1: the selection overlay keeps its muted-gray
             // fill + marquee border, layered on top of (never instead of) a
             // find highlight — a cell can be both matched AND selected.
             let mark = i < selectionMarks.count ? selectionMarks[i] : .none
             if mark.isSelected {
-                accent.withAlphaComponent(0.12).setFill()
+                selectionColor.withAlphaComponent(0.12).setFill()
                 cell.fill()
             }
             if i < cells.count, !cells[i].isEmpty {
@@ -1548,7 +1554,7 @@ final class SheetRowView: NSTableRowView {
                 p.stroke()
             }
             if mark.isSelected {
-                SheetRowView.drawSelectionBorder(mark, in: cell, accent: accent)
+                SheetRowView.drawSelectionBorder(mark, in: cell, color: selectionColor)
             }
             grid.setFill()
             NSRect(x: x + w - NativeGrid.hairline, y: 0, width: NativeGrid.hairline, height: h).fill()
@@ -1607,13 +1613,13 @@ final class SheetRowView: NSTableRowView {
     /// side(s) of `cell` that sit on the selection rect's OUTER edge (an
     /// interior selected cell gets the accent fill only, drawn above — no
     /// stroke), so a multi-cell selection reads as one continuous outlined
-    /// range rather than a grid of individually-boxed cells. A confident
-    /// 2 pt accent marquee (the Numbers look) — square caps so the per-cell
-    /// segments join seamlessly at range corners; the find highlights share
-    /// the accent but read as rounded INSET chips, so matched vs selected
-    /// stay distinct by geometry.
-    static func drawSelectionBorder(_ mark: SelectionMark, in cell: NSRect, accent: NSColor) {
-        accent.setStroke()
+    /// range rather than a grid of individually-boxed cells. A confident 2 pt
+    /// marquee (the Numbers look) in a muted gray — square caps so the per-cell
+    /// segments join seamlessly at range corners; the find highlights use the
+    /// accent and read as rounded INSET chips, so matched vs selected stay
+    /// distinct by both colour and geometry.
+    static func drawSelectionBorder(_ mark: SelectionMark, in cell: NSRect, color: NSColor) {
+        color.setStroke()
         let r = cell.insetBy(dx: 1.0, dy: 1.0)
         let path = NSBezierPath()
         path.lineWidth = 2.0
