@@ -312,6 +312,14 @@ pub const Document = struct {
     win_oversized: std.ArrayList(bool),
     win_first: u64,
     win_rows: u64,
+    // Window MATERIALIZATION EPOCH (thin-frontend-shared-core Phase 1): bumped
+    // by window.windowSet on EVERY call (a re-request may EXTEND win_rows, so
+    // win_first/win_rows alone can't tell a stale window from a grown one, and
+    // an identical first_row/count under a new filter holds different content).
+    // window.matchFlags keys its memo on it so the flags buffer is invalidated
+    // by the next ls_window_set exactly like the ls_cell borrow. DEFAULTED so
+    // openWithAllocator's literal need not mention it.
+    win_gen: u64 = 0,
 
     // Aggregate-window request identity and continuation. The materialized
     // prefix stays in win_* above; these fields retain only the O(1) source
@@ -408,6 +416,25 @@ pub const Document = struct {
     copy_cursor_pos: Pos = .{ .logical = 0, .physical = 0 },
     copy_cursor_source_row: u64 = 0,
     copy_cursor_block_consumed: u64 = 0,
+
+    // --- Match-flags memo (thin-frontend-shared-core Phase 1) ----------------
+    // One flag byte per visible cell (1 = matches the active search request,
+    // 0 = not), row-major over the materialized window x the requested column
+    // range, computed by window.matchFlags (ls_window_match_flags) from the
+    // bytes already in win_buf/win_refs — never a scan. MEMOIZED: recomputed
+    // lazily only on the first call after a window (win_gen) or search
+    // (search_gen) change, or a change to the requested column range, and
+    // reused across repaints with zero further allocation. BORROWED like
+    // win_buf: the returned ls_str points into `mf_flags` and stays valid until
+    // the next ls_window_set / ls_close. All DEFAULTED (like the copy cursor),
+    // so openWithAllocator's literal need not mention them and a doc that never
+    // paints highlights pays nothing. mf_flags is freed in freeDoc.
+    mf_flags: std.ArrayList(u8) = .empty,
+    mf_valid: bool = false,
+    mf_win_gen: u64 = 0,
+    mf_search_gen: u64 = 0,
+    mf_first_col: u32 = 0,
+    mf_col_count: u32 = 0,
 
     // --- csv-gz instrumentation state (ARCH-csv-gz) -------------------------
     // All DEFAULTED (like copy_cursor_* above), so openWithAllocator's literal
@@ -604,6 +631,7 @@ pub fn freeDoc(doc: *Document) void {
     doc.win_source.deinit(doc.gpa);
     doc.win_pos.deinit(doc.gpa);
     doc.win_oversized.deinit(doc.gpa);
+    doc.mf_flags.deinit(doc.gpa);
     doc.block_counts.deinit(doc.gpa);
     doc.search_scratch.deinit(doc.gpa);
     doc.search_refs.deinit(doc.gpa);

@@ -380,26 +380,27 @@ fn textMatch(cell: []const u8, query: []const u8, fold: bool) bool {
     return false;
 }
 
-/// Evaluate the matcher on a decoded record. Returns the matched column (lowest
-/// in-scope for TEXT; the predicate column for PREDICATE) or null. `refs` has
-/// exactly `column_count` entries (truncate/pad already applied, == ls_cell).
-pub fn matchRecord(ctx: MatchCtx, buf: []const u8, refs: []const CellRef) ?u32 {
+/// Per-cell match verdict: does column `col`'s decoded cell bytes satisfy the
+/// active request `ctx`? This is the single per-column decision `matchRecord`
+/// (below) is composed from, exposed so `window.matchFlags`
+/// (ls_window_match_flags, thin-frontend-shared-core Phase 1) reports the EXACT
+/// same verdict per visible cell — no re-derived grammar, no second matcher.
+///   * TEXT: 1 iff `col` is IN SCOPE (empty scope_mask == all columns) AND the
+///     smart-case substring rule holds; an out-of-scope column is always 0.
+///   * PREDICATE: 1 only on the target `ctx.column` (every other column 0), and
+///     there iff the operator holds — EQ/NE byte-exact, LT/GT/LE/GE the
+///     exact-decimal comparison (a non-numeric cell never matches an ordering
+///     op; the empty value is legal).
+/// Allocation-free; pure over the passed bytes.
+pub fn cellMatches(ctx: MatchCtx, col: u32, cell: []const u8) bool {
     switch (ctx.kind) {
         .text => {
-            var col: u32 = 0;
-            while (col < ctx.column_count) : (col += 1) {
-                if (col >= refs.len) break;
-                if (ctx.scope_mask.len != 0 and !ctx.scope_mask[col]) continue;
-                const ref = refs[col];
-                if (textMatch(buf[ref.start .. ref.start + ref.len], ctx.value, ctx.fold)) return col;
-            }
-            return null;
+            if (ctx.scope_mask.len != 0 and (col >= ctx.scope_mask.len or !ctx.scope_mask[col])) return false;
+            return textMatch(cell, ctx.value, ctx.fold);
         },
         .predicate => {
-            if (ctx.column >= refs.len) return null;
-            const ref = refs[ctx.column];
-            const cell = buf[ref.start .. ref.start + ref.len];
-            const matched = switch (ctx.op) {
+            if (col != ctx.column) return false;
+            return switch (ctx.op) {
                 .eq => std.mem.eql(u8, cell, ctx.value),
                 .ne => !std.mem.eql(u8, cell, ctx.value),
                 .lt, .gt, .le, .ge => blk: {
@@ -415,7 +416,30 @@ pub fn matchRecord(ctx: MatchCtx, buf: []const u8, refs: []const CellRef) ?u32 {
                     };
                 },
             };
-            return if (matched) ctx.column else null;
+        },
+    }
+}
+
+/// Evaluate the matcher on a decoded record. Returns the matched column (lowest
+/// in-scope for TEXT; the predicate column for PREDICATE) or null. `refs` has
+/// exactly `column_count` entries (truncate/pad already applied, == ls_cell).
+/// Composed from the per-cell `cellMatches` decision, so a whole-row match and
+/// a per-cell highlight verdict can never drift apart.
+pub fn matchRecord(ctx: MatchCtx, buf: []const u8, refs: []const CellRef) ?u32 {
+    switch (ctx.kind) {
+        .text => {
+            var col: u32 = 0;
+            while (col < ctx.column_count) : (col += 1) {
+                if (col >= refs.len) break;
+                const ref = refs[col];
+                if (cellMatches(ctx, col, buf[ref.start .. ref.start + ref.len])) return col;
+            }
+            return null;
+        },
+        .predicate => {
+            if (ctx.column >= refs.len) return null;
+            const ref = refs[ctx.column];
+            return if (cellMatches(ctx, ctx.column, buf[ref.start .. ref.start + ref.len])) ctx.column else null;
         },
     }
 }

@@ -334,6 +334,31 @@ public final class CoreDocumentSession: DocumentSession, @unchecked Sendable {
         return RowWindow(firstRow: range.first_row, firstColumn: columns.lowerBound, rows: rows, truncated: truncated, oversized: oversized)
     }
 
+    /// OVERRIDES the RED default (`DocumentSession`'s `[]`-for-everything
+    /// extension): the per-window MATCH FLAGS bridge (ARCH-thin-frontend-
+    /// shared-core Phase 1; `ls_window_match_flags`). Calls the core ONCE for
+    /// the window last set by `setWindow` and copies the borrowed flag bytes
+    /// (1 = matches the active search request, 0 = not; row-major, stride
+    /// `columnCount`, `count == windowRowCount * columnCount`) straight into an
+    /// owned `[UInt8]` — the UTF-8-copy-out discipline of `copyCell(_:)`, so the
+    /// core's window-tied borrow is never held past this call. WINDOW LANE like
+    /// `setWindow` / `ls_cell`: takes the window-lane `lock` (NOT the copy
+    /// `copyBufferLock`), so it is serialized with window materialization —
+    /// exactly the caller contract `ls_window_match_flags` documents. A
+    /// `firstColumn < 0` or `columnCount <= 0` (empty/invalid range) returns
+    /// `[]` without touching the core; larger-than-`UInt32` indices clamp, which
+    /// the core then reports as out of range (the empty buffer). The core
+    /// returns `[]` for IDLE / no window / out-of-range, so those surface as an
+    /// empty array here — no highlights.
+    public func windowMatchFlags(firstColumn: Int, columnCount: Int) -> [UInt8] {
+        guard firstColumn >= 0, columnCount > 0 else { return [] }
+        lock.lock()
+        defer { lock.unlock() }
+        let flags = ls_window_match_flags(doc, UInt32(clamping: firstColumn), UInt32(clamping: columnCount))
+        guard flags.len > 0, let ptr = flags.ptr else { return [] }
+        return [UInt8](UnsafeBufferPointer(start: ptr, count: flags.len))
+    }
+
     /// RACE GUARD (round 5: closes the residual UAF round 4 left — the copy
     /// task's `advanceFrontier` pre-pass calls THIS before ever reaching
     /// `copyCell`). SAME `copyBufferLock` / reasoning as `copyCell`/`close()`

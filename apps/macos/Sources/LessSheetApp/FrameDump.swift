@@ -252,16 +252,23 @@ enum FrameDump {
 
     /// A find scene (ARCH req. 9): the grid (with the search's viewport
     /// highlights) plus the overlay's find popup in a chosen state, rendered
-    /// with the opaque dump chrome. The synthetic `findSession` drives both the
-    /// popup copy and the grid highlights (via the snapshot's CellMatcher).
+    /// with the opaque dump chrome. The synthetic `findSession` drives the popup
+    /// copy AND the strong current-match highlight; the SUBTLE highlights come
+    /// from the CORE's per-window match flags (thin-frontend-shared-core Phase 1
+    /// — the frontend keeps no matcher). The dump snapshot is sessionless, so we
+    /// compute those flags once on the LIVE core (same window) for the scene's
+    /// request and seed them into the snapshot (`seedMatchFlags`).
     @MainActor
     private static func findScene(_ model: DocumentModel, findSession: FindSession, fieldActive: Bool) -> some View {
         let snapshot = DocumentModel.dumpSnapshot(
             from: model, revealed: true, expandedPill: nil, jumpFlow: .idle,
             findSession: findSession, findFieldActive: fieldActive
         )
+        if let request = findSession.display.request {
+            snapshot.seedMatchFlags(model.dumpMatchFlagsMask(for: request))
+        }
         return ZStack(alignment: .bottomTrailing) {
-            DumpGrid(model: snapshot)          // highlights read from snapshot.findSession
+            DumpGrid(model: snapshot)          // subtle highlights from the seeded core mask; strong from findSession
             OverlayView(model: snapshot)
         }
         .environment(\.overlayDumpChrome, true)

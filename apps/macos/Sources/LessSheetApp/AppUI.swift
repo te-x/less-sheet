@@ -624,6 +624,12 @@ struct ContentView: View {
                 // mutation to classify instant vs defer-to-scroll — logs +
                 // terminates itself.
                 RepaintAuditProbe.run(model: model)
+            } else if MatchFlagsFetchProbe.active {
+                // Verification: count real windowMatchFlags ABI fetches across
+                // repaints + a same-geometry content change, proving one fetch
+                // per materialize (AC5) and no stale mask (finding 1) — logs +
+                // terminates itself.
+                MatchFlagsFetchProbe.run(model: model)
             } else if FrameDump.liveGridInitialDumpPath == nil {
                 // Overlay / find / settings / overscroll etc. render off a SwiftUI
                 // mirror here; the plain grid-content scene instead self-captures

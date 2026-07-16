@@ -238,7 +238,6 @@ final class DocumentModel {
     private let findControl = FindControl()
     private let filterControl = FilterControl()
     private let windowPoll = WindowPoll()
-    private let cellMatcher = CellMatcher()
     /// The pure selection geometry, TSV copy builder, and column-width algebra
     /// (ARCH-select-copy) — same layering as the collaborators above.
     private let selectionModel = SelectionModel()
@@ -271,6 +270,38 @@ final class DocumentModel {
     private var cachedLayoutWidths: [Double] = []
     private var cachedTotalVisibleWidth: CGFloat = 0
     private var layoutWidthsStale = true
+    /// The per-window MATCH-FLAGS mask (ARCH-thin-frontend-shared-core Phase 1):
+    /// the highlight verdicts computed by the CORE (`ls_window_match_flags` via
+    /// `DocumentSession.windowMatchFlags`) instead of a frontend matcher — one
+    /// flag byte per materialized cell (1 = the cell matches the active
+    /// find/predicate request, 0 = not; row-major, stride == the fetched column
+    /// width). Fetched ONCE whenever the window geometry or the active request
+    /// changes (`ensureMatchFlagsFresh`), then indexed per cell by every repaint
+    /// (`matchFlag`) — O(viewport), with NO per-cell FFI and NO per-frame
+    /// matching, replacing the deleted-in-round-2 `CellMatcher`'s per-cell
+    /// KMP-per-repaint. `@ObservationIgnored`: a derived cache, not observable
+    /// state — views observe `window` / `findSession.display`, and those changes
+    /// are exactly what invalidate the mask below.
+    @ObservationIgnored private var matchFlagsMask: [UInt8] = []
+    @ObservationIgnored private var matchFlagsKey: MatchFlagsCacheKey?
+    /// Monotonic CONTENT/materialization epoch — the mask cache's window-content
+    /// identity. Window GEOMETRY + request do NOT uniquely determine the visible
+    /// bytes (they also depend on which document/dialect/filter is open), so the
+    /// mask key alone could serve one document's mask over another's rows after a
+    /// same-geometry re-open (or a filter set/clear). This counter is bumped on
+    /// EVERY materialization (`materialize`) and on every content-swap that can
+    /// keep an identical geometry — `adoptSession` (new document) and both filter
+    /// paths (`applyFindAsFilter` / `clearFilter`) — so the key changes on every
+    /// window materialization regardless of geometry (AC5's literal "once per
+    /// window materialization"). `@ObservationIgnored`: pure cache-invalidation
+    /// state, never observed.
+    @ObservationIgnored private var matchFlagsContentGen = 0
+
+    /// Bumps the match-flags content epoch (see `matchFlagsContentGen`). Called
+    /// wherever the visible bytes may change under a possibly-unchanged geometry.
+    private func invalidateMatchFlags() {
+        matchFlagsContentGen &+= 1
+    }
     /// Set on a header on/off re-open (consumed by the grid): how a data-row
     /// index shifts across the re-derivation so the viewport can re-anchor to the
     /// SAME file record. +1 when the header turns OFF (the former header record
@@ -527,6 +558,12 @@ final class DocumentModel {
             self.path = path
             self.columnCount = session.columnCount
             self.dialect = session.dialect
+            // New document identity: a different file/dialect can present the
+            // SAME window geometry (e.g. a re-open at firstRow 0 with a matching
+            // column count), so bump the mask's content epoch — otherwise a stale
+            // key would short-circuit and serve the previous document's mask over
+            // the new rows until a scroll self-healed it.
+            invalidateMatchFlags()
             if session is CoreDocumentSession {
                 // Do not touch the compatibility `headerCells` property here:
                 // it intentionally materializes all labels for legacy callers.
@@ -886,6 +923,12 @@ final class DocumentModel {
         desiredCount = count
         let columns = columnFetchRange()
         window = session.setWindow(firstRow: start, rowCount: count, columns: columns)
+        // A fresh window materialization: the visible bytes just changed (even
+        // when the geometry happens to match the previous window — e.g. a
+        // same-dims document re-open lands here at firstRow 0). Bump the mask's
+        // content epoch so the next highlight refetches (AC5: one fetch per
+        // materialize), never serving the previous window's mask.
+        invalidateMatchFlags()
         refreshWindowLabels(columns: columns)
         growColumnWidthsToFitWindow()
     }
@@ -2415,36 +2458,143 @@ final class DocumentModel {
         landViewport(on: row)
     }
 
-    /// Per-visible-column highlight state for a data row (O(viewport), zero core
-    /// calls — the frontend matcher is pinned byte-identical to the core's). The
-    /// current match is strong; every other matching visible cell is subtle;
-    /// header cells are never passed here (never matched).
+    /// Per-visible-column highlight state for a data row (O(viewport), one core
+    /// mask fetch per materialize/search-change — NEVER per cell). The current
+    /// match is strong; every other matching visible cell is subtle; header
+    /// cells are never passed here (never matched).
     func cellHighlights(forRow row: Int) -> [SheetCellHighlight] {
-        highlights(forRow: row, over: visibleColumns, cells: visibleBodyCells(forRow: row))
+        highlights(forRow: row, over: visibleColumns)
     }
 
     /// The window-bound analog of `cellHighlights` — the live grid's path
     /// (ARCH-column-windowing): O(column window), never O(visible columns).
     func windowCellHighlights(forRow row: Int) -> [SheetCellHighlight] {
-        let cols = windowColumns()
-        return highlights(forRow: row, over: cols, cells: cellsAt(cols, forRow: row))
+        highlights(forRow: row, over: windowColumns())
     }
 
     /// Shared highlight derivation over an explicit (absolute-indexed) column
-    /// list + its already-fetched cell text, so `cellHighlights` /
-    /// `windowCellHighlights` differ only in which columns they cover.
-    private func highlights(forRow row: Int, over columns: [Int], cells: [String]) -> [SheetCellHighlight] {
-        guard let request = findSession.display.request else {
+    /// list. The subtle verdict now comes from the CORE's per-window match
+    /// flags (`ensureMatchFlagsFresh` fetches the mask once per window/search
+    /// change; `matchFlag` indexes it per cell — no frontend matcher), so
+    /// `cellHighlights` / `windowCellHighlights` differ only in which columns
+    /// they cover. The strong current-match highlight stays driven by
+    /// `findSession.display.current` (found_row/found_col), needing no mask.
+    private func highlights(forRow row: Int, over columns: [Int]) -> [SheetCellHighlight] {
+        guard findSession.display.request != nil else {
             return Array(repeating: .none, count: columns.count)
         }
+        ensureMatchFlagsFresh()
         let current = findSession.display.current
-        return columns.enumerated().map { index, column in
-            let text = index < cells.count ? cells[index] : ""
+        return columns.map { column in
             if let current, current.row == UInt64(row), current.column == column {
                 return .strong
             }
-            return cellMatcher.matches(cell: text, column: column, under: request) ? .subtle : .none
+            return matchFlag(row: row, column: column) ? .subtle : .none
         }
+    }
+
+    /// Identity of a cached match-flags mask: the materialized window geometry it
+    /// was fetched for, PLUS the active request, PLUS the content epoch
+    /// (`matchFlagsContentGen`) — the last is what distinguishes two windows that
+    /// share a geometry+request but hold different bytes (a same-dims re-open, a
+    /// filter set/clear). A change in any field means the mask must be refetched
+    /// (Equatable is auto-synthesized).
+    private struct MatchFlagsCacheKey: Equatable {
+        var contentGen: Int
+        var firstRow: UInt64
+        var firstColumn: Int
+        var rowCount: Int
+        var columnCount: Int
+        var request: SearchRequest?
+    }
+
+    /// (Re)fetch the per-window match-flags mask from the core iff the
+    /// materialized window geometry OR the active search request changed since
+    /// the last fetch — exactly ONE `windowMatchFlags` call per
+    /// materialize-or-search-change, never per repaint and never per cell (AC5).
+    /// With no active request (or an empty window / column range) the core
+    /// returns `[]`, so nothing is subtly highlighted. The window-tied borrow is
+    /// copied out inside `windowMatchFlags`, so the cached `[UInt8]` is safe to
+    /// index across later repaints until the next refetch.
+    private func ensureMatchFlagsFresh() {
+        let key = currentMatchFlagsKey()
+        guard key != matchFlagsKey else { return }
+        matchFlagsKey = key
+        if let session, key.request != nil, key.rowCount > 0, key.columnCount > 0 {
+            matchFlagsMask = session.windowMatchFlags(firstColumn: key.firstColumn, columnCount: key.columnCount)
+            matchFlagsFetchCount &+= 1   // instrumentation (MatchFlagsFetchProbe): a REAL ABI fetch
+        } else {
+            matchFlagsMask = []
+        }
+    }
+
+    /// Cumulative count of REAL `windowMatchFlags` ABI fetches (a cache miss in
+    /// `ensureMatchFlagsFresh` that actually hit the core — NOT cache hits, NOT
+    /// the empty no-search branch). Pure instrumentation for `MatchFlagsFetchProbe`
+    /// (the AC5 fetch-cadence lock), mirroring the `copyAdvances` seam — irrelevant
+    /// to any rendered pixel. `@ObservationIgnored`: never observed.
+    @ObservationIgnored private(set) var matchFlagsFetchCount = 0
+
+    /// Reset the fetch counter (probe-only). Inert in normal use.
+    func resetMatchFlagsFetchCount() { matchFlagsFetchCount = 0 }
+
+    /// The cache key for the CURRENT materialized window + active request — the
+    /// geometry the mask is fetched for (`firstColumn`/`columnCount` mirror
+    /// `RowWindow.firstColumn` and the fetched column width). Shared by
+    /// `ensureMatchFlagsFresh` and `seedMatchFlags` so a seeded mask is treated
+    /// as already-fresh (no refetch attempt).
+    private func currentMatchFlagsKey() -> MatchFlagsCacheKey {
+        MatchFlagsCacheKey(
+            contentGen: matchFlagsContentGen,
+            firstRow: window.firstRow,
+            firstColumn: window.firstColumn,
+            rowCount: window.rows.count,
+            columnCount: window.rows.first?.count ?? 0,
+            request: findSession.display.request
+        )
+    }
+
+    /// DUMP/PROBE hook (FrameDump find scenes): seed the match-flags cache with a
+    /// mask computed on a real core session ELSEWHERE, so a SESSIONLESS dump
+    /// snapshot still renders the CORE's subtle highlights (its own
+    /// `windowMatchFlags` returns `[]` with no session). `flags` MUST have been
+    /// fetched for THIS model's current window + `findSession.display.request`
+    /// (`window.firstColumn` × the fetched column width); the seeded key mirrors
+    /// what `ensureMatchFlagsFresh` would compute, so it is treated as fresh.
+    /// Inert in normal use (the live model fetches its own mask).
+    func seedMatchFlags(_ flags: [UInt8]) {
+        matchFlagsMask = flags
+        matchFlagsKey = currentMatchFlagsKey()
+    }
+
+    /// DUMP/PROBE hook (FrameDump find scenes): compute the CORE's per-window
+    /// match-flags mask for `request` over THIS model's already-materialized
+    /// window, keeping `session` private (the sessionless dump snapshot can't
+    /// reach it). Sets `request` active on the session, then reads the flags —
+    /// which come from the active request + the materialized window, NOT the
+    /// match-scan (so no wait). Returns `[]` with no session or empty window.
+    /// This model is a throwaway dump driver; the flags feed `seedMatchFlags`.
+    func dumpMatchFlagsMask(for request: SearchRequest) -> [UInt8] {
+        guard let session else { return [] }
+        _ = session.startSearch(request)
+        let stride = window.rows.first?.count ?? 0
+        return session.windowMatchFlags(firstColumn: window.firstColumn, columnCount: stride)
+    }
+
+    /// The core's SUBTLE-highlight verdict for absolute (`row`, `column`), read
+    /// from the cached mask (`ensureMatchFlagsFresh` must have run this frame).
+    /// Any cell outside the materialized window — or when no mask was fetched
+    /// (no search, empty range) — is `false`. Column-relative mapping mirrors
+    /// `RowWindow.firstColumn`: absolute column `c` sits at slot
+    /// `c - firstColumn` of its row.
+    private func matchFlag(row: Int, column: Int) -> Bool {
+        guard let key = matchFlagsKey, key.columnCount > 0, !matchFlagsMask.isEmpty else { return false }
+        let r = row - Int(key.firstRow)
+        let c = column - key.firstColumn
+        guard r >= 0, r < key.rowCount, c >= 0, c < key.columnCount else { return false }
+        let idx = r * key.columnCount + c
+        guard idx < matchFlagsMask.count else { return false }
+        return matchFlagsMask[idx] == 1
     }
 
     // MARK: - Filter (filtered-views)
@@ -2528,6 +2678,10 @@ final class DocumentModel {
                 return
             }
             filterDocumentRows = capturedDocumentRows
+            // The view now shows FILTERED rows — a content swap that can keep an
+            // identical window geometry, so invalidate the mask epoch directly
+            // (belt-and-suspenders with materialize's own bump on the landing).
+            invalidateMatchFlags()
             cancelWrapNav()
             findSession = findControl.invalidated(findSession)
             searchNavDirection = .forward
@@ -2568,6 +2722,9 @@ final class DocumentModel {
         _ = session.setWindow(firstRow: UInt64(firstVisibleRow), rowCount: 1)
         let anchor = session.sourceRow(UInt64(firstVisibleRow)) ?? 0
         session.clearFilter()
+        // Back to the identity view — another same-geometry-possible content
+        // swap; invalidate the mask epoch (see applyFindAsFilter).
+        invalidateMatchFlags()
         filterSnapshot = nil
         filterDocumentRows = nil
         filterScanStartedAt = nil
@@ -2728,6 +2885,17 @@ final class DocumentModel {
         firstVisibleRow = Int(min(startRow, UInt64(Int.max)))
         lastVisibleCount = 40
         materialize(start: startRow, count: 120)
+    }
+
+    /// Verification-only (MatchFlagsFetchProbe): re-materialize the CURRENT window
+    /// with the SAME first row + row count, so the window geometry is byte-identical
+    /// but a new materialization occurred (the content epoch bumps). Proves a
+    /// same-geometry materialization still refetches the match-flags mask (AC5 /
+    /// Round-2 finding 1 — geometry alone must not gate the cache). Inert in normal
+    /// use. No-op with no session / empty window.
+    func rematerializeSameWindowForProbe() {
+        guard session != nil, !window.rows.isEmpty else { return }
+        materialize(start: window.firstRow, count: window.rows.count)
     }
 
     // MARK: - Polling (off the main actor; stops when idle)

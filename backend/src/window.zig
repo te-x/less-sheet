@@ -16,6 +16,7 @@ const base = @import("base.zig");
 const matcher = @import("matcher.zig");
 const nav = @import("nav.zig");
 const filter = @import("filter.zig");
+const search = @import("search.zig");
 
 const Document = base.Document;
 const Checkpoint = base.Checkpoint;
@@ -80,6 +81,11 @@ fn appendRowMetadata(d: *Document, source_row: u64, pos: Pos, oversized: bool, b
 /// `api.window_row_scan_max_bytes`, so this stays O(min(row bytes, cap) x
 /// rows) regardless of row size (see the materialize loop below).
 pub fn windowSet(d: *Document, first_row: u64, row_count: u32) api.RowRange {
+    // MATERIALIZATION EPOCH bump (thin-frontend-shared-core Phase 1): every
+    // ls_window_set invalidates the match-flags borrow (win_gen keys the memo),
+    // exactly like it invalidates the ls_cell borrow. Window-lane serialized
+    // with matchFlags, so no lock is needed for this counter itself.
+    d.win_gen +%= 1;
     d.window_charged_bytes = 0;
     const clamped: u64 = @min(@as(u64, row_count), @as(u64, api.window_max_rows));
 
@@ -336,23 +342,80 @@ pub fn cell(d: *const Document, row: u64, col: u32) api.Str {
     return .{ .ptr = d.win_buf.items.ptr + ref.start, .len = ref.len };
 }
 
-/// RED SEED (thin-frontend-shared-core Phase 1) — see api/lesssheet.h
-/// `ls_window_match_flags` (MATCH-FLAGS EXTENSION). The real impl computes
-/// ONE flag byte per cell over the materialized window (win_buf/win_refs, the
-/// same CellRefs `cell` above indexes) for the ACTIVE search request — the
-/// matcher.zig per-cell verdict (matchRecord's per-column result) over the
-/// requested column range [first_col, first_col + col_count), row-major,
-/// len == win_rows * col_count — memoized in interior state until the next
-/// window or search change and invalidated by the next windowSet/close.
-/// The seed returns the EMPTY Str, so the `mf*` behavior tests are RED at the
-/// VERDICT level (they expect a win_rows*col_count buffer of 1/0), never at
-/// compile/link. `d` is mutable because the real memoization latches interior
-/// state (like the copy cursor); the seed touches nothing.
+/// See api/lesssheet.h `ls_window_match_flags` (MATCH-FLAGS EXTENSION,
+/// thin-frontend-shared-core Phase 1). ONE flag byte per cell (1 = matches the
+/// ACTIVE search request, 0 = not) over the materialized window's rows x the
+/// requested column range [first_col, first_col + col_count), row-major with
+/// stride col_count and len == win_rows * col_count. The per-cell verdict is
+/// `matcher.cellMatches` — the SAME decision `matchRecord` (and thus ls_search_*)
+/// is composed from — evaluated over the cell bytes AS MATERIALIZED IN THE
+/// WINDOW (win_buf/win_refs, the display-capped bytes `cell` above serves), so
+/// the flags are byte-identical to the core's matcher and never re-derive the
+/// grammar. Empty ls_str when: the column range is empty / out of bounds
+/// (col_count == 0, first_col >= column_count, or the range spills past it),
+/// or the search is IDLE (no highlights). NEVER scans; ZERO heap allocation
+/// beyond the one reused, memoized buffer; never fails.
+///
+/// MEMOIZED & BORROWED like `cell`: the buffer (`d.mf_flags`) is recomputed
+/// lazily only when the window epoch (`win_gen`), the search (`search_gen`), or
+/// the requested column range changed since the last compute; otherwise the
+/// same bytes are returned with no further work. The returned pointer stays
+/// valid until the next windowSet (which bumps win_gen) / ls_close (freeDoc).
+/// The whole read is done under `d.lock()` so the request buffers docCtx
+/// borrows (search_value / scope_mask / failure) can't be freed by a concurrent
+/// ls_search_start mid-compute; win_buf/win_refs are window-lane state the
+/// caller already serializes with this call.
 pub fn matchFlags(d: *Document, first_col: u32, col_count: u32) api.Str {
-    _ = d;
-    _ = first_col;
-    _ = col_count;
-    return empty_str;
+    // Empty / out-of-range column range -> empty ls_str (never fails). Widen to
+    // u64 so first_col + col_count can't wrap.
+    if (col_count == 0 or first_col >= d.column_count or
+        @as(u64, first_col) + @as(u64, col_count) > d.column_count)
+        return empty_str;
+
+    d.lock();
+    defer d.unlock();
+
+    // IDLE (no search since open, or after a reset) -> no highlights.
+    if (d.search_state == .idle) return empty_str;
+    const search_gen = d.search_gen;
+
+    const total: usize = @intCast(d.win_rows * @as(u64, col_count));
+
+    // Memo hit: same window epoch, same search, same requested range.
+    if (!(d.mf_valid and d.mf_win_gen == d.win_gen and d.mf_search_gen == search_gen and
+        d.mf_first_col == first_col and d.mf_col_count == col_count))
+    {
+        d.mf_valid = false; // invalid until fully recomputed (an OOM leaves it so)
+        d.mf_flags.clearRetainingCapacity();
+        d.mf_flags.ensureTotalCapacity(d.gpa, total) catch return empty_str;
+        d.mf_flags.items.len = total;
+
+        const ctx = search.docCtx(d);
+        var wr: u64 = 0;
+        while (wr < d.win_rows) : (wr += 1) {
+            var c: u32 = 0;
+            while (c < col_count) : (c += 1) {
+                const col = first_col + c;
+                const src_idx = wr * d.column_count + col;
+                var verdict: u8 = 0;
+                if (src_idx < d.win_refs.items.len) {
+                    const ref = d.win_refs.items[@intCast(src_idx)];
+                    if (matcher.cellMatches(ctx, col, d.win_buf.items[ref.start .. ref.start + ref.len]))
+                        verdict = 1;
+                }
+                d.mf_flags.items[@intCast(wr * @as(u64, col_count) + c)] = verdict;
+            }
+        }
+
+        d.mf_valid = true;
+        d.mf_win_gen = d.win_gen;
+        d.mf_search_gen = search_gen;
+        d.mf_first_col = first_col;
+        d.mf_col_count = col_count;
+    }
+
+    if (d.mf_flags.items.len == 0) return empty_str;
+    return .{ .ptr = d.mf_flags.items.ptr, .len = d.mf_flags.items.len };
 }
 
 /// See api/lesssheet.h `ls_header_cell`. Zero allocation; total function.
