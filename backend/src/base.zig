@@ -417,6 +417,14 @@ pub const Document = struct {
     copy_cursor_source_row: u64 = 0,
     copy_cursor_block_consumed: u64 = 0,
 
+    // --- Streaming-copy cap test seam (thin-frontend-shared-core Phase 2) ----
+    // DEFAULTED (like copy_cursor_* above), so openWithAllocator's literal is
+    // undisturbed. 0 == the natural LS_COPY_MAX_CELLS (api.copy_max_cells); a
+    // Zig-only test seam (copyCapCellsForTest) forces a small value so the
+    // ls_copy_* budget_capped behavior is testable without a 10M-cell fixture.
+    // Read only by the ls_copy_* job path; never crosses the C ABI.
+    copy_cap_cells: u64 = 0,
+
     // --- Match-flags memo (thin-frontend-shared-core Phase 1) ----------------
     // One flag byte per visible cell (1 = matches the active search request,
     // 0 = not), row-major over the materialized window x the requested column

@@ -78,8 +78,16 @@ struct AmendmentContractGuardTests {
         // ls_net_*). Updated by the planner through the change-authority process,
         // exactly as this guard's contract provides for an architect-approved
         // header amendment.
+        // Baseline re-bumped for the ARCH-thin-frontend-shared-core Phase 2
+        // amendment: ONE additive appended block (the STREAMING COPY EXTENSION —
+        // LS_COPY_MAX_CELLS + ls_copy_rect / ls_copy_step / ls_copy_progress /
+        // ls_copy_job + ls_copy_open / ls_copy_next / ls_copy_close), with struct /
+        // enum / signature / constant / prototype LAYOUT above it (incl. the Phase 1
+        // MATCH-FLAGS EXTENSION) BYTE-IDENTICAL (verified by the root planner: the
+        // only change is the appended block). Updated through the change-authority
+        // process, exactly as this guard provides for an approved header amendment.
         expectEmptyDiff("api/lesssheet.h",
-                        baseline: "3bb7263307aa6ed86ee9bcb6b0494c047c2c45277349c71ea2b2772d62f6aae6")
+                        baseline: "e4854551fc91c8d46254a7ef956633d01b706b3dee76760da6b1d08d666c4ab2")
     }
 
     // AC23 — the public Swift search/layout contracts are byte-identical:

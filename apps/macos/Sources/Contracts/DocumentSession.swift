@@ -272,6 +272,22 @@ public protocol DocumentSession: AnyObject, Sendable {
     /// array — with NO matcher of its own.
     func windowMatchFlags(firstColumn: Int, columnCount: Int) -> [UInt8]
 
+    /// Open a pull-model STREAMING TSV COPY of the rectangular selection `rect`
+    /// (ARCH-thin-frontend-shared-core Phase 2; mirrors `ls_copy_open`). The CORE
+    /// frames the TSV — TAB/LF separators, spreadsheet quoting, the single-cell raw
+    /// special-case, lossless cells — BYTE-IDENTICAL to the deleted `TSVCopyBuilder`,
+    /// so the frontend copies a selection with NO per-cell FFI, NO main-thread stall,
+    /// and NO TSV logic of its own. The frontend drives the returned `CopyStreaming`
+    /// OFF the main thread (append `step.bytes`, handle `.stalled` via
+    /// `startJump(to:)`, report progress from `rowsDone`, read `budgetCapped` on
+    /// `.done`) and `close`s it EXACTLY ONCE (cancel = stop + close). `rect` rows are
+    /// VIEW-relative (FILTERED indices while a filter is active); columns are physical
+    /// indices. Returns nil ONLY if the job handle couldn't be allocated. ADDITIVE:
+    /// the RED default below returns nil (nothing copies) so existing conformers
+    /// compile; the real conformer OVERRIDES it to open an `ls_copy_*` job wrapped as
+    /// a `CopyStreaming`.
+    func openCopy(_ rect: SelectionRect) -> (any CopyStreaming)?
+
     /// Release the core handle. Idempotent; nothing else may be called
     /// afterwards.
     func close()
@@ -317,6 +333,17 @@ public extension DocumentSession {
     /// `[]`) to GREEN (the real per-cell verdicts, byte-identical to the
     /// deleted CellMatcher).
     func windowMatchFlags(firstColumn: Int, columnCount: Int) -> [UInt8] { [] }
+
+    /// DEFAULT (RED seed) for the streaming copy: returns nil, so NOTHING copies
+    /// through it. Keeps existing conformers compiling before the bridge lands
+    /// (`openCopy` is a PROTOCOL REQUIREMENT — declared in the body above, not only
+    /// here — so a real override is dispatched through `any DocumentSession` via the
+    /// witness table). A conformer wires copy to the core by OVERRIDING this to open
+    /// an `ls_copy_open` job wrapped as a `CopyStreaming` (driving `ls_copy_next` /
+    /// `ls_copy_close`), which flips the golden streaming-copy bridge test from RED
+    /// (this default: nil) to GREEN (the real core-framed TSV, byte-identical to the
+    /// deleted `TSVCopyBuilder`).
+    func openCopy(_ rect: SelectionRect) -> (any CopyStreaming)? { nil }
 }
 
 /// Opens document sessions through the core's C ABI. This is the ONLY entry

@@ -2231,6 +2231,189 @@ void ls_net_open_release(ls_net_open_job *job);
  */
 ls_str ls_window_match_flags(const ls_doc *doc, uint32_t first_col, uint32_t col_count);
 
+/* =========================================================================
+ * STREAMING COPY EXTENSION (thin-frontend-shared-core slice, Phase 2) — ADDITIVE
+ * =========================================================================
+ * (thin-frontend-shared-core slice — ONE additive, core-framed streaming TSV
+ * COPY JOB family; struct / enum / signature / constant / prototype LAYOUT
+ * above this block — including the Phase 1 MATCH-FLAGS EXTENSION — is
+ * BYTE-IDENTICAL to every prior revision of this header. Two-key root-planner
+ * freeze; the author's sign-off relayed 2026-07-15. See
+ * docs/architecture/ARCH-thin-frontend-shared-core.md, Phase 2. The Phase 1
+ * MATCH-FLAGS EXTENSION and the LS_BYTES_TOTAL_UNKNOWN amendment above are the
+ * additive-amendment precedents.)
+ *
+ * This block adds ONE constant (LS_COPY_MAX_CELLS), THREE types (ls_copy_rect,
+ * ls_copy_step, ls_copy_progress), ONE opaque handle (ls_copy_job), and THREE
+ * function prototypes (ls_copy_open / ls_copy_next / ls_copy_close). It adds NO
+ * field to and changes NO existing symbol's shape, value, allocation behavior,
+ * threading lane, or borrow lifetime, so a client compiled against any prior
+ * header links and behaves identically. (NOTE: the ls_copy_* job family is
+ * distinct from the pre-existing ls_copy_result enum of ls_cell_copy — the names
+ * share the ls_copy_ prefix but no symbol or enumerator collides.)
+ *
+ * WHY. Selection copy today is O(document) PER-CELL FFI: a frontend calls
+ * ls_cell_copy once per selected cell and frames the TSV (TAB/LF, spreadsheet
+ * quoting, the single-cell raw special-case) itself. Because each ls_cell_copy
+ * re-locates its row independently, a 100k x 3 copy was measured at ~80 s
+ * off-main; and every frontend re-implements the fiddly quoting. This job family
+ * hands the frontend a core-framed TSV byte stream over a demand-served
+ * rectangle — the core owns the framing (byte-identical to the deleted
+ * TSVCopyBuilder), the sweep reuses the O(1) forward copy cursor already behind
+ * ls_cell_copy, and every future frontend reuses the one implementation with no
+ * per-cell round-trip and no main-thread stall.
+ */
+
+/*
+ * Overall SAFETY CAP for one streaming copy job: the maximum number of selection
+ * CELLS the core will emit before it stops the sweep and reports the copy as
+ * capped (LS_COPY_STEP_DONE with budget_capped true — see ls_copy_progress).
+ * This bounds a pathological huge selection (e.g. a whole-document Cmd+A over a
+ * billion rows) inside the core, INDEPENDENT of how many bytes those cells hold;
+ * it mirrors the cell-count safety cap the deleted TSVCopyBuilder enforced
+ * (CopyBudget.standard.maxCells). It is the ONE core-side ceiling: the total
+ * OUTPUT bytes are bounded by the CALLER (it chooses when to stop pulling and
+ * close — see ls_copy_next), never by the core. A selection with at most this
+ * many cells is never capped (budget_capped false on DONE).
+ */
+#define LS_COPY_MAX_CELLS (10000000)
+
+/*
+ * The rectangular selection to serialize. Rows are 0-based, 64-bit,
+ * VIEW-RELATIVE (FILTERED indices while a filter is active — the same
+ * coordinates as ls_window_set / ls_cell); columns are 0-based PHYSICAL column
+ * indices. Half-open in both axes: rows [first_row, first_row + row_count),
+ * columns [first_col, first_col + col_count). An empty rect (row_count == 0 or
+ * col_count == 0) is valid and steps straight to LS_COPY_STEP_DONE with 0 bytes.
+ * The struct is copied by ls_copy_open; the caller keeps ownership.
+ */
+typedef struct ls_copy_rect {
+    uint64_t first_row;   /* view-relative, filtered-aware (like ls_window_set) */
+    uint64_t row_count;
+    uint32_t first_col;   /* physical column index */
+    uint32_t col_count;
+} ls_copy_rect;
+
+/*
+ * The outcome of one ls_copy_next pull. Distinct, stable values.
+ */
+typedef enum ls_copy_step {
+    LS_COPY_STEP_MORE    = 0, /* wrote *written bytes; more chunks remain — call again */
+    LS_COPY_STEP_DONE    = 1, /* wrote the final *written bytes; the selection is complete */
+    LS_COPY_STEP_STALLED = 2, /* next row is at/beyond the frontier; nothing written — advance the
+                               * frontier (ls_jump_start to stalled_row) and retry */
+} ls_copy_step;
+
+/*
+ * Progress returned by ls_copy_next. `written` is the bytes framed into the
+ * caller's buf this call (0 on STALLED, and 0 is also legal on DONE for an empty
+ * or fully-capped selection). `rows_done` is the cumulative count of selection
+ * rows FULLY emitted so far — monotone non-decreasing across a job's lifetime —
+ * so a frontend renders progress as rows_done / rect.row_count. `stalled_row` is
+ * meaningful only on STALLED (the VIEW row to advance the frontier to before
+ * retrying; 0 otherwise). `budget_capped` is meaningful only on DONE: true iff
+ * the core's LS_COPY_MAX_CELLS safety cap cut the selection short (mirrors the
+ * deleted TSVCopyBuilder's cap; false for any selection that completed in full).
+ */
+typedef struct ls_copy_progress {
+    ls_copy_step step;
+    size_t   written;      /* bytes written into buf this call (<= buf_len) */
+    uint64_t rows_done;    /* cumulative selection rows fully emitted (monotone) — progress =
+                            * rows_done / rect.row_count */
+    uint64_t stalled_row;  /* on STALLED: the view row to jump to; 0 otherwise */
+    bool     budget_capped;/* on DONE: true iff the core's safety cap cut the selection short
+                            * (mirrors the deleted TSVCopyBuilder cap) */
+} ls_copy_progress;
+
+/*
+ * Opaque streaming-copy job handle: one in-progress pull-model TSV
+ * serialization of an ls_copy_rect. Core-owned; released exactly once by
+ * ls_copy_close. Holds NO background thread — it is a cursor driven entirely by
+ * the caller's ls_copy_next calls (see THREADING for concurrency).
+ */
+typedef struct ls_copy_job ls_copy_job;
+
+/*
+ * Open a pull-model streaming TSV serialization of `rect` over `doc`. Validates
+ * synchronously: an out-of-range column range (first_col + col_count >
+ * ls_column_count(doc)) makes the job step DONE with 0 bytes (nothing to
+ * serialize), and an empty rect (see ls_copy_rect) is likewise a valid job that
+ * steps DONE with 0 bytes. Returns a handle immediately (no scan, no file read),
+ * or NULL ONLY if the handle itself could not be allocated. `rect` is COPIED;
+ * the caller keeps ownership of it. The caller MUST call ls_copy_close exactly
+ * once.
+ *
+ * The job serializes in the coordinate space in effect at OPEN (the identity
+ * view, or the active filter's FILTERED coordinates). Setting/clearing a filter
+ * or re-opening the document changes that space; a caller that changes the view
+ * mid-copy should close the job and open a fresh one.
+ */
+ls_copy_job *ls_copy_open(const ls_doc *doc, const ls_copy_rect *rect);
+
+/*
+ * Frame the next TSV chunk of the job into the caller's buffer and return
+ * progress. Writes at most `buf_len` bytes to `buf`. A chunk normally ends at a
+ * field/row BOUNDARY (after a complete field or row); the SOLE exception is a
+ * single field longer than `buf_len`, which is split across successive chunks at
+ * a UTF-8 CODE-POINT boundary (a code point is NEVER split). Either way the
+ * chunks of successive calls CONCATENATE, byte-for-byte, into one well-formed TSV
+ * payload. `buf` may be NULL only when `buf_len` is 0. The caller OWNS `buf`:
+ * ls_copy_next COPIES into
+ * it (this is NOT a borrow — the bytes have no tie to the ls_str eviction rule
+ * and survive any later ls_window_set on any thread).
+ *
+ * THE FRAMING (core-owned; BYTE-IDENTICAL to the deleted TSVCopyBuilder, pinned
+ * by the existing copy fixtures):
+ *   - Fields in a row are separated by a TAB (0x09); rows are separated by a LF
+ *     (0x0A); there is NO trailing separator after the final row.
+ *   - SPREADSHEET QUOTING: a cell whose content contains a TAB, CR (0x0D), LF,
+ *     or a double-quote (0x22) is wrapped in double-quotes with every interior
+ *     double-quote DOUBLED; any other cell is emitted raw.
+ *   - SINGLE-CELL RAW: a 1x1 rect (row_count == 1 AND col_count == 1) emits the
+ *     cell's raw content verbatim — NEVER quoted, no trailing LF.
+ *   - Cells are read LOSSLESSLY: the COMPLETE transcoded cell content, WITHOUT
+ *     the LS_CELL_MAX_BYTES display cap ls_cell applies (exactly as ls_cell_copy
+ *     reads it), with the column-count truncate/pad rule (a missing cell of a
+ *     ragged record is the empty string). An OVERSIZED row (source extent past
+ *     LS_WINDOW_ROW_SCAN_MAX_BYTES) is served as the same bounded prefix
+ *     ls_cell_copy serves.
+ *
+ * PROGRESS & STEP (see ls_copy_progress):
+ *   - LS_COPY_STEP_MORE: `written` bytes were framed; more chunks remain — call
+ *     again. `rows_done` reflects rows fully emitted so far.
+ *   - LS_COPY_STEP_DONE: the final `written` bytes were framed and the selection
+ *     is complete (or was cut by the LS_COPY_MAX_CELLS cap — then `budget_capped`
+ *     is true). Do not call ls_copy_next again; call ls_copy_close.
+ *   - LS_COPY_STEP_STALLED: the next selection row is AT/BEYOND the scan frontier
+ *     (not yet servable), so NOTHING was written this call and `stalled_row` is
+ *     that row. Advance the frontier over it (ls_jump_start(doc, stalled_row),
+ *     await LS_JUMP_DONE) and call ls_copy_next again to resume — the same
+ *     servability model as ls_cell_copy's LS_COPY_PENDING. The job reads the
+ *     document's shared frontier; the job itself NEVER scans and never advances
+ *     the frontier.
+ *
+ * SINGLE-CONSUMER: do not call ls_copy_next concurrently on one job. See
+ * THREADING (ls_copy_close) for cross-job / cross-lane concurrency.
+ */
+ls_copy_progress ls_copy_next(ls_copy_job *job, uint8_t *buf, size_t buf_len);
+
+/*
+ * Release the job (call EXACTLY ONCE; the handle is invalid afterwards). CANCEL
+ * is simply "stop calling ls_copy_next, then ls_copy_close": the job holds no
+ * background thread, so there is nothing to join and a cancel costs nothing. It
+ * is safe against a concurrent ls_close on the same document under the same
+ * poll/control-lane discipline as ls_cell_copy / the jump lane.
+ *
+ * THREADING: the whole job family is poll/control lane — safe from ANY thread at
+ * any time (a large copy runs on a background worker while the window lane
+ * scrolls on another thread and background scans advance), EXCEPT concurrently
+ * with ls_open / ls_close on the same document. ls_copy_next COPIES into the
+ * caller's buffer (no borrow), which is what frees a copy from the window-lane
+ * eviction rule. A job is SINGLE-CONSUMER (one thread drives its ls_copy_next /
+ * ls_copy_close at a time).
+ */
+void ls_copy_close(ls_copy_job *job);
+
 #ifdef __cplusplus
 }
 #endif

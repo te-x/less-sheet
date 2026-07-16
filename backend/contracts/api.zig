@@ -1387,3 +1387,98 @@ comptime {
     if (@TypeOf(core.ls_window_match_flags) != fn (*const Doc, u32, u32) callconv(.c) Str)
         @compileError("signature drift: ls_window_match_flags");
 }
+
+
+// ===========================================================================
+// thin-frontend-shared-core slice — Phase 2 (ARCH-thin-frontend-shared-core).
+// ADDITIVE: the core-framed streaming TSV COPY JOB family. Mirrors the appended
+// api/lesssheet.h "STREAMING COPY EXTENSION" block EXACTLY (ONE constant, THREE
+// types, ONE opaque handle, THREE C-ABI entry points). Everything above --
+// including the Phase 1 MATCH-FLAGS EXTENSION -- is byte-identical. Planner-owned;
+// amended only with the C header. The observable framing (byte-identical to the
+// deleted TSVCopyBuilder) is pinned by the `cp*` behavior tests (backend) + the
+// macOS golden bridge test; the impl lives in src/ (root.zig + the sweep reusing
+// window.zig's forward copy cursor behind ls_cell_copy).
+//
+// NOTE: the ls_copy_* / Copy* job family is DISTINCT from the pre-existing
+// CopyResult enum (ls_cell_copy's result) -- the names share a prefix but no
+// symbol collides.
+// ===========================================================================
+
+/// Mirrors `ls_copy_rect`: the rectangular selection to serialize. Rows are
+/// 0-based, view-relative (FILTERED indices while a filter is active, like
+/// ls_window_set); columns are 0-based physical column indices; half-open in
+/// both axes. Copied by ls_copy_open; the caller keeps ownership.
+pub const CopyRect = extern struct {
+    first_row: u64,
+    row_count: u64,
+    first_col: u32,
+    col_count: u32,
+};
+
+/// Mirrors `ls_copy_step`: the outcome of one ls_copy_next pull. Distinct,
+/// stable values.
+///   more    -- wrote `written` bytes; more chunks remain (call again).
+///   done    -- wrote the final `written` bytes; selection complete
+///              (budget_capped says whether LS_COPY_MAX_CELLS cut it short).
+///   stalled -- next row is at/beyond the frontier; nothing written; advance the
+///              frontier (ls_jump_start to stalled_row) and retry.
+pub const CopyStep = enum(c_int) {
+    more = 0,
+    done = 1,
+    stalled = 2,
+};
+
+/// Mirrors `ls_copy_progress`: the progress ls_copy_next returns. Field order
+/// matches the C struct exactly.
+pub const CopyProgress = extern struct {
+    step: CopyStep,
+    written: usize,
+    rows_done: u64,
+    stalled_row: u64,
+    budget_capped: bool,
+};
+
+/// Mirrors `ls_copy_job`: opaque streaming-copy job handle, core-owned, released
+/// exactly once by ls_copy_close. Holds no background thread.
+pub const CopyJob = opaque {};
+
+/// Mirrors LS_COPY_MAX_CELLS: the per-job overall SAFETY CAP -- the max selection
+/// CELLS the core emits before it stops and reports budget_capped on DONE
+/// (mirrors the deleted TSVCopyBuilder's CopyBudget.standard.maxCells). The ONE
+/// core-side ceiling; total OUTPUT bytes are bounded by the caller (when it stops
+/// pulling + closes), never by the core.
+pub const copy_max_cells: u64 = 10_000_000;
+
+/// C ABI -- open a pull-model streaming TSV serialization of `rect` over `doc`
+/// (validates synchronously; returns a handle, or null only on handle-alloc
+/// failure; rect is copied). See api/lesssheet.h "STREAMING COPY EXTENSION".
+pub const ls_copy_open = core.ls_copy_open;
+
+/// C ABI -- frame the next TSV chunk into the caller's buffer (cut at a field/row
+/// boundary, never a split code point; COPIES, no borrow) and return progress.
+/// Framing is byte-identical to the deleted TSVCopyBuilder; STALLED when the next
+/// row is at/beyond the frontier. See api/lesssheet.h.
+pub const ls_copy_next = core.ls_copy_next;
+
+/// C ABI -- release the job (exactly once). Cancel = stop calling next + close;
+/// no background thread to join. See api/lesssheet.h.
+pub const ls_copy_close = core.ls_copy_close;
+
+/// Zig-only test seam (NOT the C ABI -- like copyCursorSetEnabled): force the
+/// per-job cell SAFETY CAP to `cells` (0 == the natural copy_max_cells) so the
+/// budget_capped behavior is testable without a 10M-cell fixture. api/lesssheet.h
+/// stays byte-identical (no new C symbol).
+pub const copyCapCellsForTest = core.copyCapCellsForTest;
+
+comptime {
+    if (@TypeOf(core.ls_copy_open) != fn (*const Doc, *const CopyRect) callconv(.c) ?*CopyJob)
+        @compileError("signature drift: ls_copy_open");
+    if (@TypeOf(core.ls_copy_next) != fn (*CopyJob, ?[*]u8, usize) callconv(.c) CopyProgress)
+        @compileError("signature drift: ls_copy_next");
+    if (@TypeOf(core.ls_copy_close) != fn (*CopyJob) callconv(.c) void)
+        @compileError("signature drift: ls_copy_close");
+    // Zig-only test seam (NOT C ABI -- no callconv).
+    if (@TypeOf(core.copyCapCellsForTest) != fn (*Doc, u64) void)
+        @compileError("signature drift: copyCapCellsForTest");
+}

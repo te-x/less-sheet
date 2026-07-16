@@ -7852,3 +7852,364 @@ test "mf8: AC1 a filter changes WHICH rows the window holds, not the per-cell ve
         0, 0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 1,
     }, matchFlags(od.doc, 0, 3));
 }
+
+// ===========================================================================
+// thin-frontend-shared-core slice — Phase 2 (ARCH-thin-frontend-shared-core).
+// cp1..cp_perf: the core-framed streaming TSV COPY JOB (ls_copy_open /
+// ls_copy_next / ls_copy_close). The concatenated ls_copy_next chunks must be
+// BYTE-IDENTICAL to the deleted frontend TSVCopyBuilder — TAB (0x09) field
+// separators, LF (0x0A) row separators, NO trailing separator, spreadsheet
+// quoting (quote a cell containing TAB/CR/LF/quote; double interior quotes), the
+// single-cell raw special-case, lossless cells (no LS_CELL_MAX_BYTES display
+// cap), and the LS_COPY_MAX_CELLS safety cap reported via budget_capped. Tests
+// exercise the PUBLIC C ABI (@import("api")) plus the Zig-only cap seam
+// (copyCapCellsForTest — NOT the C ABI, like copyAdvances), so api/lesssheet.h is
+// byte-identical.
+//
+// SEED: ls_copy_next reports DONE with 0 bytes -> the framing / STALLED /
+// rows_done / budget_capped / advance-count behaviors are RED (empty output,
+// never stalls, rows_done 0, never capped, 0 advances); the lifecycle hygiene
+// (empty/out-of-range rects DONE-0, cancel/drain leak nothing) + the ABI link /
+// enum-value pins are GREEN-by-construction. RED -> GREEN: the implementer builds
+// the row-major sweep + TSV framing here, reusing window.zig's forward COPY
+// CURSOR (behind ls_cell_copy).
+// ===========================================================================
+
+const CopyDrive = struct {
+    bytes: std.ArrayList(u8),
+    steps: usize, // number of MORE chunks
+    stalls: usize, // number of STALLED steps handled (via a jump)
+    rows_done: u64, // last reported rows_done (its value at DONE)
+    monotone: bool, // rows_done never regressed across the stream
+    boundary_ok: bool, // every chunk's `written` <= buf_len; STALLED wrote 0
+    budget_capped: bool, // budget_capped reported on DONE
+
+    fn deinit(self: *CopyDrive, gpa: std.mem.Allocator) void {
+        self.bytes.deinit(gpa);
+    }
+};
+
+fn copyRect(first_row: u64, row_count: u64, first_col: u32, col_count: u32) api.CopyRect {
+    return .{ .first_row = first_row, .row_count = row_count, .first_col = first_col, .col_count = col_count };
+}
+
+/// Drive a WHOLE streaming copy of `sel` in `buf_len`-byte chunks, advancing the
+/// shared frontier (public ls_jump_start) on STALLED and retrying, until DONE.
+/// Accumulates the framed TSV bytes and records the streaming invariants.
+fn driveCopy(gpa: std.mem.Allocator, doc: *api.Doc, sel: api.CopyRect, buf_len: usize) !CopyDrive {
+    const rr = sel;
+    const job = api.ls_copy_open(doc, &rr) orelse return error.CopyOpenFailed;
+    defer api.ls_copy_close(job);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    const buf = try gpa.alloc(u8, buf_len);
+    defer gpa.free(buf);
+
+    var steps: usize = 0;
+    var stalls: usize = 0;
+    var last: u64 = 0;
+    var monotone = true;
+    var boundary_ok = true;
+    var capped = false;
+    var guard: usize = 0;
+    while (true) {
+        guard += 1;
+        if (guard > 10_000_000) return error.CopyRunaway;
+        const p = api.ls_copy_next(job, buf.ptr, buf.len);
+        if (p.rows_done < last) monotone = false;
+        last = p.rows_done;
+        switch (p.step) {
+            .more => {
+                steps += 1;
+                if (p.written > buf.len) boundary_ok = false;
+                try out.appendSlice(gpa, buf[0..p.written]);
+            },
+            .done => {
+                if (p.written > buf.len) boundary_ok = false;
+                try out.appendSlice(gpa, buf[0..p.written]);
+                capped = p.budget_capped;
+                break;
+            },
+            .stalled => {
+                stalls += 1;
+                if (p.written != 0) boundary_ok = false;
+                api.ls_jump_start(doc, p.stalled_row);
+                _ = try waitJumpDone(doc);
+            },
+        }
+    }
+    return .{ .bytes = out, .steps = steps, .stalls = stalls, .rows_done = last, .monotone = monotone, .boundary_ok = boundary_ok, .budget_capped = capped };
+}
+
+// The full fv_fixture copy, row-major, TSV-framed (TSVCopyBuilder rules). No cell
+// contains TAB/CR/LF/quote, so every cell is raw; row 6's empty name is a leading
+// empty field; no trailing newline. This is ALSO the macOS bridge test's golden
+// (find.csv == fv_fixture, byte-for-byte).
+const fv_full_tsv =
+    "Widget\t2\talpha needle\n" ++
+    "NEEDLE\t10\tbeta\n" ++
+    "needle\t2.0\tgamma\n" ++
+    "gadget\t-3\tNeedle point\n" ++
+    "Gizmo\t1e2\tdelta\n" ++
+    "café\t0.5\tCAFÉ\n" ++
+    "\t5.\tneedleneedle\n" ++
+    "plain\tabc\tend needle";
+
+// Quoting fixture (== apps/macos .../Fixtures/copyquote.csv): header on (c1,c2
+// non-numeric); data row 0 col0 has a literal TAB, col1 a literal double-quote;
+// data row 1 col0 is a quoted field with an embedded LF. Each special cell must
+// be spreadsheet-quoted on copy.
+const cp_quote_fixture = "c1,c2\na\tb,x\"y\n\"p\nq\",plain\n";
+const cp_quote_opts: api.OpenOptions = .{ .separator = ',', .header = api.header_on, .index_mode = api.index_manual };
+
+test "cp1: AC1 TSV framing byte-identical to TSVCopyBuilder — plain cells, empty cell, single-cell raw, column sub-window" {
+    const gpa = std.testing.allocator;
+    var od = try openBytes(fv_fixture); // MANUAL; <= head budget -> fully indexed, every row servable
+    defer od.deinit();
+
+    // Full 8x3 selection in one big chunk.
+    {
+        var d = try driveCopy(gpa, od.doc, copyRect(0, 8, 0, 3), 1 << 16);
+        defer d.deinit(gpa);
+        try std.testing.expectEqualStrings(fv_full_tsv, d.bytes.items);
+        try std.testing.expectEqual(@as(u64, 8), d.rows_done);
+        try std.testing.expect(d.monotone and d.boundary_ok and !d.budget_capped);
+    }
+    // Single cell (row 0, col 0) -> RAW value, no newline, no quoting.
+    {
+        var d = try driveCopy(gpa, od.doc, copyRect(0, 1, 0, 1), 1 << 16);
+        defer d.deinit(gpa);
+        try std.testing.expectEqualStrings("Widget", d.bytes.items);
+    }
+    // Single EMPTY cell (row 6, col 0 == "") -> empty output.
+    {
+        var d = try driveCopy(gpa, od.doc, copyRect(6, 1, 0, 1), 1 << 16);
+        defer d.deinit(gpa);
+        try std.testing.expectEqualStrings("", d.bytes.items);
+    }
+    // The empty cell inside a MULTI-cell row is a leading empty field.
+    {
+        var d = try driveCopy(gpa, od.doc, copyRect(6, 1, 0, 3), 1 << 16);
+        defer d.deinit(gpa);
+        try std.testing.expectEqualStrings("\t5.\tneedleneedle", d.bytes.items);
+    }
+    // Column sub-window: qty column only (col 1), rows 0..2 -> multi-row single col.
+    {
+        var d = try driveCopy(gpa, od.doc, copyRect(0, 3, 1, 1), 1 << 16);
+        defer d.deinit(gpa);
+        try std.testing.expectEqualStrings("2\n10\n2.0", d.bytes.items);
+    }
+}
+
+test "cp2: AC1 spreadsheet quoting (TAB / quote / embedded-newline cells); single-cell raw bypasses quoting" {
+    const gpa = std.testing.allocator;
+    var od = try openWith(cp_quote_fixture, cp_quote_opts);
+    defer od.deinit();
+    try expectDims(od.doc, 2, 2);
+
+    // Full 2x2: each special cell quoted (interior quote doubled), plain raw.
+    {
+        var d = try driveCopy(gpa, od.doc, copyRect(0, 2, 0, 2), 1 << 16);
+        defer d.deinit(gpa);
+        try std.testing.expectEqualStrings("\"a\tb\"\t\"x\"\"y\"\n\"p\nq\"\tplain", d.bytes.items);
+    }
+    // The SAME tab-containing cell as a SINGLE-cell copy is RAW (never quoted).
+    {
+        var d = try driveCopy(gpa, od.doc, copyRect(0, 1, 0, 1), 1 << 16);
+        defer d.deinit(gpa);
+        try std.testing.expectEqualStrings("a\tb", d.bytes.items);
+    }
+}
+
+test "cp3: AC1 lossless (cell past the 4 KiB display cap read WHOLE) + AC3 tiny-buffer chunks concatenate identically" {
+    const gpa = std.testing.allocator;
+    // A first cell of 5000 'A' (> LS_CELL_MAX_BYTES 4096), then a 2nd column.
+    var fx: std.ArrayList(u8) = .empty;
+    defer fx.deinit(gpa);
+    try fx.appendSlice(gpa, "h1,h2\n");
+    var i: usize = 0;
+    while (i < 5000) : (i += 1) try fx.append(gpa, 'A');
+    try fx.appendSlice(gpa, ",tail\n");
+    var od = try openWith(fx.items, .{ .separator = ',', .header = api.header_on, .index_mode = api.index_manual });
+    defer od.deinit();
+    try expectDims(od.doc, 1, 2);
+
+    // Expected TSV = <5000 A> \t tail (lossless: the full cell, NOT capped at 4096).
+    var expected: std.ArrayList(u8) = .empty;
+    defer expected.deinit(gpa);
+    i = 0;
+    while (i < 5000) : (i += 1) try expected.append(gpa, 'A');
+    try expected.appendSlice(gpa, "\ttail");
+
+    // Big buffer: whole selection in one shot.
+    var big = try driveCopy(gpa, od.doc, copyRect(0, 1, 0, 2), 1 << 16);
+    defer big.deinit(gpa);
+    try std.testing.expectEqualStrings(expected.items, big.bytes.items);
+
+    // Tiny buffer forces the oversized field to split across chunks (at code-point
+    // boundaries): the concatenation is byte-identical, and no chunk exceeds buf_len.
+    var small = try driveCopy(gpa, od.doc, copyRect(0, 1, 0, 2), 64);
+    defer small.deinit(gpa);
+    try std.testing.expectEqualStrings(expected.items, small.bytes.items);
+    try std.testing.expect(small.boundary_ok);
+}
+
+test "cp4: AC3 streaming — tiny-buffer chunks concatenate byte-identical; rows_done monotone to rect.row_count" {
+    const gpa = std.testing.allocator;
+    const n: u64 = 5000; // 5000*18 = 90 KB <= head budget -> fully indexed at open
+    const fixture = try genFixedRows(gpa, n);
+    defer gpa.free(fixture);
+    var od = try openBytes(fixture);
+    defer od.deinit();
+    try expectDims(od.doc, n, 2);
+
+    // Reference expected TSV, built from the known fixed cells.
+    var expected: std.ArrayList(u8) = .empty;
+    defer expected.deinit(gpa);
+    var b0: [8]u8 = undefined;
+    var b1: [8]u8 = undefined;
+    var r: u64 = 0;
+    while (r < n) : (r += 1) {
+        if (r > 0) try expected.append(gpa, '\n');
+        try expected.appendSlice(gpa, fixedCell(&b0, @intCast(r)));
+        try expected.append(gpa, '\t');
+        try expected.appendSlice(gpa, fixedCell(&b1, @intCast(2 * r)));
+    }
+
+    var d = try driveCopy(gpa, od.doc, copyRect(0, n, 0, 2), 200); // small buffer -> many chunks
+    defer d.deinit(gpa);
+    try std.testing.expectEqualStrings(expected.items, d.bytes.items);
+    try std.testing.expect(d.monotone); // rows_done never regressed
+    try std.testing.expectEqual(n, d.rows_done); // reached rect.row_count at DONE
+    try std.testing.expect(d.steps >= 1); // genuinely streamed (multiple chunks)
+    try std.testing.expect(d.boundary_ok);
+}
+
+test "cp5: AC4 a selection crossing the frontier STALLS with stalled_row; a jump advances it and it resumes to DONE" {
+    const gpa = std.testing.allocator;
+    const n: u64 = 300_000; // 5.4 MB > head budget: MANUAL open leaves later rows past the frontier
+    const top: u64 = 250_000;
+    const fixture = try genFixedRows(gpa, n);
+    defer gpa.free(fixture);
+
+    // REFERENCE: a fully-scanned copy of the same rect never stalls.
+    var ref = try openBytes(fixture);
+    defer ref.deinit();
+    try scanToEnd(ref.doc);
+    var refd = try driveCopy(gpa, ref.doc, copyRect(0, top, 0, 2), 1 << 16);
+    defer refd.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 0), refd.stalls);
+
+    // SUBJECT: MANUAL, NOT scanned -> the sweep hits the frontier and STALLS;
+    // driveCopy advances via ls_jump_start(stalled_row) and resumes until DONE.
+    var sub = try openBytes(fixture);
+    defer sub.deinit();
+    var subd = try driveCopy(gpa, sub.doc, copyRect(0, top, 0, 2), 1 << 16);
+    defer subd.deinit(gpa);
+    try std.testing.expect(subd.stalls >= 1); // it genuinely crossed the frontier
+    try std.testing.expectEqualStrings(refd.bytes.items, subd.bytes.items); // identical output either way
+    try std.testing.expectEqual(top, subd.rows_done);
+}
+
+test "cp6: AC1 the LS_COPY_MAX_CELLS safety cap is reported via budget_capped (Zig seam forces a small cap)" {
+    const gpa = std.testing.allocator;
+    var od = try openBytes(fv_fixture);
+    defer od.deinit();
+
+    // Uncapped reference: a 9-cell (3x3) selection is far below the natural cap.
+    var full = try driveCopy(gpa, od.doc, copyRect(0, 3, 0, 3), 1 << 16);
+    defer full.deinit(gpa);
+    try std.testing.expect(!full.budget_capped);
+
+    // Force a 4-cell cap: the 9-cell selection is cut short and reported on DONE.
+    api.copyCapCellsForTest(od.doc, 4);
+    var capped = try driveCopy(gpa, od.doc, copyRect(0, 3, 0, 3), 1 << 16);
+    defer capped.deinit(gpa);
+    try std.testing.expect(capped.budget_capped); // cut short -> reported
+    try std.testing.expect(capped.bytes.items.len > 0); // some cells emitted
+    try std.testing.expect(capped.bytes.items.len < full.bytes.items.len); // strictly truncated
+    try std.testing.expect(std.mem.startsWith(u8, full.bytes.items, capped.bytes.items)); // a front prefix
+}
+
+test "cp7: AC3 lifecycle hygiene — empty/out-of-range rects DONE with 0 bytes; cancel/drain leak nothing" {
+    const gpa = std.testing.allocator;
+    var od = try openBytes(fv_fixture);
+    defer od.deinit();
+
+    // Empty rect (row_count 0) -> a valid job that steps DONE with 0 bytes.
+    {
+        var d = try driveCopy(gpa, od.doc, copyRect(0, 0, 0, 3), 1 << 16);
+        defer d.deinit(gpa);
+        try std.testing.expectEqualStrings("", d.bytes.items);
+    }
+    // Empty rect (col_count 0) -> DONE, 0 bytes.
+    {
+        var d = try driveCopy(gpa, od.doc, copyRect(0, 8, 0, 0), 1 << 16);
+        defer d.deinit(gpa);
+        try std.testing.expectEqualStrings("", d.bytes.items);
+    }
+    // Out-of-range column range (col 5 >= column_count 3) -> DONE, 0 bytes.
+    {
+        var d = try driveCopy(gpa, od.doc, copyRect(0, 8, 5, 2), 1 << 16);
+        defer d.deinit(gpa);
+        try std.testing.expectEqualStrings("", d.bytes.items);
+    }
+    // CANCEL mid-stream: open, pull once, close WITHOUT draining -> no leak
+    // (std.testing.allocator fails the test on any leak).
+    {
+        const rr = copyRect(0, 8, 0, 3);
+        const job = api.ls_copy_open(od.doc, &rr) orelse return error.CopyOpenFailed;
+        var buf: [16]u8 = undefined;
+        _ = api.ls_copy_next(job, &buf, buf.len);
+        api.ls_copy_close(job); // released exactly once
+    }
+    // Open + close with no next at all -> no leak.
+    {
+        const rr = copyRect(0, 1, 0, 1);
+        const job = api.ls_copy_open(od.doc, &rr) orelse return error.CopyOpenFailed;
+        api.ls_copy_close(job);
+    }
+}
+
+test "cp_perf: AC2 the streaming sweep is O(rows), interval-invariant (advance count, not wall-clock)" {
+    const gpa = std.testing.allocator;
+    const n: u64 = 6_000; // spans multiple sparse checkpoints (interval 2048)
+    const fixture = try genFixedRows(gpa, n);
+    defer gpa.free(fixture);
+    var od = try openBytes(fixture);
+    defer od.deinit();
+    try scanToEnd(od.doc);
+    try expectDims(od.doc, n, 2);
+
+    api.copyAdvancesReset(od.doc);
+    var d = try driveCopy(gpa, od.doc, copyRect(0, n, 0, 2), 1 << 16);
+    defer d.deinit(gpa);
+    const advances = api.copyAdvances(od.doc);
+    // A forward sweep advances ~once per row after anchoring, with NO checkpoint-
+    // interval term. RED seed: the seed emits nothing -> 0 advances, so the linear
+    // FLOOR fails. GREEN: the cursor sweep is O(rows). The linear CEILING rules out
+    // any O(rows x interval) locate-per-row cost (the ~80 s path this replaces).
+    try std.testing.expect(advances >= n - 1);
+    try std.testing.expect(advances <= 4 * n + 64);
+}
+
+const c_linked_copy_job = struct {
+    extern fn ls_copy_open(doc: *const api.Doc, rrect: *const api.CopyRect) ?*api.CopyJob;
+    extern fn ls_copy_next(job: *api.CopyJob, buf: ?[*]u8, buf_len: usize) api.CopyProgress;
+    extern fn ls_copy_close(job: *api.CopyJob) void;
+};
+
+test "cp_abi: the streaming-copy symbols link through extern linkage; ls_copy_step values pinned" {
+    try std.testing.expectEqual(@as(c_int, 0), @intFromEnum(api.CopyStep.more));
+    try std.testing.expectEqual(@as(c_int, 1), @intFromEnum(api.CopyStep.done));
+    try std.testing.expectEqual(@as(c_int, 2), @intFromEnum(api.CopyStep.stalled));
+
+    var od = try openBytes("a,b\nx,y\n");
+    defer od.deinit();
+    const rr = copyRect(0, 1, 0, 2);
+    const job = c_linked_copy_job.ls_copy_open(od.doc, &rr) orelse return error.CopyOpenFailed;
+    var buf: [64]u8 = undefined;
+    const p = c_linked_copy_job.ls_copy_next(job, &buf, buf.len);
+    try std.testing.expect(p.step == .more or p.step == .done or p.step == .stalled);
+    c_linked_copy_job.ls_copy_close(job);
+}

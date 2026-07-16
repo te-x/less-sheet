@@ -360,6 +360,61 @@ pub export fn ls_window_match_flags(doc: *const api.Doc, first_col: u32, col_cou
     return window.matchFlags(asDocMut(doc), first_col, col_count);
 }
 
+// ---------------------------------------------------------------------------
+// Streaming copy (thin-frontend-shared-core Phase 2) — the core-framed TSV COPY
+// JOB (api/lesssheet.h "STREAMING COPY EXTENSION"). Poll/control lane; COPIES
+// into the caller buffer (no borrow); the job holds no background thread.
+//
+// SEED (planner freeze): ls_copy_open allocates a job handle from the document's
+// gpa, ls_copy_next reports DONE with 0 bytes (NO framing yet), ls_copy_close
+// frees it. This compiles + links + is leak-clean (close-exactly-once), so the
+// C-ABI/enum link guard and the empty-rect DONE path are green, while the
+// byte-identical-TSV / STALLED / rows_done / budget_capped behavior tests are RED
+// (empty output, never STALLED, rows_done 0, never capped). RED -> GREEN: the
+// implementer builds the row-major sweep + TSV framing (TAB/LF, spreadsheet
+// quoting, single-cell raw) here — byte-identical to the deleted TSVCopyBuilder,
+// reusing window.zig's forward COPY CURSOR (behind ls_cell_copy) for the sweep,
+// honoring d.copy_cap_cells (0 == api.copy_max_cells) for budget_capped.
+// ---------------------------------------------------------------------------
+
+const CopyJobSeed = struct {
+    gpa: std.mem.Allocator,
+    doc: *Document,
+    rect: api.CopyRect,
+};
+
+/// See api/lesssheet.h `ls_copy_open`. SEED: allocate the job handle; null only
+/// on handle-alloc failure. rect is copied (the caller keeps ownership).
+pub export fn ls_copy_open(doc: *const api.Doc, rect: *const api.CopyRect) callconv(.c) ?*api.CopyJob {
+    const d = asDocMut(doc);
+    const job = d.gpa.create(CopyJobSeed) catch return null;
+    job.* = .{ .gpa = d.gpa, .doc = d, .rect = rect.* };
+    return @ptrCast(job);
+}
+
+/// See api/lesssheet.h `ls_copy_next`. SEED: no framing — reports DONE with 0
+/// bytes (this is the RED behavior the framing tests fail against).
+pub export fn ls_copy_next(job: *api.CopyJob, buf: ?[*]u8, buf_len: usize) callconv(.c) api.CopyProgress {
+    _ = buf;
+    _ = buf_len;
+    const self: *CopyJobSeed = @ptrCast(@alignCast(job));
+    _ = self;
+    return .{ .step = .done, .written = 0, .rows_done = 0, .stalled_row = 0, .budget_capped = false };
+}
+
+/// See api/lesssheet.h `ls_copy_close`. Frees the job (call exactly once).
+pub export fn ls_copy_close(job: *api.CopyJob) callconv(.c) void {
+    const self: *CopyJobSeed = @ptrCast(@alignCast(job));
+    self.gpa.destroy(self);
+}
+
+/// See contracts/api.zig `copyCapCellsForTest`. Zig-only test seam (NOT the C
+/// ABI): force the per-job cell SAFETY CAP (0 == the natural api.copy_max_cells)
+/// so the budget_capped path is testable without a 10M-cell fixture.
+pub fn copyCapCellsForTest(doc: *api.Doc, cells: u64) void {
+    asDocMut(doc).copy_cap_cells = cells;
+}
+
 // ===========================================================================
 // csv-gz internal-seam re-exports + instrumentation seams (ARCH-csv-gz).
 // The re-exports below let contracts/api.zig pin the enumerated Source/Reader
