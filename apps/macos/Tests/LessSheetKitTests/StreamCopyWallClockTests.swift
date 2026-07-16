@@ -1,30 +1,32 @@
-// Frozen behavior test — stream-copy slice (planner-owned), the END-TO-END COPY
-// WALL-CLOCK probe (ARCH-stream-copy AC7, GATING). The real-core half: it opens
-// a real document and copies its WHOLE selection through the REAL
-// TSVCopyBuilder + copyCell + ls_cell_copy (no mocks), exactly like
-// CellCopyBridgeTests, and asserts the copy finishes under a deliberately
-// GENEROUS ceiling.
+// Frozen behavior test — thin-frontend-shared-core Phase 2 (planner-owned), the
+// END-TO-END STREAMING-COPY WALL-CLOCK probe (GATING). The real-core half: it
+// opens a real ~100k-row document and copies its WHOLE selection through the
+// STREAMING path — DocumentSession.openCopy -> ls_copy_open / ls_copy_next /
+// ls_copy_close, the SAME binding the product drives (ViewerModel.copySelection
+// -> streamCopy -> openCopy), no mocks and NO TSVCopyBuilder / per-cell
+// ls_cell_copy loop — and asserts it finishes under a deliberately GENEROUS
+// ceiling. This gate-locks the ~80 s (per-cell, locate-from-scratch) -> O(rows)
+// cursor win on the SHIPPING path.
 //
-// EXPECTED RED IN THIS CELL UNTIL THE BACKEND CURSOR LANDS. This links the real
-// core, and today ls_cell_copy locates every cell FROM SCRATCH — a full 100k x
-// 10 (1,000,000-cell) copy is ~140 s. So this is RED in the frontend cell and
-// goes GREEN only once the backend COPY CURSOR (the sibling backend cell — the
-// backend∥frontend split, ARCH "Isolation note") makes ls_cell_copy O(rows).
-// It is LISTED, not chased, pre-integration. A fail-fast deadline (2x the
-// ceiling) inside the fetch keeps a RED gate iteration cheap (~10 s, not ~140 s)
-// by stopping the build at a row boundary; the GREEN cursor path finishes far
-// under the ceiling and never trips it.
+// WHY DRIVE openCopy DIRECTLY + CROSS THE FRONTIER. This locks what the tiny
+// StreamingCopyBridgeTests cannot: the wall-clock over a real 100k-row sweep AND
+// the STALLED -> jump -> resume orchestration (their fixtures are fully indexed,
+// so that branch never runs at runtime). We DELIBERATELY do NOT wait for the AUTO
+// scan frontier to reach EOF before copying, so the whole-document selection
+// extends PAST the lagging frontier: the stream returns .stalled, the drive
+// advances the frontier (startJump(to:), awaiting the jump) and resumes,
+// repeatedly, until .done. IDENTITY VIEW (no filter): step.stalledRow is both the
+// view and the original row — the correct-as-written jump target — so this is
+// unaffected by the filtered-stall implementation finding fixed separately. The
+// streaming OUTCOME is asserted deterministically (every row emitted, not budget-
+// capped, under the ceiling); the stall path is exercised whenever the frontier
+// lags (which it does at open) rather than asserted, so a fast indexer that
+// happens to outrun the sweep cannot false-fail the gate.
 //
 // The ceiling is 5 s — deliberately generous (ARCH: expected sub-second-to-low-
-// seconds; ~28x headroom over the ~140 s today) so machine load cannot false-
-// fail. On GREEN the assembled .app is reassembled so select-copy finally SHIPS
-// (ARCH AC7) — that + the release-mode measure on a bigger selection are the
-// reviewer's run; this gate pins the same bound in debug on a generated fixture.
-//
-// Determinism: the ~8 MB fixture is generated per run into the temp dir (like
-// CellCopyBridgeTests); AUTO indexing advances the frontier to EOF and the test
-// waits for the exact row count before copying, so no row is `.pending` except
-// via the fail-fast deadline.
+// seconds; ~28x headroom over the ~80 s per-cell path) so machine load cannot
+// false-fail. A failFast wall-clock bound (2x the ceiling) breaks a hung or
+// regressed drive cheaply instead of hanging the gate.
 import Foundation
 import Testing
 import Contracts
@@ -49,18 +51,10 @@ private func makeWideTallCSV(rows: Int, cols: Int) throws -> String {
     return url.path(percentEncoded: false)
 }
 
-private func waitForExactRowCount(_ session: any DocumentSession, timeout: Duration) async throws {
-    let deadline = ContinuousClock.now + timeout
-    while ContinuousClock.now < deadline {
-        if session.rowCount().isExact { return }
-        try await Task.sleep(for: .milliseconds(10))
-    }
-}
-
 @Suite("stream-copy wall-clock (real core)", .serialized)
 struct StreamCopyWallClockTests {
 
-    @Test func fullSelectionCopyOfHundredKRowsIsUnderCeiling() async throws {
+    @Test func fullSelectionStreamingCopyOfHundredKRowsIsUnderCeiling() async throws {
         let rows = 100_000
         let cols = 10
         let path = try makeWideTallCSV(rows: rows, cols: cols)
@@ -68,40 +62,69 @@ struct StreamCopyWallClockTests {
         defer { session.close() }
         #expect(session.columnCount == cols)
 
-        // Cover the whole document so every selected row is servable (AUTO
-        // indexes to EOF); only the fail-fast deadline may then yield `.pending`.
-        try await waitForExactRowCount(session, timeout: .seconds(30))
-        let rc = session.rowCount()
-        #expect(rc.isExact)
-        #expect(rc.count == UInt64(rows))
-
-        let ceiling = Duration.seconds(5)    // GATING; generous (see file header)
-        let failFast = Duration.seconds(10)  // bounds a RED (from-scratch) iteration
-        let budget = CopyBudget.standard
+        let ceiling = Duration.seconds(5)     // GATING; generous (see file header)
+        let failFast = Duration.seconds(10)   // bounds a hung / regressed iteration
         let rect = SelectionRect(top: 0, bottom: UInt64(rows - 1), left: 0, right: cols - 1)
 
+        // Copy IMMEDIATELY — do NOT wait for AUTO indexing to reach EOF, so the
+        // whole-document selection crosses the lagging scan frontier and the stream
+        // must STALL, jump, and resume (identity view: stalledRow is the ORIGINAL
+        // row, the correct-as-written jump target).
         let start = ContinuousClock.now
         let deadline = start + failFast
-        // REAL end-to-end fetch: TSVCopyBuilder -> this closure -> copyCell ->
-        // ls_cell_copy. The ONLY wrapper is the fail-fast deadline (returns
-        // `.pending`, stopping the build at a row boundary) so a RED gate does not
-        // sit for the ~140 s a from-scratch copy of 1,000,000 cells takes today.
-        let fetch: CopyCellFetch = { row, col in
-            if ContinuousClock.now >= deadline {
-                return CopiedCell(status: .pending, text: "", truncated: false)
+
+        let job = try #require(
+            session.openCopy(rect),
+            "openCopy returned nil — the streaming copy binding is not wired"
+        )
+        defer { job.close() }
+
+        var payloadBytes = 0
+        var rowsDone: UInt64 = 0
+        var lastRowsDone: UInt64 = 0
+        var budgetCapped = false
+        var stalls = 0
+        var finished = false
+        var guardCount = 0
+
+        drive: while ContinuousClock.now < deadline {
+            guardCount += 1
+            try #require(guardCount < 5_000_000, "streaming copy loop runaway")
+            let step = job.next(maxChunkBytes: 1 << 16)
+            #expect(step.rowsDone >= lastRowsDone, "rows_done regressed")
+            lastRowsDone = step.rowsDone
+            switch step.kind {
+            case .more:
+                payloadBytes += step.bytes.count
+            case .done:
+                payloadBytes += step.bytes.count
+                rowsDone = step.rowsDone
+                budgetCapped = step.budgetCapped
+                finished = true
+                break drive
+            case .stalled:
+                stalls += 1
+                session.startJump(to: step.stalledRow)
+                while true {
+                    if case .done = session.jumpStatus() { break }
+                    try #require(ContinuousClock.now < deadline, "frontier jump timed out")
+                    try await Task.sleep(for: .milliseconds(2))
+                }
             }
-            return session.copyCell(row: row, column: col, maxBytes: budget.perCellMaxBytes)
         }
-        let report = await Task.detached { TSVCopyBuilder().build(rect, budget: budget, fetch: fetch) }.value
         let elapsed = ContinuousClock.now - start
 
-        // GREEN once the backend cursor makes ls_cell_copy O(rows): the whole rect
-        // completes well under the 5 s ceiling. RED today (from-scratch): the
-        // deadline trips (outcome != .complete) and elapsed blows the ceiling.
+        // GREEN: the streaming path completes the WHOLE 100k-row selection —
+        // crossing the frontier via jump/resume — well under the 5 s ceiling (the
+        // O(rows) cursor win vs the ~80 s per-cell path). RED (regressed / hung):
+        // failFast breaks the drive with finished == false, or elapsed blows it.
         #expect(
-            report.outcome == .complete,
-            "copy did not finish within \(failFast) — likely the from-scratch (pre-cursor) path; outcome \(report.outcome), rows \(report.rowCount)"
+            finished,
+            "streaming copy did not reach .done within \(failFast) — regressed or stalling drive (rowsDone \(rowsDone), stalls \(stalls))"
         )
-        #expect(elapsed < ceiling, "100k x 10 full-selection copy took \(elapsed); GATING ceiling \(ceiling)")
+        #expect(rowsDone == UInt64(rows), "streaming copy emitted \(rowsDone) of \(rows) rows")
+        #expect(budgetCapped == false, "1M cells is well under the 10M LS_COPY_MAX_CELLS cap")
+        #expect(payloadBytes > 0, "streaming copy produced no bytes")
+        #expect(elapsed < ceiling, "100k x 10 full-selection streaming copy took \(elapsed); GATING ceiling \(ceiling)")
     }
 }

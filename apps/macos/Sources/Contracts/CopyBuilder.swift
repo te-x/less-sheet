@@ -49,12 +49,6 @@ public struct CopiedCell: Sendable, Equatable {
     public static let empty = CopiedCell(status: .ok, text: "", truncated: false)
 }
 
-/// The per-cell read the builder calls, row-major, for each cell in the rect.
-/// `@Sendable` so the whole build is dispatchable to a background executor (AC4).
-/// The real closure captures the (`Sendable`) `DocumentSession` and calls
-/// `copyCell(row:column:maxBytes:)`, passing `CopyBudget.perCellMaxBytes`.
-public typealias CopyCellFetch = @Sendable (_ row: UInt64, _ column: Int) -> CopiedCell
-
 /// The copy TUNABLES (ARCH: "a tunable frontend constant"). `.standard` carries
 /// the shipping values; the frozen tests NEVER assert the exact numbers — they
 /// use tiny budgets to pin the STOPPING behavior (bounded, not a magic size).
@@ -130,52 +124,4 @@ public struct CopyReport: Sendable, Equatable {
         self.outcome = outcome
         self.lossyCells = lossyCells
     }
-}
-
-/// Builds a clipboard payload from a selection rect. Implemented in `LessSheetKit`
-/// as `TSVCopyBuilder`, pinned by a frozen conformance test
-/// (`let _: any CopyBuilding = TSVCopyBuilder()`).
-///
-/// `build(_:budget:fetch:)` — iterate the rect ROW-MAJOR (each row `top…bottom`,
-/// each column `left…right`), calling `fetch(row, column)` per cell, and build a
-/// TSV string with the pinned rules below. Returns a `CopyReport`.
-///
-/// PINNED rules (this doc-comment is the spec the seed does NOT yet satisfy):
-///
-/// 1. SINGLE CELL. A 1×1 rect yields the cell's RAW `text` verbatim — no quoting,
-///    no trailing newline — regardless of `maxTotalBytes` (the atomic unit is
-///    already bounded by the per-cell cap). `rowCount == 1`, `outcome ==
-///    .complete` (unless the single cell is `.pending` → `.stoppedAtFrontier`).
-///
-/// 2. TSV STRUCTURE (multi-cell). Cells in a row are joined by a TAB (`\t`); rows
-///    are joined by a LINE FEED (`\n`); NO trailing newline after the last row.
-///
-/// 3. EXCEL/NUMBERS QUOTING. A cell whose content contains a TAB, CR, LF, or a
-///    double-quote (`"`) is wrapped in double-quotes with every interior `"`
-///    DOUBLED (`a"b` → `"a""b"`); any other cell is emitted raw. (Single-cell
-///    copy, rule 1, is never quoted.)
-///
-/// 4. BYTE BUDGET. Maintain the running UTF-8 byte count of the payload
-///    (separators included). Before EMITTING a cell, if at least one cell is
-///    already emitted AND adding this cell's contribution would push the count
-///    past `maxTotalBytes`, STOP (`.stoppedAtBudget`). The FIRST cell is always
-///    emitted (progress guarantee), so the payload is bounded by
-///    `maxTotalBytes + one cell` (and a cell is per-cell-capped) — never
-///    unbounded.
-///
-/// 5. CELL-COUNT SAFETY. Fetch at most `maxCells` cells. When the cap is reached,
-///    STOP (`.stoppedAtCellCap`). This is what stops an all-EMPTY huge selection
-///    that the byte budget alone would let run for millions of near-zero-byte
-///    fetches.
-///
-/// 6. FRONTIER. A `.pending` cell STOPS the build (`.stoppedAtFrontier`); since
-///    `.pending` is per-row, this is a clean row boundary (`rowCount` exact). The
-///    frontend advances the frontier over the rect (a jump to `bottom`) BEFORE
-///    building so this is rare; when the bottom is still past the frontier, copy
-///    reports the rows that fit and the notice says so.
-///
-/// 7. TOTALITY. A `.noCell` cell is treated as empty (`""`) and the build
-///    continues. `lossyCells` is true iff any emitted cell had `truncated == true`.
-public protocol CopyBuilding: Sendable {
-    func build(_ rect: SelectionRect, budget: CopyBudget, fetch: CopyCellFetch) -> CopyReport
 }
