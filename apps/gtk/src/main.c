@@ -663,23 +663,14 @@ open_document (App *app, LsgDocument *doc, const char *title)
 /* Open local file                                                            */
 /* ------------------------------------------------------------------------- */
 
+/* Open one local GFile into the grid (or an error page). Does NOT take
+ * ownership of `file`. Shared by the file dialog, drag-open (future), and the
+ * command-line "open" path. */
 static void
-on_file_opened (GObject *source, GAsyncResult *res, gpointer data)
+open_file (App *app, GFile *file)
 {
-  App *app = data;
-  GError *error = NULL;
-  GFile *file =
-      gtk_file_dialog_open_finish (GTK_FILE_DIALOG (source), res, &error);
-  if (file == NULL)
-    {
-      /* User cancellation is not an error to surface. */
-      g_clear_error (&error);
-      return;
-    }
-
   char *path = g_file_get_path (file);
   char *base = g_file_get_basename (file);
-  g_object_unref (file);
 
   if (path == NULL)
     {
@@ -698,6 +689,23 @@ on_file_opened (GObject *source, GAsyncResult *res, gpointer data)
 
   g_free (path);
   g_free (base);
+}
+
+static void
+on_file_opened (GObject *source, GAsyncResult *res, gpointer data)
+{
+  App *app = data;
+  GError *error = NULL;
+  GFile *file =
+      gtk_file_dialog_open_finish (GTK_FILE_DIALOG (source), res, &error);
+  if (file == NULL)
+    {
+      /* User cancellation is not an error to surface. */
+      g_clear_error (&error);
+      return;
+    }
+  open_file (app, file);
+  g_object_unref (file);
 }
 
 static void
@@ -1006,10 +1014,13 @@ build_grid_page (App *app)
   return grid;
 }
 
+/* Build the single window once (idempotent). Shared by "activate" (no file) and
+ * "open" (a file passed on the command line / by the file manager). */
 static void
-on_activate (GtkApplication *gtk_app, gpointer data)
+ensure_window (App *app, GtkApplication *gtk_app)
 {
-  App *app = data;
+  if (app->window != NULL)
+    return;
   app->app = ADW_APPLICATION (gtk_app);
 
   GtkWidget *win = adw_application_window_new (gtk_app);
@@ -1059,7 +1070,33 @@ on_activate (GtkApplication *gtk_app, gpointer data)
   adw_toolbar_view_set_content (ADW_TOOLBAR_VIEW (toolbar), content);
 
   adw_application_window_set_content (ADW_APPLICATION_WINDOW (win), toolbar);
+}
+
+/* No file: launch screen. */
+static void
+on_activate (GtkApplication *gtk_app, gpointer data)
+{
+  App *app = data;
+  ensure_window (app, gtk_app);
   gtk_window_present (app->window);
+}
+
+/*
+ * Command-line / file-manager open (G_APPLICATION_HANDLES_OPEN). Opens the
+ * FIRST passed file via the shared local-open path; extra files are ignored
+ * (single-window slice 1). The GFile array is owned by GApplication for the
+ * duration of the call — we borrow, never unref.
+ */
+static void
+on_open (GApplication *gapp, GFile **files, gint n_files, const char *hint,
+         gpointer data)
+{
+  (void) hint;
+  App *app = data;
+  ensure_window (app, GTK_APPLICATION (gapp));
+  gtk_window_present (app->window);
+  if (n_files >= 1 && files != NULL && files[0] != NULL)
+    open_file (app, files[0]);
 }
 
 int
@@ -1070,8 +1107,9 @@ main (int argc, char *argv[])
   app.font_desc = pango_font_description_from_string ("Monospace 11");
 
   g_autoptr (AdwApplication) application =
-      adw_application_new ("dev.lesssheet.Gtk", G_APPLICATION_DEFAULT_FLAGS);
+      adw_application_new ("dev.lesssheet.Gtk", G_APPLICATION_HANDLES_OPEN);
   g_signal_connect (application, "activate", G_CALLBACK (on_activate), &app);
+  g_signal_connect (application, "open", G_CALLBACK (on_open), &app);
   int status = g_application_run (G_APPLICATION (application), argc, argv);
 
   app_reset_document (&app);
