@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(bash .aidev/gate.sh)",
+      "Bash(bash .aidev/gate.sh:*)",
+      "Bash(bash .aidev/freeze.sh)",
+      "Bash(bash .aidev/freeze.sh:*)",
+      "Bash(bash ~/.claude/aidev/gate.sh:*)",
+      "Bash(bash ~/.claude/aidev/freeze.sh:*)",
+      "Bash(bash ~/.claude/aidev/role-runner.sh:*)",
+      "Bash(bash ~/.claude/aidev/set-models.sh:*)"
+    ]
+  }
+}
