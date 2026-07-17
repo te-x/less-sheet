@@ -24,7 +24,7 @@ const std = @import("std");
 const api = @import("api");
 
 const posix = std.posix;
-const c = std.c;
+const sysio = @import("sysio.zig");
 
 const base = @import("base.zig");
 const csv_reader = @import("csv_reader.zig");
@@ -103,12 +103,13 @@ pub fn openWithAllocator(gpa: std.mem.Allocator, path: [*:0]const u8, options: ?
         error.AccessDenied, error.PermissionDenied => .permission_denied,
         else => .io,
     };
-    defer _ = c.close(fd);
+    defer sysio.close(fd);
 
-    var st: c.Stat = undefined;
-    if (c.fstat(fd, &st) != 0) return .io;
-    if (!posix.S.ISREG(@as(u32, st.mode))) return .io; // dirs/devices -> distinct .io
-    const file_size: u64 = if (st.size > 0) @intCast(st.size) else 0;
+    // Portable stat via std.Io.File (0.16.0 removed the std.posix file syscalls;
+    // std.c bindings are void on linux-musl). One fstat, same as before.
+    const st = sysio.file(fd).stat(sysio.io()) catch return .io;
+    if (st.kind != .file) return .io; // dirs/devices -> distinct .io
+    const file_size: u64 = st.size;
 
     // Map the file head-to-tail (sparse tails cost nothing; pages fault lazily
     // and the indexer madvises them away). Empty files are not mapped.

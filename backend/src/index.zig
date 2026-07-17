@@ -10,7 +10,6 @@
 const std = @import("std");
 const api = @import("api");
 const posix = std.posix;
-const c = std.c;
 
 const base = @import("base.zig");
 const filter = @import("filter.zig");
@@ -416,7 +415,7 @@ fn madviseDontNeed(doc: *Document, start_physical: u64, end_physical: u64) void 
     const a_end = std.mem.alignBackward(u64, end_physical, psz);
     if (a_end <= a_start or a_end > m.len) return;
     const ptr: [*]align(std.heap.page_size_min) u8 = @alignCast(@constCast(m.ptr + @as(usize, @intCast(a_start))));
-    posix.madvise(ptr, @intCast(a_end - a_start), c.MADV.DONTNEED) catch {};
+    posix.madvise(ptr, @intCast(a_end - a_start), posix.MADV.DONTNEED) catch {};
 }
 
 // ---------------------------------------------------------------------------

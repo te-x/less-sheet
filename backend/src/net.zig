@@ -21,7 +21,7 @@
 const std = @import("std");
 const api = @import("api");
 
-const c = std.c;
+const sysio = @import("sysio.zig");
 const default_gpa = std.heap.smp_allocator;
 
 const net_source = @import("net_source.zig");
@@ -34,7 +34,7 @@ const redirect_cap: u32 = 3;
 /// A `.done` job's `doc` outlives the job (closed independently by ls_close).
 pub const NetOpenJob = struct {
     gpa: std.mem.Allocator,
-    mutex: c.pthread_mutex_t = .{},
+    mutex: sysio.Mutex = .init,
     state: api.NetOpenState = .pending,
     err: api.NetStatus = .ok,
     http_status: i32 = 0,
@@ -51,10 +51,10 @@ pub const NetOpenJob = struct {
     cancel_flag: std.atomic.Value(bool) = .init(false),
 
     fn lock(self: *NetOpenJob) void {
-        _ = c.pthread_mutex_lock(&self.mutex);
+        self.mutex.lockUncancelable(sysio.io());
     }
     fn unlock(self: *NetOpenJob) void {
-        _ = c.pthread_mutex_unlock(&self.mutex);
+        self.mutex.unlock(sysio.io());
     }
 };
 
@@ -289,7 +289,7 @@ pub fn release(job: *NetOpenJob) void {
         cancel(job);
     }
     if (job.url.len > 0) job.gpa.free(job.url);
-    _ = c.pthread_mutex_destroy(&job.mutex);
+    // std.Io.Mutex needs no explicit destroy (unlike pthread_mutex_destroy).
     job.gpa.destroy(job);
 }
 

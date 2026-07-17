@@ -17,14 +17,13 @@ const std = @import("std");
 const api = @import("api");
 const source_mod = @import("source.zig");
 
-const c = std.c;
 const posix = std.posix;
+const sysio = @import("sysio.zig");
 
-/// Short blocking sleep (libc nanosleep — the backend links libc) used to back
-/// off while a sequential fill waits for withheld bytes. Never holds a lock.
+/// Short blocking sleep (portable std.Io sleep) used to back off while a
+/// sequential fill waits for withheld bytes. Never holds a lock.
 fn sleepMs(ms: u64) void {
-    var ts: c.timespec = .{ .sec = @intCast(ms / 1000), .nsec = @intCast((ms % 1000) * std.time.ns_per_ms) };
-    _ = c.nanosleep(&ts, null);
+    sysio.sleepMs(ms);
 }
 
 pub const chunk_bytes: u64 = 256 * 1024; // mirrors source.chunk_bytes
@@ -369,7 +368,7 @@ const seq_reserve: u64 = 64 * 1024 * 1024 * 1024;
 
 pub const HttpRange = struct {
     gpa: std.mem.Allocator,
-    mutex: c.pthread_mutex_t = .{},
+    mutex: sysio.Mutex = .init,
     transport: Transport,
     spool_fd: ?posix.fd_t = null,
     // Known-length: the presized [0,total) mapping. Unknown-length: the stable
@@ -402,10 +401,10 @@ pub const HttpRange = struct {
     progress: ?Progress = null,
 
     pub fn lock(self: *HttpRange) void {
-        _ = c.pthread_mutex_lock(&self.mutex);
+        self.mutex.lockUncancelable(sysio.io());
     }
     pub fn unlock(self: *HttpRange) void {
-        _ = c.pthread_mutex_unlock(&self.mutex);
+        self.mutex.unlock(sysio.io());
     }
 
     fn numChunks(total: u64) usize {
@@ -423,12 +422,12 @@ pub const HttpRange = struct {
     fn openSpoolKnown(self: *HttpRange) bool {
         if (self.total == 0) return true; // nothing to map (empty resource)
         const fd = self.createSpoolFd() orelse return false;
-        if (c.ftruncate(fd, @intCast(self.total)) != 0) {
-            _ = c.close(fd);
+        sysio.file(fd).setLength(sysio.io(), self.total) catch {
+            sysio.close(fd);
             return false;
-        }
+        };
         const m = posix.mmap(null, @intCast(self.total), .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, fd, 0) catch {
-            _ = c.close(fd);
+            sysio.close(fd);
             return false;
         };
         self.spool_fd = fd;
@@ -444,7 +443,7 @@ pub const HttpRange = struct {
     fn openSpoolUnknown(self: *HttpRange) bool {
         const fd = self.createSpoolFd() orelse return false;
         const reservation = posix.mmap(null, @intCast(seq_reserve), .{}, .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .NORESERVE = true }, -1, 0) catch {
-            _ = c.close(fd);
+            sysio.close(fd);
             return false;
         };
         self.spool_fd = fd;
@@ -456,12 +455,12 @@ pub const HttpRange = struct {
 
     fn createSpoolFd(self: *HttpRange) ?posix.fd_t {
         var path_buf: [160]u8 = undefined;
-        const path = std.fmt.bufPrintZ(&path_buf, "/tmp/lesssheet-net-{d}-{x}.spool", .{ c.getpid(), @intFromPtr(self) }) catch return null;
+        const path = std.fmt.bufPrintZ(&path_buf, "/tmp/lesssheet-net-{x}-{x}.spool", .{ sysio.uniqueToken(), @intFromPtr(self) }) catch return null;
         const fd = posix.openatZ(posix.AT.FDCWD, path.ptr, .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true }, 0o600) catch return null;
-        if (c.unlink(path.ptr) != 0) {
-            _ = c.close(fd);
+        sysio.unlinkAbsolute(path) catch {
+            sysio.close(fd);
             return null;
-        }
+        };
         return fd;
     }
 
@@ -473,7 +472,7 @@ pub const HttpRange = struct {
         if (need_end > self.reserve_len) return false; // exceeds the reservation
         const new_mapped = std.mem.alignForward(u64, @min(need_end, self.reserve_len), chunk_bytes);
         const fd = self.spool_fd orelse return false;
-        if (c.ftruncate(fd, @intCast(new_mapped)) != 0) return false;
+        sysio.file(fd).setLength(sysio.io(), new_mapped) catch return false;
         const region_ptr: [*]align(std.heap.page_size_min) u8 = @alignCast(self.spool.ptr + @as(usize, @intCast(self.mapped_len)));
         _ = posix.mmap(region_ptr, @intCast(new_mapped - self.mapped_len), .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED, .FIXED = true }, fd, @intCast(self.mapped_len)) catch return false;
         self.mapped_len = new_mapped;
@@ -685,7 +684,7 @@ pub const HttpRange = struct {
     pub fn deinit(self: *HttpRange) void {
         const span: u64 = if (self.reserve_len > 0) self.reserve_len else self.total;
         if (span > 0 and self.spool.len > 0) posix.munmap(self.spool.ptr[0..@intCast(span)]);
-        if (self.spool_fd) |fd| _ = c.close(fd);
+        if (self.spool_fd) |fd| sysio.close(fd);
         self.resident_order.deinit(self.gpa);
         if (self.present.len > 0) self.gpa.free(self.present);
         if (self.resident.len > 0) self.gpa.free(self.resident);

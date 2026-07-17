@@ -15,7 +15,7 @@ const source_mod = @import("source.zig");
 const column_state = @import("column_state.zig");
 
 const posix = std.posix;
-const c = std.c;
+const sysio = @import("sysio.zig");
 
 /// Re-exported so sibling modules can keep writing `base.Pos` (matching how
 /// they already reference `base.CellRef`/`base.Checkpoint`) without a
@@ -151,8 +151,8 @@ pub const Document = struct {
     row0_pinned_refs: []const CellRef,
 
     // Frontier + index + jump slot (mutex-protected).
-    mutex: c.pthread_mutex_t,
-    cond: c.pthread_cond_t,
+    mutex: sysio.Mutex,
+    cond: sysio.Condition,
     checkpoints: std.ArrayList(Checkpoint),
     // ARCH-huge-row-budget: an extra checkpoint dropped immediately AFTER
     // every row whose source extent exceeded LS_WINDOW_ROW_SCAN_MAX_BYTES
@@ -567,16 +567,16 @@ pub const Document = struct {
     column_parsed_work_gen: u64 = 0,
 
     pub fn lock(self: *Document) void {
-        _ = c.pthread_mutex_lock(&self.mutex);
+        self.mutex.lockUncancelable(sysio.io());
     }
     pub fn unlock(self: *Document) void {
-        _ = c.pthread_mutex_unlock(&self.mutex);
+        self.mutex.unlock(sysio.io());
     }
     pub fn wakeWorker(self: *Document) void {
-        _ = c.pthread_cond_broadcast(&self.cond);
+        self.cond.broadcast(sysio.io());
     }
     pub fn waitWork(self: *Document) void {
-        _ = c.pthread_cond_wait(&self.cond, &self.mutex);
+        self.cond.waitUncancelable(sysio.io(), &self.mutex);
     }
 
     /// Return the whole-job FILTER/SEARCH cursor, replacing a stale cursor
@@ -674,8 +674,7 @@ pub fn freeDoc(doc: *Document) void {
     if (doc.row0_pinned_refs.len > 0) doc.gpa.free(doc.row0_pinned_refs);
     source_mod.sourceDeinit(&doc.source);
     if (doc.mapping) |m| posix.munmap(m);
-    _ = c.pthread_cond_destroy(&doc.cond);
-    _ = c.pthread_mutex_destroy(&doc.mutex);
+    // std.Io.Mutex/Condition need no explicit destroy (unlike pthread_*_destroy).
     doc.gpa.destroy(doc);
 }
 

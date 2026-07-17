@@ -7,8 +7,8 @@ const api = @import("api");
 const flate = std.compress.flate;
 const Reader = std.Io.Reader;
 const Decompress = flate.Decompress;
-const c = std.c;
 const posix = std.posix;
+const sysio = @import("sysio.zig");
 
 const net_source = @import("net_source.zig");
 /// The network `http_range` Source state (ARCH-network-source) — a genuinely
@@ -98,8 +98,8 @@ pub const Gzip = struct {
     /// budget stop; stream EOF = the clean/damaged terminal), NOT `mapping.len`.
     /// null for a LOCAL gzip (mapping.len IS the end — byte-identical).
     provider: ?*net_source.HttpRange = null,
-    mutex: c.pthread_mutex_t = .{},
-    cond: c.pthread_cond_t = .{},
+    mutex: sysio.Mutex = .init,
+    cond: sysio.Condition = .init,
     forward: *Session,
     replay: *Session,
     replay2: *Session,
@@ -147,10 +147,10 @@ pub const Gzip = struct {
     head_mark_count: usize = 0,
 
     pub fn lock(self: *Gzip) void {
-        _ = c.pthread_mutex_lock(&self.mutex);
+        self.mutex.lockUncancelable(sysio.io());
     }
     pub fn unlock(self: *Gzip) void {
-        _ = c.pthread_mutex_unlock(&self.mutex);
+        self.mutex.unlock(sysio.io());
     }
 
     fn init(gpa: std.mem.Allocator, mapping: []const u8) !*Gzip {
@@ -210,14 +210,13 @@ pub const Gzip = struct {
         for (self.checkpoints.items) |entry| if (entry.hot) |cp| self.gpa.destroy(cp);
         self.checkpoints.deinit(self.gpa);
         self.head.deinit(self.gpa);
-        if (self.spill_fd) |fd| _ = c.close(fd);
+        if (self.spill_fd) |fd| sysio.close(fd);
         self.gpa.destroy(self.forward);
         self.gpa.destroy(self.replay);
         self.gpa.destroy(self.replay2);
         self.gpa.destroy(self.spill_snapshot);
         self.gpa.destroy(self.spill_snapshot2);
-        _ = c.pthread_cond_destroy(&self.cond);
-        _ = c.pthread_mutex_destroy(&self.mutex);
+        // std.Io.Mutex/Condition need no explicit destroy (unlike pthread_*_destroy).
         if (self.provider) |hr| hr.deinit(); // network gzip owns its compressed spool
         self.gpa.destroy(self);
     }
@@ -376,12 +375,12 @@ pub const Gzip = struct {
     fn createSpill(self: *Gzip) void {
         if (self.spill_fd != null or self.spill_fail_after.load(.acquire) == 0) return;
         var path_buf: [160]u8 = undefined;
-        const path = std.fmt.bufPrintZ(&path_buf, "/tmp/lesssheet-gz-{d}-{x}.ckpt", .{ c.getpid(), @intFromPtr(self) }) catch return;
+        const path = std.fmt.bufPrintZ(&path_buf, "/tmp/lesssheet-gz-{x}-{x}.ckpt", .{ sysio.uniqueToken(), @intFromPtr(self) }) catch return;
         const fd = posix.openatZ(posix.AT.FDCWD, path.ptr, .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true }, 0o600) catch return;
-        if (c.unlink(path.ptr) != 0) {
-            _ = c.close(fd);
+        sysio.unlinkAbsolute(path) catch {
+            sysio.close(fd);
             return;
-        }
+        };
         self.spill_fd = fd;
     }
 
@@ -391,12 +390,7 @@ pub const Gzip = struct {
         const fd = self.spill_fd orelse return null;
         const bytes = std.mem.asBytes(cp);
         const start = self.spill_bytes;
-        var done: usize = 0;
-        while (done < bytes.len) {
-            const n = c.pwrite(fd, bytes[done..].ptr, bytes.len - done, @intCast(start + done));
-            if (n <= 0) return null;
-            done += @intCast(n);
-        }
+        sysio.file(fd).writePositionalAll(sysio.io(), bytes, start) catch return null;
         self.spill_bytes += bytes.len;
         self.spill_ops += 1;
         return start;
@@ -408,12 +402,8 @@ pub const Gzip = struct {
         const fd = self.spill_fd orelse return null;
         const snapshot = if (lane == 2) self.spill_snapshot2 else self.spill_snapshot;
         const bytes = std.mem.asBytes(snapshot);
-        var done: usize = 0;
-        while (done < bytes.len) {
-            const n = c.pread(fd, bytes[done..].ptr, bytes.len - done, @intCast(offset + done));
-            if (n <= 0) return null;
-            done += @intCast(n);
-        }
+        const got = sysio.file(fd).readPositionalAll(sysio.io(), bytes, offset) catch return null;
+        if (got != bytes.len) return null;
         snapshot.dec.input = &snapshot.input;
         snapshot.dec.reader.buffer = &snapshot.history;
         return snapshot;
@@ -646,7 +636,7 @@ pub const Cursor = struct {
                         session.terminal = .inflating;
                     }
                 }
-                _ = c.pthread_cond_broadcast(&g.cond);
+                g.cond.broadcast(sysio.io());
                 g.unlock();
             },
             .mmap => {},
@@ -999,7 +989,7 @@ pub fn cursorAt(source: Source, logical: u64, logical_limit: ?u64, physical_budg
                         break;
                     }
                 }
-                _ = c.pthread_cond_wait(&g.cond, &g.mutex);
+                g.cond.waitUncancelable(sysio.io(), &g.mutex);
             }
             g.lane_busy[cur.lane] = true;
             g.lane_physical_budget[cur.lane] = physical_budget;
@@ -1046,7 +1036,7 @@ pub fn scanCursorAt(source: Source, logical: u64) Cursor {
                         break;
                     }
                 }
-                _ = c.pthread_cond_wait(&g.cond, &g.mutex);
+                g.cond.waitUncancelable(sysio.io(), &g.mutex);
             }
             g.lane_busy[cur.lane] = true;
             const session = if (cur.lane == 0) g.forward else if (cur.lane == 1) g.replay else g.replay2;
