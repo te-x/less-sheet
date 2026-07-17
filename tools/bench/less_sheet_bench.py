@@ -274,27 +274,48 @@ def gen_fixture(path, target_bytes):
     return written
 
 
-def drop_caches():
-    """Best-effort page-cache drop for a cold read. Returns (ok, note)."""
+def prime_cold_sudo():
+    """For --cold: obtain root ONCE up front (sudo caches its timestamp for the
+    session) so the per-fixture cache drop stays non-interactive and never
+    re-prompts — one password entry for the whole cold run. Returns (ok, note)."""
     sysname = platform.system()
+    if sysname not in ("Darwin", "Linux"):
+        return False, "unsupported OS for cache drop"
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        return True, "root"
+    if not shutil.which("sudo"):
+        return False, "no sudo on PATH (run as root for cold)"
+    # already have a cached or passwordless sudo timestamp?
+    if subprocess.run(["sudo", "-n", "true"], capture_output=True).returncode == 0:
+        return True, "sudo (cached / passwordless)"
+    print("[cold] page-cache drop needs root — enter your password once:", flush=True)
+    if subprocess.run(["sudo", "-v"]).returncode != 0:
+        return False, "sudo authentication failed"
+    return True, "sudo (primed once)"
+
+
+def drop_caches():
+    """Drop the page cache for a cold read. Assumes prime_cold_sudo() already
+    obtained root, so this stays NON-interactive (`sudo -n`) and never prompts
+    mid-run. Returns (ok, note)."""
+    sysname = platform.system()
+    root = hasattr(os, "geteuid") and os.geteuid() == 0
     try:
         subprocess.run(["sync"], check=False)
         if sysname == "Darwin":
-            r = subprocess.run(["purge"], capture_output=True)
-            if r.returncode == 0:
-                return True, "purge"
-            return False, "purge failed (try `sudo purge`)"
+            cmd, label = (["purge"] if root else ["sudo", "-n", "purge"]), "purge"
         elif sysname == "Linux":
-            # Needs root. Try direct, then sudo -n (non-interactive).
-            for cmd in (["sh", "-c", "echo 3 > /proc/sys/vm/drop_caches"],
-                        ["sudo", "-n", "sh", "-c", "echo 3 > /proc/sys/vm/drop_caches"]):
-                r = subprocess.run(cmd, capture_output=True)
-                if r.returncode == 0:
-                    return True, "drop_caches"
-            return False, "drop_caches needs root (run as root or with passwordless sudo)"
+            drop = "echo 3 > /proc/sys/vm/drop_caches"
+            cmd = ["sh", "-c", drop] if root else ["sudo", "-n", "sh", "-c", drop]
+            label = "drop_caches"
+        else:
+            return False, "unsupported OS for cache drop"
+        r = subprocess.run(cmd, capture_output=True)
+        if r.returncode == 0:
+            return True, label
+        return False, (r.stderr.decode(errors="replace").strip() or "%s failed" % label)
     except Exception as e:  # noqa
         return False, "cache-drop error: %r" % e
-    return False, "unsupported OS for cache drop"
 
 
 def parse_run(stdout):
@@ -466,6 +487,12 @@ def main():
         workdir = tempfile.mkdtemp(prefix="lsbench-")
         harness = compile_harness(repo, lib, workdir)
 
+    cold_ok = False
+    if args.cold:
+        cold_ok, cnote = prime_cold_sudo()
+        print("[cold] %s" % ("root ready via " + cnote if cold_ok
+              else "cache drop unavailable: %s (cold numbers will equal warm)" % cnote))
+
     fixtures = []
     per_fixture = []
     try:
@@ -478,9 +505,10 @@ def main():
 
             entry = {"name": name, "bytes": actual}
             if args.cold:
-                ok, note = drop_caches()
-                if not ok:
-                    print("[cold] cache drop unavailable: %s (cold numbers will equal warm)" % note)
+                if cold_ok:
+                    ok, note = drop_caches()
+                    if not ok:
+                        print("[cold] drop failed: %s (this fixture's cold ~= warm)" % note)
                 print("[run ] %s cold pass ..." % name, flush=True)
                 entry["cold"] = run_harness(harness, path, args.copy_cap)
             # warm: run twice, keep the second (steady-state)
