@@ -77,8 +77,25 @@ primitive changed). A first single-run pass showed `index_scan` +7.8%, which van
 machinery — a link-input size delta, not a runtime cost (link-time DCE trims unused Io code; the macOS app
 still built, linked, and passed).
 
-## Pending — human-runtime acceptance criteria (the author, real hardware; correctly out of gate)
-The gate proves compile + archive + 142 tests + macOS app; it cannot exercise a Linux binary or real TLS.
-- **H1/H2** — a recorded `tools/bench/bench_lesssheet_on` run on the aarch64 ARM board **and** an x86_64 Linux box.
-- **H3** — a real HTTPS `ls_open_url_*` open on Linux (system CA / TLS) via `tools/netprobe/netprobe_on`,
-  on both arches.
+## Human-runtime acceptance criteria — VERIFIED on real hardware (the author, 2026-07-17)
+The gate can't exercise a Linux binary or real TLS; these were run on real hardware and PASS.
+- **H1 (aarch64) — PASS.** `bench_lesssheet_on` ran correctly on a ARM board 4B (Cortex-A72,
+  Linux 6.18, aarch64), warm + cold, at 8/100/500 MB, on both a USB-SSD and a USB-HDD.
+- **H2 (x86_64) — PASS.** Same on an i7-12700 box (Arch, Linux 7.0, x86_64), warm + cold, on NVMe and HDD.
+- **H3 (real Linux TLS) — PASS on both arches.** `netprobe_on` opened
+  `https://samplelib.com/csv/sample-30mb.csv` over real HTTPS on the ARM board AND the x86_64 box: the system
+  cert store loaded, TLS verified, 31,457,327 bytes fetched, 8 columns + first rows parsed correctly,
+  state PENDING→FETCHING→DONE, exit OK. (Not a fake seam — a real socket + real certificate.)
+
+### Cross-platform performance (recorded)
+The same core, cross-compiled once on the Mac, runs correctly + performantly on macOS/arm64,
+Linux/x86_64, and Linux/aarch64. Highlights (cold cache, 500 MB / 12.5M-row CSV):
+- **User-facing open→first-paint is disk-independent.** Worst case (ARM board + USB-HDD, cold) opens in
+  52 ms with a 0.19 ms first window — vs the <500 ms budget. This is the O(head) open + O(viewport)
+  first-window design holding on the slowest hardware/disk combination.
+- **Disk only bottlenecks when its bandwidth is below the CPU lexer rate** (warm index: mac 0.67 /
+  arch 0.57 / ARM board 0.13 GB/s). A fast CPU + HDD (arch) shows a +158% cold index-scan penalty; the
+  ARM board is CPU-bound, so its USB-HDD ≈ USB-SSD. Full-file scans are CPU-bound (the deferred SIMD-scan work
+  is the lever, not faster disk).
+
+**All acceptance criteria satisfied (GATE + H1 + H2 + H3). Merged to master 2026-07-17.**
