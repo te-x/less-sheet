@@ -426,7 +426,18 @@ def main():
     ap.add_argument("--copy-cap", type=int, default=1000000, help="max rows to copy in copy_rows (default 1e6)")
     ap.add_argument("--keep", action="store_true", help="keep the generated fixtures (don't delete)")
     ap.add_argument("--out", default=None, help="report file path (default bench-<host>-<ts>.txt in CWD)")
+    ap.add_argument("--harness", default=None,
+                    help="use a PREBUILT harness binary (skips repo/zig/cc entirely). "
+                         "This is how the remote runner works: cross-compile on a machine "
+                         "that has zig, ship the binary here.")
+    ap.add_argument("--print-harness", action="store_true",
+                    help="print the embedded C harness source to stdout and exit "
+                         "(used by the remote runner to cross-compile).")
     args = ap.parse_args()
+
+    if args.print_harness:
+        sys.stdout.write(HARNESS_C)
+        return
 
     try:
         sizes_mb = [int(x) for x in args.sizes.split(",") if x.strip()]
@@ -434,13 +445,26 @@ def main():
         die("--sizes must be comma-separated integers (MB)")
 
     cwd = os.getcwd()
-    repo = find_repo(args.repo)
-    print("[info] repo:  %s" % repo)
-    print("[info] disk under test (CWD): %s" % cwd)
-
-    lib = build_lib(repo, args.lib)
-    workdir = tempfile.mkdtemp(prefix="lsbench-")
-    harness = compile_harness(repo, lib, workdir)
+    if args.harness:
+        # Prebuilt (e.g. cross-compiled + shipped by the remote runner): no repo,
+        # no zig, no C compiler needed here.
+        harness = os.path.abspath(args.harness)
+        if not os.path.isfile(harness):
+            die("--harness not found: " + harness)
+        try:
+            os.chmod(harness, 0o755)
+        except OSError:
+            pass
+        workdir = None
+        print("[info] prebuilt harness: %s" % harness)
+        print("[info] disk under test (CWD): %s" % cwd)
+    else:
+        repo = find_repo(args.repo)
+        print("[info] repo:  %s" % repo)
+        print("[info] disk under test (CWD): %s" % cwd)
+        lib = build_lib(repo, args.lib)
+        workdir = tempfile.mkdtemp(prefix="lsbench-")
+        harness = compile_harness(repo, lib, workdir)
 
     fixtures = []
     per_fixture = []
@@ -486,7 +510,8 @@ def main():
             print("[clean] removed %d fixture(s) from %s" % (len(fixtures), cwd))
         else:
             print("[keep] fixtures left in %s" % cwd)
-        shutil.rmtree(workdir, ignore_errors=True)
+        if workdir:
+            shutil.rmtree(workdir, ignore_errors=True)
 
 
 if __name__ == "__main__":
