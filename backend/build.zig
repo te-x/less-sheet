@@ -34,25 +34,37 @@ pub fn build(b: *std.Build) void {
         .root_module = api_mod,
     });
 
-    // Zig's self-hosted archiver only guarantees 2-byte member alignment,
-    // but Apple's ld64 requires 64-bit mach-o archive members to be 8-byte
-    // aligned (whether a given build trips this depends on member sizes).
-    // Re-pack the archive with Apple libtool so the installed
-    // zig-out/lib/liblesssheet.a always links from Swift.
-    // (The archiver also writes mode-000 member headers, so the objects are
-    // extracted and chmod-ed before libtool re-archives them.)
-    const repack = b.addSystemCommand(&.{
-        "/bin/sh", "-c",
-        "set -eu; " ++
-            "case \"$0\" in /*) src=\"$0\";; *) src=\"$PWD/$0\";; esac; " ++
-            "case \"$1\" in /*) out=\"$1\";; *) out=\"$PWD/$1\";; esac; " ++
-            "tmp=$(mktemp -d); trap 'rm -rf \"$tmp\"' EXIT; " ++
-            "cd \"$tmp\"; ar x \"$src\"; chmod 644 *.o; libtool -static -o \"$out\" ./*.o",
-    });
-    repack.addArtifactArg(lib);
-    const repacked = repack.addOutputFileArg("liblesssheet.a");
-    const install_lib = b.addInstallFile(repacked, "lib/liblesssheet.a");
-    b.getInstallStep().dependOn(&install_lib.step);
+    // Archive production is PER-TARGET (ARCH-backend-linux-portability §build.zig).
+    //
+    // On a macOS TARGET the installed archive is linked by SwiftPM/ld64, which
+    // requires 64-bit mach-o archive members to be 8-byte aligned; Zig's
+    // self-hosted archiver only guarantees 2-byte (and writes mode-000 member
+    // headers). So on macOS we re-pack with Apple `ar`+`libtool` (extract,
+    // chmod 644, re-archive) — the historical, SwiftPM-linking fixup.
+    //
+    // That step is mach-o/ld64-specific: `libtool` is a mac-only tool and the
+    // 8-byte-alignment requirement is ld64's. For a non-macOS TARGET (the
+    // aarch64/x86_64 -linux-musl cross-builds) it is both unnecessary and
+    // impossible, so install the zig-native static archive directly — lld
+    // links musl-static ELF archives without a repack. `installArtifact` of a
+    // static lib installs to lib/liblesssheet.a (the same path the repack
+    // writes and the bench/net cross-compile-and-ship tools expect).
+    if (target.result.os.tag == .macos) {
+        const repack = b.addSystemCommand(&.{
+            "/bin/sh", "-c",
+            "set -eu; " ++
+                "case \"$0\" in /*) src=\"$0\";; *) src=\"$PWD/$0\";; esac; " ++
+                "case \"$1\" in /*) out=\"$1\";; *) out=\"$PWD/$1\";; esac; " ++
+                "tmp=$(mktemp -d); trap 'rm -rf \"$tmp\"' EXIT; " ++
+                "cd \"$tmp\"; ar x \"$src\"; chmod 644 *.o; libtool -static -o \"$out\" ./*.o",
+        });
+        repack.addArtifactArg(lib);
+        const repacked = repack.addOutputFileArg("liblesssheet.a");
+        const install_lib = b.addInstallFile(repacked, "lib/liblesssheet.a");
+        b.getInstallStep().dependOn(&install_lib.step);
+    } else {
+        b.installArtifact(lib);
+    }
 
     // csv-corpus (ARCH-csv-corpus): the frozen sweep in tests/all_tests.zig
     // reads a GENERATED corpus + manifest.json via an injected `corpus` options
