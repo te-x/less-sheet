@@ -149,7 +149,7 @@ non-GUI logic is unit-testable headlessly and only rendering needs a display.
   streaming-copy chunk assembly + clipboard-string build, column-config reducers, dialect compose, column
   layout / width math, selection rect algebra, and the locale number/date formatter. Direct C analogs of
   the macOS `LessSheetKit` logic files.
-- **Grid widget (`src/grid.*`).** A custom `GtkDrawingArea` painting via `GtkSnapshot`/GSK with Pango text,
+- **Grid widget (`src/grid.*`).** A custom `GtkDrawingArea` painting via Cairo + PangoCairo (its `draw_func`, GSK-composited) with Pango text,
   driven by a hand-managed `GtkAdjustment` + `GtkScrollbar` (uniform row height ⇒ O(1) geometry; content
   height = `row_estimate * row_height`; the filler/overscroll strip below EOF). It hand-draws the header,
   gutter, cells, hairlines, highlights (from `ls_window_match_flags`), selection, and markers; implements
@@ -201,12 +201,19 @@ them when he signs off this ARCH (no separate question round).
    matches the workspace's existing `c-gtk` aidev profile. *Alternatives rejected:* **Rust + gtk4-rs**
    (memory safety we don't need for a thin caller, at the cost of an FFI wrapper + a large cargo tree +
    bigger binary); **Vala** (ergonomic but niche tooling, compiles through C anyway). *(the author.)*
-2. **Grid = custom `GtkDrawingArea`** (GtkSnapshot/GSK + Pango, hand-driven `GtkAdjustment` + `GtkScrollbar`,
+2. **Grid = custom `GtkDrawingArea`** (Cairo + PangoCairo via its `draw_func`, GSK-composited; hand-driven `GtkAdjustment` + `GtkScrollbar`,
    uniform row height, viewport-only via `ls_window_set`, deferred estimate adjustment). The direct analog
    of the proven macOS NSTableView-shell technique. *Alternative rejected:* **GtkColumnView** — it requires
    an N-item `GListModel` (enumerates all rows), instantiates a factory widget per visible cell per column,
    and has documented fast-scroll jank and broken scrollbar estimation on estimated/uneven row counts; it
    structurally fights "materialize only the viewport." *(the author; corroborated by the survey + GTK docs.)*
+   **AMENDED 2026-07-18 (the author-ratified per the Slice-1 reviewer's `[design]` finding):** the literal
+   "GtkSnapshot/GSK" was internally inconsistent — a `GtkDrawingArea`'s only paint API is the Cairo
+   `draw_func` (GSK snapshot nodes need a `GtkWidget` subclass `snapshot` vfunc, i.e. NOT a GtkDrawingArea).
+   The realization is therefore **Cairo + PangoCairo, GSK-composited by GtkDrawingArea internally**; paint is
+   viewport-bounded (~visible cells per frame, never O(rows)), analogous to the macOS CoreGraphics/CoreText
+   cell draw. The GSK-vfunc-subclass alternative was considered and deferred; the perf verdict is the **H4
+   human GUI pass** — if scroll janks on real GNOME hardware, revisit.
 3. **Window chrome = native Adwaita** (`AdwHeaderBar` + `GtkPopover` find/jump + `AdwBanner` + `AdwToast` +
    `AdwStatusPage` + `AdwPreferencesWindow`). Satisfies "look native in GNOME / as default as possible";
    interaction parity (not pixel parity) is the bar. *Alternative rejected:* replicating the macOS
