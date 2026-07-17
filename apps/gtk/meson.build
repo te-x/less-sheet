@@ -20,30 +20,105 @@ glib_dep = dependency('glib-2.0',                          include_type : 'syste
 core_dir = meson.current_source_dir() / '.core-linux' / 'lib'
 core_dep = cc.find_library('lesssheet', dirs : [core_dir], static : true)
 
-# The frozen cross-component ABI. include/lesssheet.h is a symlink to the single
-# source of truth, ../../api/lesssheet.h (never a copy — ARCH decision, matches
-# apps/macos/Sources/CLessSheet).
+# The frozen cross-component ABI (include/lesssheet.h — a symlink to the single
+# source of truth ../../api/lesssheet.h, never a copy) AND the frontend's own
+# frozen module headers (include/lsg_*.h) both live under include/.
 core_inc = include_directories('include')
 
-# Minimal app: proves the GTK4 + libadwaita toolchain compiles and links, and
-# that the core archive is a valid link input. Compiled by the gate but NOT run
-# there (needs a display — that is the human GUI pass).
-executable('less-sheet-gtk',
-  'src/main.c',
-  dependencies : [gtk_dep, adw_dep, core_dep],
+# ---------------------------------------------------------------------------
+# Slice 1 frontend logic modules (contract in include/lsg_*.h). Display-free C
+# built once into a static library and linked into the app + every test binary.
+# Compiling this under -Werror is the CONFORMANCE gate: the module sources must
+# match the frozen headers exactly or the build fails.
+# ---------------------------------------------------------------------------
+lsg_sources = files(
+  'src/lsg_document.c',
+  'src/lsg_net_open.c',
+  'src/lsg_formatter.c',
+  'src/lsg_grid_geometry.c',
+  'src/lsg_window_poll.c',
+)
+lsgkit = static_library('lsgkit',
+  lsg_sources,
+  dependencies : [glib_dep],
   include_directories : core_inc,
   install : false,
 )
 
-# One behavior test: proves the core links and is callable over the C ABI.
-# Display-free (glib only, no GTK). The fixture path is baked in at compile time
-# and resolves inside the container (the repo is mounted).
+# App: hosts the slice-1 modules over the GTK4 + libadwaita toolchain and links
+# the core archive. Compiled by the gate but NOT run there (needs a display —
+# that is the human GUI pass). The real grid/chrome is authored during build.
+executable('less-sheet-gtk',
+  'src/main.c',
+  dependencies : [gtk_dep, adw_dep, glib_dep, core_dep],
+  link_with : lsgkit,
+  include_directories : core_inc,
+  install : false,
+)
+
+# Behavior tests: display-free g_test binaries (glib only, no GTK) linked
+# against the modules and the core archive. Run in-container by `meson test`.
+test_deps = [glib_dep, core_dep]
+
+# Bootstrap linkage test (kept): proves the core links and is callable over the
+# C ABI. The fixture path is baked in and resolves inside the container.
 fixture = meson.current_source_dir() / 'tests' / 'fixtures' / 'tiny.csv'
 test_core_link = executable('test-core-link',
   'tests/test_core_link.c',
-  dependencies : [glib_dep, core_dep],
+  dependencies : test_deps,
   include_directories : core_inc,
   c_args : ['-DFIXTURE_PATH="' + fixture + '"'],
   install : false,
 )
 test('core-link', test_core_link)
+
+# Document session (over the real core; needs the tiny fixture path).
+test_document = executable('test-document',
+  'tests/test_document.c',
+  dependencies : test_deps,
+  link_with : lsgkit,
+  include_directories : core_inc,
+  c_args : ['-DFIXTURE_PATH="' + fixture + '"'],
+  install : false,
+)
+test('document', test_document)
+
+# Network-open reducer + drive (synthetic snapshots + real-ABI scheme reject).
+test_net_open = executable('test-net-open',
+  'tests/test_net_open.c',
+  dependencies : test_deps,
+  link_with : lsgkit,
+  include_directories : core_inc,
+  install : false,
+)
+test('net-open', test_net_open)
+
+# Cell formatter engine (pure; kind gate + lossless decimal + locale glyphs).
+test_formatter = executable('test-formatter',
+  'tests/test_formatter.c',
+  dependencies : test_deps,
+  link_with : lsgkit,
+  include_directories : core_inc,
+  install : false,
+)
+test('formatter', test_formatter)
+
+# Grid geometry / window math (pure; row/column windows + scrollbar mapping).
+test_grid_geometry = executable('test-grid-geometry',
+  'tests/test_grid_geometry.c',
+  dependencies : test_deps,
+  link_with : lsgkit,
+  include_directories : core_inc,
+  install : false,
+)
+test('grid-geometry', test_grid_geometry)
+
+# Window-poll decision (pure).
+test_window_poll = executable('test-window-poll',
+  'tests/test_window_poll.c',
+  dependencies : test_deps,
+  link_with : lsgkit,
+  include_directories : core_inc,
+  install : false,
+)
+test('window-poll', test_window_poll)
