@@ -238,10 +238,11 @@ final class DocumentModel {
     private let findControl = FindControl()
     private let filterControl = FilterControl()
     private let windowPoll = WindowPoll()
-    /// The pure selection geometry, TSV copy builder, and column-width algebra
-    /// (ARCH-select-copy) — same layering as the collaborators above.
+    /// The pure selection geometry and column-width algebra (ARCH-select-copy)
+    /// — same layering as the collaborators above. TSV copy framing now lives in
+    /// the core (ARCH-thin-frontend-shared-core Phase 2): `copySelection` streams
+    /// it off `DocumentSession.openCopy` instead of a frontend `TSVCopyBuilder`.
     private let selectionModel = SelectionModel()
-    private let copyBuilder = TSVCopyBuilder()
     private let columnSizer = ColumnSizer()
     /// The direction of the outstanding search navigation (drives the wrap
     /// notice's start/end choice when a poll reports exhaustion).
@@ -1605,31 +1606,25 @@ final class DocumentModel {
     /// writes would only ever want the LATEST to win — cancelling makes
     /// that the only possible outcome instead of blocking on a stale one.
     ///
-    /// Before building, gives the background index a bounded chance to
+    /// Before streaming, gives the background index a bounded chance to
     /// advance the scan frontier to the selection's bottom row
     /// (`advanceFrontier`, finding 3): without this, a selection made soon
     /// after opening a large file — before AUTO indexing has caught up —
-    /// copies only up to the frontier and reports `.stoppedAtFrontier`
-    /// (`CopyBuilding.build` rule 6) even though the rest of the rows exist
-    /// and would be servable moments later.
+    /// streams only up to the frontier and reports `.stoppedAtFrontier`
+    /// (`streamCopy`'s STALLED handling) even though the rest of the rows
+    /// exist and would be servable moments later.
     ///
-    /// PERFORMANCE NOTE (measured, not a bug): `ls_cell_copy` re-locates its
-    /// row from the nearest index checkpoint (every 2048 rows, backend
-    /// `checkpoint_interval`) on EVERY call, independently — unlike the
-    /// paged `setWindow`/`ls_cell` the scrolling grid uses (which amortizes
-    /// that cost across a whole page), so a copy spanning many rows AND
-    /// columns can take real, human-noticeable time (a 100k-row x 3-column
-    /// selection measured ~80 s off-main). This is why the ARCH calls for
-    /// the "Copying…" affordance below rather than assuming near-instant
-    /// completion — and why that affordance now carries a Cancel escape
-    /// hatch (finding 2) for exactly that long tail; deliberately NOT
-    /// "fixed" by routing this through `setWindow` instead — that would
-    /// evict/thrash the SAME live window the on-screen grid is scrolling
-    /// through, exactly the interference `ls_cell_copy` (window-INDEPENDENT)
-    /// exists to avoid (AC4: "the UI keeps scrolling... undisturbed").
-    /// Main-thread responsiveness is unaffected either way (verified:
-    /// `SelectCopyProbe`'s heartbeat stays under budget for the whole
-    /// build) — only wall-clock completion time is.
+    /// PERFORMANCE (ARCH-thin-frontend-shared-core Phase 2 — the ~80 s stall is
+    /// FIXED): the copy now STREAMS core-framed TSV via `openCopy` → `next`
+    /// (`streamCopy` below) instead of the deleted `TSVCopyBuilder`'s per-cell
+    /// `ls_cell_copy` loop. The former loop re-located each row from the nearest
+    /// index checkpoint on EVERY call, so a 100k-row × 3-column copy measured
+    /// ~80 s off-main; the in-core sweep instead rides the O(1) forward copy
+    /// cursor (row-major, no per-cell re-location), so cost is O(rows-read). It
+    /// stays window-INDEPENDENT (the grid keeps scrolling undisturbed — AC4) and
+    /// off-main (`SelectCopyProbe`'s heartbeat stays under budget). The "Copying…"
+    /// affordance + Cancel remain (a huge selection can still take real time; the
+    /// stream is cancellable per pull — see `streamCopy` / `cancelCopy`).
     func copySelection() {
         guard let session, let rect = selection?.rect else { return }
         cancelCopy()   // supersede any copy already running (see doc above)
@@ -1661,24 +1656,116 @@ final class DocumentModel {
             self.copyProgress = indication
             if indication.isVisible { self.copyNotice = "Copying…" }
         }
-        let builder = copyBuilder
         let budget = CopyBudget.standard
-        let fetch: CopyCellFetch = { row, column in session.copyCell(row: row, column: column, maxBytes: budget.perCellMaxBytes) }
         copyTask = Task.detached { [weak self] in
+            // Pre-advance the scan frontier over the whole selection so the
+            // stream below rarely STALLS — and this pre-pass is the common,
+            // cancellable spot a cancel lands on a lagging index (finding 3).
             await Self.advanceFrontier(session: session, to: rect.bottom)
             guard !Task.isCancelled else { return }
-            let report = builder.build(rect, budget: budget, fetch: fetch)
+            let report = await Self.streamCopy(session: session, rect: rect, budget: budget)
             guard !Task.isCancelled else { return }
             await self?.completeCopy(report)
         }
+    }
+
+    /// Per-pull chunk size for the streaming copy — a tunable; the payload total
+    /// is bounded by the byte budget + the core's cell cap, never by this.
+    /// `nonisolated` so the off-main `streamCopy` (also nonisolated) can read it.
+    nonisolated private static let copyChunkBytes = 1 << 16   // 64 KiB
+
+    /// Streams the CORE-FRAMED TSV copy of `rect` off the main thread
+    /// (ARCH-thin-frontend-shared-core Phase 2): drives `DocumentSession.openCopy`
+    /// → `next` / `close`, appending each chunk to a growing blob, advancing the
+    /// frontier on `.stalled` (the SAME jump primitive `advanceFrontier` uses)
+    /// then resuming, and stopping at the frontend byte budget. The core owns the
+    /// framing (TAB/LF, spreadsheet quoting, single-cell raw, lossless cells) AND
+    /// the cell-count safety cap (`budgetCapped` → `.stoppedAtCellCap`), so this
+    /// holds NO TSV logic — it replaces the deleted `TSVCopyBuilder` per-cell
+    /// drive and fixes its ~80 s/100k-row stall (the in-core O(1) copy cursor).
+    /// Cancellable: checked each pull, and `close()` runs in a `defer` (cancel =
+    /// stop pulling + close, no thread to join). Produces the SAME `CopyReport`
+    /// shape `completeCopy` consumes (pasteboard + notice unchanged). `lossyCells`
+    /// is false: the stream reads each cell losslessly to the core's oversized-row
+    /// source cap, so the old per-cell ~1 MiB display truncation no longer arises.
+    ///
+    /// `nonisolated` so it runs on the caller's `Task.detached` executor, OFF the
+    /// main actor — the per-chunk `job.next` core copy must NOT hop onto
+    /// `DocumentModel`'s MainActor (AC4: the grid keeps scrolling while a big copy
+    /// runs). `internal` (not `private`) so `StreamCopyOutcomeProbe` can drive it
+    /// headlessly with a fake session to gate-lock the `.stopped*` outcomes below.
+    nonisolated static func streamCopy(session: any DocumentSession, rect: SelectionRect, budget: CopyBudget) async -> CopyReport {
+        guard let job = session.openCopy(rect) else {
+            return CopyReport(text: "", byteCount: 0, rowCount: 0, outcome: .complete, lossyCells: false)
+        }
+        defer { job.close() }
+        var blob: [UInt8] = []
+        var rowsDone: UInt64 = 0
+        var outcome: CopyOutcome = .complete
+        // FINDING 1 no-progress guard: the LAST view row we asked startJump to
+        // advance the frontier over. A STALLED that reports the SAME row again means
+        // the jump made no progress (a filtered mis-target — see the .stalled case).
+        var lastStalledRow: UInt64? = nil
+        pull: while true {
+            if Task.isCancelled { break }
+            let step = job.next(maxChunkBytes: copyChunkBytes)
+            rowsDone = step.rowsDone
+            blob.append(contentsOf: step.bytes)
+            switch step.kind {
+            case .more:
+                // BYTE BUDGET (frontend cap, ~64 MiB): stop pulling once the blob
+                // reaches it — mirrors the deleted builder's `.stoppedAtBudget`
+                // (the core's own ceiling is cell-count, reported on `.done`).
+                if blob.count >= budget.maxTotalBytes {
+                    outcome = .stoppedAtBudget
+                    break pull
+                }
+            case .stalled:
+                // FINDING 1 (filtered STALLED): the core's `stalledRow` is a VIEW
+                // (filtered) index, but startJump(to:) targets an ORIGINAL data row
+                // while a filter is active (api/lesssheet.h "JUMP under a filter"),
+                // so under a filter the jump can't advance the frontier over the
+                // stalled view row and returns DONE without progress. If the SAME
+                // stalledRow recurs after a jump, stop cleanly at the frontier (the
+                // pre-Phase-2 `.stoppedAtFrontier`) instead of re-jumping it forever
+                // (which would busy-spin a core under AUTO / hang under MANUAL). The
+                // IDENTITY view never trips this: a real advance makes the next stall
+                // a strictly-later row (view row == original row there).
+                if step.stalledRow == lastStalledRow {
+                    outcome = .stoppedAtFrontier
+                    break pull
+                }
+                lastStalledRow = step.stalledRow
+                session.startJump(to: step.stalledRow)
+                // Wait for the jump to settle, ALWAYS yielding at least once FIRST
+                // (the back-off) so an immediately-DONE jump can never let this loop
+                // busy-spin — even before the no-progress guard above fires.
+                var settled = false
+                for _ in 0..<frontierPollMaxTicks {
+                    if Task.isCancelled { break pull }
+                    try? await Task.sleep(for: frontierPollInterval)
+                    if case .done = session.jumpStatus() { settled = true; break }
+                }
+                if !settled {
+                    outcome = .stoppedAtFrontier   // frontier could not advance in time
+                    break pull
+                }
+            case .done:
+                outcome = step.budgetCapped ? .stoppedAtCellCap : .complete
+                break pull
+            }
+        }
+        let text = String(decoding: blob, as: UTF8.self)
+        return CopyReport(text: text, byteCount: blob.count, rowCount: rowsDone, outcome: outcome, lossyCells: false)
     }
 
     /// How long `advanceFrontier` waits for AUTO indexing to reach the
     /// selection's bottom row before giving up and building anyway — bounded
     /// so a copy can never hang on an arbitrarily slow scan. One poll every
     /// `frontierPollInterval`, up to `frontierPollMaxTicks` times.
-    private static let frontierPollInterval: Duration = .milliseconds(50)
-    private static let frontierPollMaxTicks = 40   // ~2 s total
+    /// `nonisolated` so the off-main `streamCopy` / `advanceFrontier` can read them.
+    nonisolated private static let frontierPollInterval: Duration = .milliseconds(50)
+    nonisolated private static let frontierPollMaxTicks = 40   // ~2 s total
 
     /// Pre-advances the core's scan frontier toward `target` (ARCH-select-
     /// copy round 2, finding 3) by reusing the SAME jump-scan primitives a
@@ -1697,7 +1784,14 @@ final class DocumentModel {
     /// response while a copy is waiting here, its most likely spot). Shares
     /// the core's single scan slot with a real jump/find — an existing,
     /// accepted trade-off (see `DocumentSession.startJump`'s doc comment).
-    private static func advanceFrontier(session: any DocumentSession, to target: UInt64) async {
+    nonisolated private static func advanceFrontier(session: any DocumentSession, to target: UInt64) async {
+        // FINDING 1: `target` (the selection's bottom) is a VIEW row. Under a
+        // FILTER, startJump(to:) targets an ORIGINAL data row (api/lesssheet.h
+        // "JUMP under a filter"), so a filtered view index is the wrong target and
+        // cannot correctly pre-advance the filter frontier — skip the pre-pass and
+        // let `streamCopy` stop cleanly at the frontier if the selection outruns it
+        // (its no-progress guard). The IDENTITY view is unaffected (view == original).
+        guard session.filterStatus() == nil else { return }
         session.startJump(to: target)
         if case .done = session.jumpStatus() { return }
         for _ in 0..<frontierPollMaxTicks {
@@ -1729,19 +1823,16 @@ final class DocumentModel {
 
     /// Cancels an in-flight copy (Esc, the "Copying…" notice's Cancel
     /// button, or a fresh ⌘C superseding it — ARCH-select-copy round 2,
-    /// finding 2). Best-effort over the BUILD itself: `TSVCopyBuilder.build`
-    /// is a tight synchronous loop with no cancellation checkpoint of its
-    /// own (reviewer-verified-correct pure logic, out of scope for this
-    /// round's fixes), so an already-running fetch loop keeps running to
-    /// completion in the background rather than stopping mid-cell.
-    /// `advanceFrontier`'s wait — the common
-    /// place a cancel actually lands, since on a lagging index it dominates
-    /// the latency before the build even starts — DOES poll in a cancellable
-    /// loop and stops within one tick. Either way, what this method
-    /// guarantees unconditionally: the UI-visible state clears immediately
-    /// (no perpetual "Copying…"), and any result the orphaned task
-    /// eventually produces is silently dropped (`completeCopy` checks
-    /// `Task.isCancelled` before touching the pasteboard or the notice).
+    /// finding 2). The streaming drive (`streamCopy`, ARCH-thin-frontend-
+    /// shared-core Phase 2) now checks `Task.isCancelled` on EVERY pull (and in
+    /// its STALLED frontier-wait), so a cancel stops the stream promptly instead
+    /// of running a whole `TSVCopyBuilder.build` loop to completion in the
+    /// background. `advanceFrontier`'s pre-pass wait — where a cancel most often
+    /// lands on a lagging index — also polls cancellably and stops within one
+    /// tick. Unconditionally: the UI-visible state clears immediately (no
+    /// perpetual "Copying…"), the job is `close`d by the drive task's `defer`,
+    /// and any result an orphaned pull produces is silently dropped
+    /// (`completeCopy` checks `Task.isCancelled` before the pasteboard/notice).
     func cancelCopy() {
         copyTask?.cancel()
         copyTask = nil

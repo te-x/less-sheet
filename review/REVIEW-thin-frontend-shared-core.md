@@ -75,16 +75,74 @@ still gate-locked by `mf1`–`mf8` + the `CellMatcher`-free `MatchFlagsBridgeTes
   ledger, which is the external-adapter mechanism) — the ORCHESTRATOR invariant that native handoffs are
   "journaled+audited, not structurally forced".
 
-## Verdict
-**DONE.** Phase 1 of thin-frontend-shared-core landed on `feat/thin-frontend-shared-core`. The macOS
-frontend no longer owns a cell matcher; a future GTK frontend gets highlight verdicts from
-`ls_window_match_flags` with zero re-implementation.
+# Phase 2 — streaming copy (`ls_copy_*`)
 
-## Outstanding / next
-1. **Phase 2 — core-framed streaming copy** (`ls_copy_open/next/close`): the separate later freeze; fixes
-   the ~80 s/100k-row copy stall + de-dups TSV framing. This is where the big perf win lives; a full
-   before/after belongs there ([[perf-before-after-tracking]]).
-2. **Cosmetic (non-blocking):** a few stale `CellMatcher`/`CellMatching` doc-comment mentions linger in the
-   planner-owned frozen `Sources/Contracts/{DocumentSession,FindControl}.swift`; tidy on the next
-   contract touch (not worth a freeze of its own).
-3. Human visual pass on the highlight rendering after this + the pending selection-color change.
+Contract frozen at `8d8659e`; amended (two-key, DECISION-2) at `e2fb894`. Native implementer (opus) ⇄
+native reviewer (opus/high) cell, run-id `tfsc-p2`, **2 rounds to convergence**. Additive ABI:
+`ls_copy_open` / `ls_copy_next` / `ls_copy_close` + `ls_copy_rect`/`ls_copy_step`/`ls_copy_progress` +
+`LS_COPY_MAX_CELLS` (10M cells, mirroring today's cap; byte-bounding stays caller-side per the ARCH).
+Pull-model, caller-owned buffer, TSV framing byte-identical to `TSVCopyBuilder`, `STALLED` at/beyond the
+frontier, no background thread.
+
+## Round 1 — implementer
+Core `ls_copy_*` frames TSV via `window.cellCopy` (byte-identical by construction — same primitive the
+builder drove) reusing the O(1) forward cursor (`cp_perf` pins O(rows) advances); `CoreCopyStream`/`openCopy`
+bridge with the `copyBufferLock`/`isClosed` UAF discipline; `ViewerModel` re-pointed to stream off
+`openCopy` on a detached task. Orchestrator gate: **GATE: PASS** (backend `cp1`–`cp7`/`cp_perf`/`cp_abi`;
+macOS 165 incl. 3 `streamingCopy*` goldens). CHANGE-REQUEST drafted.
+
+## Round 1 — reviewer: NOT PASS (2 `[impl]`) + CHANGE-REQUEST `[contract]` with a carve-out
+- **Finding 1 `[impl]`** — the filtered STALLED path passed a *view* row to `startJump` (which takes an
+  *original* row under a filter) → mis-target → no frontier progress → immediate-`.done` jump → poll loop
+  re-pulls with no sleep → **CPU hot-spin** (AUTO, self-heals) / **unbounded hang** (MANUAL). Regressed the
+  old clean `.stoppedAtFrontier`.
+- **Finding 2 `[impl]`** — the shipping streaming path was gate-unlocked for wall-clock / STALLED-resume /
+  budget; the only wall-clock test still drove the *deleted* builder.
+- **CHANGE-REQUEST**: co-signed removing the `CopyBuilding` protocol + the builder behavior tests, but
+  **REFUSED a blanket deletion of `StreamCopyWallClockTests`** — carve-out: re-point it onto `openCopy`
+  and keep the `<5 s` ceiling so the frontend perf lock survives.
+
+## Contract amendment (two-key) — planner Mode B, committed `e2fb894`
+Removed the `CopyBuilding` protocol + dead `CopyCellFetch` typealias + the conformance pin + 7 builder
+behavior tests; **re-pointed `StreamCopyWallClockTests` onto `session.openCopy`** (kept, crosses the
+frontier, asserts outcome + `<5 s`). RETAIN types intact.
+
+## Round 2 — implementer
+Deleted `TSVCopyBuilder` + `Decimal10`-analog helpers (completes the de-dup). Fixed finding 1 with a
+`lastStalledRow` no-progress guard (recurring stalled row after a non-advancing jump → `.stoppedAtFrontier`)
++ a **sleep-first** back-off (poll can never busy-spin) + an `advanceFrontier` filter-skip. Fixed finding 2
+with the env-gated `StreamCopyOutcomeProbe`. A correctness bonus: `streamCopy`/`advanceFrontier` made
+`nonisolated` (the class is `@MainActor`) — R1 latently hopped the whole sweep back to the main actor; R2
+keeps it off-main (AC4). Orchestrator gate: **GATE: PASS** (macOS 158 = −7 removed builder tests).
+
+## Round 2 — reviewer: PASS
+Both findings resolved (guard is filter-scoped by construction; identity resume intact per the re-pointed
+1.752 s wall-clock test; `nonisolated` verified safe + fixes off-main); `TSVCopyBuilder`/`CopyBuilding`/
+`CopyCellFetch` cleanly gone, RETAIN types live, equivalence still locked by `cp1`–`cp6` +
+`StreamingCopyBridgeTests`. Non-blocking recommendation: hoist the now-pure `streamCopy` into `LessSheetKit`
+so its outcomes gate-lock instead of probe-lock.
+
+## Perf — before/after (HONEST; corrects the ARCH figure)
+Same `StreamCopyWallClockTests`, 100k rows, debug: **before (`TSVCopyBuilder`, `0986a18`) = 2.54 s;
+after (streaming) = 1.75 s → ~1.45× faster.** The ARCH's "~80 s/100k-row stall" **did NOT reproduce** — the
+builder was already ~2.5 s at 100k (the `ls_cell_copy` cursor was already forward-optimized). The durable
+win is the **O(rows)-advances guarantee** (`cp_perf`-locked, so the gap widens with selection size — the
+per-cell-FFI path is linear in *cells*, where a large multiplier would appear at millions of cells, a regime
+NOT measured here), plus streaming/cancel/off-main/frontier-handling the builder lacked, plus the
+cross-frontend de-dup. The StreamCopyOutcomeProbe: all four outcomes pass (filtered `.stoppedAtFrontier` in
+~52 ms — the finding-1 lock, no spin).
+
+# Verdict (both phases)
+**DONE.** Phases 1 (match-flags) + 2 (streaming copy) of thin-frontend-shared-core landed on
+`feat/thin-frontend-shared-core`. The macOS frontend no longer owns the cell matcher OR the TSV copy
+builder; both are core C-ABI calls (`ls_window_match_flags`, `ls_copy_*`) a future GTK frontend reuses
+with zero re-implementation. Ready to merge to master.
+
+## Outstanding / next (non-blocking)
+1. **Recommendation:** hoist the pure `nonisolated streamCopy` into `LessSheetKit` so its outcome mapping +
+   the finding-1 guard become gate-locked tests instead of runtime-probe-locked (reviewer's R2 note).
+2. **Cosmetic doc rot:** stale `CellMatcher`/`CellMatching`/`CopyBuilding.build` mentions in the frozen
+   `Sources/Contracts/{DocumentSession,FindControl,CopyBuilder,Selection}.swift`; tidy on the next contract touch.
+3. Human visual pass: highlight rendering + the muted-gray selection + a copy of a large selection.
+4. If the ARCH's "~80 s" matters, measure a millions-of-cells before/after (needs the deleted builder via a
+   worktree + a big fixture) to validate or formally retire the figure.

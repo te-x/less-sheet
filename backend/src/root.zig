@@ -365,46 +365,260 @@ pub export fn ls_window_match_flags(doc: *const api.Doc, first_col: u32, col_cou
 // JOB (api/lesssheet.h "STREAMING COPY EXTENSION"). Poll/control lane; COPIES
 // into the caller buffer (no borrow); the job holds no background thread.
 //
-// SEED (planner freeze): ls_copy_open allocates a job handle from the document's
-// gpa, ls_copy_next reports DONE with 0 bytes (NO framing yet), ls_copy_close
-// frees it. This compiles + links + is leak-clean (close-exactly-once), so the
-// C-ABI/enum link guard and the empty-rect DONE path are green, while the
-// byte-identical-TSV / STALLED / rows_done / budget_capped behavior tests are RED
-// (empty output, never STALLED, rows_done 0, never capped). RED -> GREEN: the
-// implementer builds the row-major sweep + TSV framing (TAB/LF, spreadsheet
-// quoting, single-cell raw) here — byte-identical to the deleted TSVCopyBuilder,
-// reusing window.zig's forward COPY CURSOR (behind ls_cell_copy) for the sweep,
-// honoring d.copy_cap_cells (0 == api.copy_max_cells) for budget_capped.
+// The job is a pull-model cursor over the caller's ls_copy_next calls: it sweeps
+// the rect ROW-MAJOR, reading each cell LOSSLESSLY through window.cellCopy (the
+// SAME primitive ls_cell_copy exposes, so the framing rides its forward COPY
+// CURSOR — O(1) per row-major step, no per-cell re-location, which is what kills
+// the ~80 s/100k-row stall), frames the TSV into a reused `pending` buffer
+// (TAB/LF separators, spreadsheet quoting, the single-cell raw special-case —
+// BYTE-IDENTICAL to the deleted TSVCopyBuilder), and hands the caller ≤ buf_len
+// bytes per pull. A chunk ends at a field/row boundary except a single field
+// longer than buf_len, which splits across pulls at a UTF-8 code-point boundary.
+// A row at/beyond the frontier yields STALLED (nothing written; the caller jumps
+// to stalled_row and retries). d.copy_cap_cells (0 == api.copy_max_cells) is the
+// LS_COPY_MAX_CELLS safety cap reported via budget_capped on DONE.
 // ---------------------------------------------------------------------------
 
-const CopyJobSeed = struct {
+/// Transcode-expansion bound on ONE cell's lossless output: a row's SOURCE is
+/// capped at window_row_scan_max_bytes; the worst-case transcode (Latin-1 high
+/// bytes double) expands it 2x. Sizing the per-cell scratch to this means a
+/// window.cellCopy truncation flag can ONLY mean the genuine oversized-row source
+/// cap (never a too-small buffer), so the served bytes match ls_cell_copy's own
+/// bounded prefix exactly (the framing is byte-identical to reading the cell
+/// through ls_cell_copy with an ~unbounded buffer).
+const copy_cell_output_max: usize = 2 * @as(usize, api.window_row_scan_max_bytes) + 8;
+
+const StreamCopyJob = struct {
     gpa: std.mem.Allocator,
     doc: *Document,
     rect: api.CopyRect,
+
+    // Framing invariants captured at open (the rect never changes mid-job).
+    single_cell: bool, // 1x1 rect -> raw, no quoting, no separators
+    empty_job: bool, // empty / out-of-range rect -> DONE with 0 bytes, no sweep
+    cap: u64, // LS_COPY_MAX_CELLS, or the copy_cap_cells test override
+
+    // Sweep position within the selection.
+    sel_row: u64 = 0, // next selection row (0..rect.row_count)
+    sel_col: u32 = 0, // next column within the current row (0..rect.col_count)
+    rows_done: u64 = 0, // selection rows fully framed (monotone)
+    cells_done: u64 = 0, // cells framed (for the cap)
+    budget_capped: bool = false,
+    done: bool = false,
+
+    // Framed-but-not-yet-delivered TSV bytes. Reused across cells; only a field
+    // longer than one buf_len leaves a residual across ls_copy_next calls.
+    pending: std.ArrayList(u8) = .empty,
+    pending_off: usize = 0,
+
+    // Grow-only scratch for one cell's lossless decode (grown to at most
+    // copy_cell_output_max). Reused across every cell of the sweep.
+    scratch: []u8 = &.{},
+
+    fn progress(self: *StreamCopyJob, step: api.CopyStep, written: usize, stalled_row: u64) api.CopyProgress {
+        return .{
+            .step = step,
+            .written = written,
+            .rows_done = self.rows_done,
+            .stalled_row = stalled_row,
+            .budget_capped = if (step == .done) self.budget_capped else false,
+        };
+    }
+
+    /// Read cell (view_row, phys_col) LOSSLESSLY into `self.scratch`, growing the
+    /// scratch (grow-only, reused) until the cell fits or the oversized-row source
+    /// cap is hit. Returns window.cellCopy's result verdict; on `.ok`, `out_len`
+    /// is the served byte count (a bounded prefix only for a genuinely oversized
+    /// row). OOM is reported as `.no_cell` (the sweep then stops — defensive).
+    fn readCell(self: *StreamCopyJob, view_row: u64, phys_col: u32, out_len: *usize) api.CopyResult {
+        out_len.* = 0;
+        var cap: usize = if (self.scratch.len == 0) @min(64 * 1024, copy_cell_output_max) else self.scratch.len;
+        while (true) {
+            self.ensureScratch(cap) catch return .no_cell;
+            var ol: usize = 0;
+            var tr: bool = false;
+            const res = window.cellCopy(self.doc, view_row, phys_col, self.scratch.ptr, self.scratch.len, &ol, &tr);
+            if (res != .ok) return res;
+            // Full cell, or the buffer already spans the source-cap bound -> the
+            // truncation (if any) is the genuine oversized-row prefix: accept it.
+            if (!tr or self.scratch.len >= copy_cell_output_max) {
+                out_len.* = ol;
+                return .ok;
+            }
+            cap = @min(self.scratch.len * 2, copy_cell_output_max);
+        }
+    }
+
+    fn ensureScratch(self: *StreamCopyJob, n: usize) !void {
+        if (self.scratch.len >= n) return;
+        self.scratch = if (self.scratch.len == 0)
+            try self.gpa.alloc(u8, n)
+        else
+            try self.gpa.realloc(self.scratch, n);
+    }
+
+    /// Frame ONE cell (the separator that precedes it, then the raw/quoted
+    /// content) into `pending`, byte-identical to TSVCopyBuilder. Precondition:
+    /// `pending` is empty. The separator depends on the CURRENT sel_row/sel_col
+    /// (computed before the caller advances): the very first cell gets none, a
+    /// new row (sel_col == 0) gets LF, otherwise TAB.
+    fn frameCell(self: *StreamCopyJob, bytes: []const u8) !void {
+        if (!(self.sel_row == 0 and self.sel_col == 0)) {
+            try self.pending.append(self.gpa, if (self.sel_col == 0) '\n' else '\t');
+        }
+        if (self.single_cell) {
+            try self.pending.appendSlice(self.gpa, bytes); // raw, never quoted
+        } else if (needsQuoting(bytes)) {
+            try self.pending.append(self.gpa, '"');
+            for (bytes) |b| {
+                try self.pending.append(self.gpa, b);
+                if (b == '"') try self.pending.append(self.gpa, '"');
+            }
+            try self.pending.append(self.gpa, '"');
+        } else {
+            try self.pending.appendSlice(self.gpa, bytes);
+        }
+    }
 };
 
-/// See api/lesssheet.h `ls_copy_open`. SEED: allocate the job handle; null only
-/// on handle-alloc failure. rect is copied (the caller keeps ownership).
+/// Spreadsheet quoting trigger, byte-exact (TAB/CR/LF/quote are single-byte
+/// ASCII; a UTF-8 continuation byte is always >= 0x80, so a raw byte scan is
+/// exact) — mirrors TSVCopyBuilder.needsQuoting.
+fn needsQuoting(bytes: []const u8) bool {
+    for (bytes) |b| {
+        if (b == '\t' or b == '\r' or b == '\n' or b == '"') return true;
+    }
+    return false;
+}
+
+/// Largest cut <= `take` of `buf[start..]` that does not split a UTF-8 code
+/// point: retreat off a continuation byte (0x80..0xBF) at the cut position. Only
+/// meaningful for a PARTIAL cut (start + take < buf.len); returns `take`
+/// unchanged for a full delivery.
+fn codePointCut(buf: []const u8, start: usize, take: usize) usize {
+    var t = take;
+    while (t > 0 and (start + t) < buf.len and (buf[start + t] & 0xC0) == 0x80) : (t -= 1) {}
+    return t;
+}
+
+/// See api/lesssheet.h `ls_copy_open`. Validates the rect synchronously (an
+/// empty / out-of-range column range becomes a valid job that steps DONE with 0
+/// bytes); returns a handle immediately (no scan, no file read), or null only on
+/// handle-alloc failure. `rect` is copied; the caller keeps ownership.
 pub export fn ls_copy_open(doc: *const api.Doc, rect: *const api.CopyRect) callconv(.c) ?*api.CopyJob {
     const d = asDocMut(doc);
-    const job = d.gpa.create(CopyJobSeed) catch return null;
-    job.* = .{ .gpa = d.gpa, .doc = d, .rect = rect.* };
+    const r = rect.*;
+    // Out-of-range column range or an empty rect -> nothing to serialize.
+    const col_end: u64 = @as(u64, r.first_col) + r.col_count;
+    const empty = r.row_count == 0 or r.col_count == 0 or
+        d.column_count == 0 or col_end > d.column_count;
+    const job = d.gpa.create(StreamCopyJob) catch return null;
+    job.* = .{
+        .gpa = d.gpa,
+        .doc = d,
+        .rect = r,
+        .single_cell = (r.row_count == 1 and r.col_count == 1) and !empty,
+        .empty_job = empty,
+        .cap = if (d.copy_cap_cells != 0) d.copy_cap_cells else api.copy_max_cells,
+    };
     return @ptrCast(job);
 }
 
-/// See api/lesssheet.h `ls_copy_next`. SEED: no framing — reports DONE with 0
-/// bytes (this is the RED behavior the framing tests fail against).
+/// See api/lesssheet.h `ls_copy_next`. Frames the next TSV chunk into the
+/// caller's buffer and returns progress. Pull-model row-major sweep over
+/// window.cellCopy (rides its forward COPY CURSOR); COPIES into `buf` (no
+/// borrow). See StreamCopyJob for the framing/boundary/STALLED model.
 pub export fn ls_copy_next(job: *api.CopyJob, buf: ?[*]u8, buf_len: usize) callconv(.c) api.CopyProgress {
-    _ = buf;
-    _ = buf_len;
-    const self: *CopyJobSeed = @ptrCast(@alignCast(job));
-    _ = self;
-    return .{ .step = .done, .written = 0, .rows_done = 0, .stalled_row = 0, .budget_capped = false };
+    const self: *StreamCopyJob = @ptrCast(@alignCast(job));
+    if (self.done or self.empty_job) {
+        self.done = true;
+        return self.progress(.done, 0, 0);
+    }
+    const out: [*]u8 = buf orelse undefined; // buf may be null only when buf_len == 0
+    var written: usize = 0;
+    while (true) {
+        // (1) Drain any framed-but-undelivered bytes first.
+        const avail = self.pending.items.len - self.pending_off;
+        if (avail > 0) {
+            const room = buf_len - written;
+            if (room == 0) return self.progress(.more, written, 0);
+            if (avail <= room) {
+                // Whole remaining field/row fits: deliver it, clear, keep going.
+                @memcpy(out[written .. written + avail], self.pending.items[self.pending_off .. self.pending_off + avail]);
+                written += avail;
+                self.pending.clearRetainingCapacity();
+                self.pending_off = 0;
+                continue;
+            }
+            if (self.pending_off == 0 and written > 0) {
+                // A FRESH whole cell that does not fully fit AND we already have
+                // bytes this chunk: end the chunk at the previous field boundary,
+                // keep the cell in `pending` for the next pull (contract: cut at a
+                // field boundary except a field longer than buf_len).
+                return self.progress(.more, written, 0);
+            }
+            // Split a field longer than the buffer at a UTF-8 code-point boundary
+            // (either mid-field already, or a fresh cell alone bigger than buf_len).
+            var take = codePointCut(self.pending.items, self.pending_off, room);
+            if (take == 0) take = room; // buf_len smaller than one code point: force progress
+            @memcpy(out[written .. written + take], self.pending.items[self.pending_off .. self.pending_off + take]);
+            written += take;
+            self.pending_off += take;
+            return self.progress(.more, written, 0);
+        }
+        // (2) pending is empty: finish or produce the next cell.
+        if (self.sel_row >= self.rect.row_count) {
+            self.done = true;
+            return self.progress(.done, written, 0);
+        }
+        if (self.cells_done >= self.cap) {
+            self.done = true;
+            self.budget_capped = true;
+            return self.progress(.done, written, 0);
+        }
+        if (written == buf_len) return self.progress(.more, written, 0); // buffer full; frame next pull
+        const view_row = self.rect.first_row + self.sel_row;
+        const phys_col = self.rect.first_col + self.sel_col;
+        var cell_len: usize = 0;
+        switch (self.readCell(view_row, phys_col, &cell_len)) {
+            .ok => {
+                self.frameCell(self.scratch[0..cell_len]) catch {
+                    self.done = true;
+                    return self.progress(.done, written, 0);
+                };
+                self.cells_done += 1;
+                self.sel_col += 1;
+                if (self.sel_col == self.rect.col_count) {
+                    self.sel_col = 0;
+                    self.sel_row += 1;
+                    self.rows_done += 1;
+                }
+                continue; // loop to deliver the freshly framed cell
+            },
+            .pending => {
+                // The next row is at/beyond the frontier. If this pull already
+                // delivered bytes, hand them over now (MORE); the caller's next
+                // pull hits this same row again and gets a clean STALLED.
+                if (written > 0) return self.progress(.more, written, 0);
+                return self.progress(.stalled, 0, view_row);
+            },
+            .no_cell => {
+                // Row past an EXACT row count (a rect clamped to the extent never
+                // reaches here) -> nothing more to serialize.
+                self.done = true;
+                return self.progress(.done, written, 0);
+            },
+        }
+    }
 }
 
-/// See api/lesssheet.h `ls_copy_close`. Frees the job (call exactly once).
+/// See api/lesssheet.h `ls_copy_close`. Frees the job + its buffers (call exactly
+/// once). The job holds no background thread, so there is nothing to join;
+/// cancel is "stop calling ls_copy_next, then ls_copy_close".
 pub export fn ls_copy_close(job: *api.CopyJob) callconv(.c) void {
-    const self: *CopyJobSeed = @ptrCast(@alignCast(job));
+    const self: *StreamCopyJob = @ptrCast(@alignCast(job));
+    self.pending.deinit(self.gpa);
+    if (self.scratch.len > 0) self.gpa.free(self.scratch);
     self.gpa.destroy(self);
 }
 

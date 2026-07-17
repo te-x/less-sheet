@@ -604,6 +604,12 @@ struct ContentView: View {
                 // Verification: drive selection/copy/resize directly against the
                 // model (ARCH-select-copy) — logs + terminates itself.
                 SelectCopyProbe.run(model: model)
+            } else if StreamCopyOutcomeProbe.active {
+                // Verification: drive DocumentModel.streamCopy with fake sessions and
+                // assert the frontend copy OUTCOMES (byte-budget cut, cell-cap map,
+                // filtered-stall clean stop w/o spin — Phase-2 findings 1/2) — logs
+                // + terminates itself. Ignores `model` (uses deterministic fakes).
+                StreamCopyOutcomeProbe.run()
             } else if ConfigRepaintProbe.active {
                 // Verification: drive one real model-side column-config edit and
                 // prove the live grid controller applied it with no interaction

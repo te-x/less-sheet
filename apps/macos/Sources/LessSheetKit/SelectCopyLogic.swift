@@ -75,107 +75,17 @@ public struct SelectionModel: Selecting {
     }
 }
 
-// MARK: - CopyBuilding (AC2 / AC3)
-
-/// The TSV clipboard builder (`CopyBuilding`): row-major, byte-bounded,
-/// lossless per cell. See the protocol doc-comment for the seven pinned
-/// rules this implements verbatim (single-cell raw value, TSV structure,
-/// Excel/Numbers quoting, byte budget with a first-cell progress guarantee,
-/// the cell-count safety cap, the frontier stop, and totality/lossiness).
-public struct TSVCopyBuilder: CopyBuilding {
-    public init() {}
-
-    public func build(_ rect: SelectionRect, budget: CopyBudget, fetch: CopyCellFetch) -> CopyReport {
-        if rect.isSingleCell {
-            return Self.buildSingleCell(rect, fetch: fetch)
-        }
-
-        var text = ""
-        var byteCount = 0
-        var cellsFetched = 0
-        var lossyCells = false
-        var rowCount: UInt64 = 0
-        var lastRowWithOutput: UInt64?
-        var outcome: CopyOutcome = .complete
-        var emittedAny = false
-
-        rowLoop: for row in rect.rows {
-            var isFirstColumnInRow = true
-            for column in rect.columns {
-                // Cell-count SAFETY (rule 5): checked before every fetch, so a
-                // pathological all-empty selection can never do more than
-                // `maxCells` fetches regardless of the byte budget.
-                guard cellsFetched < budget.maxCells else {
-                    outcome = .stoppedAtCellCap
-                    break rowLoop
-                }
-                let cell = fetch(row, column)
-                cellsFetched += 1
-
-                // FRONTIER (rule 6): a per-row condition — stop at this row
-                // boundary, nothing from this row is emitted.
-                if cell.status == .pending {
-                    outcome = .stoppedAtFrontier
-                    break rowLoop
-                }
-
-                // TOTALITY (rule 7): a missing cell reads as empty.
-                let raw = cell.status == .noCell ? "" : cell.text
-                let field = Self.quoted(raw)
-                let separator = !emittedAny ? "" : (isFirstColumnInRow ? "\n" : "\t")
-                let addition = separator.utf8.count + field.utf8.count
-
-                // BYTE BUDGET (rule 4): the first cell overall is ALWAYS
-                // emitted (progress guarantee) — only checked once something
-                // has already been emitted.
-                if emittedAny, byteCount + addition > budget.maxTotalBytes {
-                    outcome = .stoppedAtBudget
-                    break rowLoop
-                }
-
-                text += separator
-                text += field
-                byteCount += addition
-                emittedAny = true
-                isFirstColumnInRow = false
-                if cell.truncated { lossyCells = true }
-                if row != lastRowWithOutput { rowCount += 1; lastRowWithOutput = row }
-            }
-        }
-
-        return CopyReport(text: text, byteCount: byteCount, rowCount: rowCount, outcome: outcome, lossyCells: lossyCells)
-    }
-
-    /// SINGLE CELL (rule 1): the raw value, verbatim — never quoted, no
-    /// trailing newline — regardless of the byte budget (the atomic unit is
-    /// already bounded by the per-cell cap the fetch closure applied). A
-    /// `.pending` single cell copies nothing (`.stoppedAtFrontier`).
-    private static func buildSingleCell(_ rect: SelectionRect, fetch: CopyCellFetch) -> CopyReport {
-        let cell = fetch(rect.top, rect.left)
-        guard cell.status != .pending else {
-            return CopyReport(text: "", byteCount: 0, rowCount: 0, outcome: .stoppedAtFrontier, lossyCells: false)
-        }
-        let text = cell.status == .noCell ? "" : cell.text
-        return CopyReport(text: text, byteCount: text.utf8.count, rowCount: 1, outcome: .complete, lossyCells: cell.truncated)
-    }
-
-    /// EXCEL/NUMBERS QUOTING (rule 3): a cell containing a tab, CR, LF, or a
-    /// double-quote is wrapped in double-quotes with every interior quote
-    /// doubled; anything else is emitted raw.
-    private static func quoted(_ text: String) -> String {
-        guard Self.needsQuoting(text) else { return text }
-        return "\"" + text.replacingOccurrences(of: "\"", with: "\"\"") + "\""
-    }
-
-    /// Byte-level check (tab/CR/LF/quote are all single-byte ASCII, so a raw
-    /// UTF-8 byte scan is exact — no multibyte sequence can contain one of
-    /// these bytes as a continuation byte, which are all >= 0x80).
-    private static func needsQuoting(_ text: String) -> Bool {
-        text.utf8.contains {
-            $0 == UInt8(ascii: "\t") || $0 == UInt8(ascii: "\r") || $0 == UInt8(ascii: "\n") || $0 == UInt8(ascii: "\"")
-        }
-    }
-}
+// MARK: - Streaming copy (ARCH-thin-frontend-shared-core Phase 2)
+//
+// The former `TSVCopyBuilder` (a `CopyBuilding` conformer driving a per-cell
+// `CopyCellFetch`) is DELETED: TSV framing (TAB/LF, spreadsheet quoting,
+// single-cell raw, lossless cells, the cell-count cap) now lives ONCE in the
+// core (`ls_copy_*`), streamed by `CoreDocumentSession.openCopy` and driven by
+// `DocumentModel.streamCopy`. The `CopyBuilding` protocol + `CopyCellFetch`
+// typealias were removed from `Contracts/CopyBuilder.swift` (DECISION-2); the
+// retained `CopyBudget` / `CopyReport` / `CopyOutcome` / `CopiedCell` /
+// `CopyCellStatus` / `SelectionRect` are still used by the streaming drive and
+// the `copyCell` / `ls_cell_copy` lossless single-cell read.
 
 // MARK: - ColumnSizing (AC5)
 
