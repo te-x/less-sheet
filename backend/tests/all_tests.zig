@@ -2959,6 +2959,76 @@ test "fv15: setting/clearing a filter resets an active find; a re-open clears th
 }
 
 // ---------------------------------------------------------------------------
+// fv16 — ABI conformance: SYNCHRONOUS-after-DONE navigation UNDER A FILTER.
+// api/lesssheet.h (ls_search_nav): "After LS_SEARCH_DONE every navigation takes
+// [the O(one block re-lex), never O(file)] path" — UNCONDITIONAL, no filter
+// carve-out. The unfiltered path already honors this (see f4's "DONE navs
+// complete synchronously"); this pins the SAME promise for a FILTERED view over
+// NORMAL (bounded) rows: once a filtered Find reaches DONE, ls_search_nav
+// resolves the answer BEFORE it returns, so the IMMEDIATELY-following SINGLE
+// ls_search_poll is already terminal (FOUND / EXHAUSTED), NEVER SEARCHING.
+// This is the normal/bounded regime. The distinct giant-row carve-out — where
+// the counted-region re-lex would exceed the 8 MiB synchronous budget and so
+// defers off-main with LS_SEARCH_NAV_SEARCHING — is the separate, still-frozen
+// wb_ac11 / wb_ac12 proof and is NOT relaxed here (see ARCH-window-budget
+// criterion 12: off-main only when "synchronous resolution is not provably
+// bounded"). The implementer honors both by dispatching off-main ONLY when the
+// re-lex would exceed the budget, and inline (resolveNavLockedFiltered on the
+// calling thread) otherwise — not blanket off-main under any filter.
+// ---------------------------------------------------------------------------
+
+test "fv16: after DONE under a filter, ls_search_nav resolves SYNCHRONOUSLY on the single post-nav poll (ABI synchronous-after-DONE; normal/bounded rows)" {
+    var od = try openBytes(fv_fixture);
+    defer od.deinit();
+    // A filtered view (qty >= 2 -> source rows 0,1,2,4,6 = filtered 0..4), then a
+    // Find "needle" WITHIN it to DONE (filtered matches 0,1,2,4 -> total 4). These
+    // are the exact coordinates fv14 already pins via the poll-until-terminal path;
+    // fv16 pins that under a filter they are delivered SYNCHRONOUSLY, like unfiltered.
+    try setFilter(od.doc, predReq(1, .ge, "2"));
+    _ = try waitFilterDone(od.doc);
+    try startSearch(od.doc, textReq("needle"));
+    const done = try waitSearchDone(od.doc);
+    try std.testing.expectEqual(@as(u64, 4), done.total);
+    try std.testing.expectEqual(true, done.total_exact);
+
+    // Each navigation below is post-DONE over NORMAL rows: the counted-region
+    // re-lex is a handful of bytes, well within the synchronous budget, so the
+    // answer must be resolved BEFORE ls_search_nav returns. We take the SINGLE
+    // poll IMMEDIATELY after each nav (no wait loop): it must NOT be SEARCHING and
+    // must carry the exact FILTERED-coordinate result. RED today — under an active
+    // filter with a worker present the core defers EVERY nav off-main
+    // (src/search.zig resolveNavLocked: `if (doc.worker != null) return;`), so the
+    // immediate poll reads SEARCHING for ~1 tick, violating the ABI.
+
+    // FORWARD from filtered 0 -> filtered 0 (src 0, "alpha needle" col 2), position 1.
+    api.ls_search_nav(od.doc, 0, .forward);
+    const p0 = api.ls_search_poll(od.doc);
+    try std.testing.expect(p0.nav != .searching); // synchronous: no 1-tick SEARCHING lag
+    try expectFound(p0, 0, 2, 1);
+
+    // FORWARD from filtered 3 (src 4 "Gizmo", NOT a find match) skips to the next
+    // match filtered 4 (src 6, "needleneedle" col 2), position 4 — one poll, no lag.
+    api.ls_search_nav(od.doc, 3, .forward);
+    const p3 = api.ls_search_poll(od.doc);
+    try std.testing.expect(p3.nav != .searching);
+    try expectFound(p3, 4, 2, 4);
+
+    // BACKWARD from past-the-end (UINT64_MAX = "last-in-file"): the LAST filtered
+    // match, filtered 4 (src 6, col 2), position 4 — also synchronous.
+    api.ls_search_nav(od.doc, std.math.maxInt(u64), .backward);
+    const pb = api.ls_search_poll(od.doc);
+    try std.testing.expect(pb.nav != .searching);
+    try expectFound(pb, 4, 2, 4);
+
+    // The EXHAUSTING anchor resolves synchronously too: FORWARD from filtered 5
+    // (past the last filtered match) is EXHAUSTED on the single post-nav poll.
+    api.ls_search_nav(od.doc, 5, .forward);
+    const pe = api.ls_search_poll(od.doc);
+    try std.testing.expect(pe.nav != .searching);
+    try std.testing.expectEqual(api.SearchNavState.exhausted, pe.nav);
+}
+
+// ---------------------------------------------------------------------------
 // Public C ABI: the filter symbols are callable through extern linkage, and the
 // enum values / sentinel are pinned to the header (regression guard; the seed
 // links and reports IDLE, so this stays green from the seed).
