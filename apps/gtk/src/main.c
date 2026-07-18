@@ -25,6 +25,7 @@
 #include <lsg_window_poll.h>
 #include <lsg_formatter.h>
 #include <lsg_find.h>
+#include <lsg_jump.h>
 
 #include <string.h>
 
@@ -99,6 +100,16 @@ typedef struct {
   LsgFindNotice find_sticky_notice;  /* a briefly-lingering wrap notice for the label */
   guint find_notice_id;              /* timeout clearing the sticky notice */
 
+  /* Jump-to-row (slice 3): the pure flow + the popover widgets. */
+  LsgJumpFlow jump;
+  GtkMenuButton *jump_button;
+  GtkPopover *jump_popover;
+  GtkEditable *jump_entry;
+  GtkProgressBar *jump_progress;
+  GtkButton *jump_cancel;
+  GtkLabel *jump_status;
+  guint jump_reject_id;              /* timeout clearing the rejection blink */
+
   /* Env-gated timing instrumentation (LESSSHEET_GTK_TIMING). Entirely inert —
    * no output, no measurable cost — unless `timing` is set. */
   gboolean timing;
@@ -156,6 +167,18 @@ find_clear_mask (App *app)
  * poll loop (grid_poll_tick) calls it. */
 static void find_poll_fold (App *app);
 
+/* Poll the core jump slot, fold it, and act on land/reject. Defined with the
+ * jump helpers below; the poll loop calls it while a jump is scanning. */
+static void jump_poll_fold (App *app);
+
+/* Open the jump popover pre-filled with a digit typed on the grid (macOS
+ * parity). Defined with the jump helpers; the grid key handler calls it. */
+static void open_jump_with_digit (App *app, char digit);
+
+/* Open the jump popover. Defined with the jump helpers; the window Ctrl+G/L
+ * handler (in the find section) calls it. */
+static void open_jump (App *app);
+
 /* ------------------------------------------------------------------------- */
 /* View teardown                                                              */
 /* ------------------------------------------------------------------------- */
@@ -187,6 +210,14 @@ app_reset_document (App *app)
   app->find_sticky_notice = LSG_FIND_NOTICE_NONE;
   app->find_wrap_issued = FALSE;
   find_clear_mask (app);
+
+  /* The old document's jump slot died with its core handle: reset the flow. */
+  if (app->jump_reject_id != 0)
+    {
+      g_source_remove (app->jump_reject_id);
+      app->jump_reject_id = 0;
+    }
+  app->jump = lsg_jump_initial ();
 }
 
 /* ------------------------------------------------------------------------- */
@@ -451,6 +482,15 @@ grid_poll_tick (gpointer data)
     {
       find_poll_fold (app);
       keep = TRUE;
+    }
+
+  /* Keep ticking while a jump scans (ORed at the widget with the frozen
+   * window-poll decision — lsg_window_poll.h is untouched). */
+  if (app->jump.kind == LSG_JUMP_FLOW_SCANNING)
+    {
+      jump_poll_fold (app);
+      if (app->jump.kind == LSG_JUMP_FLOW_SCANNING)
+        keep = TRUE;
     }
 
   if (!keep)
@@ -1028,10 +1068,24 @@ on_key_pressed (GtkEventControllerKey *ctrl, guint keyval, guint keycode,
 {
   (void) ctrl;
   (void) keycode;
-  (void) state;
   App *app = data;
   if (app->doc == NULL)
     return GDK_EVENT_PROPAGATE;
+
+  /* A plain digit typed on the grid opens the jump field, pre-filled. */
+  if (!(state & (GDK_CONTROL_MASK | GDK_ALT_MASK)))
+    {
+      if (keyval >= GDK_KEY_0 && keyval <= GDK_KEY_9)
+        {
+          open_jump_with_digit (app, (char) ('0' + (keyval - GDK_KEY_0)));
+          return GDK_EVENT_STOP;
+        }
+      if (keyval >= GDK_KEY_KP_0 && keyval <= GDK_KEY_KP_9)
+        {
+          open_jump_with_digit (app, (char) ('0' + (keyval - GDK_KEY_KP_0)));
+          return GDK_EVENT_STOP;
+        }
+    }
 
   double v = gtk_adjustment_get_value (app->vadj);
   double page = gtk_adjustment_get_page_size (app->vadj);
@@ -1079,7 +1133,7 @@ on_area_resize (GtkDrawingArea *area, int width, int height, gpointer data)
 /* ------------------------------------------------------------------------- */
 
 static void
-find_ensure_poll (App *app)
+ensure_poll (App *app)
 {
   if (app->poll_id == 0 && app->doc != NULL)
     app->poll_id = g_timeout_add (POLL_INTERVAL_MS, grid_poll_tick, app);
@@ -1136,6 +1190,16 @@ scroll_to_match (App *app, guint64 row)
   gtk_adjustment_set_value (app->vadj, off);  /* fires materialize + repaint */
 }
 
+/* Re-anchor the viewport so `row` is exactly the first visible row (the
+ * cancel/reject restore, and the jump landing puts the target at the top). */
+static void
+scroll_to_first_row (App *app, guint64 row)
+{
+  double upper = gtk_adjustment_get_upper (app->vadj);
+  double off = lsg_grid_offset_for_top_row (row, upper, app->row_estimate, app->row_h);
+  gtk_adjustment_set_value (app->vadj, off);  /* fires materialize + repaint */
+}
+
 static gboolean
 find_notice_clear (gpointer data)
 {
@@ -1175,7 +1239,7 @@ find_run_query (App *app)
       app->find_nav_direction = LSG_SEARCH_FORWARD;
       app->find_wrap_issued = FALSE;
       lsg_document_search_nav (app->doc, lsg_search_nav_from_top ());
-      find_ensure_poll (app);
+      ensure_poll (app);
     }
   else
     {
@@ -1239,7 +1303,7 @@ do_find_step (App *app, LsgSearchDir direction)
       app->find_nav_direction = direction;
       app->find_wrap_issued = FALSE;
       lsg_document_search_nav (app->doc, nav);
-      find_ensure_poll (app);
+      ensure_poll (app);
     }
 }
 
@@ -1338,11 +1402,20 @@ on_window_key (GtkEventControllerKey *ctrl, guint keyval, guint keycode,
   (void) ctrl;
   (void) keycode;
   App *app = data;
-  if ((state & GDK_CONTROL_MASK)
-      && (keyval == GDK_KEY_f || keyval == GDK_KEY_F))
+  if (state & GDK_CONTROL_MASK)
     {
-      open_find (app);
-      return GDK_EVENT_STOP;
+      if (keyval == GDK_KEY_f || keyval == GDK_KEY_F)
+        {
+          open_find (app);
+          return GDK_EVENT_STOP;
+        }
+      /* Ctrl+G / Ctrl+L both open jump-to-row (go to line). */
+      if (keyval == GDK_KEY_g || keyval == GDK_KEY_G
+          || keyval == GDK_KEY_l || keyval == GDK_KEY_L)
+        {
+          open_jump (app);
+          return GDK_EVENT_STOP;
+        }
     }
   return GDK_EVENT_PROPAGATE;
 }
@@ -1389,6 +1462,300 @@ build_find_popover (App *app)
   GtkEventController *keys = gtk_event_controller_key_new ();
   g_signal_connect (keys, "key-pressed", G_CALLBACK (on_find_entry_key), app);
   gtk_widget_add_controller (entry, keys);
+}
+
+/* ------------------------------------------------------------------------- */
+/* Jump-to-row (slice 3): the popover UI over lsg_jump                          */
+/* ------------------------------------------------------------------------- */
+
+/* Show progress + cancel only while scanning; keep the fraction current. */
+static void
+jump_update_ui (App *app)
+{
+  gboolean scanning = (app->jump.kind == LSG_JUMP_FLOW_SCANNING);
+  if (app->jump_progress != NULL)
+    {
+      gtk_widget_set_visible (GTK_WIDGET (app->jump_progress), scanning);
+      if (scanning)
+        gtk_progress_bar_set_fraction (app->jump_progress, app->jump.progress);
+    }
+  if (app->jump_cancel != NULL)
+    gtk_widget_set_visible (GTK_WIDGET (app->jump_cancel), scanning);
+}
+
+static gboolean
+jump_reject_clear (gpointer data)
+{
+  App *app = data;
+  if (app->jump_entry != NULL)
+    {
+      gtk_widget_remove_css_class (GTK_WIDGET (app->jump_entry), "error");
+      gtk_widget_remove_css_class (GTK_WIDGET (app->jump_entry), "lsg-shake");
+    }
+  app->jump_reject_id = 0;
+  return G_SOURCE_REMOVE;
+}
+
+static gboolean
+jump_shake_add (gpointer data)
+{
+  App *app = data;
+  if (app->jump_entry != NULL)
+    gtk_widget_add_css_class (GTK_WIDGET (app->jump_entry), "lsg-shake");
+  return G_SOURCE_REMOVE;
+}
+
+/* Rejection feedback: the Adwaita error state (red) plus a short shake — the
+ * shake class is removed then re-added on an idle so the animation restarts on
+ * a repeated reject. */
+static void
+jump_reject_feedback (App *app)
+{
+  if (app->jump_entry == NULL)
+    return;
+  GtkWidget *e = GTK_WIDGET (app->jump_entry);
+  gtk_widget_add_css_class (e, "error");
+  gtk_widget_remove_css_class (e, "lsg-shake");
+  g_idle_add (jump_shake_add, app);
+  if (app->jump_reject_id != 0)
+    g_source_remove (app->jump_reject_id);
+  app->jump_reject_id = g_timeout_add (700, jump_reject_clear, app);
+}
+
+static void
+jump_clear_feedback (App *app)
+{
+  if (app->jump_reject_id != 0)
+    {
+      g_source_remove (app->jump_reject_id);
+      app->jump_reject_id = 0;
+    }
+  if (app->jump_entry != NULL)
+    {
+      gtk_widget_remove_css_class (GTK_WIDGET (app->jump_entry), "error");
+      gtk_widget_remove_css_class (GTK_WIDGET (app->jump_entry), "lsg-shake");
+    }
+}
+
+/* Forward-declared above; fold one core jump poll and act on the outcome. */
+static void
+jump_poll_fold (App *app)
+{
+  if (app->doc == NULL || app->jump.kind != LSG_JUMP_FLOW_SCANNING)
+    return;
+
+  LsgJumpStatus st = lsg_document_jump_poll (app->doc);
+  /* No filter slice yet -> identity view (filtered FALSE). */
+  app->jump = lsg_jump_resolve (app->jump, st, FALSE);
+
+  switch (app->jump.kind)
+    {
+    case LSG_JUMP_FLOW_LANDED:
+      scroll_to_first_row (app, app->jump.landed_row);
+      gtk_popover_popdown (app->jump_popover);   /* closes -> resets to idle */
+      break;
+    case LSG_JUMP_FLOW_REJECTED:
+      if (app->jump.has_restore)
+        scroll_to_first_row (app, app->jump.restore_first_row);
+      jump_reject_feedback (app);
+      /* Keep the field open + re-armed; the flow is terminal (not scanning). */
+      break;
+    default:
+      break;   /* still SCANNING: progress updated below */
+    }
+  jump_update_ui (app);
+}
+
+/* Enter / Go: parse + validate + start (or reject) the jump. */
+static void
+do_jump_submit (App *app)
+{
+  if (app->doc == NULL)
+    return;
+
+  const char *text = gtk_editable_get_text (app->jump_entry);
+  LsgRowCount rc = lsg_document_row_count (app->doc);
+  LsgJumpSubmit sub = lsg_jump_submit (text, rc, FALSE, app->cur_top_row);
+  app->jump = sub.flow;
+
+  if (sub.outcome == LSG_JUMP_RUN)
+    {
+      lsg_document_jump_start (app->doc, sub.target);
+      /* A behind-frontier / clamped target completes before the start returns —
+       * fold the immediate poll so it lands without a tick. */
+      jump_poll_fold (app);
+      if (app->jump.kind == LSG_JUMP_FLOW_SCANNING)
+        ensure_poll (app);
+    }
+  else
+    {
+      jump_reject_feedback (app);      /* upfront reject: no scan, no move */
+    }
+  jump_update_ui (app);
+}
+
+static void
+do_jump_cancel (App *app)
+{
+  if (app->jump.kind != LSG_JUMP_FLOW_SCANNING)
+    return;
+  if (app->doc != NULL)
+    lsg_document_jump_cancel (app->doc);
+  app->jump = lsg_jump_cancel (app->jump);
+  if (app->jump.kind == LSG_JUMP_FLOW_CANCELLED)
+    scroll_to_first_row (app, app->jump.restore_first_row);
+  jump_update_ui (app);
+}
+
+static void
+on_jump_go_clicked (GtkButton *button, gpointer data)
+{
+  (void) button;
+  do_jump_submit ((App *) data);
+}
+
+static void
+on_jump_cancel_clicked (GtkButton *button, gpointer data)
+{
+  (void) button;
+  do_jump_cancel ((App *) data);
+}
+
+static gboolean
+on_jump_entry_key (GtkEventControllerKey *ctrl, guint keyval, guint keycode,
+                   GdkModifierType state, gpointer data)
+{
+  (void) ctrl;
+  (void) keycode;
+  (void) state;
+  App *app = data;
+  switch (keyval)
+    {
+    case GDK_KEY_Escape:
+      gtk_popover_popdown (app->jump_popover);
+      return GDK_EVENT_STOP;
+    case GDK_KEY_Return:
+    case GDK_KEY_KP_Enter:
+      do_jump_submit (app);
+      return GDK_EVENT_STOP;
+    default:
+      return GDK_EVENT_PROPAGATE;
+    }
+}
+
+/* Close (Esc / click-away): cancel an in-flight scan + restore, reset to idle. */
+static void
+on_jump_popover_closed (GtkPopover *popover, gpointer data)
+{
+  (void) popover;
+  App *app = data;
+  if (app->doc != NULL && app->jump.kind == LSG_JUMP_FLOW_SCANNING)
+    {
+      lsg_document_jump_cancel (app->doc);
+      LsgJumpFlow c = lsg_jump_cancel (app->jump);
+      if (c.kind == LSG_JUMP_FLOW_CANCELLED)
+        scroll_to_first_row (app, c.restore_first_row);
+    }
+  app->jump = lsg_jump_initial ();
+  jump_clear_feedback (app);
+  jump_update_ui (app);
+}
+
+static void
+on_jump_popover_show (GtkWidget *popover, gpointer data)
+{
+  (void) popover;
+  App *app = data;
+  gtk_widget_grab_focus (GTK_WIDGET (app->jump_entry));
+  gtk_editable_set_position (app->jump_entry, -1);
+}
+
+static void
+open_jump (App *app)
+{
+  if (app->doc == NULL || app->jump_button == NULL)
+    return;
+  gtk_menu_button_popup (app->jump_button);
+}
+
+/* Digit typed on the grid opens the jump field pre-filled (macOS parity). */
+static void
+open_jump_with_digit (App *app, char digit)
+{
+  if (app->doc == NULL || app->jump_entry == NULL)
+    return;
+  char text[2] = { digit, '\0' };
+  gtk_editable_set_text (app->jump_entry, text);
+  open_jump (app);
+  gtk_editable_set_position (app->jump_entry, -1);
+}
+
+static void
+build_jump_popover (App *app)
+{
+  GtkWidget *pop = gtk_popover_new ();
+  GtkWidget *box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 6);
+
+  GtkWidget *row = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 6);
+  GtkWidget *entry = gtk_entry_new ();
+  gtk_entry_set_input_purpose (GTK_ENTRY (entry), GTK_INPUT_PURPOSE_DIGITS);
+  gtk_entry_set_placeholder_text (GTK_ENTRY (entry), "Row number");
+  gtk_widget_set_hexpand (entry, TRUE);
+  gtk_widget_set_size_request (entry, 160, -1);
+  app->jump_entry = GTK_EDITABLE (entry);
+
+  GtkWidget *go = gtk_button_new_with_label ("Go");
+  gtk_widget_add_css_class (go, "suggested-action");
+
+  gtk_box_append (GTK_BOX (row), entry);
+  gtk_box_append (GTK_BOX (row), go);
+
+  GtkWidget *progress = gtk_progress_bar_new ();
+  gtk_widget_set_visible (progress, FALSE);
+  app->jump_progress = GTK_PROGRESS_BAR (progress);
+
+  GtkWidget *cancel = gtk_button_new_with_label ("Cancel");
+  gtk_widget_set_halign (cancel, GTK_ALIGN_END);
+  gtk_widget_set_visible (cancel, FALSE);
+  app->jump_cancel = GTK_BUTTON (cancel);
+
+  gtk_box_append (GTK_BOX (box), row);
+  gtk_box_append (GTK_BOX (box), progress);
+  gtk_box_append (GTK_BOX (box), cancel);
+  gtk_popover_set_child (GTK_POPOVER (pop), box);
+  app->jump_popover = GTK_POPOVER (pop);
+
+  g_signal_connect (go, "clicked", G_CALLBACK (on_jump_go_clicked), app);
+  g_signal_connect (cancel, "clicked", G_CALLBACK (on_jump_cancel_clicked), app);
+  g_signal_connect (pop, "closed", G_CALLBACK (on_jump_popover_closed), app);
+  g_signal_connect (pop, "show", G_CALLBACK (on_jump_popover_show), app);
+
+  GtkEventController *keys = gtk_event_controller_key_new ();
+  g_signal_connect (keys, "key-pressed", G_CALLBACK (on_jump_entry_key), app);
+  gtk_widget_add_controller (entry, keys);
+}
+
+/* Install the one-time CSS for the rejection shake animation. */
+static void
+install_jump_css (void)
+{
+  GtkCssProvider *css = gtk_css_provider_new ();
+  gtk_css_provider_load_from_string (
+      css,
+      "@keyframes lsg-shake {"
+      "  0%   { margin-left: 0px;  margin-right: 0px; }"
+      "  20%  { margin-left: 6px;  margin-right: -6px; }"
+      "  40%  { margin-left: -5px; margin-right: 5px; }"
+      "  60%  { margin-left: 4px;  margin-right: -4px; }"
+      "  80%  { margin-left: -2px; margin-right: 2px; }"
+      "  100% { margin-left: 0px;  margin-right: 0px; }"
+      "}"
+      ".lsg-shake { animation: lsg-shake 300ms ease; }");
+  GdkDisplay *display = gdk_display_get_default ();
+  if (display != NULL)
+    gtk_style_context_add_provider_for_display (
+        display, GTK_STYLE_PROVIDER (css), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+  g_object_unref (css);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -1482,6 +1849,7 @@ ensure_window (App *app, GtkApplication *gtk_app)
   if (app->window != NULL)
     return;
   app->app = ADW_APPLICATION (gtk_app);
+  install_jump_css ();
 
   GtkWidget *win = adw_application_window_new (gtk_app);
   app->window = GTK_WINDOW (win);
@@ -1518,6 +1886,16 @@ ensure_window (App *app, GtkApplication *gtk_app)
   build_find_popover (app);
   gtk_menu_button_set_popover (GTK_MENU_BUTTON (find_btn), GTK_WIDGET (app->find_popover));
   adw_header_bar_pack_end (ADW_HEADER_BAR (header), find_btn);
+
+  /* Jump-to-row: a menu button whose popover is the jump UI (Ctrl+G / Ctrl+L,
+   * or type a digit on the grid). */
+  GtkWidget *jump_btn = gtk_menu_button_new ();
+  gtk_menu_button_set_icon_name (GTK_MENU_BUTTON (jump_btn), "go-jump-symbolic");
+  gtk_widget_set_tooltip_text (jump_btn, "Jump to row (Ctrl+G)");
+  app->jump_button = GTK_MENU_BUTTON (jump_btn);
+  build_jump_popover (app);
+  gtk_menu_button_set_popover (GTK_MENU_BUTTON (jump_btn), GTK_WIDGET (app->jump_popover));
+  adw_header_bar_pack_end (ADW_HEADER_BAR (header), jump_btn);
 
   /* Banner (network progress) above the swappable content stack. */
   app->banner = ADW_BANNER (adw_banner_new (""));
@@ -1584,6 +1962,7 @@ main (int argc, char *argv[])
   app.row_estimate = 1;
   app.find = lsg_find_initial ();
   app.find_nav_direction = LSG_SEARCH_FORWARD;
+  app.jump = lsg_jump_initial ();
   app.font_desc = pango_font_description_from_string ("Monospace 11");
 
   g_autoptr (AdwApplication) application =
@@ -1602,6 +1981,8 @@ main (int argc, char *argv[])
     g_source_remove (app.net_poll_id);
   if (app.find_notice_id != 0)
     g_source_remove (app.find_notice_id);
+  if (app.jump_reject_id != 0)
+    g_source_remove (app.jump_reject_id);
   find_clear_mask (&app);
   g_clear_pointer (&app.pending_url, g_free);
   g_clear_pointer (&app.vadj, g_object_unref);

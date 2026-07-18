@@ -114,3 +114,39 @@ to active find; Ctrl+F stops only on Ctrl+F; teardown clears mask + notice).
 ### Pending — H3 (find interaction) folds into the desktop GUI pass
 The popover feel, accent-follow-on-theme-change, scroll-to-match, and highlight look are display-only —
 verified live via `tools/gtk/run_gtk_on` on a real desktop, not the headless gate.
+
+## Slice 3 (jump-to-row)
+
+**Verdict: PASS (converged in 1 round).** Frozen contract `f2fcf35`; implementation committed on top.
+Additive — Slices-1/2 frozen surface untouched; jump is a pure ABI consumer (no core / `api/` change).
+
+### What shipped (all in `apps/gtk/src/`)
+- `lsg_jump.c` — two layers: a **pure view-model** (C port of the macOS `JumpControl` + the two lifted
+  `ViewerModel` reject rules): `parse` (1-based digits → 0-based, overflow-guarded, rejects
+  empty/non-digit/zero/overflow), `submit` (upfront out-of-range reject `!filtered && exact &&
+  target>=count`, filtered-suppressed; else RUN→SCANNING), `resolve` (MAX-fold progress; DONE short-land
+  reject+restore vs LANDED; IDLE unchanged), `cancel` (restore=pre); and a **jump bridge**
+  (`lsg_document_jump_start/cancel/poll` over `ls_jump_*`, poll/control-lane lockless).
+- `main.c` — a `go-jump-symbolic` header-bar popover (digits-only entry, Go, progress bar, cancel) opened
+  by **Ctrl+G/Ctrl+L** or by **typing a digit on the grid**; immediate-poll for behind-frontier land, ~100 ms
+  poll fold for the async scan, cancel-restore, **scroll-to-landing** (reusing `lsg_grid_offset_for_top_row`),
+  and reject feedback (Adwaita `.error` red-blink + a margin-keyframe shake — GTK4 CSS has no `transform`).
+
+### Reviewer verification (vs the macOS originals) — no defects
+Verified line-by-line vs `JumpControl`/`ViewerModel` (parse + overflow boundary, both reject paths'
+`has_restore`, MAX-fold progress, land/cancel restore — all match the Swift + the 11 tests). Bridge lockless
+poll/control lane correct for Slice 3. No Slice-1/2 regression: `find_ensure_poll`→`ensure_poll` is a
+byte-identical rename (find untouched), digit-to-open swallows no grid navigation key, the poll loop reverts
+cleanly (no runaway), no leak/UAF. The red-blink reject cue is acceptable GUI-pass latitude.
+
+### Objective gate (orchestrator, tree `14df2b1…`)
+`gate.sh --require-frozen apps/gtk` → **PASS**: conformance GREEN (`-Werror`), behavior **8/8** (Slices-1/2's
+seven + `jump`). Post-review tree-hash identical.
+
+### Forward note (non-blocking)
+When the **copy slice** adds a background worker that touches the jump/search bridge, the macOS
+`copyBufferLock` close-guard equivalent will be required (Slice 3 is main-thread-only, so not yet).
+
+### Pending — jump interaction folds into the desktop GUI pass
+The popover, live progress, cancel, digit-to-open, scroll-to-landing, and the reject shake feel are
+display-only — verified live via `run_gtk_on`, not the headless gate.
