@@ -405,14 +405,20 @@ test_stop_close_reopen (void)
   g_assert_cmpuint (stopped.display.current.row, ==, 2);
   g_assert_cmpstr (stopped.draft.text, ==, "needle");
 
-  /* A cancelled-phase poll (a jump took the scan slot) reads the same way. */
+  /* A CANCELLED-phase poll that CARRIES a landing (nav FOUND) still freezes the
+   * partials -- the counts hold and the progress UI ends -- like an explicit
+   * stop. Its NOTICE, though, must NOT read "Stopped": a network re-park (nfd_ac6)
+   * lands the first match AND parks the scan in one poll, so the count must show.
+   * That outcome is pinned mechanism-agnostically by /find/resolved-net-park-
+   * landing; here we assert only the mechanism-independent partials, staying
+   * neutral on the fix (a landed-match guard and a user-stopped flag fold the
+   * partials alike). */
   LsgSearchSnapshot cancelled = {
     .phase = LSG_SEARCH_PHASE_CANCELLED, .progress = 0.3,
     .nav = LSG_SEARCH_NAV_FOUND, .found = { .row = 2, .column = 0 },
     .position = 1, .total = 2, .total_exact = FALSE
   };
   LsgFindSession viaPoll = lsg_find_resolved (s, TRUE, cancelled, LSG_SEARCH_FORWARD);
-  g_assert_cmpint (viaPoll.display.notice, ==, LSG_FIND_NOTICE_STOPPED);
   g_assert_false (viaPoll.display.has_progress);
   g_assert_cmpuint (viaPoll.display.total, ==, 2);
 
@@ -428,6 +434,54 @@ test_stop_close_reopen (void)
   LsgFindSession reopened = lsg_find_invalidated (s);
   g_assert_false (reopened.display.active);
   g_assert_cmpstr (reopened.draft.text, ==, "needle");
+}
+
+/* --- REGRESSION: a network net-park poll (CANCELLED that CARRIES a landing)
+ *     presents the count, NOT "Stopped" ---
+ *
+ * On an http_range (network) document the core drives the fetch frontier via
+ * ls_search_nav, lands the first match, then RE-PARKS the scan at CANCELLED by
+ * design (nfd_ac6). So ONE poll can carry BOTH a fresh landing (nav == FOUND,
+ * position/total set) AND phase == CANCELLED. Folding that poll must PRESENT THE
+ * COUNT ("1 of N", non-final) -- the STOPPED notice belongs only to an explicit
+ * user Stop (lsg_find_stopped). main.c renders the notice BEFORE the count
+ * branch, so a STOPPED here MASKS the real "1 of N". The macOS view-model carries
+ * the same latent mislabel (FindLogic.swift), which this GTK OUTCOME pin forbids
+ * the port from inheriting. The FIX mechanism is chosen by the implementer -- a
+ * landed-match guard, or a user-stopped flag -- so this asserts only the outcome
+ * (both mechanisms agree: a CANCELLED poll that carries a landing is not
+ * STOPPED). */
+static void
+test_resolved_net_park_landing (void)
+{
+  LsgFindSession s = lsg_find_initial ();
+  s.draft.mode = LSG_FIND_TEXT;
+  s.draft.text = "needle";
+  s = lsg_find_began (s);
+
+  /* The net-park poll: the first match has landed (nav FOUND, "1 of 4" so far)
+   * while the scan simultaneously parked at CANCELLED (total still growing). */
+  LsgSearchSnapshot net_park = {
+    .phase = LSG_SEARCH_PHASE_CANCELLED, .progress = 0.4,
+    .nav = LSG_SEARCH_NAV_FOUND, .found = { .row = 3, .column = 2 },
+    .position = 1, .total = 4, .total_exact = FALSE
+  };
+  LsgFindSession r = lsg_find_resolved (s, TRUE, net_park, LSG_SEARCH_FORWARD);
+
+  /* The poll landing + partial count fold in as usual (these pass today). */
+  g_assert_true (r.display.has_current);
+  g_assert_cmpuint (r.display.current.row, ==, 3);
+  g_assert_cmpuint (r.display.current.column, ==, 2);
+  g_assert_cmpuint (r.display.position, ==, 1);
+  g_assert_cmpuint (r.display.total, ==, 4);
+  g_assert_false (r.display.total_final);   /* "1 of 4", still growing */
+  g_assert_false (r.display.has_progress);  /* CANCELLED ends the % UI */
+
+  /* THE REGRESSION: the landed match must NOT be masked as "Stopped" -- the count
+   * shows (notice NONE). RED today (the unconditional CANCELLED -> STOPPED map in
+   * lsg_find.c). */
+  g_assert_cmpint (r.display.notice, !=, LSG_FIND_NOTICE_STOPPED);
+  g_assert_cmpint (r.display.notice, ==, LSG_FIND_NOTICE_NONE);
 }
 
 /* --- resolved is stable on idle polls and cleared sessions --- */
@@ -796,6 +850,7 @@ main (int argc, char *argv[])
   g_test_add_func ("/find/zero-matches", test_zero_matches);
   g_test_add_func ("/find/step-anchors", test_step_anchors);
   g_test_add_func ("/find/stop-close-reopen", test_stop_close_reopen);
+  g_test_add_func ("/find/resolved-net-park-landing", test_resolved_net_park_landing);
   g_test_add_func ("/find/resolved-stable", test_resolved_stable);
 
   /* Search bridge over the real core. */
