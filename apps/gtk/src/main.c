@@ -84,6 +84,14 @@ typedef struct {
   LsgNetOpen *net;
   guint net_poll_id;
   char *pending_url;
+
+  /* Env-gated timing instrumentation (LESSSHEET_GTK_TIMING). Entirely inert —
+   * no output, no measurable cost — unless `timing` is set. */
+  gboolean timing;
+  gint64 t_start;              /* main() entry (monotonic µs) */
+  gboolean ui_shown_reported;  /* one-shot: window first mapped */
+  gint64 t_open_begin;         /* file-open begin (monotonic µs) */
+  gboolean first_frame_pending;/* one-shot: awaiting the first painted grid frame */
 } App;
 
 /* ------------------------------------------------------------------------- */
@@ -423,6 +431,17 @@ grid_draw (GtkDrawingArea *area, cairo_t *cr, int width, int height,
   if (app->doc == NULL || app->win == NULL)
     return;
 
+  /* Milestone 2: window-fill = file-open begin -> first painted grid frame.
+   * Cheap one-shot flag check; the delta is recorded here on the first real
+   * paint after a document loads. */
+  if (app->timing && app->first_frame_pending)
+    {
+      app->first_frame_pending = FALSE;
+      gint64 dt = g_get_monotonic_time () - app->t_open_begin;
+      g_printerr ("[timing] window-fill (open begin -> first frame): %.1f ms\n",
+                  (double) dt / 1000.0);
+    }
+
   /* All colors resolve from the active theme — no literal color constants. */
   GdkRGBA fg;
   gtk_widget_get_color (GTK_WIDGET (area), &fg);
@@ -626,6 +645,14 @@ sample_column_widths (App *app)
 static void
 open_document (App *app, LsgDocument *doc, const char *title)
 {
+  /* Arm the window-fill timer if an outer caller (open_file) has not already —
+   * e.g. the network-adopt path enters here directly. */
+  if (app->timing && !app->first_frame_pending)
+    {
+      app->t_open_begin = g_get_monotonic_time ();
+      app->first_frame_pending = TRUE;
+    }
+
   app_reset_document (app);
   app->doc = doc;
 
@@ -680,12 +707,24 @@ open_file (App *app, GFile *file)
       return;
     }
 
+  /* Window-fill begin edge is captured BEFORE the open so the measured time
+   * includes the O(head) ls_open cost; armed only on success. */
+  gint64 begin = app->timing ? g_get_monotonic_time () : 0;
   LsgOpenError err = LSG_OPEN_OK;
   LsgDocument *doc = lsg_document_open_local (path, NULL, &err);
   if (doc == NULL)
-    show_error (app, "Could not open file", open_error_text (err));
+    {
+      show_error (app, "Could not open file", open_error_text (err));
+    }
   else
-    open_document (app, doc, base);
+    {
+      if (app->timing)
+        {
+          app->t_open_begin = begin;
+          app->first_frame_pending = TRUE;
+        }
+      open_document (app, doc, base);
+    }
 
   g_free (path);
   g_free (base);
@@ -1014,6 +1053,21 @@ build_grid_page (App *app)
   return grid;
 }
 
+/* Milestone 1: UI cold-start = main() entry -> the window first mapped/shown.
+ * One-shot (map can fire again on remap); inert unless timing is enabled. */
+static void
+on_window_map (GtkWidget *widget, gpointer data)
+{
+  (void) widget;
+  App *app = data;
+  if (!app->timing || app->ui_shown_reported)
+    return;
+  app->ui_shown_reported = TRUE;
+  gint64 dt = g_get_monotonic_time () - app->t_start;
+  g_printerr ("[timing] ui cold-start (main -> window mapped): %.1f ms\n",
+              (double) dt / 1000.0);
+}
+
 /* Build the single window once (idempotent). Shared by "activate" (no file) and
  * "open" (a file passed on the command line / by the file manager). */
 static void
@@ -1025,6 +1079,7 @@ ensure_window (App *app, GtkApplication *gtk_app)
 
   GtkWidget *win = adw_application_window_new (gtk_app);
   app->window = GTK_WINDOW (win);
+  g_signal_connect (win, "map", G_CALLBACK (on_window_map), app);
   gtk_window_set_title (app->window, "less-sheet");
   gtk_window_set_default_size (app->window, 1024, 720);
 
@@ -1103,6 +1158,8 @@ int
 main (int argc, char *argv[])
 {
   App app = { 0 };
+  app.t_start = g_get_monotonic_time ();            /* capture entry ASAP */
+  app.timing = (g_getenv ("LESSSHEET_GTK_TIMING") != NULL);
   app.row_estimate = 1;
   app.font_desc = pango_font_description_from_string ("Monospace 11");
 
