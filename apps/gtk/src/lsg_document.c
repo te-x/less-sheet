@@ -23,13 +23,8 @@
 #include <lsg_document.h>
 #include "lsg_document_internal.h"
 
-struct _LsgDocument {
-  ls_doc *doc;
-  /* Heap-allocated so the poll-lane accessors can lock through a
-   * `const LsgDocument *` (locking mutates the pointee, not the const field). */
-  GMutex *window_lock;
-  GMutex *control_lock;
-};
+/* struct _LsgDocument is defined in lsg_document_internal.h (shared with the
+ * sibling slice bridges, e.g. lsg_find.c). */
 
 struct _LsgWindow {
   guint64 first_row;

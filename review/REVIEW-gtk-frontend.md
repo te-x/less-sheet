@@ -69,3 +69,48 @@ The gate proves compile + display-free logic (6/6). It cannot judge the rendered
 native look + live dark/accent (H1), cold-start <500 ms + big-file O(viewport) smoothness (H2/H4),
 interaction parity so far (H3), a real HTTPS `.csv`/`.csv.gz` open over TLS (H5). Accessibility (H6)
 remains the deferred item across all slices.
+
+## Slice 2 (find)
+
+**Verdict: PASS (converged in 1 round).** Frozen contract `9f3d454`; implementation committed on top.
+Additive — Slice-1's frozen surface untouched; find is a pure ABI consumer (no core / `api/` change).
+
+### What shipped (all in `apps/gtk/src/`)
+- `lsg_find.c` — two layers: a **pure view-model** (line-by-line C port of the macOS `FindControl` /
+  `FindLogic.swift`: smart-case, the count/notice/wrap state machine — MAX-fold count + `total_final`
+  latch, NO_MATCHES vs WRAPPED_TO_START/END vs STOPPED vs NONE, next/prev step anchors, numeric grammar)
+  and a **search bridge** (`lsg_document_search_start/nav/cancel/poll` over `ls_search_*`;
+  `lsg_document_window_match_flags` over `ls_window_match_flags`, copying the borrowed per-cell mask out
+  under the window lock).
+- `lsg_document_internal.h` / `lsg_document.c` — moved `struct _LsgDocument` into the non-frozen internal
+  header so the bridge reaches `doc->doc` + `window_lock`; `LsgDocument` stays opaque in the frozen
+  `include/lsg_document.h` (no widening).
+- `main.c` — a header-bar find button + **Ctrl+F** → `GtkPopover` (search entry, match count, next/prev,
+  wrap notice, **Esc** close+clear), live/incremental; **match highlighting** in `grid_draw` via the mask,
+  tinted with the live Adwaita **system accent** (subtle in-scope / strong current), viewport-only,
+  refreshed on scroll.
+
+### Reviewer verification (vs the macOS originals) — no defects
+View-model verified line-by-line vs `FindControl` (count machine, notices, wrap round-trip, step anchors,
+smart-case, numeric grammar — all match the Swift + the 18 frozen tests). Bridge lane discipline identical
+to `CoreDocumentSession` (search lockless poll/control; match-flags under the window lock); `IDLE`→no
+snapshot; mask copy-out leak/UAF-free. Struct-move behavior-identical + opaque preserved. Highlighting
+viewport-only, 1:1 aligned, live-accent, per-frame leak-free. No Slice-1 regression (find poll loop scoped
+to active find; Ctrl+F stops only on Ctrl+F; teardown clears mask + notice).
+
+### Objective gate (orchestrator, tree `a7ad80f…`)
+`gate.sh --require-frozen apps/gtk` → **PASS**: conformance GREEN (23 targets, `-Werror`), behavior **7/7**
+(Slice-1's six + `find`). Post-review tree-hash identical (read-only reviewer).
+
+### Non-blocking follow-ups (recorded)
+- **Predicate "Where" widget** — the predicate *engine* (validation + bridge + core rejection) is done +
+  gate-pinned, but only the text search *widget* is wired, so a user can't yet reach predicate find via
+  the UI. Track for a follow-up slice.
+- `find_poll_fold` re-materializes the viewport every ~100 ms tick during an active search (bounded
+  O(viewport)); gate it on an actual window/landing change if a GUI pass shows cost.
+- Benign parity note: macOS `submit` sorts the visible-column scope; the C forwards it unsorted
+  (immaterial — the ABI treats scope as a set, and `main.c` passes NULL/all).
+
+### Pending — H3 (find interaction) folds into the desktop GUI pass
+The popover feel, accent-follow-on-theme-change, scroll-to-match, and highlight look are display-only —
+verified live via `tools/gtk/run_gtk_on` on a real desktop, not the headless gate.

@@ -24,6 +24,7 @@
 #include <lsg_grid_geometry.h>
 #include <lsg_window_poll.h>
 #include <lsg_formatter.h>
+#include <lsg_find.h>
 
 #include <string.h>
 
@@ -85,6 +86,19 @@ typedef struct {
   guint net_poll_id;
   char *pending_url;
 
+  /* Find (slice 2): the pure view-model session + the popover widgets + the
+   * current window's highlight mask (owned; refreshed each materialize). */
+  LsgFindSession find;
+  LsgSearchDir find_nav_direction;   /* direction of the outstanding navigation */
+  gboolean find_wrap_issued;         /* the wrap follow-up nav has been issued */
+  LsgMatchFlags mask;                /* per-visible-cell match flags (OWNED) */
+  GtkMenuButton *find_button;
+  GtkPopover *find_popover;
+  GtkEditable *find_entry;
+  GtkLabel *find_status;
+  LsgFindNotice find_sticky_notice;  /* a briefly-lingering wrap notice for the label */
+  guint find_notice_id;              /* timeout clearing the sticky notice */
+
   /* Env-gated timing instrumentation (LESSSHEET_GTK_TIMING). Entirely inert —
    * no output, no measurable cost — unless `timing` is set. */
   gboolean timing;
@@ -129,6 +143,19 @@ free_window_headers (App *app)
   app->hdr_count = 0;
 }
 
+static void
+find_clear_mask (App *app)
+{
+  g_clear_pointer (&app->mask.flags, g_free);
+  app->mask.rows = 0;
+  app->mask.cols = 0;
+}
+
+/* Poll the active search, fold it into the display, refresh the mask + labels,
+ * and scroll to a new landing. Defined with the other find helpers below; the
+ * poll loop (grid_poll_tick) calls it. */
+static void find_poll_fold (App *app);
+
 /* ------------------------------------------------------------------------- */
 /* View teardown                                                              */
 /* ------------------------------------------------------------------------- */
@@ -148,6 +175,18 @@ app_reset_document (App *app)
   app->n_cols = 0;
   app->row_estimate = 1;
   app->window_short = FALSE;
+
+  /* The old document's search state died with its core handle: clear the find
+   * display + highlights (the DRAFT is retained, so re-running is one Enter). */
+  if (app->find_notice_id != 0)
+    {
+      g_source_remove (app->find_notice_id);
+      app->find_notice_id = 0;
+    }
+  app->find = lsg_find_invalidated (app->find);
+  app->find_sticky_notice = LSG_FIND_NOTICE_NONE;
+  app->find_wrap_issued = FALSE;
+  find_clear_mask (app);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -346,6 +385,13 @@ grid_materialize (App *app)
   grid_window_headers (app, colwin.first, colwin.count);
   grid_autofit_widths (app, colwin, nw);
 
+  /* Refresh the per-visible-cell find highlight mask for THIS window (O(viewport)
+   * — only the visible column range is evaluated by the core). Empty when no
+   * search is active. Fetched right after set_window (window lane). */
+  find_clear_mask (app);
+  if (app->find.display.active)
+    app->mask = lsg_document_window_match_flags (app->doc, colwin.first, colwin.count);
+
   /* Short => rows beyond the frontier are not yet servable; re-issue on poll. */
   app->window_short = (lsg_window_row_count (nw) < span.row_count);
 }
@@ -397,7 +443,17 @@ grid_poll_tick (gpointer data)
 
   grid_update_title_counts (app, rc, prog);
 
-  if (!d.continue_polling)
+  /* Keep polling (and folding search snapshots) while a find is active, so its
+   * live count grows, its landing scrolls into view, and the highlight mask
+   * tracks the scan — even after the index poll would otherwise stop. */
+  gboolean keep = d.continue_polling;
+  if (app->find.display.active)
+    {
+      find_poll_fold (app);
+      keep = TRUE;
+    }
+
+  if (!keep)
     {
       app->poll_id = 0;
       return G_SOURCE_REMOVE;
@@ -471,6 +527,21 @@ grid_draw (GtkDrawingArea *area, cairo_t *cr, int width, int height,
   GdkRGBA line = fg;
   line.alpha = 0.15;
 
+  /* Find highlights use the live system accent (Adwaita), never a hardcoded
+   * color: subtle for in-scope matches, strong for the current match. */
+  GdkRGBA accent = { 0, 0, 0, 0 };
+  gboolean have_accent = FALSE;
+  if (app->find.display.active)
+    {
+      GdkRGBA *a = adw_style_manager_get_accent_color_rgba (adw_style_manager_get_default ());
+      if (a != NULL)
+        {
+          accent = *a;
+          gdk_rgba_free (a);
+          have_accent = TRUE;
+        }
+    }
+
   /* --- cells (clipped to the scrolling body region) --- */
   cairo_save (cr);
   cairo_rectangle (cr, gutter, header_h, (double) width - gutter,
@@ -492,6 +563,24 @@ grid_draw (GtkDrawingArea *area, cairo_t *cr, int width, int height,
           double colw = (col < app->n_cols && app->col_widths[col] > 0.0)
                             ? app->col_widths[col]
                             : 0.0;
+
+          /* Highlight a matching cell from the core's mask (accent tint); the
+           * current match cell gets a stronger tint. */
+          if (have_accent && app->mask.flags != NULL && ri < app->mask.rows
+              && ci < app->mask.cols
+              && app->mask.flags[(gsize) ri * app->mask.cols + ci])
+            {
+              gboolean is_current = app->find.display.has_current
+                                    && app->find.display.current.row == view_row
+                                    && app->find.display.current.column == col;
+              GdkRGBA h = accent;
+              h.alpha = is_current ? 0.55 : 0.28;
+              gdk_cairo_set_source_rgba (cr, &h);
+              cairo_rectangle (cr, x, y, colw, row_h);
+              cairo_fill (cr);
+              gdk_cairo_set_source_rgba (cr, &fg);   /* restore for the text */
+            }
+
           const char *text = lsg_window_cell (app->win, ri, ci);
           draw_text (cr, layout, text, x + pad, y, colw - 2.0 * pad, row_h, line_h);
           x += colw;
@@ -986,6 +1075,323 @@ on_area_resize (GtkDrawingArea *area, int width, int height, gpointer data)
 }
 
 /* ------------------------------------------------------------------------- */
+/* Find (slice 2): the popover UI + highlight glue over lsg_find               */
+/* ------------------------------------------------------------------------- */
+
+static void
+find_ensure_poll (App *app)
+{
+  if (app->poll_id == 0 && app->doc != NULL)
+    app->poll_id = g_timeout_add (POLL_INTERVAL_MS, grid_poll_tick, app);
+}
+
+/* Compose the count / notice label from the pure display (+ a lingering wrap
+ * notice, which is otherwise a single-tick state). */
+static void
+find_update_labels (App *app)
+{
+  if (app->find_status == NULL)
+    return;
+  const LsgFindDisplay *d = &app->find.display;
+  char *owned = NULL;
+  const char *text = "";
+
+  if (app->find_sticky_notice == LSG_FIND_NOTICE_WRAPPED_TO_START)
+    text = "Wrapped to start";
+  else if (app->find_sticky_notice == LSG_FIND_NOTICE_WRAPPED_TO_END)
+    text = "Wrapped to end";
+  else if (d->notice == LSG_FIND_NOTICE_NO_MATCHES)
+    text = "No matches";
+  else if (d->notice == LSG_FIND_NOTICE_STOPPED)
+    text = "Stopped";
+  else if (d->active)
+    {
+      if (d->has_current)
+        owned = g_strdup_printf ("%" G_GUINT64_FORMAT " of %" G_GUINT64_FORMAT "%s",
+                                 d->position, d->total, d->total_final ? "" : "…");
+      else if (d->total > 0)
+        owned = g_strdup_printf ("%" G_GUINT64_FORMAT " matches%s",
+                                 d->total, d->total_final ? "" : "…");
+      else
+        text = "Searching…";
+    }
+
+  gtk_label_set_text (app->find_status, owned != NULL ? owned : text);
+  g_free (owned);
+}
+
+/* Scroll the grid so `row` is comfortably visible (no-op if it already is). */
+static void
+scroll_to_match (App *app, guint64 row)
+{
+  int h = gtk_widget_get_height (GTK_WIDGET (app->area));
+  if (h <= 0 || app->row_h <= 0.0)
+    return;
+  double visible = ((double) h - app->header_h) / app->row_h;
+  if (row >= app->cur_top_row && (double) (row - app->cur_top_row) < visible - 1.0)
+    return;                                   /* already on screen */
+  guint64 target = (row > 2) ? row - 2 : 0;   /* leave a small top margin */
+  double upper = gtk_adjustment_get_upper (app->vadj);
+  double off = lsg_grid_offset_for_top_row (target, upper, app->row_estimate, app->row_h);
+  gtk_adjustment_set_value (app->vadj, off);  /* fires materialize + repaint */
+}
+
+static gboolean
+find_notice_clear (gpointer data)
+{
+  App *app = data;
+  app->find_sticky_notice = LSG_FIND_NOTICE_NONE;
+  app->find_notice_id = 0;
+  find_update_labels (app);
+  return G_SOURCE_REMOVE;
+}
+
+static void
+find_set_sticky_notice (App *app, LsgFindNotice notice)
+{
+  app->find_sticky_notice = notice;
+  if (app->find_notice_id != 0)
+    g_source_remove (app->find_notice_id);
+  app->find_notice_id = g_timeout_add (2500, find_notice_clear, app);
+}
+
+/* (Re)run the current entry text as a live TEXT search, or clear when empty. */
+static void
+find_run_query (App *app)
+{
+  if (app->doc == NULL)
+    return;
+
+  app->find.draft.mode = LSG_FIND_TEXT;
+  app->find.draft.text = gtk_editable_get_text (app->find_entry); /* borrowed */
+
+  /* Slice-2 UI is text find over ALL columns (no column hiding yet): the whole
+   * column set is visible, so the composed scope is NULL. */
+  LsgFindSubmit sub = lsg_find_submit (app->find, NULL, app->n_cols, app->n_cols);
+  if (sub.outcome == LSG_FIND_RUN
+      && lsg_document_search_start (app->doc, sub.request))
+    {
+      app->find = lsg_find_began (app->find);
+      app->find_nav_direction = LSG_SEARCH_FORWARD;
+      app->find_wrap_issued = FALSE;
+      lsg_document_search_nav (app->doc, lsg_search_nav_from_top ());
+      find_ensure_poll (app);
+    }
+  else
+    {
+      /* Empty query (IGNORED) or a rejected/failed start: clear the search. */
+      lsg_document_search_cancel (app->doc);
+      app->find = lsg_find_closed (app->find);
+    }
+
+  grid_materialize (app);          /* refresh (or clear) the highlight mask */
+  find_update_labels (app);
+  gtk_widget_queue_draw (GTK_WIDGET (app->area));
+}
+
+/* Forward-declared above; folds one search poll into the display. */
+static void
+find_poll_fold (App *app)
+{
+  LsgSearchSnapshot snap;
+  gboolean has = lsg_document_search_poll (app->doc, &snap);
+
+  gboolean prev_has = app->find.display.has_current;
+  guint64 prev_row = prev_has ? app->find.display.current.row : 0;
+
+  app->find = lsg_find_resolved (app->find, has, snap, app->find_nav_direction);
+
+  /* A wrap notice asks for a follow-up navigation (issued once); it self-clears
+   * when the wrap lands as a FOUND poll. */
+  LsgSearchNav wnav;
+  if (lsg_find_wrap_nav (app->find, &wnav))
+    {
+      if (!app->find_wrap_issued)
+        {
+          app->find_nav_direction = wnav.direction;
+          app->find_wrap_issued = TRUE;
+          lsg_document_search_nav (app->doc, wnav);
+          find_set_sticky_notice (app, app->find.display.notice);
+        }
+    }
+  else
+    {
+      app->find_wrap_issued = FALSE;
+    }
+
+  if (app->find.display.has_current
+      && (!prev_has || app->find.display.current.row != prev_row))
+    scroll_to_match (app, app->find.display.current.row);
+
+  grid_materialize (app);          /* refresh the highlight mask as the scan advances */
+  find_update_labels (app);
+  gtk_widget_queue_draw (GTK_WIDGET (app->area));
+}
+
+static void
+do_find_step (App *app, LsgSearchDir direction)
+{
+  if (app->doc == NULL || !app->find.display.active)
+    return;
+  LsgSearchNav nav;
+  if (lsg_find_step (app->find, direction, app->cur_top_row, &nav))
+    {
+      app->find_nav_direction = direction;
+      app->find_wrap_issued = FALSE;
+      lsg_document_search_nav (app->doc, nav);
+      find_ensure_poll (app);
+    }
+}
+
+static void
+on_find_search_changed (GtkSearchEntry *entry, gpointer data)
+{
+  (void) entry;
+  find_run_query ((App *) data);
+}
+
+static void
+on_find_next_clicked (GtkButton *button, gpointer data)
+{
+  (void) button;
+  do_find_step ((App *) data, LSG_SEARCH_FORWARD);
+}
+
+static void
+on_find_prev_clicked (GtkButton *button, gpointer data)
+{
+  (void) button;
+  do_find_step ((App *) data, LSG_SEARCH_BACKWARD);
+}
+
+static gboolean
+on_find_entry_key (GtkEventControllerKey *ctrl, guint keyval, guint keycode,
+                   GdkModifierType state, gpointer data)
+{
+  (void) ctrl;
+  (void) keycode;
+  App *app = data;
+  switch (keyval)
+    {
+    case GDK_KEY_Escape:
+      gtk_popover_popdown (app->find_popover);
+      return GDK_EVENT_STOP;
+    case GDK_KEY_Return:
+    case GDK_KEY_KP_Enter:
+      do_find_step (app, (state & GDK_SHIFT_MASK) ? LSG_SEARCH_BACKWARD
+                                                  : LSG_SEARCH_FORWARD);
+      return GDK_EVENT_STOP;
+    default:
+      return GDK_EVENT_PROPAGATE;
+    }
+}
+
+/* Esc / click-away: cancel the core search + clear highlights; keep the draft. */
+static void
+on_find_popover_closed (GtkPopover *popover, gpointer data)
+{
+  (void) popover;
+  App *app = data;
+  if (app->doc != NULL)
+    lsg_document_search_cancel (app->doc);
+  app->find = lsg_find_closed (app->find);
+  app->find_wrap_issued = FALSE;
+  app->find_sticky_notice = LSG_FIND_NOTICE_NONE;
+  if (app->find_notice_id != 0)
+    {
+      g_source_remove (app->find_notice_id);
+      app->find_notice_id = 0;
+    }
+  find_clear_mask (app);
+  find_update_labels (app);
+  if (app->doc != NULL)
+    {
+      grid_materialize (app);
+      gtk_widget_queue_draw (GTK_WIDGET (app->area));
+    }
+}
+
+/* Opening (re)focuses the entry and re-runs any retained query to re-highlight. */
+static void
+on_find_popover_show (GtkWidget *popover, gpointer data)
+{
+  (void) popover;
+  App *app = data;
+  gtk_widget_grab_focus (GTK_WIDGET (app->find_entry));
+  const char *text = gtk_editable_get_text (app->find_entry);
+  if (text != NULL && text[0] != '\0')
+    find_run_query (app);
+}
+
+static void
+open_find (App *app)
+{
+  if (app->doc == NULL || app->find_button == NULL)
+    return;
+  gtk_menu_button_popup (app->find_button);
+}
+
+static gboolean
+on_window_key (GtkEventControllerKey *ctrl, guint keyval, guint keycode,
+               GdkModifierType state, gpointer data)
+{
+  (void) ctrl;
+  (void) keycode;
+  App *app = data;
+  if ((state & GDK_CONTROL_MASK)
+      && (keyval == GDK_KEY_f || keyval == GDK_KEY_F))
+    {
+      open_find (app);
+      return GDK_EVENT_STOP;
+    }
+  return GDK_EVENT_PROPAGATE;
+}
+
+static void
+build_find_popover (App *app)
+{
+  GtkWidget *pop = gtk_popover_new ();
+  GtkWidget *box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 6);
+
+  GtkWidget *row = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 6);
+  GtkWidget *entry = gtk_search_entry_new ();
+  gtk_widget_set_hexpand (entry, TRUE);
+  gtk_widget_set_size_request (entry, 220, -1);
+  app->find_entry = GTK_EDITABLE (entry);
+
+  GtkWidget *prev = gtk_button_new_from_icon_name ("go-up-symbolic");
+  gtk_widget_set_tooltip_text (prev, "Previous match (Shift+Enter)");
+  gtk_widget_add_css_class (prev, "flat");
+  GtkWidget *next = gtk_button_new_from_icon_name ("go-down-symbolic");
+  gtk_widget_set_tooltip_text (next, "Next match (Enter)");
+  gtk_widget_add_css_class (next, "flat");
+
+  gtk_box_append (GTK_BOX (row), entry);
+  gtk_box_append (GTK_BOX (row), prev);
+  gtk_box_append (GTK_BOX (row), next);
+
+  GtkWidget *status = gtk_label_new ("");
+  gtk_widget_set_halign (status, GTK_ALIGN_START);
+  gtk_widget_add_css_class (status, "dim-label");
+  app->find_status = GTK_LABEL (status);
+
+  gtk_box_append (GTK_BOX (box), row);
+  gtk_box_append (GTK_BOX (box), status);
+  gtk_popover_set_child (GTK_POPOVER (pop), box);
+  app->find_popover = GTK_POPOVER (pop);
+
+  g_signal_connect (entry, "search-changed", G_CALLBACK (on_find_search_changed), app);
+  g_signal_connect (prev, "clicked", G_CALLBACK (on_find_prev_clicked), app);
+  g_signal_connect (next, "clicked", G_CALLBACK (on_find_next_clicked), app);
+  g_signal_connect (pop, "closed", G_CALLBACK (on_find_popover_closed), app);
+  g_signal_connect (pop, "show", G_CALLBACK (on_find_popover_show), app);
+
+  GtkEventController *keys = gtk_event_controller_key_new ();
+  g_signal_connect (keys, "key-pressed", G_CALLBACK (on_find_entry_key), app);
+  gtk_widget_add_controller (entry, keys);
+}
+
+/* ------------------------------------------------------------------------- */
 /* UI construction                                                            */
 /* ------------------------------------------------------------------------- */
 
@@ -1080,6 +1486,12 @@ ensure_window (App *app, GtkApplication *gtk_app)
   GtkWidget *win = adw_application_window_new (gtk_app);
   app->window = GTK_WINDOW (win);
   g_signal_connect (win, "map", G_CALLBACK (on_window_map), app);
+
+  /* Ctrl+F opens find from anywhere in the window (capture phase). */
+  GtkEventController *win_keys = gtk_event_controller_key_new ();
+  gtk_event_controller_set_propagation_phase (win_keys, GTK_PHASE_CAPTURE);
+  g_signal_connect (win_keys, "key-pressed", G_CALLBACK (on_window_key), app);
+  gtk_widget_add_controller (win, win_keys);
   gtk_window_set_title (app->window, "less-sheet");
   gtk_window_set_default_size (app->window, 1024, 720);
 
@@ -1097,6 +1509,15 @@ ensure_window (App *app, GtkApplication *gtk_app)
   gtk_widget_set_tooltip_text (url_btn, "Open URL");
   g_signal_connect (url_btn, "clicked", G_CALLBACK (action_open_url), app);
   adw_header_bar_pack_start (ADW_HEADER_BAR (header), url_btn);
+
+  /* Find: a menu button on the right whose popover is the find UI (Ctrl+F). */
+  GtkWidget *find_btn = gtk_menu_button_new ();
+  gtk_menu_button_set_icon_name (GTK_MENU_BUTTON (find_btn), "edit-find-symbolic");
+  gtk_widget_set_tooltip_text (find_btn, "Find (Ctrl+F)");
+  app->find_button = GTK_MENU_BUTTON (find_btn);
+  build_find_popover (app);
+  gtk_menu_button_set_popover (GTK_MENU_BUTTON (find_btn), GTK_WIDGET (app->find_popover));
+  adw_header_bar_pack_end (ADW_HEADER_BAR (header), find_btn);
 
   /* Banner (network progress) above the swappable content stack. */
   app->banner = ADW_BANNER (adw_banner_new (""));
@@ -1161,6 +1582,8 @@ main (int argc, char *argv[])
   app.t_start = g_get_monotonic_time ();            /* capture entry ASAP */
   app.timing = (g_getenv ("LESSSHEET_GTK_TIMING") != NULL);
   app.row_estimate = 1;
+  app.find = lsg_find_initial ();
+  app.find_nav_direction = LSG_SEARCH_FORWARD;
   app.font_desc = pango_font_description_from_string ("Monospace 11");
 
   g_autoptr (AdwApplication) application =
@@ -1177,6 +1600,9 @@ main (int argc, char *argv[])
     }
   if (app.net_poll_id != 0)
     g_source_remove (app.net_poll_id);
+  if (app.find_notice_id != 0)
+    g_source_remove (app.find_notice_id);
+  find_clear_mask (&app);
   g_clear_pointer (&app.pending_url, g_free);
   g_clear_pointer (&app.vadj, g_object_unref);
   g_clear_pointer (&app.hadj, g_object_unref);
