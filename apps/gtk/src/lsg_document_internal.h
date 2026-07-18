@@ -16,6 +16,8 @@
 #define LSG_DOCUMENT_INTERNAL_H
 
 #include <lsg_document.h>
+#include <lsg_find.h>    /* LsgSearchRequest — shared by the find + filter bridges */
+#include <string.h>
 
 G_BEGIN_DECLS
 
@@ -46,6 +48,39 @@ struct _LsgDocument {
  * returned document `ls_close`s it. `core_doc` must be non-NULL.
  */
 LsgDocument *lsg_document_adopt (ls_doc *core_doc);
+
+/*
+ * Marshal the shared `LsgSearchRequest` into the ABI's `ls_search_request` — the
+ * SINGLE place the find bridge (`ls_search_start`) and the filter bridge
+ * (`ls_filter_set`) build it, so their marshaling can never drift. The `value`
+ * and `scope` buffers are borrowed only for the enclosing core call. `static
+ * inline` (each including TU gets its own copy; unused TUs draw no warning).
+ */
+static inline ls_search_request
+lsg_build_abi_request (LsgSearchRequest request)
+{
+  ls_search_request req;
+  req.value_ptr = (const uint8_t *) request.value;
+  req.value_len = (request.value != NULL) ? strlen (request.value) : 0;
+
+  if (request.kind == LSG_FIND_TEXT)
+    {
+      req.kind = LS_SEARCH_TEXT;
+      req.op = LS_SEARCH_OP_EQ;             /* ignored for TEXT */
+      req.column = 0;                       /* ignored for TEXT */
+      req.scope_ptr = request.scope;        /* NULL means ALL columns */
+      req.scope_len = request.scope_len;
+    }
+  else
+    {
+      req.kind = LS_SEARCH_PREDICATE;
+      req.op = (ls_search_op) request.op;   /* LsgSearchOp is pinned to ls_search_op */
+      req.column = request.column;
+      req.scope_ptr = NULL;                 /* ignored for PREDICATE */
+      req.scope_len = 0;
+    }
+  return req;
+}
 
 G_END_DECLS
 

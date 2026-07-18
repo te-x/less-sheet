@@ -150,3 +150,50 @@ When the **copy slice** adds a background worker that touches the jump/search br
 ### Pending — jump interaction folds into the desktop GUI pass
 The popover, live progress, cancel, digit-to-open, scroll-to-landing, and the reject shake feel are
 display-only — verified live via `run_gtk_on`, not the headless gate.
+
+## Slice 4 (filter-to-matches)
+
+**Verdict: PASS (converged in 2 rounds; R1 raised a `[contract]` finding → DECISION-1).** Frozen contract
+`33a4936`; contract amendment `25e812d` (DECISION-1); implementation committed on top. Additive — Slices-1/2/3
+frozen surface otherwise untouched; filter is a pure ABI consumer.
+
+### What shipped (all in `apps/gtk/src/`)
+- `lsg_filter.c` — a **pure view-model** (C port of macOS `FilterControl` + the `ViewerModel` toggle): `applied`
+  (captures base M; re-apply keeps the ORIGINAL M), `cleared`, `resolved` (persist filtered mode on a nil poll),
+  `banner` (scanning/done/cancelled/empty state machine), `jump_rowcount`; and a **filter bridge**
+  (`lsg_document_filter_set/clear/poll` over `ls_filter_*`, lockless poll/control lane).
+- `main.c` — a "Filter to matches" `GtkToggleButton` (in the find popover) + an `AdwBanner` ("Filtered — N of
+  ~M · P%" / done / empty, with Clear). Composition: applies the current find query as the filter (reuses
+  `lsg_find_submit`), passes `filter.active` as jump's `filtered` flag, re-anchors on the ORIGINAL source row on
+  clear (`lsg_window_source_row`, ARCH #13).
+- `lsg_document_internal.h` — a shared `static inline lsg_build_abi_request` (DRY'd from the find + filter bridges).
+
+### The `[contract]` resolution (DECISION-1)
+R1 was green but the reviewer traced a `[contract]` defect to root cause: to satisfy the frozen
+`test_bridge_find_within_filter` (which single-polled `lsg_document_search_nav` after DONE), the implementer had
+added a **main-thread `g_usleep` busy-loop** to the Slice-2 bridge to absorb a ~1-tick nav lag the core exhibits
+*under a filter* — violating the "never block the UI" NFR and diverging from macOS (`navFound` polls; production
+is non-blocking, folded over the tick). **Resolution (planner Mode B, DECISION-1):** relax the frozen test to
+**poll-for-FOUND** (`wait_search_nav_resolved`, like macOS `navFound`); R2 reverted the bridge to plain
+non-blocking `ls_search_nav`. `include/lsg_find.h` unchanged (faithfully mirrors the ABI).
+
+### BACKEND / `api/` follow-up (recorded, NOT done)
+Root cause is a **core defect**: `ls_search_nav` violates its ABI "synchronous after `LS_SEARCH_DONE`" guarantee
+(`api/lesssheet.h:1242-1247`, no filter carve-out) under an active filter. Reconcile via a root-`api/` two-key:
+fix the core to be truly synchronous-after-DONE under a filter, OR relax the ABI doc to admit a bounded async
+tail. The GTK frontend is correct either way (it polls, like macOS).
+
+### Reviewer verification (2 rounds) — no defects beyond the [contract]
+`lsg_filter.c` verified line-by-line vs `FilterControl`/`ViewerModel` (keeps-original-M, resolved fold, banner
+state machine, jump/find composition, ARCH-#13 clear-restore). R2: the nav revert is byte-identical to the
+cleared Slice-2 form; the shared marshaler has no include cycle + is `-Werror`-clean; the filter poll-keep
+(`!total_exact`) is ABI-verified bounded (AUTO-mode filter auto-converges, so a CANCELLED pause auto-resumes to
+DONE). No Slice-1/2/3 regression.
+
+### Objective gate (orchestrator, tree `2cf90b2…`)
+`gate.sh --require-frozen apps/gtk` → **PASS**: conformance GREEN (`-Werror`), behavior **9/9** (the eight +
+`filter`). Post-review tree-hash identical.
+
+### Pending — filter interaction folds into the desktop GUI pass
+The toggle/banner look + interaction (and the delayed-progress banner gating) are display-only — verified live
+via `run_gtk_on`.

@@ -26,6 +26,7 @@
 #include <lsg_formatter.h>
 #include <lsg_find.h>
 #include <lsg_jump.h>
+#include <lsg_filter.h>
 
 #include <string.h>
 
@@ -110,6 +111,12 @@ typedef struct {
   GtkLabel *jump_status;
   guint jump_reject_id;              /* timeout clearing the rejection blink */
 
+  /* Filter-to-matches (slice 4): the pure state + the toggle + the banner. */
+  LsgFilterState filter;
+  GtkToggleButton *filter_toggle;
+  AdwBanner *filter_banner;
+  gboolean filter_ui_guard;          /* re-entrancy guard for programmatic toggle */
+
   /* Env-gated timing instrumentation (LESSSHEET_GTK_TIMING). Entirely inert —
    * no output, no measurable cost — unless `timing` is set. */
   gboolean timing;
@@ -171,6 +178,19 @@ static void find_poll_fold (App *app);
  * jump helpers below; the poll loop calls it while a jump is scanning. */
 static void jump_poll_fold (App *app);
 
+/* Poll the core filter slot, fold it, and refresh the banner + grid. Defined
+ * with the filter helpers below; the poll loop calls it while filtered. */
+static void filter_poll_fold (App *app);
+
+/* Filter helpers referenced from the earlier find section (the toggle lives in
+ * the find popover); defined with the filter helpers below. */
+static void on_filter_toggled (GtkToggleButton *toggle, gpointer data);
+static void filter_update_toggle_sensitivity (App *app);
+
+/* Sync the filter toggle + banner to state; called after opening a document
+ * (the reset cleared any prior filter). Defined with the filter helpers. */
+static void filter_sync_ui (App *app);
+
 /* Open the jump popover pre-filled with a digit typed on the grid (macOS
  * parity). Defined with the jump helpers; the grid key handler calls it. */
 static void open_jump_with_digit (App *app, char digit);
@@ -218,6 +238,9 @@ app_reset_document (App *app)
       app->jump_reject_id = 0;
     }
   app->jump = lsg_jump_initial ();
+
+  /* The old document's filter died with its core handle: back to identity. */
+  app->filter = lsg_filter_initial ();
 }
 
 /* ------------------------------------------------------------------------- */
@@ -490,6 +513,17 @@ grid_poll_tick (gpointer data)
     {
       jump_poll_fold (app);
       if (app->jump.kind == LSG_JUMP_FLOW_SCANNING)
+        keep = TRUE;
+    }
+
+  /* Keep ticking while a filter-scan is not yet final (the "N of M" banner grows
+   * and the grid materializes the widening filtered view). Under LS_INDEX_AUTO a
+   * CANCELLED scan (a jump/find took the slot) auto-resumes to DONE without
+   * caller input, so `!total_exact` is more robust than `phase == SCANNING`. */
+  if (app->filter.active)
+    {
+      filter_poll_fold (app);
+      if (!app->filter.snapshot.total_exact)
         keep = TRUE;
     }
 
@@ -810,6 +844,7 @@ open_document (App *app, LsgDocument *doc, const char *title)
   gtk_stack_set_visible_child_name (app->stack, "grid");
   grid_materialize (app);
   gtk_widget_queue_draw (GTK_WIDGET (app->area));
+  filter_sync_ui (app);            /* the reset cleared any prior filter */
 
   if (app->poll_id == 0)
     app->poll_id = g_timeout_add (POLL_INTERVAL_MS, grid_poll_tick, app);
@@ -1250,6 +1285,7 @@ find_run_query (App *app)
 
   grid_materialize (app);          /* refresh (or clear) the highlight mask */
   find_update_labels (app);
+  filter_update_toggle_sensitivity (app);   /* canApplyFilter follows the query */
   gtk_widget_queue_draw (GTK_WIDGET (app->area));
 }
 
@@ -1448,8 +1484,15 @@ build_find_popover (App *app)
   gtk_widget_add_css_class (status, "dim-label");
   app->find_status = GTK_LABEL (status);
 
+  /* "Filter to matches" — applies the current find query as a filter. */
+  GtkWidget *toggle = gtk_toggle_button_new_with_label ("Filter to matches");
+  gtk_widget_set_sensitive (toggle, FALSE);
+  app->filter_toggle = GTK_TOGGLE_BUTTON (toggle);
+  g_signal_connect (toggle, "toggled", G_CALLBACK (on_filter_toggled), app);
+
   gtk_box_append (GTK_BOX (box), row);
   gtk_box_append (GTK_BOX (box), status);
+  gtk_box_append (GTK_BOX (box), toggle);
   gtk_popover_set_child (GTK_POPOVER (pop), box);
   app->find_popover = GTK_POPOVER (pop);
 
@@ -1545,8 +1588,9 @@ jump_poll_fold (App *app)
     return;
 
   LsgJumpStatus st = lsg_document_jump_poll (app->doc);
-  /* No filter slice yet -> identity view (filtered FALSE). */
-  app->jump = lsg_jump_resolve (app->jump, st, FALSE);
+  /* Composition: a filtered short-land LANDS (filtered index vs original target
+   * are not comparable), never rejects. */
+  app->jump = lsg_jump_resolve (app->jump, st, app->filter.active);
 
   switch (app->jump.kind)
     {
@@ -1574,8 +1618,12 @@ do_jump_submit (App *app)
     return;
 
   const char *text = gtk_editable_get_text (app->jump_entry);
-  LsgRowCount rc = lsg_document_row_count (app->doc);
-  LsgJumpSubmit sub = lsg_jump_submit (text, rc, FALSE, app->cur_top_row);
+  /* Composition: while filtered the jump box takes ORIGINAL row numbers, so hint
+   * with the base document count M and drive the frozen jump with filtered=TRUE
+   * (which suppresses its out-of-range reject). */
+  LsgRowCount rc = lsg_filter_jump_rowcount (app->filter,
+                                             lsg_document_row_count (app->doc));
+  LsgJumpSubmit sub = lsg_jump_submit (text, rc, app->filter.active, app->cur_top_row);
   app->jump = sub.flow;
 
   if (sub.outcome == LSG_JUMP_RUN)
@@ -1759,6 +1807,221 @@ install_jump_css (void)
 }
 
 /* ------------------------------------------------------------------------- */
+/* Filter-to-matches (slice 4): the toggle + banner over lsg_filter             */
+/* ------------------------------------------------------------------------- */
+
+/* The toggle may turn ON only when the current find draft is filterable
+ * (canApplyFilter = the compose is not IGNORED), or stay live to turn OFF. */
+static void
+filter_update_toggle_sensitivity (App *app)
+{
+  if (app->filter_toggle == NULL)
+    return;
+  gboolean can = app->filter.active;
+  if (!can && app->find_entry != NULL)
+    {
+      const char *t = gtk_editable_get_text (app->find_entry);
+      can = (t != NULL && t[0] != '\0');
+    }
+  gtk_widget_set_sensitive (GTK_WIDGET (app->filter_toggle),
+                            app->doc != NULL && can);
+}
+
+/* Render the "Filtered — N of M rows" AdwBanner from the pure banner model, or
+ * hide it in the identity view. */
+static void
+filter_update_banner (App *app)
+{
+  if (app->filter_banner == NULL)
+    return;
+  LsgFilterBanner b;
+  if (!lsg_filter_banner (app->filter, &b))
+    {
+      adw_banner_set_revealed (app->filter_banner, FALSE);
+      return;
+    }
+
+  const char *tilde = b.document_rows_estimated ? "~" : "";
+  char *text;
+  if (b.is_empty_result)
+    text = g_strdup ("Filtered — no matching rows");
+  else if (b.has_progress)
+    text = g_strdup_printf (
+        "Filtered — %" G_GUINT64_FORMAT " of %s%" G_GUINT64_FORMAT " rows · %d%%",
+        b.matching, tilde, b.document_rows, (int) (b.progress * 100.0));
+  else
+    text = g_strdup_printf (
+        "Filtered — %" G_GUINT64_FORMAT " of %s%" G_GUINT64_FORMAT " rows",
+        b.matching, tilde, b.document_rows);
+
+  adw_banner_set_title (app->filter_banner, text);
+  adw_banner_set_button_label (app->filter_banner, "Clear");
+  adw_banner_set_revealed (app->filter_banner, TRUE);
+  g_free (text);
+}
+
+static void
+filter_set_toggle (App *app, gboolean active)
+{
+  if (app->filter_toggle == NULL)
+    return;
+  app->filter_ui_guard = TRUE;
+  gtk_toggle_button_set_active (app->filter_toggle, active);
+  app->filter_ui_guard = FALSE;
+}
+
+/* Sync the whole filter UI (toggle position + sensitivity + banner) to state. */
+static void
+filter_sync_ui (App *app)
+{
+  filter_set_toggle (app, app->filter.active);
+  filter_update_toggle_sensitivity (app);
+  filter_update_banner (app);
+}
+
+/* Capture the ORIGINAL row number of the top visible (filtered) row, so the
+ * identity view can re-anchor there after clearing (ARCH criterion 13). */
+static guint64
+capture_top_source_row (App *app)
+{
+  guint64 sr = 0;
+  if (app->doc == NULL)
+    return 0;
+  LsgWindow *w = lsg_document_set_window (app->doc, app->cur_top_row, 1, 0, 1);
+  guint64 s = lsg_window_source_row (w, 0);
+  if (s != LSG_NO_ROW)
+    sr = s;
+  lsg_window_free (w);
+  return sr;
+}
+
+/* Reflect a filtered/identity row-count change into the grid geometry and land
+ * the viewport on `first_row` (filtered row 0 on apply, the captured source row
+ * on clear). */
+static void
+filter_rebuild_grid (App *app, guint64 first_row)
+{
+  LsgRowCount rc = lsg_document_row_count (app->doc);
+  app->row_estimate = (rc.count > 0) ? rc.count : 1;
+  grid_update_gutter (app);
+  grid_update_vadjustment (app);
+  scroll_to_first_row (app, first_row);   /* fires materialize + repaint */
+  grid_materialize (app);
+  gtk_widget_queue_draw (GTK_WIDGET (app->area));
+}
+
+/* Apply the CURRENT find draft as a filter (routes the same request Find would
+ * run to the filter bridge). */
+static void
+do_apply_filter (App *app)
+{
+  if (app->doc == NULL)
+    return;
+
+  app->find.draft.mode = LSG_FIND_TEXT;
+  app->find.draft.text = gtk_editable_get_text (app->find_entry);
+  LsgFindSubmit sub = lsg_find_submit (app->find, NULL, app->n_cols, app->n_cols);
+  if (sub.outcome != LSG_FIND_RUN)
+    {
+      filter_set_toggle (app, FALSE);   /* not filterable (empty / rejected) */
+      return;
+    }
+
+  LsgRowCount id_rc = lsg_document_row_count (app->doc);   /* base M (first apply) */
+  if (!lsg_document_filter_set (app->doc, sub.request))
+    {
+      filter_set_toggle (app, FALSE);   /* the core rejected it */
+      return;
+    }
+
+  /* The guaranteed non-idle post-set poll makes the banner correct immediately. */
+  LsgFilterSnapshot snap = { LSG_FILTER_PHASE_SCANNING, 0.0, 0, FALSE };
+  lsg_document_filter_poll (app->doc, &snap);
+  app->filter = lsg_filter_applied (app->filter, id_rc, snap);
+
+  /* Applying a filter resets the active find + jump (the coordinate space
+   * changed); the find DRAFT is retained. */
+  app->find = lsg_find_invalidated (app->find);
+  app->find_sticky_notice = LSG_FIND_NOTICE_NONE;
+  app->find_wrap_issued = FALSE;
+  find_clear_mask (app);
+  app->jump = lsg_jump_initial ();
+
+  filter_rebuild_grid (app, 0);         /* land on filtered row 0 */
+  filter_update_banner (app);
+  filter_update_toggle_sensitivity (app);
+  ensure_poll (app);
+}
+
+/* Clear the active filter, restoring the identity view re-anchored near the row
+ * that was on screen. */
+static void
+do_clear_filter (App *app)
+{
+  if (app->doc == NULL || !app->filter.active)
+    {
+      app->filter = lsg_filter_cleared (app->filter);   /* no-op */
+      filter_update_banner (app);
+      return;
+    }
+
+  guint64 restore = capture_top_source_row (app);        /* BEFORE clearing */
+  lsg_document_filter_clear (app->doc);
+  app->filter = lsg_filter_cleared (app->filter);
+
+  app->find = lsg_find_invalidated (app->find);
+  app->find_sticky_notice = LSG_FIND_NOTICE_NONE;
+  find_clear_mask (app);
+  app->jump = lsg_jump_initial ();
+
+  filter_rebuild_grid (app, restore);   /* identity view, re-anchored */
+  filter_update_banner (app);
+  filter_update_toggle_sensitivity (app);
+}
+
+/* Forward-declared above; fold one filter poll into the banner + grid. */
+static void
+filter_poll_fold (App *app)
+{
+  if (app->doc == NULL || !app->filter.active)
+    return;
+  LsgFilterSnapshot snap;
+  gboolean has = lsg_document_filter_poll (app->doc, &snap);
+  app->filter = lsg_filter_resolved (app->filter, has, snap);
+  filter_update_banner (app);
+  /* The filtered row count m grows as the scan advances (row_estimate is already
+   * refreshed at the top of the poll tick); re-materialize so the widening view
+   * paints. */
+  if (app->filter.snapshot.phase == LSG_FILTER_PHASE_SCANNING)
+    {
+      grid_materialize (app);
+      gtk_widget_queue_draw (GTK_WIDGET (app->area));
+    }
+}
+
+static void
+on_filter_toggled (GtkToggleButton *toggle, gpointer data)
+{
+  App *app = data;
+  if (app->filter_ui_guard)
+    return;                             /* programmatic set: ignore */
+  if (gtk_toggle_button_get_active (toggle))
+    do_apply_filter (app);
+  else
+    do_clear_filter (app);
+}
+
+static void
+on_filter_banner_clear (AdwBanner *banner, gpointer data)
+{
+  (void) banner;
+  App *app = data;
+  /* Route through the toggle (fires on_filter_toggled -> do_clear_filter). */
+  if (app->filter_toggle != NULL)
+    gtk_toggle_button_set_active (app->filter_toggle, FALSE);
+}
+
+/* ------------------------------------------------------------------------- */
 /* UI construction                                                            */
 /* ------------------------------------------------------------------------- */
 
@@ -1914,8 +2177,15 @@ ensure_window (App *app, GtkApplication *gtk_app)
 
   gtk_stack_set_visible_child_name (app->stack, "launch");
 
+  /* Filter banner ("Filtered — N of M rows", with a Clear affordance). */
+  app->filter_banner = ADW_BANNER (adw_banner_new (""));
+  adw_banner_set_revealed (app->filter_banner, FALSE);
+  g_signal_connect (app->filter_banner, "button-clicked",
+                    G_CALLBACK (on_filter_banner_clear), app);
+
   GtkWidget *content = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
   gtk_box_append (GTK_BOX (content), GTK_WIDGET (app->banner));
+  gtk_box_append (GTK_BOX (content), GTK_WIDGET (app->filter_banner));
   gtk_box_append (GTK_BOX (content), GTK_WIDGET (app->stack));
 
   GtkWidget *toolbar = adw_toolbar_view_new ();
@@ -1963,6 +2233,7 @@ main (int argc, char *argv[])
   app.find = lsg_find_initial ();
   app.find_nav_direction = LSG_SEARCH_FORWARD;
   app.jump = lsg_jump_initial ();
+  app.filter = lsg_filter_initial ();
   app.font_desc = pango_font_description_from_string ("Monospace 11");
 
   g_autoptr (AdwApplication) application =

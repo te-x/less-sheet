@@ -355,40 +355,14 @@ lsg_find_invalidated (LsgFindSession session)
 /* Search bridge (port of CoreDocumentSession search methods)                 */
 /* ------------------------------------------------------------------------- */
 
-/* Marshal an LsgSearchRequest into the ABI's ls_search_request. Both value and
- * scope buffers are borrowed only for the enclosing core call. */
-static ls_search_request
-build_abi_request (LsgSearchRequest request)
-{
-  ls_search_request req;
-  req.value_ptr = (const uint8_t *) request.value;
-  req.value_len = (request.value != NULL) ? strlen (request.value) : 0;
-
-  if (request.kind == LSG_FIND_TEXT)
-    {
-      req.kind = LS_SEARCH_TEXT;
-      req.op = LS_SEARCH_OP_EQ;         /* ignored for TEXT */
-      req.column = 0;                   /* ignored for TEXT */
-      req.scope_ptr = request.scope;    /* NULL means ALL columns */
-      req.scope_len = request.scope_len;
-    }
-  else
-    {
-      req.kind = LS_SEARCH_PREDICATE;
-      req.op = (ls_search_op) request.op;   /* LsgSearchOp is pinned to ls_search_op */
-      req.column = request.column;
-      req.scope_ptr = NULL;                 /* ignored for PREDICATE */
-      req.scope_len = 0;
-    }
-  return req;
-}
-
 gboolean
 lsg_document_search_start (LsgDocument *doc, LsgSearchRequest request)
 {
   if (doc == NULL || doc->doc == NULL)
     return FALSE;
-  ls_search_request req = build_abi_request (request);
+  /* The shared marshaler (lsg_document_internal.h) — the SAME one the filter
+   * bridge uses, so they can never drift. */
+  ls_search_request req = lsg_build_abi_request (request);
   return ls_search_start (doc->doc, &req) ? TRUE : FALSE;
 }
 
@@ -397,7 +371,10 @@ lsg_document_search_nav (LsgDocument *doc, LsgSearchNav nav)
 {
   if (doc == NULL || doc->doc == NULL)
     return;
-  /* LsgSearchDir is pinned to ls_search_dir. */
+  /* Plain non-blocking nav (LsgSearchDir is pinned to ls_search_dir). The
+   * result is observed by polling — synchronously on the caller's next poll
+   * unfiltered, or over the ~100 ms tick loop (find_poll_fold) when the core has
+   * a transient under-a-filter nav lag. NEVER blocks the UI thread. */
   ls_search_nav (doc->doc, nav.anchor, (ls_search_dir) nav.direction);
 }
 
