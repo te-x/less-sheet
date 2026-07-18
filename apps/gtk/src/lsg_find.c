@@ -245,7 +245,12 @@ lsg_find_resolved (LsgFindSession session,
     }
 
   /* Notice derives PURELY from this snapshot (so a wrap notice self-clears when
-   * the wrap navigation lands as a FOUND poll). */
+   * the wrap navigation lands as a FOUND poll). A CANCELLED phase from a POLL is
+   * NEVER "Stopped": on a network (http_range) document the core lands the first
+   * match AND RE-PARKS the scan at CANCELLED in the SAME poll by design (nfd_ac6),
+   * so mapping CANCELLED -> STOPPED here would mask the real "N of M" count. The
+   * STOPPED notice belongs ONLY to an explicit user Stop (`lsg_find_stopped`);
+   * the net-park outcome is pinned by /find/resolved-net-park-landing. */
   d.notice = LSG_FIND_NOTICE_NONE;
   if (snapshot.nav == LSG_SEARCH_NAV_EXHAUSTED)
     {
@@ -264,10 +269,6 @@ lsg_find_resolved (LsgFindSession session,
                          ? LSG_FIND_NOTICE_WRAPPED_TO_START
                          : LSG_FIND_NOTICE_WRAPPED_TO_END;
         }
-    }
-  else if (snapshot.phase == LSG_SEARCH_PHASE_CANCELLED)
-    {
-      d.notice = LSG_FIND_NOTICE_STOPPED;
     }
 
   session.display = d;

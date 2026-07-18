@@ -52,6 +52,7 @@ typedef struct {
   GtkDrawingArea *area;
   GtkAdjustment *vadj;
   GtkAdjustment *hadj;
+  GtkWidget *hscroll;          /* auto-hidden when all columns fit the viewport */
 
   /* Open document + derived view state. */
   LsgDocument *doc;
@@ -81,7 +82,8 @@ typedef struct {
   guint hdr_first;
   guint hdr_count;
 
-  PangoFontDescription *font_desc;
+  PangoFontDescription *font_desc;         /* data cells: small sans-serif */
+  PangoFontDescription *header_font_desc;  /* header row: bold sans-serif */
 
   /* Network open. */
   LsgNetOpen *net;
@@ -116,6 +118,13 @@ typedef struct {
   GtkToggleButton *filter_toggle;
   AdwBanner *filter_banner;
   gboolean filter_ui_guard;          /* re-entrancy guard for programmatic toggle */
+
+  /* Network doc (http_range): the core is DEMAND-DRIVEN — a bare ls_window_set
+   * fetches nothing, so every viewport landing beyond the fetched frontier
+   * (filter-apply, filter/deep scroll) must be driven through ls_jump_start.
+   * `net_drive_active` guards an in-flight fetch-drive (async over the tick). */
+  gboolean is_network;
+  gboolean net_drive_active;
 
   /* Env-gated timing instrumentation (LESSSHEET_GTK_TIMING). Entirely inert —
    * no output, no measurable cost — unless `timing` is set. */
@@ -182,6 +191,13 @@ static void jump_poll_fold (App *app);
  * with the filter helpers below; the poll loop calls it while filtered. */
 static void filter_poll_fold (App *app);
 
+/* Network demand-drive: on an http_range doc, fetch the frontier to `target_row`
+ * via ls_jump_start so a subsequent window materialize serves real rows (a bare
+ * ls_window_set fetches nothing). Defined with the jump helpers; called from the
+ * scroll handler, the filter-apply, and the poll loop. */
+static void net_drive_begin (App *app, guint64 target_row);
+static void net_drive_poll (App *app);
+
 /* Filter helpers referenced from the earlier find section (the toggle lives in
  * the find popover); defined with the filter helpers below. */
 static void on_filter_toggled (GtkToggleButton *toggle, gpointer data);
@@ -241,6 +257,9 @@ app_reset_document (App *app)
 
   /* The old document's filter died with its core handle: back to identity. */
   app->filter = lsg_filter_initial ();
+
+  app->is_network = FALSE;
+  app->net_drive_active = FALSE;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -302,20 +321,26 @@ grid_update_vadjustment (App *app)
 static void
 grid_update_hadjustment (App *app)
 {
-  double total = 0.0;
+  double content = 0.0;
   for (guint32 i = 0; i < app->n_cols; i++)
-    total += (app->col_widths[i] > 0.0) ? app->col_widths[i] : 0.0;
+    content += (app->col_widths[i] > 0.0) ? app->col_widths[i] : 0.0;
   int w = gtk_widget_get_width (GTK_WIDGET (app->area));
   double page = (double) w - app->gutter_w;
   if (page < 0.0)
     page = 0.0;
-  if (total < page)
-    total = page;
+
+  /* upper == actual content width (clamped to at least page for a sane empty
+   * value range); the scrollbar is HIDDEN when everything fits, so no dead,
+   * non-interactive horizontal scrollbar shows. */
+  gboolean overflow = content > page + 0.5;
   gtk_adjustment_set_lower (app->hadj, 0.0);
-  gtk_adjustment_set_upper (app->hadj, total);
+  gtk_adjustment_set_upper (app->hadj, overflow ? content : page);
   gtk_adjustment_set_page_size (app->hadj, page);
   gtk_adjustment_set_step_increment (app->hadj, app->char_advance * 4.0);
   gtk_adjustment_set_page_increment (app->hadj, page);
+
+  if (app->hscroll != NULL)
+    gtk_widget_set_visible (app->hscroll, overflow);
 }
 
 /* Fetch header labels for the current column window only — O(visible columns),
@@ -527,6 +552,14 @@ grid_poll_tick (gpointer data)
         keep = TRUE;
     }
 
+  /* Keep ticking while a network fetch-drive is in flight (net-park). */
+  if (app->net_drive_active)
+    {
+      net_drive_poll (app);
+      if (app->net_drive_active)
+        keep = TRUE;
+    }
+
   if (!keep)
     {
       app->poll_id = 0;
@@ -711,6 +744,7 @@ grid_draw (GtkDrawingArea *area, cairo_t *cr, int width, int height,
   if (app->has_header && app->hdr_labels != NULL)
     {
       gdk_cairo_set_source_rgba (cr, &fg);
+      pango_layout_set_font_description (layout, app->header_font_desc);  /* bold */
       double x = gutter + (cw.first_x - hval);
       for (guint32 ci = 0; ci < cw.count; ci++)
         {
@@ -723,6 +757,7 @@ grid_draw (GtkDrawingArea *area, cairo_t *cr, int width, int height,
                      colw - 2.0 * pad, header_h, line_h);
           x += colw;
         }
+      pango_layout_set_font_description (layout, app->font_desc);  /* back to cells */
     }
   cairo_restore (cr);
 
@@ -806,7 +841,7 @@ sample_column_widths (App *app)
 }
 
 static void
-open_document (App *app, LsgDocument *doc, const char *title)
+open_document (App *app, LsgDocument *doc, const char *title, gboolean is_network)
 {
   /* Arm the window-fill timer if an outer caller (open_file) has not already —
    * e.g. the network-adopt path enters here directly. */
@@ -818,6 +853,7 @@ open_document (App *app, LsgDocument *doc, const char *title)
 
   app_reset_document (app);
   app->doc = doc;
+  app->is_network = is_network;   /* gates the demand-driven fetch (net-park) */
 
   app->n_cols = lsg_document_column_count (doc);
   app->has_header = lsg_document_has_header (doc);
@@ -887,7 +923,7 @@ open_file (App *app, GFile *file)
           app->t_open_begin = begin;
           app->first_frame_pending = TRUE;
         }
-      open_document (app, doc, base);
+      open_document (app, doc, base, FALSE);   /* local file */
     }
 
   g_free (path);
@@ -981,7 +1017,8 @@ net_poll_tick (gpointer data)
       lsg_net_open_release (app->net);
       app->net = NULL;
       if (doc != NULL)
-        open_document (app, doc, (app->pending_url != NULL) ? app->pending_url : "URL");
+        open_document (app, doc,
+                       (app->pending_url != NULL) ? app->pending_url : "URL", TRUE);
       else
         show_error (app, "Could not open URL",
                     "The network document could not be adopted.");
@@ -1146,6 +1183,13 @@ on_adjustment_changed (GtkAdjustment *adj, gpointer data)
     return;
   grid_materialize (app);
   gtk_widget_queue_draw (GTK_WIDGET (app->area));
+  /* Net-park: a scroll landing beyond the fetched frontier comes back SHORT (a
+   * bare ls_window_set fetched nothing) — drive the fetch to the top row so the
+   * target rows appear. Identity view: cur_top_row is an original row. Filtered:
+   * it is a filtered index driven as an original row, which still advances the
+   * filter frontier (best-effort; a monotone scroll converges). */
+  if (app->is_network && app->window_short && !app->net_drive_active)
+    net_drive_begin (app, app->cur_top_row);
 }
 
 static void
@@ -1610,6 +1654,44 @@ jump_poll_fold (App *app)
   jump_update_ui (app);
 }
 
+/*
+ * NETWORK DEMAND-DRIVE (net-park rule). On an http_range document the core
+ * advances the fetch/filter frontier ONLY when the frontend issues an
+ * ls_jump_start / ls_search_nav; a bare ls_window_set fetches nothing. So any
+ * viewport landing beyond the fetched frontier — filter-apply, filter scroll,
+ * deep scroll — must first drive a jump to the target row. This is the plumbing;
+ * it deliberately does NOT touch the user's jump-popover flow (`app->jump`). It
+ * is a no-op on local documents (their frontier is already ahead), and it is not
+ * gate-testable (no fake network at the C ABI) — verified on a real desktop.
+ */
+static void
+net_drive_begin (App *app, guint64 target_row)
+{
+  if (!app->is_network || app->doc == NULL)
+    return;
+  app->net_drive_active = TRUE;
+  lsg_document_jump_start (app->doc, target_row);
+  /* Fold the immediate poll (a behind-frontier / small fetch completes at once);
+   * otherwise the ~100 ms tick keeps folding until DONE. */
+  net_drive_poll (app);
+  if (app->net_drive_active)
+    ensure_poll (app);
+}
+
+static void
+net_drive_poll (App *app)
+{
+  if (!app->net_drive_active || app->doc == NULL)
+    return;
+  LsgJumpStatus st = lsg_document_jump_poll (app->doc);
+  if (st.state == LSG_JUMP_DONE)
+    {
+      app->net_drive_active = FALSE;
+      grid_materialize (app);          /* the target rows are now fetched */
+      gtk_widget_queue_draw (GTK_WIDGET (app->area));
+    }
+}
+
 /* Enter / Go: parse + validate + start (or reject) the jump. */
 static void
 do_jump_submit (App *app)
@@ -1662,6 +1744,15 @@ on_jump_go_clicked (GtkButton *button, gpointer data)
   do_jump_submit ((App *) data);
 }
 
+/* Enter in the jump entry submits (a plain GtkEntry consumes Return as its
+ * "activate" signal, so the key controller never sees it — wire activate). */
+static void
+on_jump_activate (GtkEntry *entry, gpointer data)
+{
+  (void) entry;
+  do_jump_submit ((App *) data);
+}
+
 static void
 on_jump_cancel_clicked (GtkButton *button, gpointer data)
 {
@@ -1677,18 +1768,15 @@ on_jump_entry_key (GtkEventControllerKey *ctrl, guint keyval, guint keycode,
   (void) keycode;
   (void) state;
   App *app = data;
-  switch (keyval)
+  /* Enter is handled by the entry's "activate" signal (the internal GtkText
+   * consumes Return before this bubble-phase controller — that was the bug);
+   * here we only need Escape to close. */
+  if (keyval == GDK_KEY_Escape)
     {
-    case GDK_KEY_Escape:
       gtk_popover_popdown (app->jump_popover);
       return GDK_EVENT_STOP;
-    case GDK_KEY_Return:
-    case GDK_KEY_KP_Enter:
-      do_jump_submit (app);
-      return GDK_EVENT_STOP;
-    default:
-      return GDK_EVENT_PROPAGATE;
     }
+  return GDK_EVENT_PROPAGATE;
 }
 
 /* Close (Esc / click-away): cancel an in-flight scan + restore, reset to idle. */
@@ -1777,6 +1865,7 @@ build_jump_popover (App *app)
   g_signal_connect (cancel, "clicked", G_CALLBACK (on_jump_cancel_clicked), app);
   g_signal_connect (pop, "closed", G_CALLBACK (on_jump_popover_closed), app);
   g_signal_connect (pop, "show", G_CALLBACK (on_jump_popover_show), app);
+  g_signal_connect (entry, "activate", G_CALLBACK (on_jump_activate), app);   /* Enter = Go */
 
   GtkEventController *keys = gtk_event_controller_key_new ();
   g_signal_connect (keys, "key-pressed", G_CALLBACK (on_jump_entry_key), app);
@@ -1804,6 +1893,73 @@ install_jump_css (void)
     gtk_style_context_add_provider_for_display (
         display, GTK_STYLE_PROVIDER (css), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
   g_object_unref (css);
+}
+
+/*
+ * The jump-to-row button glyph — a Cairo replication of the macOS
+ * `JumpArrowGlyph` (OverlayView.swift): two small circles (a "here" and a
+ * "there") joined by a right-bulging circular arc that arrows south-west into
+ * the lower circle. the author finds this clearer than the stock `go-jump-symbolic`.
+ * Design bbox x[19,56] y[7,93], mapped/centred into the drawing area; the
+ * fixed-geometry angles and unit vectors are hardcoded so the app needs no libm.
+ * Tinted with the widget's current foreground color (gtk_widget_get_color), so
+ * it reads correctly in both light and dark, like the accent handling elsewhere.
+ */
+static void
+jump_glyph_draw (GtkDrawingArea *area, cairo_t *cr, int width, int height,
+                 gpointer data)
+{
+  (void) data;
+  GdkRGBA fg;
+  gtk_widget_get_color (GTK_WIDGET (area), &fg);
+  gdk_cairo_set_source_rgba (cr, &fg);
+
+  const double b_min_x = 19.0, b_max_x = 56.0, b_min_y = 7.0, b_max_y = 93.0;
+  const double bw = b_max_x - b_min_x, bh = b_max_y - b_min_y;
+  const double fill = 0.88;                     /* leave the stroke a small margin */
+  double kx = (double) width / bw, ky = (double) height / bh;
+  double k = (kx < ky ? kx : ky) * fill;
+  double ox = ((double) width - bw * k) / 2.0 - b_min_x * k;
+  double oy = ((double) height - bh * k) / 2.0 - b_min_y * k;
+#define GX(x) (ox + (x) * k)
+#define GY(y) (oy + (y) * k)
+
+  double lw = (double) height * 0.11;
+  if (lw < 1.2)
+    lw = 1.2;
+  cairo_set_line_width (cr, lw);
+  cairo_set_line_cap (cr, CAIRO_LINE_CAP_ROUND);
+  cairo_set_line_join (cr, CAIRO_LINE_JOIN_ROUND);
+
+  /* Two small circles: the "here" (top) and "there" (bottom). */
+  double rr = 11.0 * k;
+  cairo_new_sub_path (cr);
+  cairo_arc (cr, GX (30), GY (18), rr, 0.0, 2.0 * G_PI);
+  cairo_new_sub_path (cr);
+  cairo_arc (cr, GX (30), GY (82), rr, 0.0, 2.0 * G_PI);
+  cairo_stroke (cr);
+
+  /* Right-bulging arc from (40,26) to (40,74): centre (30,50), radius 26,
+   * angles atan2(∓24,10). */
+  double ex = GX (40), ey = GY (74);
+  const double a1 = -1.17600521, a2 = 1.17600521;
+  cairo_new_sub_path (cr);
+  cairo_arc (cr, GX (30), GY (50), 26.0 * k, a1, a2);
+  cairo_stroke (cr);
+
+  /* Arrowhead at the arc's arrival: barbs the unit back-vector (12/13, -5/13)
+   * rotated by ±0.55 rad, opening SW into the lower circle. */
+  const double bxu = 12.0 / 13.0, byu = -5.0 / 13.0;
+  const double ca = 0.85252452, sa = 0.52268723;   /* cos/sin(0.55) */
+  double barb = 12.0 * k;
+  cairo_move_to (cr, ex + barb * (bxu * ca - byu * sa),
+                     ey + barb * (bxu * sa + byu * ca));
+  cairo_line_to (cr, ex, ey);
+  cairo_line_to (cr, ex + barb * (bxu * ca + byu * sa),
+                     ey + barb * (-bxu * sa + byu * ca));
+  cairo_stroke (cr);
+#undef GX
+#undef GY
 }
 
 /* ------------------------------------------------------------------------- */
@@ -1948,6 +2104,11 @@ do_apply_filter (App *app)
   app->jump = lsg_jump_initial ();
 
   filter_rebuild_grid (app, 0);         /* land on filtered row 0 */
+  /* Net-park (Bug 2): ls_filter_set parks the filter-scan immediately (count 0);
+   * the filtered frontier advances ONLY via a filtered ls_jump_start. Drive it
+   * to original row 0 so the first matching rows are fetched and the view is not
+   * empty (a bare ls_window_set fetched nothing). No-op on a local doc. */
+  net_drive_begin (app, 0);
   filter_update_banner (app);
   filter_update_toggle_sensitivity (app);
   ensure_poll (app);
@@ -2070,6 +2231,7 @@ build_grid_page (App *app)
 
   GtkWidget *vscroll = gtk_scrollbar_new (GTK_ORIENTATION_VERTICAL, app->vadj);
   GtkWidget *hscroll = gtk_scrollbar_new (GTK_ORIENTATION_HORIZONTAL, app->hadj);
+  app->hscroll = hscroll;
 
   g_signal_connect (app->vadj, "value-changed", G_CALLBACK (on_adjustment_changed), app);
   g_signal_connect (app->hadj, "value-changed", G_CALLBACK (on_adjustment_changed), app);
@@ -2126,6 +2288,15 @@ ensure_window (App *app, GtkApplication *gtk_app)
   gtk_window_set_title (app->window, "less-sheet");
   gtk_window_set_default_size (app->window, 1024, 720);
 
+  /* App logo: register the embedded GResource icon (compiled into the binary as
+   * a hicolor-laid-out resource) so the running app shows it without an install,
+   * then name the window's icon after the app id. */
+  GdkDisplay *display = gdk_display_get_default ();
+  if (display != NULL)
+    gtk_icon_theme_add_resource_path (gtk_icon_theme_get_for_display (display),
+                                      "/dev/lesssheet/Gtk/icons");
+  gtk_window_set_icon_name (app->window, "dev.lesssheet.Gtk");
+
   /* Header bar: Open + Open URL on the left, filename title in the center. */
   GtkWidget *header = adw_header_bar_new ();
   app->title = ADW_WINDOW_TITLE (adw_window_title_new ("less-sheet", ""));
@@ -2136,7 +2307,9 @@ ensure_window (App *app, GtkApplication *gtk_app)
   g_signal_connect (open_btn, "clicked", G_CALLBACK (action_open), app);
   adw_header_bar_pack_start (ADW_HEADER_BAR (header), open_btn);
 
-  GtkWidget *url_btn = gtk_button_new_from_icon_name ("emblem-web-symbolic");
+  /* `insert-link-symbolic` is a minimal link glyph present in current Adwaita;
+   * the old `emblem-web-symbolic` was dropped from the theme and rendered blank. */
+  GtkWidget *url_btn = gtk_button_new_from_icon_name ("insert-link-symbolic");
   gtk_widget_set_tooltip_text (url_btn, "Open URL");
   g_signal_connect (url_btn, "clicked", G_CALLBACK (action_open_url), app);
   adw_header_bar_pack_start (ADW_HEADER_BAR (header), url_btn);
@@ -2151,9 +2324,16 @@ ensure_window (App *app, GtkApplication *gtk_app)
   adw_header_bar_pack_end (ADW_HEADER_BAR (header), find_btn);
 
   /* Jump-to-row: a menu button whose popover is the jump UI (Ctrl+G / Ctrl+L,
-   * or type a digit on the grid). */
+   * or type a digit on the grid). Its icon is the custom macOS-style jump glyph
+   * (drawn into a 16px GtkDrawingArea child, tinting with the theme fg). */
   GtkWidget *jump_btn = gtk_menu_button_new ();
-  gtk_menu_button_set_icon_name (GTK_MENU_BUTTON (jump_btn), "go-jump-symbolic");
+  GtkWidget *jump_glyph = gtk_drawing_area_new ();
+  gtk_widget_set_size_request (jump_glyph, 16, 16);
+  gtk_widget_set_halign (jump_glyph, GTK_ALIGN_CENTER);
+  gtk_widget_set_valign (jump_glyph, GTK_ALIGN_CENTER);
+  gtk_drawing_area_set_draw_func (GTK_DRAWING_AREA (jump_glyph), jump_glyph_draw,
+                                  NULL, NULL);
+  gtk_menu_button_set_child (GTK_MENU_BUTTON (jump_btn), jump_glyph);
   gtk_widget_set_tooltip_text (jump_btn, "Jump to row (Ctrl+G)");
   app->jump_button = GTK_MENU_BUTTON (jump_btn);
   build_jump_popover (app);
@@ -2234,7 +2414,9 @@ main (int argc, char *argv[])
   app.find_nav_direction = LSG_SEARCH_FORWARD;
   app.jump = lsg_jump_initial ();
   app.filter = lsg_filter_initial ();
-  app.font_desc = pango_font_description_from_string ("Monospace 11");
+  /* Data cells: the system default sans-serif at a small size; headers bold. */
+  app.font_desc = pango_font_description_from_string ("Sans 10");
+  app.header_font_desc = pango_font_description_from_string ("Sans Bold 10");
 
   g_autoptr (AdwApplication) application =
       adw_application_new ("dev.lesssheet.Gtk", G_APPLICATION_HANDLES_OPEN);
@@ -2259,5 +2441,6 @@ main (int argc, char *argv[])
   g_clear_pointer (&app.vadj, g_object_unref);
   g_clear_pointer (&app.hadj, g_object_unref);
   pango_font_description_free (app.font_desc);
+  pango_font_description_free (app.header_font_desc);
   return status;
 }
