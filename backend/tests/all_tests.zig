@@ -5598,6 +5598,73 @@ test "wb_ac12: the #6 off-main nav supersedes/cancels and never blocks a concurr
     try std.testing.expectEqual(api.SearchNavState.none, api.ls_search_poll(od.doc).nav);
 }
 
+/// wb (#6 regression): a > 2048-row FILTERED doc engineered to force a filtered
+/// forward find-next to "walk PAST" the anchor's own checkpoint block. EVERY
+/// data row matches the FILTER ("needle"); only source row 0 and the block-1
+/// GIANT also match the FIND ("hit"), so those two are the ONLY combined (find
+/// AND filter) matches. Layout (checkpoint_interval == 2048 rows/block):
+///   row 0          "needle,hit"            -> combined match  (block 0)
+///   rows 1..2047   "needle,{i}"            -> filter-only     (block 0 tail)
+///   row 2048       "needlehit"+filler+",z" -> combined match  (block 1);
+///                                             ONE row > window_budget_max_bytes
+/// block_counts[0] != 0 (its combined match at row 0), but that match is BEHIND
+/// the find-next anchor's source row (row 1), so findForwardMatch finds nothing
+/// in block 0 and walks forward into block 1 -- re-lexing the giant. The budget
+/// gate, seeing hi == firstCombinedBlockFrom(lo) == lo == block 0 (tiny), thinks
+/// only block 0 is touched: the under-bound. Caller frees.
+fn genNavWalkPastDoc(gpa: std.mem.Allocator, giant: usize) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(gpa);
+    try buf.appendSlice(gpa, "k,v\n");
+    try buf.appendSlice(gpa, "needle,hit\n"); // source row 0: combined (needle AND hit)
+    var line: [24]u8 = undefined;
+    var i: u64 = 1;
+    while (i < 2048) : (i += 1) // rows 1..2047: filter-only (needle, NO hit) -> fill block 0
+        try buf.appendSlice(gpa, try std.fmt.bufPrint(&line, "needle,{d}\n", .{i}));
+    // source row 2048 == the FIRST row of checkpoint block 1: an OVERSIZED combined
+    // match -- col-0 "needlehit" prefix (both terms) + `giant` filler over the cap.
+    const blob = try gpa.alloc(u8, giant);
+    defer gpa.free(blob);
+    @memset(blob, 'X');
+    try buf.appendSlice(gpa, "needlehit");
+    try buf.appendSlice(gpa, blob);
+    try buf.appendSlice(gpa, ",z\n");
+    return buf.toOwnedSlice(gpa);
+}
+
+test "wb_nav_walkpast: a filtered forward find-next whose next combined match sits one non-empty block PAST the anchor's own block defers off-main -- it must NOT re-lex the intervening > 8 MiB giant inline (AC11/AC12 #6 budget under-bound regression)" {
+    const gpa = std.testing.allocator;
+    // ONE giant row larger than the whole 8 MiB ceiling: a single inline re-lex of
+    // it already blows the synchronous budget (no accumulation needed to prove it).
+    const giant: usize = @intCast(api.window_budget_max_bytes + 1024 * 1024);
+    const g = try genNavWalkPastDoc(gpa, giant);
+    defer gpa.free(g);
+    var od = try openWith(g, .{ .index_mode = api.index_auto });
+    defer od.deinit();
+
+    try setFilter(od.doc, textReq("needle")); // every one of the 2049 data rows matches
+    try std.testing.expectEqual(@as(u64, 2049), (try waitFilterDone(od.doc)).total);
+    try startSearch(od.doc, textReq("hit")); // only source row 0 + the giant are combined
+    try std.testing.expectEqual(@as(u64, 2), (try waitSearchDone(od.doc)).total);
+
+    // Canonical find-next: the current match is filtered 0 (source row 0); the
+    // frontend navigates FORWARD from anchor = current + 1 = filtered 1 (source
+    // row 1, in the SAME checkpoint block 0). The next combined match is the GIANT
+    // at filtered index 2048 -- ONE non-empty block further on.
+    //
+    // GREEN (extended bound): this crossing is NOT provably bounded, so the nav
+    // DEFERS -- the immediate poll is SEARCHING and the synchronous charge stays
+    // <= the ceiling (the giant is re-lexed OFF-MAIN, never on the calling thread),
+    // then the worker publishes the exact filtered row 2048 / col 0 / position 2.
+    // RED today (under-bound): filteredNavFitsBudget sees only block 0, resolves
+    // INLINE, and re-lexes the > 8 MiB giant synchronously under the doc lock --
+    // the immediate poll is already FOUND and navChargedBytes exceeds the ceiling.
+    api.ls_search_nav(od.doc, 1, .forward);
+    try std.testing.expectEqual(api.SearchNavState.searching, api.ls_search_poll(od.doc).nav);
+    try std.testing.expect(api.navChargedBytes(od.doc) <= api.window_budget_max_bytes);
+    try expectFound(try waitNavTerminal(od.doc), 2048, 0, 2);
+}
+
 test "wb_ac13: window retries add no leak and never touch the source file (ARCH AC13)" {
     // The dependency manifest (build.zig) is unchanged -- enforced by the FREEZE,
     // not a runtime check. Here: bounded retained continuation state is released on
