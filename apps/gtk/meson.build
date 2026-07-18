@@ -50,11 +50,24 @@ lsgkit = static_library('lsgkit',
   install : false,
 )
 
+# App logo: the branding icon (data/dev.lesssheet.Gtk.svg, copied from
+# branding/icon.svg) is compiled into the binary as a GResource, laid out like a
+# hicolor icon theme, so the running app shows it WITHOUT installation (the GUI
+# run helper launches ./build/less-sheet-gtk directly; it never `meson install`s).
+# main.c registers the resource path and sets the window icon-name to the app id.
+gnome = import('gnome')
+app_resources = gnome.compile_resources(
+  'lesssheet-resources',
+  'data/lesssheet.gresource.xml',
+  source_dir : 'data',
+)
+
 # App: hosts the frontend modules over the GTK4 + libadwaita toolchain and links
 # the core archive. Compiled by the gate but NOT run there (needs a display —
 # that is the human GUI pass). The real grid/chrome is authored during build.
 executable('less-sheet-gtk',
   'src/main.c',
+  app_resources,
   dependencies : [gtk_dep, adw_dep, glib_dep, core_dep],
   link_with : lsgkit,
   include_directories : core_inc,

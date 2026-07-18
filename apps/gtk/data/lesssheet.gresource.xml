@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Embeds the app logo (branding/icon.svg, copied here as the app-id-named icon)
+  as a GResource compiled into the binary, laid out like a hicolor icon theme so
+  gtk_icon_theme_add_resource_path() finds it by name — WITHOUT installation
+  (the run helper launches ./build/less-sheet-gtk directly, never `meson install`).
+-->
+<gresources>
+  <gresource prefix="/dev/lesssheet/Gtk/icons/scalable/apps">
+    <file preprocess="xml-stripblanks">dev.lesssheet.Gtk.svg</file>
+  </gresource>
+</gresources>
