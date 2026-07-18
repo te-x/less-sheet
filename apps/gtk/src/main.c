@@ -1669,6 +1669,12 @@ net_drive_begin (App *app, guint64 target_row)
 {
   if (!app->is_network || app->doc == NULL)
     return;
+  /* The user's manual jump owns the single core scan slot; a net fetch-drive
+   * (from a scroll or filter-apply) must NOT retarget it to `target_row` mid-scan
+   * and mis-land the user's jump. Filter-apply resets the jump to IDLE before it
+   * drives, so this only suppresses a scroll-drive during a live user jump. */
+  if (app->jump.kind == LSG_JUMP_FLOW_SCANNING)
+    return;
   app->net_drive_active = TRUE;
   lsg_document_jump_start (app->doc, target_row);
   /* Fold the immediate poll (a behind-frontier / small fetch completes at once);
@@ -2327,6 +2333,11 @@ ensure_window (App *app, GtkApplication *gtk_app)
    * or type a digit on the grid). Its icon is the custom macOS-style jump glyph
    * (drawn into a 16px GtkDrawingArea child, tinting with the theme fg). */
   GtkWidget *jump_btn = gtk_menu_button_new ();
+  /* Flat like the other header-bar buttons (background only on hover/active).
+   * GtkMenuButton defaults has-frame TRUE, and a custom `set_child` icon doesn't
+   * get the `image-button` flattening `set_icon_name` gives the find button, so
+   * without this the jump button looks permanently highlighted. */
+  gtk_menu_button_set_has_frame (GTK_MENU_BUTTON (jump_btn), FALSE);
   GtkWidget *jump_glyph = gtk_drawing_area_new ();
   gtk_widget_set_size_request (jump_glyph, 16, 16);
   gtk_widget_set_halign (jump_glyph, GTK_ALIGN_CENTER);
@@ -2414,8 +2425,9 @@ main (int argc, char *argv[])
   app.find_nav_direction = LSG_SEARCH_FORWARD;
   app.jump = lsg_jump_initial ();
   app.filter = lsg_filter_initial ();
-  /* Data cells: the system default sans-serif at a small size; headers bold. */
-  app.font_desc = pango_font_description_from_string ("Sans 10");
+  /* Data cell VALUES: small MONOSPACE (uniform advance -> accurate O(1) column
+   * widths + macOS parity). Headers + all chrome stay sans-serif. */
+  app.font_desc = pango_font_description_from_string ("Monospace 10");
   app.header_font_desc = pango_font_description_from_string ("Sans Bold 10");
 
   g_autoptr (AdwApplication) application =

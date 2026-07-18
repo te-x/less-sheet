@@ -32,14 +32,23 @@ head — find-result, filter-apply, filter-scroll, deep-scroll — drives a jump
   overshoot/stall/storm. Net-live fills are NOT gate-testable (no fake-net at the C-ABI) →
   the author's desktop pass.
 
-## Fast-follow (NON-BLOCKING `[impl]`) — TRACKED
+## Fast-follow (NON-BLOCKING `[impl]`) — RESOLVED (follow-up batch)
 `net_drive_begin` and `do_jump_submit` both call `ls_jump_start` on the single core jump slot; the
 scroll re-trigger gates only on `!net_drive_active`, NOT on an in-flight USER jump
 (`jump.kind == LSG_JUMP_FLOW_SCANNING`). On a net doc a manual scroll during a manual-jump-scan
 could retarget the slot to `cur_top_row` and mis-land the jump (network-only, specific
 interleaving, often masked by GtkPopover autohide; mislanding not corruption). **Fix:** gate
 `net_drive_begin` on `jump.kind != LSG_JUMP_FLOW_SCANNING` (and/or suppress the scroll-drive while
-the jump popover is open). Fold into the next GTK round.
+the jump popover is open).
+
+**RESOLVED** in a follow-up batch (main.c, reviewer PASS on tree-hash `628d747`, gate 9/9): gated
+`net_drive_begin` with an early return on `jump.kind == LSG_JUMP_FLOW_SCANNING` at the single choke
+point — filter-apply still drives (it resets jump→IDLE before driving), the scroll-drive yields to
+a live user jump, no stall (a dropped drive re-fires on the jump-landing scroll). The same batch
+also (a) reverted data cells → `Monospace 10` (headers stay `Sans Bold 10`; the author: "monospace for
+the data, sans serif for the rest" — restores the uniform-advance width geometry + macOS parity)
+and (b) made the jump `GtkMenuButton` flat via `set_has_frame(FALSE)` (its custom `set_child` glyph
+missed the `image-button` auto-flatten class, so it rendered a persistent frame).
 
 ## (B) UI polish (7) — code-level ✓; visual fidelity = the author's desktop pass
 1. URL icon `emblem-web-symbolic` (dropped from current Adwaita → blank) → `insert-link-symbolic`.
