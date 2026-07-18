@@ -30,7 +30,7 @@ core_inc = include_directories('include')
 # once into a static library and linked into the app + every test binary.
 # Compiling this under -Werror is the CONFORMANCE gate: the module sources must
 # match the frozen headers exactly or the build fails. The surface grows per
-# slice (slice 1: open/display/scroll; slice 2: find).
+# slice (slice 1: open/display/scroll; slice 2: find; slice 3: jump).
 # ---------------------------------------------------------------------------
 lsg_sources = files(
   'src/lsg_document.c',
@@ -39,6 +39,7 @@ lsg_sources = files(
   'src/lsg_grid_geometry.c',
   'src/lsg_window_poll.c',
   'src/lsg_find.c',
+  'src/lsg_jump.c',
 )
 lsgkit = static_library('lsgkit',
   lsg_sources,
@@ -137,3 +138,17 @@ test_find = executable('test-find',
   install : false,
 )
 test('find', test_find)
+
+# Jump (slice 3): pure view-model (parse + run/reject + progress fold + land /
+# cancel / reject) + the jump bridge over the real core. Reuses the tiny.csv
+# fixture (its whole contents sit within the initial window, so every jump is
+# behind the frontier and completes synchronously).
+test_jump = executable('test-jump',
+  'tests/test_jump.c',
+  dependencies : test_deps,
+  link_with : lsgkit,
+  include_directories : core_inc,
+  c_args : ['-DFIXTURE_PATH="' + fixture + '"'],
+  install : false,
+)
+test('jump', test_jump)
