@@ -306,21 +306,31 @@ private let sampleRequest = SearchRequest.text(query: "x", scope: nil)
         total: 2, totalIsFinal: false
     ), navDirection: .forward)
     // The scan-cancel affordance: partial knowledge stays, progress UI ends.
+    // This is the GENUINE user-invoked stop (the stop button / `cancelSearch`)
+    // — it correctly reads "Stopped" even though a match had already landed.
     let stopped = c.stopped(s)
     #expect(stopped.display.notice == .stopped)
     #expect(stopped.display.progress == nil)
     #expect(stopped.display.total == 2)
     #expect(stopped.display.current == SearchMatch(row: 2, column: 0))
     #expect(stopped.draft == s.draft)
-    // A cancelled-phase poll (a jump took the scan slot) reads the same way.
+    // A cancelled-PHASE poll that CARRIES a landing (row 2) is structurally a
+    // network net-park poll (the core navigates to the match, then re-parks at
+    // cancelled in the SAME poll — api nfd_ac6). Mechanism-independent folds
+    // still hold here: cancelled ends the progress UI, the count folds, and the
+    // landing + its position are kept. The NOTICE for this input class
+    // (cancelled + landing) is pinned by
+    // networkFindParkedAtCancelledShowsCountNotStopped (it presents the count,
+    // NEVER "Stopped") — so it is deliberately NOT asserted here.
     let viaPoll = c.resolved(s, with: SearchSnapshot(
         phase: .cancelled(progress: 0.3),
         nav: .found(SearchMatch(row: 2, column: 0), position: 1),
         total: 2, totalIsFinal: false
     ), navDirection: .forward)
-    #expect(viaPoll.display.notice == .stopped)
     #expect(viaPoll.display.progress == nil)
     #expect(viaPoll.display.total == 2)
+    #expect(viaPoll.display.current == SearchMatch(row: 2, column: 0))
+    #expect(viaPoll.display.position == 1)
     // Esc: the active search and highlights clear (request nil), the DRAFT
     // is retained — re-running is one Enter.
     let closed = c.closed(s)
@@ -330,6 +340,34 @@ private let sampleRequest = SearchRequest.text(query: "x", scope: nil)
     let reopened = c.invalidated(s)
     #expect(reopened.display == c.initial().display)
     #expect(reopened.draft == s.draft)
+}
+
+@Test func networkFindParkedAtCancelledShowsCountNotStopped() {
+    // Network parity fix (mirrors the GTK `lsg_find_resolved` fix): on an
+    // http_range document the core drives the nav to the first match, then
+    // RE-PARKS the scan at LS_SEARCH_CANCELLED in the SAME poll (api nfd_ac6 —
+    // it never runs a background network scan). So a SUCCESSFUL network find
+    // poll carries BOTH a landing (found + 1-based position + a non-final
+    // total >= 1) AND a cancelled phase. The unconditional
+    // `.cancelled -> .stopped` mapping in `resolved` mislabels that success as
+    // "Stopped" instead of the real "n of m".
+    let c = FindControl()
+    var s = c.began(c.initial(), running: sampleRequest)
+    s = c.resolved(s, with: SearchSnapshot(
+        phase: .cancelled(progress: 0.5),
+        nav: .found(SearchMatch(row: 4, column: 1), position: 1),
+        total: 3, totalIsFinal: false
+    ), navDirection: .forward)
+    // OUTCOME pinned (mechanism-agnostic — a landed-match guard OR a user-stop
+    // flag both satisfy it): a cancelled poll that carries a landing is never
+    // the "Stopped" notice.
+    #expect(s.display.notice != .stopped)
+    // ...and the count is presented: the landing, its 1-based position, and the
+    // still-growing total are all shown.
+    #expect(s.display.current == SearchMatch(row: 4, column: 1))
+    #expect(s.display.position == 1)
+    #expect(s.display.total == 3)
+    #expect(!s.display.totalIsFinal)
 }
 
 @Test func resolvedIsStableOnIdlePollsAndClearedSessions() {
