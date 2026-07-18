@@ -235,6 +235,115 @@ fn setExhausted(doc: *Document) void {
     doc.nav_pending = false;
 }
 
+// ---------------------------------------------------------------------------
+// Budget gate for INLINE filtered-nav resolution (ARCH-window-budget criterion
+// 12: off-main only when synchronous resolution is not provably bounded).
+// Computed purely from checkpoint offsets + per-block match counts
+// (O(checkpoints), NO re-lex), it decides whether resolveNavLockedFiltered may
+// run on the calling thread. Normal/bounded rows fit -> inline (fv16, and the
+// ABI's "synchronous after LS_SEARCH_DONE" promise); a giant-row crossing whose
+// counted-block span exceeds window_budget_max_bytes does NOT -> defer off-main
+// (wb_ac11 / wb_ac12). This mirrors the unfiltered path, which resolves a single
+// bounded checkpoint block inline.
+// ---------------------------------------------------------------------------
+
+/// Source logical-byte offset at the START of counted checkpoint block `b`.
+fn blockStartByte(doc: *Document, b: usize) u64 {
+    return doc.reader.logicalBytes(doc.source, doc.checkpoints.items[b].pos);
+}
+
+/// Source logical-byte offset at the END of counted checkpoint block `b` — the
+/// next block's checkpoint, or the current counted frontier for the last block.
+fn blockEndByte(doc: *Document, b: usize) u64 {
+    if (b + 1 < doc.checkpoints.items.len)
+        return doc.reader.logicalBytes(doc.source, doc.checkpoints.items[b + 1].pos);
+    return doc.reader.logicalBytes(doc.source, doc.search_pos);
+}
+
+/// The checkpoint block holding the `idx`-th (0-based) FILTER match, or null
+/// when `idx` is at/beyond the filter's counted match total.
+fn filterMatchBlock(doc: *Document, idx: u64) ?usize {
+    var cum: u64 = 0;
+    var b: usize = 0;
+    while (b < doc.filter_block_counts.items.len) : (b += 1) {
+        cum += doc.filter_block_counts.items[b];
+        if (cum > idx) return b;
+    }
+    return null;
+}
+
+/// First block at/after `from_block` that carries a combined (find AND filter)
+/// match — the only block `findForwardMatch` re-lexes (it skips empty blocks for
+/// free); null when the counted region has none beyond `from_block`.
+fn firstCombinedBlockFrom(doc: *Document, from_block: usize) ?usize {
+    var b: usize = from_block;
+    while (b < doc.block_counts.items.len) : (b += 1) {
+        if (doc.block_counts.items[b] != 0) return b;
+    }
+    return null;
+}
+
+/// Last block strictly before `upto_block` (exclusive) that carries a combined
+/// match — the only block `findBackwardMatch` re-lexes; null when none.
+fn lastCombinedBlockTo(doc: *Document, upto_block: usize) ?usize {
+    var b: usize = @min(upto_block, doc.block_counts.items.len);
+    while (b > 0) {
+        b -= 1;
+        if (doc.block_counts.items[b] != 0) return b;
+    }
+    return null;
+}
+
+/// True iff resolving the pending FILTERED navigation INLINE would re-lex a
+/// checkpoint span within the synchronous responsiveness budget. The resolution
+/// re-lexes the anchor's filter-match block (nthMatchLocation) and the one
+/// combined-match block that carries the answer (findForward/BackwardMatch);
+/// empty blocks between them are skipped, never scanned. The contiguous byte
+/// span covering that block range (checkpoint offsets) upper-bounds the work —
+/// tiny for normal rows, but > window_budget_max_bytes when the range straddles
+/// a giant row.
+///
+/// The answer's block is NOT always the anchor's own block: when the anchor
+/// block is non-empty in block_counts but all its combined matches fall on the
+/// ALREADY-PASSED side of the anchor row (behind it for FORWARD / ahead of it
+/// for BACKWARD), findForward/BackwardMatch re-lexes the anchor block, finds
+/// nothing on the wanted side, and WALKS INTO the next non-empty combined block
+/// (forward: beyond `lo`; backward: below `hi`) — which may hold a giant. The
+/// bound therefore extends to that walked-into block (wb_nav_walkpast), a safe
+/// over-defer that never under-bounds the real re-lex. O(1)/O(checkpoints)
+/// early-exit cases (no anchor row yet, nothing before filtered index 0) re-lex
+/// nothing and always "fit". Caller holds the mutex.
+fn filteredNavFitsBudget(doc: *Document) bool {
+    if (doc.checkpoints.items.len == 0) return true;
+    var lo: usize = undefined;
+    var hi: usize = undefined;
+    if (doc.nav_dir == .forward) {
+        if (doc.nav_anchor >= doc.filter_total) return true; // no source row yet: O(1)
+        lo = filterMatchBlock(doc, doc.nav_anchor) orelse return true;
+        // The forward walk may pass block `lo` entirely (its matches all behind
+        // the anchor row) into the next non-empty combined block BEYOND `lo`.
+        hi = firstCombinedBlockFrom(doc, lo + 1) orelse lo;
+    } else {
+        if (doc.nav_anchor == 0) return true; // nothing before filtered index 0
+        if (doc.nav_anchor - 1 < doc.filter_total) {
+            hi = filterMatchBlock(doc, doc.nav_anchor - 1) orelse return true;
+            // Symmetric: the backward walk may pass block `hi` entirely (its
+            // matches all ahead of the anchor row) into the next non-empty
+            // combined block BELOW `hi`.
+            lo = lastCombinedBlockTo(doc, hi) orelse hi;
+        } else if (doc.filter_total_exact) {
+            // anchor is at/past the (fully known) filtered view's end: the bound
+            // is filter_rows, so only the last combined block is re-lexed.
+            lo = lastCombinedBlockTo(doc, doc.block_counts.items.len) orelse return true;
+            hi = lo;
+        } else return true; // bound not established yet: re-lex nothing
+    }
+    if (lo >= doc.checkpoints.items.len) return true;
+    if (hi >= doc.checkpoints.items.len) hi = doc.checkpoints.items.len - 1;
+    if (hi < lo) hi = lo;
+    return (blockEndByte(doc, hi) -| blockStartByte(doc, lo)) <= api.window_budget_max_bytes;
+}
+
 /// Resolve the pending navigation from the counted region if the answer is
 /// determined; otherwise leave it pending (the scan will serve it). Caller holds
 /// the mutex. FORWARD = first match at-or-after anchor; BACKWARD = last match
@@ -245,12 +354,14 @@ fn setExhausted(doc: *Document) void {
 pub fn resolveNavLocked(doc: *Document) void {
     if (!doc.nav_pending) return;
     if (doc.filter_state != .idle) {
-        // Filtered counted-region resolution can re-lex a full checkpoint
-        // block. With a worker present it is a worker job, never mutex-held
-        // caller work; the no-worker degraded mode retains its terminating
-        // synchronous fallback.
-        if (doc.worker != null) return;
-        resolveNavLockedFiltered(doc);
+        // Filtered counted-region resolution can re-lex a checkpoint block that
+        // may contain giant rows. Resolve INLINE when the block span the
+        // resolution would re-lex fits the synchronous budget (the normal case:
+        // api/lesssheet.h "synchronous after LS_SEARCH_DONE" — fv16); defer to
+        // the off-main worker ONLY when a giant-row crossing would exceed it
+        // (wb_ac11 / wb_ac12). The no-worker degraded mode always resolves inline
+        // (its terminating synchronous fallback).
+        if (doc.worker == null or filteredNavFitsBudget(doc)) resolveNavLockedFiltered(doc);
         return;
     }
     const anchor = doc.nav_anchor;
