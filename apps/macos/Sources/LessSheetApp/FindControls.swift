@@ -150,6 +150,7 @@ struct FindControlView: View {
                     .textFieldStyle(.plain)
                     .focused($focus, equals: .query)
                     .onSubmit { model.submitFindField() }
+                    .onKeyPress(.return, phases: .down) { handleReturn($0) }
             }
         }
         .font(.callout)
@@ -225,6 +226,7 @@ struct FindControlView: View {
                     .foregroundStyle(rejected ? Color.red : Color.primary)
                     .focused($focus, equals: .value)
                     .onSubmit { model.submitFindField() }
+                    .onKeyPress(.return, phases: .down) { handleReturn($0) }
             }
         }
         .font(.callout)
@@ -292,6 +294,21 @@ struct FindControlView: View {
         guard (0..<model.columnCount).contains(column) else { return "" }
         let base = model.columnLabel(column)
         return model.visibility.isHidden(column) ? "\(base) (hidden)" : base
+    }
+
+    /// Return in a find field (standard find-bar pairing). Shift+Return steps to
+    /// the PREVIOUS match — the exact ⇧⌘G action (`stepFind(.backward)`) — and is
+    /// consumed here. Plain Return falls through to `.onSubmit`
+    /// (`submitFindField` = start-a-search-or-advance-to-the-next-match), so the
+    /// FIRST Enter runs the search and each subsequent Enter jumps to the next
+    /// occurrence. Either way the field is re-asserted as first responder on the
+    /// next runloop, so a landing scroll can never quietly drop focus and stall
+    /// repeated-Enter cycling (the popup stays open + hot; Esc/⌘F unaffected).
+    private func handleReturn(_ keyPress: KeyPress) -> KeyPress.Result {
+        DispatchQueue.main.async { focus = focusTarget }
+        guard keyPress.modifiers.contains(.shift) else { return .ignored }
+        model.stepFind(.backward)
+        return .handled
     }
 
     /// A rejected submit (ordering predicate, non-numeric value): keep the field
