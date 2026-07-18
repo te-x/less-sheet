@@ -247,6 +247,22 @@ final class DocumentModel {
     /// The direction of the outstanding search navigation (drives the wrap
     /// notice's start/end choice when a poll reports exhaustion).
     private var searchNavDirection: SearchDirection = .forward
+    /// Genuine-user-Cancel latch (the Stop affordance → `cancelFind`). Set true
+    /// there, honored in `foldSearch`, cleared on the next fresh search /
+    /// navigation (submitFind / stepFind) and on any find-session reset
+    /// (closeFind / filter enter-exit / new document).
+    ///
+    /// WHY it exists: the core's `ls_search_cancel` only nils a PENDING
+    /// `NAV_SEARCHING`; an already-landed `NAV_FOUND` PERSISTS (api/lesssheet.h
+    /// 191-193, 764-767). So after a user cancel with a match landed (the
+    /// common case — submitFind navigates `.fromTop`), the next ~100ms poll
+    /// carries `phase=.cancelled, nav=.found`. `FindControl.resolved` folds
+    /// THAT (correctly, for a network net-park — api nfd_ac6) as the count with
+    /// notice=nil, which would CLOBBER the "Stopped" `cancelFind` set. The latch
+    /// re-asserts "Stopped" across that follow-up fold. A net-park never sets
+    /// the latch (no user stop), so its count path is untouched. Not observed
+    /// by any view — pure control state.
+    @ObservationIgnored private var userStopped = false
 
     private var session: (any DocumentSession)?
     private var markedGeneration = -1
@@ -642,6 +658,7 @@ final class DocumentModel {
             // FindControlling.invalidated); a fresh/re-opened session has no
             // filter either (ARCH-filtered-views req. 9).
             self.cancelWrapNav()
+            self.userStopped = false   // new document identity — drop any stop latch
             self.findSession = findControl.invalidated(self.findSession)
             self.searchNavDirection = .forward
             self.filterSnapshot = nil
@@ -2427,6 +2444,7 @@ final class DocumentModel {
                 return
             }
             cancelWrapNav()
+            userStopped = false                       // a fresh search shows counts, never a stale "Stopped"
             findSession = findControl.began(findSession, running: request)
             searchNavDirection = .forward
             session.navigateSearch(.fromTop)          // "first match in the file"
@@ -2458,6 +2476,7 @@ final class DocumentModel {
               let nav = findControl.step(findSession, direction, viewportRow: UInt64(firstVisibleRow))
         else { return }
         cancelWrapNav()               // an explicit step supersedes a pending auto-wrap
+        userStopped = false           // resuming navigation supersedes a prior user stop
         searchNavDirection = direction
         session.navigateSearch(nav)
         foldSearch(session.searchStatus())
@@ -2469,6 +2488,10 @@ final class DocumentModel {
     func cancelFind() {
         cancelWrapNav()
         session?.cancelSearch()
+        // Latch the genuine user stop so the follow-up cancelled+found poll
+        // (an already-landed NAV_FOUND persists past ls_search_cancel — see
+        // `userStopped`) does not fold "Stopped" away into the count.
+        userStopped = true
         findSession = findControl.stopped(findSession)
     }
 
@@ -2477,6 +2500,7 @@ final class DocumentModel {
     func closeFind() {
         cancelWrapNav()
         session?.cancelSearch()
+        userStopped = false           // the session is cleared — drop any stop latch
         findSession = findControl.closed(findSession)
         findFieldActive = false
         searchNavDirection = .forward
@@ -2494,6 +2518,26 @@ final class DocumentModel {
     private func foldSearch(_ snapshot: SearchSnapshot?) {
         let previous = findSession.display
         findSession = findControl.resolved(findSession, with: snapshot, navDirection: searchNavDirection)
+
+        // A genuine user Cancel latched "Stopped" (userStopped). The core's
+        // ls_search_cancel leaves an already-landed NAV_FOUND in place, so the
+        // follow-up poll after the cancel folds through `resolved` as the count
+        // (notice nil — the correct net-park behavior). Re-assert "Stopped"
+        // while the latch holds, keeping every folded field (landing / position
+        // / count) the fold produced. The latch clears on the next fresh
+        // search or navigation, so subsequent searches show counts normally.
+        let folded = findSession.display
+        if userStopped, folded.request != nil, folded.notice != .stopped {
+            findSession.display = FindDisplay(
+                request: folded.request,
+                current: folded.current,
+                position: folded.position,
+                total: folded.total,
+                totalIsFinal: folded.totalIsFinal,
+                progress: folded.progress,
+                notice: .stopped
+            )
+        }
 
         // A wrap notice ("Wrapped to start/end") appeared. Issuing the follow-up
         // navigation synchronously here would coalesce into this same @Observable
@@ -2774,6 +2818,7 @@ final class DocumentModel {
             // (belt-and-suspenders with materialize's own bump on the landing).
             invalidateMatchFlags()
             cancelWrapNav()
+            userStopped = false   // find is reset entering filter mode — drop any stop latch
             findSession = findControl.invalidated(findSession)
             searchNavDirection = .forward
             setJumpFlow(.idle)
@@ -2821,6 +2866,7 @@ final class DocumentModel {
         filterScanStartedAt = nil
         rowCountInfo = session.rowCount()
         cancelWrapNav()
+        userStopped = false   // find is reset clearing the filter — drop any stop latch
         findSession = findControl.invalidated(findSession)
         searchNavDirection = .forward
         setJumpFlow(.idle)

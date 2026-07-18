@@ -94,9 +94,11 @@ public struct FindControl: FindControlling {
         // non-found polls (the old landing holds until the next one lands).
         var current = old.current
         var position = old.position
+        var landedThisPoll = false
         if case let .found(match, pos) = snapshot.nav {
             current = match
             position = pos
+            landedThisPoll = true
         }
 
         // Notice derives PURELY from this snapshot (so a wrap notice self-clears
@@ -114,7 +116,15 @@ public struct FindControl: FindControlling {
                 // wrap, keeping the current landing until the wrap lands.
                 notice = (navDirection == .forward) ? .wrappedToStart : .wrappedToEnd
             }
-        } else if case .cancelled = snapshot.phase {
+        } else if case .cancelled = snapshot.phase, !landedThisPoll {
+            // On an http_range document the core navigates to the first match
+            // and then RE-PARKS the scan at LS_SEARCH_CANCELLED in the SAME
+            // poll (api nfd_ac6 — it never runs a background network scan). So
+            // a SUCCESSFUL network find poll carries BOTH a .found landing and
+            // a cancelled phase; that is a "n of m" success, never "Stopped".
+            // Only a cancelled poll that landed NOTHING is a genuine phase-stop
+            // here — the count folds through when a match landed. (The
+            // user-invoked stop is the separate `stopped()` method, unaffected.)
             notice = .stopped
         }
 
