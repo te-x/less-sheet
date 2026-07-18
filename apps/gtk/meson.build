@@ -30,7 +30,8 @@ core_inc = include_directories('include')
 # once into a static library and linked into the app + every test binary.
 # Compiling this under -Werror is the CONFORMANCE gate: the module sources must
 # match the frozen headers exactly or the build fails. The surface grows per
-# slice (slice 1: open/display/scroll; slice 2: find; slice 3: jump).
+# slice (slice 1: open/display/scroll; slice 2: find; slice 3: jump; slice 4:
+# filter).
 # ---------------------------------------------------------------------------
 lsg_sources = files(
   'src/lsg_document.c',
@@ -40,6 +41,7 @@ lsg_sources = files(
   'src/lsg_window_poll.c',
   'src/lsg_find.c',
   'src/lsg_jump.c',
+  'src/lsg_filter.c',
 )
 lsgkit = static_library('lsgkit',
   lsg_sources,
@@ -152,3 +154,17 @@ test_jump = executable('test-jump',
   install : false,
 )
 test('jump', test_jump)
+
+# Filter to matches (slice 4): pure view-model (toggle state + "Filtered — N of M
+# rows" banner + the find/jump composition facts) + the filter bridge over the
+# real core (set / clear / poll). Reuses the find.csv fixture — the SAME settled
+# match sets the find tests pin against — so no new fixture is needed.
+test_filter = executable('test-filter',
+  'tests/test_filter.c',
+  dependencies : test_deps,
+  link_with : lsgkit,
+  include_directories : core_inc,
+  c_args : ['-DFIND_FIXTURE_PATH="' + find_fixture + '"'],
+  install : false,
+)
+test('filter', test_filter)
