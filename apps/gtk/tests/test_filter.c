@@ -403,6 +403,31 @@ wait_search_final (LsgDocument *doc, LsgSearchSnapshot *out)
   return FALSE;
 }
 
+/* Poll the search NAV slot until it RESOLVES — the pending SEARCHING/NONE state
+ * gives way to FOUND or EXHAUSTED — bounded (~10 s). The caller issues the nav
+ * first (as with wait_jump_done / wait_search_final above, and mirroring the macOS
+ * `navFound` helper in FilteredViewsTests): the ABI makes a nav synchronous once
+ * the scan is DONE, but the poll/control lane still RESOLVES it by polling (the
+ * production `find_poll_fold` folds the nav every tick), so a test reads the
+ * landing off a poll loop — never a single post-nav poll. */
+static gboolean
+wait_search_nav_resolved (LsgDocument *doc, LsgSearchSnapshot *out)
+{
+  for (int i = 0; i < 5000; i++)
+    {
+      LsgSearchSnapshot s;
+      if (lsg_document_search_poll (doc, &s)
+          && (s.nav == LSG_SEARCH_NAV_FOUND || s.nav == LSG_SEARCH_NAV_EXHAUSTED))
+        {
+          if (out)
+            *out = s;
+          return TRUE;
+        }
+      g_usleep (2000);
+    }
+  return FALSE;
+}
+
 /* The ORIGINAL (gutter) row numbers of the first `m` filtered rows, in filtered
  * order (via the frozen slice-1 window + source-row accessors). Caller frees. */
 static GArray *
@@ -656,9 +681,14 @@ test_bridge_find_within_filter (void)
   g_assert_true (wait_search_final (doc, &ss));
   g_assert_cmpuint (ss.total, ==, 3);
 
-  /* The first match is filtered index 0 (original row 0). */
+  /* The first match is filtered index 0 (original row 0). Poll the nav for FOUND
+   * off a loop — mirroring the macOS `navFound` helper and this file's own wait_*
+   * pollers: the ABI makes a nav synchronous once the scan is DONE, but the
+   * poll/control lane resolves it by polling (production `find_poll_fold` folds it
+   * every tick), so we never assume a single post-nav poll has already left
+   * SEARCHING. */
   lsg_document_search_nav (doc, lsg_search_nav_from_top ());
-  g_assert_true (lsg_document_search_poll (doc, &ss));
+  g_assert_true (wait_search_nav_resolved (doc, &ss));
   g_assert_cmpint (ss.nav, ==, LSG_SEARCH_NAV_FOUND);
   g_assert_cmpuint (ss.found.row, ==, 0);
 
