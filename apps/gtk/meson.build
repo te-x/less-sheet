@@ -26,10 +26,11 @@ core_dep = cc.find_library('lesssheet', dirs : [core_dir], static : true)
 core_inc = include_directories('include')
 
 # ---------------------------------------------------------------------------
-# Slice 1 frontend logic modules (contract in include/lsg_*.h). Display-free C
-# built once into a static library and linked into the app + every test binary.
+# Frontend logic modules (contract in include/lsg_*.h). Display-free C built
+# once into a static library and linked into the app + every test binary.
 # Compiling this under -Werror is the CONFORMANCE gate: the module sources must
-# match the frozen headers exactly or the build fails.
+# match the frozen headers exactly or the build fails. The surface grows per
+# slice (slice 1: open/display/scroll; slice 2: find).
 # ---------------------------------------------------------------------------
 lsg_sources = files(
   'src/lsg_document.c',
@@ -37,6 +38,7 @@ lsg_sources = files(
   'src/lsg_formatter.c',
   'src/lsg_grid_geometry.c',
   'src/lsg_window_poll.c',
+  'src/lsg_find.c',
 )
 lsgkit = static_library('lsgkit',
   lsg_sources,
@@ -45,7 +47,7 @@ lsgkit = static_library('lsgkit',
   install : false,
 )
 
-# App: hosts the slice-1 modules over the GTK4 + libadwaita toolchain and links
+# App: hosts the frontend modules over the GTK4 + libadwaita toolchain and links
 # the core archive. Compiled by the gate but NOT run there (needs a display —
 # that is the human GUI pass). The real grid/chrome is authored during build.
 executable('less-sheet-gtk',
@@ -122,3 +124,16 @@ test_window_poll = executable('test-window-poll',
   install : false,
 )
 test('window-poll', test_window_poll)
+
+# Find (slice 2): pure view-model + the search bridge over the real core. Needs
+# the find.csv fixture path baked in (resolves inside the container).
+find_fixture = meson.current_source_dir() / 'tests' / 'fixtures' / 'find.csv'
+test_find = executable('test-find',
+  'tests/test_find.c',
+  dependencies : test_deps,
+  link_with : lsgkit,
+  include_directories : core_inc,
+  c_args : ['-DFIND_FIXTURE_PATH="' + find_fixture + '"'],
+  install : false,
+)
+test('find', test_find)
