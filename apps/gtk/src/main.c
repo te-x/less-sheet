@@ -1546,7 +1546,13 @@ build_find_popover (App *app)
   g_signal_connect (pop, "closed", G_CALLBACK (on_find_popover_closed), app);
   g_signal_connect (pop, "show", G_CALLBACK (on_find_popover_show), app);
 
+  /* CAPTURE phase so Enter/Shift+Enter/Esc reach us BEFORE the entry's internal
+   * GtkText consumes Return (its "activate") — that's why Enter did nothing. In
+   * capture we see Return first and return STOP, so Enter advances to the next
+   * match (Shift+Enter → previous), the popover stays open for repeated Enter,
+   * and Esc still closes. Other keys PROPAGATE so typing/search-changed work. */
   GtkEventController *keys = gtk_event_controller_key_new ();
+  gtk_event_controller_set_propagation_phase (keys, GTK_PHASE_CAPTURE);
   g_signal_connect (keys, "key-pressed", G_CALLBACK (on_find_entry_key), app);
   gtk_widget_add_controller (entry, keys);
 }
