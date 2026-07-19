@@ -27,6 +27,7 @@
 #include <lsg_find.h>
 #include <lsg_jump.h>
 #include <lsg_filter.h>
+#include <lsg_copy.h>
 
 #include <string.h>
 
@@ -38,6 +39,11 @@
  * only these leading columns are measured; the rest take a default width. */
 #define WIDTH_SAMPLE_COLS 256
 #define WIDTH_SAMPLE_ROWS 64
+/* Frontend byte budget for one clipboard copy (the macOS CopyBudget.standard
+ * ~64 MiB analog); the core's LS_COPY_MAX_CELLS still bounds a pathological rect. */
+#define COPY_BUDGET_BYTES (64u * 1024u * 1024u)
+/* Per-pull chunk the copy worker frames. */
+#define COPY_CHUNK_BYTES (1u << 16)
 
 typedef struct {
   AdwApplication *app;
@@ -126,6 +132,27 @@ typedef struct {
   gboolean is_network;
   gboolean net_drive_active;
 
+  /* Streaming copy (slice 5). Selection is two corners in VIEW row coords
+   * (filtered-aware, like the window) + physical column indices; the mode chooses
+   * cells / whole-rows / whole-columns. The copy runs on an OFF-MAIN worker so the
+   * grid keeps scrolling; the header progress widget shows determinate progress +
+   * a cancel while it streams. */
+  int sel_mode;                /* SEL_* */
+  guint64 sel_a_row, sel_b_row;
+  guint sel_a_col, sel_b_col;
+  gboolean selecting;          /* a drag is in progress */
+  GtkButton *copy_button;
+
+  GThread *copy_thread;
+  struct _CopyOp *copy_op;     /* shared worker state (defined in the copy section) */
+  guint copy_poll_id;          /* main-thread progress/completion poll */
+
+  /* Reusable header-bar progress widget (the author's unified title-bar progress:
+   * determinate bar + inline cancel; other long ops can drive it later). */
+  GtkWidget *hp_box;
+  GtkProgressBar *hp_bar;
+  GtkButton *hp_cancel;
+
   /* Env-gated timing instrumentation (LESSSHEET_GTK_TIMING). Entirely inert —
    * no output, no measurable cost — unless `timing` is set. */
   gboolean timing;
@@ -134,6 +161,10 @@ typedef struct {
   gint64 t_open_begin;         /* file-open begin (monotonic µs) */
   gboolean first_frame_pending;/* one-shot: awaiting the first painted grid frame */
 } App;
+
+/* Selection modes (slice 5): a cell rectangle, whole rows (gutter drag), or
+ * whole columns (header drag). */
+enum { SEL_NONE = 0, SEL_CELLS, SEL_ROWS, SEL_COLS };
 
 /* ------------------------------------------------------------------------- */
 /* Small helpers                                                              */
@@ -198,6 +229,14 @@ static void filter_poll_fold (App *app);
 static void net_drive_begin (App *app, guint64 target_row);
 static void net_drive_poll (App *app);
 
+/* Streaming copy (slice 5): start a copy of the current selection; stop+join the
+ * worker before any document teardown (leaf-before-root). Defined in the copy
+ * section; called from the key handlers and app_reset_document. */
+static void do_copy (App *app);
+static void copy_stop_and_join (App *app);
+static void copy_update_affordance (App *app);
+static gboolean selection_contains (App *app, guint64 row, guint col);   /* grid_draw marquee */
+
 /* Filter helpers referenced from the earlier find section (the toggle lives in
  * the find popover); defined with the filter helpers below. */
 static void on_filter_toggled (GtkToggleButton *toggle, gpointer data);
@@ -222,6 +261,13 @@ static void open_jump (App *app);
 static void
 app_reset_document (App *app)
 {
+  /* LEAF BEFORE ROOT: stop + join any copy worker (and close its job) BEFORE the
+   * document is closed below — a job must never outlive its document. */
+  copy_stop_and_join (app);
+  app->sel_mode = SEL_NONE;
+  app->selecting = FALSE;
+  copy_update_affordance (app);
+
   if (app->poll_id != 0)
     {
       g_source_remove (app->poll_id);
@@ -670,6 +716,19 @@ grid_draw (GtkDrawingArea *area, cairo_t *cr, int width, int height,
           double colw = (col < app->n_cols && app->col_widths[col] > 0.0)
                             ? app->col_widths[col]
                             : 0.0;
+
+          /* Selection marquee: a MUTED-GRAY fill (the macOS NSColor.systemGray
+           * equivalent, theme-derived from fg so it reads in light + dark), drawn
+           * BEHIND the accent find highlight (which stays accent). */
+          if (selection_contains (app, view_row, col))
+            {
+              GdkRGBA sel = fg;
+              sel.alpha = 0.20;
+              gdk_cairo_set_source_rgba (cr, &sel);
+              cairo_rectangle (cr, x, y, colw, row_h);
+              cairo_fill (cr);
+              gdk_cairo_set_source_rgba (cr, &fg);
+            }
 
           /* Highlight a matching cell from the core's mask (accent tint); the
            * current match cell gets a stronger tint. */
@@ -1144,6 +1203,15 @@ on_key_pressed (GtkEventControllerKey *ctrl, guint keyval, guint keycode,
   if (app->doc == NULL)
     return GDK_EVENT_PROPAGATE;
 
+  /* Ctrl+C copies the current selection (grid-focused only, so a text entry's
+   * own Ctrl+C is untouched — that's why this lives on the grid controller, not
+   * a window-capture one). */
+  if ((state & GDK_CONTROL_MASK) && (keyval == GDK_KEY_c || keyval == GDK_KEY_C))
+    {
+      do_copy (app);
+      return GDK_EVENT_STOP;
+    }
+
   /* A plain digit typed on the grid opens the jump field, pre-filled. */
   if (!(state & (GDK_CONTROL_MASK | GDK_ALT_MASK)))
     {
@@ -1304,6 +1372,12 @@ find_run_query (App *app)
 {
   if (app->doc == NULL)
     return;
+  /* A find's ls_search_start / ls_search_nav ALSO take the shared core scan slot
+   * and would cancel a running copy's frontier-advance jump -> the copy times out
+   * at FRONTIER = a TRUNCATED copy (the same slot-contention class as jump). Yield
+   * the slot to a live copy (bounded + ✕-cancellable). See also do_find_step. */
+  if (app->copy_op != NULL)
+    return;
 
   app->find.draft.mode = LSG_FIND_TEXT;
   app->find.draft.text = gtk_editable_get_text (app->find_entry); /* borrowed */
@@ -1346,9 +1420,11 @@ find_poll_fold (App *app)
   app->find = lsg_find_resolved (app->find, has, snap, app->find_nav_direction);
 
   /* A wrap notice asks for a follow-up navigation (issued once); it self-clears
-   * when the wrap lands as a FOUND poll. */
+   * when the wrap lands as a FOUND poll. Suppress it while a copy runs — an
+   * ls_search_nav here would also take the shared scan slot from the copy's jump
+   * (deferred, not lost: it re-issues on the next tick once the copy is done). */
   LsgSearchNav wnav;
-  if (lsg_find_wrap_nav (app->find, &wnav))
+  if (app->copy_op == NULL && lsg_find_wrap_nav (app->find, &wnav))
     {
       if (!app->find_wrap_issued)
         {
@@ -1358,7 +1434,7 @@ find_poll_fold (App *app)
           find_set_sticky_notice (app, app->find.display.notice);
         }
     }
-  else
+  else if (app->copy_op == NULL)
     {
       app->find_wrap_issued = FALSE;
     }
@@ -1376,6 +1452,8 @@ static void
 do_find_step (App *app, LsgSearchDir direction)
 {
   if (app->doc == NULL || !app->find.display.active)
+    return;
+  if (app->copy_op != NULL)               /* yield the scan slot to a live copy */
     return;
   LsgSearchNav nav;
   if (lsg_find_step (app->find, direction, app->cur_top_row, &nav))
@@ -1681,6 +1759,12 @@ net_drive_begin (App *app, guint64 target_row)
    * drives, so this only suppresses a scroll-drive during a live user jump. */
   if (app->jump.kind == LSG_JUMP_FLOW_SCANNING)
     return;
+  /* A streaming copy also drives the shared frontier (to its own stalled_row);
+   * a scroll-drive that retargets the slot BELOW that row would leave the copy's
+   * frontier short -> a re-stall on the same row -> a TRUNCATED copy. Yield: the
+   * copy advances the frontier itself; scrolling far ahead just waits for it. */
+  if (app->copy_op != NULL)
+    return;
   app->net_drive_active = TRUE;
   lsg_document_jump_start (app->doc, target_row);
   /* Fold the immediate poll (a behind-frontier / small fetch completes at once);
@@ -1710,6 +1794,17 @@ do_jump_submit (App *app)
 {
   if (app->doc == NULL)
     return;
+
+  /* A streaming copy owns the shared core scan slot (it advances the frontier to
+   * its own stalled_row from the worker). A user jump's ls_jump_start would
+   * retarget that slot and TRUNCATE the copy (and the copy's bg jump would
+   * mis-land this one). Deny while a copy runs — it is bounded + has a ✕ cancel;
+   * signal the denial with the field's reject blink ("cancel the copy first"). */
+  if (app->copy_op != NULL)
+    {
+      jump_reject_feedback (app);
+      return;
+    }
 
   const char *text = gtk_editable_get_text (app->jump_entry);
   /* Composition: while filtered the jump box takes ORIGINAL row numbers, so hint
@@ -2095,6 +2190,12 @@ do_apply_filter (App *app)
       return;
     }
 
+  /* A filter changes the copy job's coordinate space (identity <-> filtered),
+   * which the frozen contract says invalidates an open job ("close this job and
+   * open a fresh one"). STOP any in-flight copy BEFORE the view change — a mid-
+   * copy filter would otherwise pull ls_copy_next in the wrong coordinate space. */
+  copy_stop_and_join (app);
+
   LsgRowCount id_rc = lsg_document_row_count (app->doc);   /* base M (first apply) */
   if (!lsg_document_filter_set (app->doc, sub.request))
     {
@@ -2137,6 +2238,10 @@ do_clear_filter (App *app)
       filter_update_banner (app);
       return;
     }
+
+  /* Clearing the filter also changes the copy job's coordinate space (filtered
+   * -> identity) — stop any in-flight copy first (same rule as apply). */
+  copy_stop_and_join (app);
 
   guint64 restore = capture_top_source_row (app);        /* BEFORE clearing */
   lsg_document_filter_clear (app->doc);
@@ -2192,6 +2297,435 @@ on_filter_banner_clear (AdwBanner *banner, gpointer data)
   /* Route through the toggle (fires on_filter_toggled -> do_clear_filter). */
   if (app->filter_toggle != NULL)
     gtk_toggle_button_set_active (app->filter_toggle, FALSE);
+}
+
+/* ------------------------------------------------------------------------- */
+/* Streaming copy (slice 5): selection + off-main worker + clipboard + the      */
+/* reusable header-bar progress widget                                          */
+/* ------------------------------------------------------------------------- */
+
+/* The off-main copy worker's shared state (defined up-front so the cancel
+ * affordance and the drive can both reach it). */
+struct _CopyOp {
+  LsgDocument *doc;            /* captured at launch (stable per leaf-before-root) */
+  LsgCopyRect rect;
+  guint64 budget;
+  gint cancel;                 /* g_atomic; set by the main thread */
+  GMutex lock;                 /* guards `progress` / `finished` / results */
+  gdouble progress;
+  gboolean finished;
+  GByteArray *blob;            /* worker-owned; read by main after join */
+  LsgCopyOutcome outcome;
+  guint64 rows_done;
+};
+
+/* --- reusable header-bar progress: a determinate bar + inline cancel. Hidden
+ *     by default; any long op (copy now, scan/index/network later) drives it via
+ *     header_progress_show / _set / _hide. --- */
+
+static void
+on_hp_cancel_clicked (GtkButton *button, gpointer data)
+{
+  (void) button;
+  App *app = data;
+  if (app->copy_op != NULL)
+    g_atomic_int_set (&app->copy_op->cancel, 1);   /* the worker stops promptly */
+}
+
+static void
+build_header_progress (App *app)
+{
+  GtkWidget *box = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 6);
+  GtkWidget *bar = gtk_progress_bar_new ();
+  gtk_widget_set_valign (bar, GTK_ALIGN_CENTER);
+  gtk_widget_set_size_request (bar, 150, -1);
+  GtkWidget *cancel = gtk_button_new_from_icon_name ("window-close-symbolic");
+  gtk_widget_add_css_class (cancel, "flat");
+  gtk_widget_set_tooltip_text (cancel, "Cancel");
+  gtk_box_append (GTK_BOX (box), bar);
+  gtk_box_append (GTK_BOX (box), cancel);
+  gtk_widget_set_visible (box, FALSE);
+  app->hp_box = box;
+  app->hp_bar = GTK_PROGRESS_BAR (bar);
+  app->hp_cancel = GTK_BUTTON (cancel);
+  g_signal_connect (cancel, "clicked", G_CALLBACK (on_hp_cancel_clicked), app);
+}
+
+static void
+header_progress_show (App *app, const char *label)
+{
+  if (app->hp_box == NULL)
+    return;
+  gtk_progress_bar_set_fraction (app->hp_bar, 0.0);
+  if (label != NULL)
+    {
+      gtk_progress_bar_set_show_text (app->hp_bar, TRUE);
+      gtk_progress_bar_set_text (app->hp_bar, label);
+    }
+  gtk_widget_set_visible (app->hp_box, TRUE);
+}
+
+/* fraction >= 0 => determinate; < 0 => indeterminate pulse. */
+static void
+header_progress_set (App *app, gdouble fraction)
+{
+  if (app->hp_bar == NULL)
+    return;
+  if (fraction >= 0.0)
+    gtk_progress_bar_set_fraction (app->hp_bar, fraction);
+  else
+    gtk_progress_bar_pulse (app->hp_bar);
+}
+
+static void
+header_progress_hide (App *app)
+{
+  if (app->hp_box != NULL)
+    gtk_widget_set_visible (app->hp_box, FALSE);
+}
+
+/* --- selection algebra (view rows + physical columns) --- */
+
+/* Normalize the two selection corners (+ mode) into the half-open copy rect. */
+static LsgCopyRect
+selection_rect (App *app)
+{
+  LsgCopyRect r = { 0, 0, 0, 0 };
+  if (app->sel_mode == SEL_NONE || app->n_cols == 0)
+    return r;
+
+  guint64 r0 = MIN (app->sel_a_row, app->sel_b_row);
+  guint64 r1 = MAX (app->sel_a_row, app->sel_b_row);
+  guint c0 = MIN (app->sel_a_col, app->sel_b_col);
+  guint c1 = MAX (app->sel_a_col, app->sel_b_col);
+
+  if (app->sel_mode == SEL_ROWS)                  /* whole rows -> all columns */
+    { c0 = 0; c1 = app->n_cols - 1; }
+  if (app->sel_mode == SEL_COLS)                  /* whole columns -> all rows */
+    { r0 = 0; r1 = (app->row_estimate > 0) ? app->row_estimate - 1 : 0; }
+
+  r.first_row = r0;
+  r.row_count = r1 - r0 + 1;
+  r.first_col = c0;
+  r.col_count = c1 - c0 + 1;
+  return r;
+}
+
+/* Whether a cell (view row, physical col) is inside the current selection. */
+static gboolean
+selection_contains (App *app, guint64 row, guint col)
+{
+  if (app->sel_mode == SEL_NONE || app->n_cols == 0)
+    return FALSE;
+  guint64 r0 = MIN (app->sel_a_row, app->sel_b_row);
+  guint64 r1 = MAX (app->sel_a_row, app->sel_b_row);
+  guint c0 = MIN (app->sel_a_col, app->sel_b_col);
+  guint c1 = MAX (app->sel_a_col, app->sel_b_col);
+  if (app->sel_mode == SEL_ROWS)
+    { c0 = 0; c1 = app->n_cols - 1; }
+  if (app->sel_mode == SEL_COLS)
+    { r0 = 0; r1 = G_MAXUINT64; }
+  return row >= r0 && row <= r1 && col >= c0 && col <= c1;
+}
+
+/* Hit-test a pointer (x,y) to a view row + physical column, and which region
+ * (0 = cell body, 1 = row-number gutter, 2 = header, 3 = corner). */
+static int
+hit_test (App *app, double x, double y, guint64 *out_row, guint *out_col)
+{
+  gboolean in_gutter = (x < app->gutter_w);
+  gboolean in_header = (y < app->header_h);
+
+  double yy = y - app->header_h + app->cur_pixel_off;
+  if (yy < 0.0)
+    yy = 0.0;
+  guint64 row = app->cur_top_row + (guint64) (yy / app->row_h);
+  if (app->row_estimate > 0 && row > app->row_estimate - 1)
+    row = app->row_estimate - 1;
+
+  double hval = gtk_adjustment_get_value (app->hadj);
+  double xx = x - app->gutter_w + hval;
+  if (xx < 0.0)
+    xx = 0.0;
+  guint col = 0;
+  double acc = 0.0;
+  for (col = 0; col < app->n_cols; col++)
+    {
+      double w = (app->col_widths[col] > 0.0) ? app->col_widths[col] : 0.0;
+      if (xx < acc + w)
+        break;
+      acc += w;
+    }
+  if (app->n_cols > 0 && col >= app->n_cols)
+    col = app->n_cols - 1;
+
+  *out_row = row;
+  *out_col = col;
+  if (in_gutter && in_header)
+    return 3;
+  if (in_gutter)
+    return 1;
+  if (in_header)
+    return 2;
+  return 0;
+}
+
+static void
+copy_update_affordance (App *app)
+{
+  if (app->copy_button != NULL)
+    gtk_widget_set_sensitive (GTK_WIDGET (app->copy_button),
+                              app->doc != NULL && app->sel_mode != SEL_NONE);
+}
+
+/* --- the off-main copy worker --- */
+
+static gpointer
+copy_worker (gpointer data)
+{
+  struct _CopyOp *op = data;
+  LsgDocument *doc = op->doc;
+  guint8 *buf = g_malloc (COPY_CHUNK_BYTES);
+  GByteArray *blob = g_byte_array_new ();
+
+  LsgCopyFlow flow = lsg_copy_begin (op->rect, op->budget);
+  LsgCopyJob *job = lsg_document_copy_open (doc, op->rect);
+
+  while (job != NULL && flow.kind != LSG_COPY_FLOW_DONE)
+    {
+      if (g_atomic_int_get (&op->cancel))
+        {
+          flow = lsg_copy_cancel (flow);
+          break;
+        }
+
+      /* A stall (row past the demand-driven / still-indexing frontier): advance
+       * the shared frontier via a jump, bounded (~2 s), then pull again. The
+       * fold's no-progress guard turns a re-stall on the same row into FRONTIER. */
+      if (flow.kind == LSG_COPY_FLOW_STALLED)
+        {
+          lsg_document_jump_start (doc, flow.stalled_row);
+          gboolean settled = FALSE;
+          for (int i = 0; i < 40; i++)   /* 40 * 50 ms = ~2 s */
+            {
+              if (g_atomic_int_get (&op->cancel))
+                break;
+              g_usleep (50000);
+              if (lsg_document_jump_poll (doc).state == LSG_JUMP_DONE)
+                {
+                  settled = TRUE;
+                  break;
+                }
+            }
+          if (g_atomic_int_get (&op->cancel))
+            {
+              flow = lsg_copy_cancel (flow);
+              break;
+            }
+          if (!settled)
+            {
+              flow.kind = LSG_COPY_FLOW_DONE;
+              flow.outcome = LSG_COPY_OUTCOME_FRONTIER;
+              break;
+            }
+        }
+
+      LsgCopyStep s = lsg_document_copy_next (job, buf, COPY_CHUNK_BYTES);
+      g_byte_array_append (blob, buf, s.written);
+      flow = lsg_copy_fold (flow, s);
+
+      g_mutex_lock (&op->lock);
+      op->progress = lsg_copy_progress_fraction (flow);
+      g_mutex_unlock (&op->lock);
+    }
+
+  if (job != NULL)
+    lsg_document_copy_close (job);       /* leaf: close the job before the doc */
+  g_free (buf);
+
+  g_mutex_lock (&op->lock);
+  op->blob = blob;
+  op->outcome = flow.outcome;
+  op->rows_done = flow.rows_done;
+  op->progress = lsg_copy_progress_fraction (flow);
+  op->finished = TRUE;
+  g_mutex_unlock (&op->lock);
+  return NULL;
+}
+
+/* Join the worker and free the op — NO widget access, so it is safe both during
+ * a normal open-new-file reset and at window destroy / process exit. */
+static void
+copy_dispose (App *app)
+{
+  if (app->copy_thread != NULL)
+    {
+      g_thread_join (app->copy_thread);
+      app->copy_thread = NULL;
+    }
+  struct _CopyOp *op = app->copy_op;
+  if (op != NULL)
+    {
+      if (op->blob != NULL)
+        g_byte_array_free (op->blob, TRUE);
+      g_mutex_clear (&op->lock);
+      g_free (op);
+      app->copy_op = NULL;
+    }
+}
+
+static gboolean
+copy_tick (gpointer data)
+{
+  App *app = data;
+  struct _CopyOp *op = app->copy_op;
+  if (op == NULL)
+    {
+      app->copy_poll_id = 0;
+      return G_SOURCE_REMOVE;
+    }
+  g_mutex_lock (&op->lock);
+  gdouble prog = op->progress;
+  gboolean finished = op->finished;
+  g_mutex_unlock (&op->lock);
+
+  header_progress_set (app, prog);       /* determinate rows_done / row_count */
+  if (!finished)
+    return G_SOURCE_CONTINUE;
+
+  /* Deliver the payload to the clipboard (widgets alive on this path — the timer
+   * is stopped at teardown before the window is gone); a cancelled copy drops
+   * its partial. */
+  if (op->outcome != LSG_COPY_OUTCOME_CANCELLED && op->blob != NULL
+      && op->blob->len > 0 && app->window != NULL)
+    {
+      GdkClipboard *clip = gtk_widget_get_clipboard (GTK_WIDGET (app->window));
+      /* NUL-terminate the payload IN PLACE (one appended byte) so it can go
+       * straight to the clipboard — avoids a second ~64 MiB g_strndup copy of the
+       * blob; gdk_clipboard_set_text makes its own internal copy of the TSV. */
+      guint8 nul = 0;
+      g_byte_array_append (op->blob, &nul, 1);
+      gdk_clipboard_set_text (clip, (const char *) op->blob->data);
+      if (app->title != NULL)
+        {
+          char *note = g_strdup_printf ("Copied %" G_GUINT64_FORMAT " rows",
+                                        op->rows_done);
+          adw_window_title_set_subtitle (app->title, note);
+          g_free (note);
+        }
+    }
+  header_progress_hide (app);
+  copy_dispose (app);
+  app->copy_poll_id = 0;
+  return G_SOURCE_REMOVE;
+}
+
+/* Forward-declared: start a copy of the current selection on the off-main worker. */
+static void
+do_copy (App *app)
+{
+  if (app->doc == NULL || app->sel_mode == SEL_NONE || app->copy_op != NULL)
+    return;
+
+  struct _CopyOp *op = g_new0 (struct _CopyOp, 1);
+  op->doc = app->doc;
+  op->rect = selection_rect (app);
+  op->budget = COPY_BUDGET_BYTES;
+  g_mutex_init (&op->lock);
+  op->progress = 0.0;
+  app->copy_op = op;
+
+  header_progress_show (app, "Copying…");
+  app->copy_thread = g_thread_new ("lsg-copy", copy_worker, op);
+  if (app->copy_poll_id == 0)
+    app->copy_poll_id = g_timeout_add (80, copy_tick, app);
+}
+
+/* Forward-declared: stop the worker + dispose (leaf-before-root, before any
+ * document teardown). Drops any partial payload (no clipboard). The widget
+ * updates are NULL-guarded, so this is also safe at window destroy / exit. */
+static void
+copy_stop_and_join (App *app)
+{
+  if (app->copy_op == NULL)
+    {
+      header_progress_hide (app);
+      return;
+    }
+  g_atomic_int_set (&app->copy_op->cancel, 1);
+  if (app->copy_poll_id != 0)
+    {
+      g_source_remove (app->copy_poll_id);
+      app->copy_poll_id = 0;
+    }
+  copy_dispose (app);                    /* join + free (no widgets) */
+  header_progress_hide (app);            /* NULL-guarded */
+  copy_update_affordance (app);          /* NULL-guarded */
+}
+
+/* --- drag-to-select + the copy affordance --- */
+
+static void
+on_sel_drag_begin (GtkGestureDrag *gesture, double x, double y, gpointer data)
+{
+  (void) gesture;
+  App *app = data;
+  if (app->doc == NULL)
+    return;
+
+  guint64 row;
+  guint col;
+  int region = hit_test (app, x, y, &row, &col);
+  if (region == 3)                       /* the corner clears the selection */
+    {
+      app->sel_mode = SEL_NONE;
+      app->selecting = FALSE;
+      copy_update_affordance (app);
+      gtk_widget_queue_draw (GTK_WIDGET (app->area));
+      return;
+    }
+
+  app->selecting = TRUE;
+  app->sel_a_row = app->sel_b_row = row;
+  app->sel_a_col = app->sel_b_col = col;
+  app->sel_mode = (region == 1) ? SEL_ROWS : (region == 2) ? SEL_COLS : SEL_CELLS;
+  gtk_widget_grab_focus (GTK_WIDGET (app->area));   /* so grid Ctrl+C fires */
+  copy_update_affordance (app);
+  gtk_widget_queue_draw (GTK_WIDGET (app->area));
+}
+
+static void
+on_sel_drag_update (GtkGestureDrag *gesture, double ox, double oy, gpointer data)
+{
+  App *app = data;
+  if (!app->selecting)
+    return;
+  double sx = 0, sy = 0;
+  gtk_gesture_drag_get_start_point (gesture, &sx, &sy);
+  guint64 row;
+  guint col;
+  hit_test (app, sx + ox, sy + oy, &row, &col);
+  app->sel_b_row = row;
+  app->sel_b_col = col;
+  gtk_widget_queue_draw (GTK_WIDGET (app->area));
+}
+
+static void
+on_sel_drag_end (GtkGestureDrag *gesture, double ox, double oy, gpointer data)
+{
+  (void) gesture;
+  (void) ox;
+  (void) oy;
+  App *app = data;
+  app->selecting = FALSE;
+  copy_update_affordance (app);
+}
+
+static void
+on_copy_button_clicked (GtkButton *button, gpointer data)
+{
+  (void) button;
+  do_copy ((App *) data);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -2257,6 +2791,14 @@ build_grid_page (App *app)
   g_signal_connect (keys, "key-pressed", G_CALLBACK (on_key_pressed), app);
   gtk_widget_add_controller (GTK_WIDGET (app->area), keys);
 
+  /* Drag-to-select a cell rectangle (or whole rows via the gutter / whole
+   * columns via the header). */
+  GtkGesture *drag = gtk_gesture_drag_new ();
+  g_signal_connect (drag, "drag-begin", G_CALLBACK (on_sel_drag_begin), app);
+  g_signal_connect (drag, "drag-update", G_CALLBACK (on_sel_drag_update), app);
+  g_signal_connect (drag, "drag-end", G_CALLBACK (on_sel_drag_end), app);
+  gtk_widget_add_controller (GTK_WIDGET (app->area), GTK_EVENT_CONTROLLER (drag));
+
   gtk_grid_attach (GTK_GRID (grid), GTK_WIDGET (app->area), 0, 0, 1, 1);
   gtk_grid_attach (GTK_GRID (grid), vscroll, 1, 0, 1, 1);
   gtk_grid_attach (GTK_GRID (grid), hscroll, 0, 1, 1, 1);
@@ -2278,6 +2820,28 @@ on_window_map (GtkWidget *widget, gpointer data)
               (double) dt / 1000.0);
 }
 
+/* On window destroy (app quit): stop timers + JOIN the copy worker while the
+ * document is still alive (leaf-before-root), then NULL widget pointers so any
+ * later teardown code is a guarded no-op (avoids touching freed widgets). */
+static void
+on_window_destroy (GtkWidget *widget, gpointer data)
+{
+  (void) widget;
+  App *app = data;
+  if (app->poll_id != 0)        { g_source_remove (app->poll_id);        app->poll_id = 0; }
+  if (app->net_poll_id != 0)    { g_source_remove (app->net_poll_id);    app->net_poll_id = 0; }
+  if (app->find_notice_id != 0) { g_source_remove (app->find_notice_id); app->find_notice_id = 0; }
+  if (app->jump_reject_id != 0) { g_source_remove (app->jump_reject_id); app->jump_reject_id = 0; }
+  app->window = NULL;
+  app->title = NULL;
+  app->area = NULL;
+  app->hp_box = NULL;
+  app->hp_bar = NULL;
+  app->hp_cancel = NULL;
+  app->copy_button = NULL;
+  copy_stop_and_join (app);     /* joins the worker; widget calls now no-op */
+}
+
 /* Build the single window once (idempotent). Shared by "activate" (no file) and
  * "open" (a file passed on the command line / by the file manager). */
 static void
@@ -2291,6 +2855,7 @@ ensure_window (App *app, GtkApplication *gtk_app)
   GtkWidget *win = adw_application_window_new (gtk_app);
   app->window = GTK_WINDOW (win);
   g_signal_connect (win, "map", G_CALLBACK (on_window_map), app);
+  g_signal_connect (win, "destroy", G_CALLBACK (on_window_destroy), app);
 
   /* Ctrl+F opens find from anywhere in the window (capture phase). */
   GtkEventController *win_keys = gtk_event_controller_key_new ();
@@ -2356,6 +2921,20 @@ ensure_window (App *app, GtkApplication *gtk_app)
   build_jump_popover (app);
   gtk_menu_button_set_popover (GTK_MENU_BUTTON (jump_btn), GTK_WIDGET (app->jump_popover));
   adw_header_bar_pack_end (ADW_HEADER_BAR (header), jump_btn);
+
+  /* Copy affordance: a header-bar Copy button (Ctrl+C on the grid also works),
+   * sensitive only when there is a selection. */
+  GtkWidget *copy_btn = gtk_button_new_from_icon_name ("edit-copy-symbolic");
+  gtk_widget_set_tooltip_text (copy_btn, "Copy selection (Ctrl+C)");
+  gtk_widget_set_sensitive (copy_btn, FALSE);
+  app->copy_button = GTK_BUTTON (copy_btn);
+  g_signal_connect (copy_btn, "clicked", G_CALLBACK (on_copy_button_clicked), app);
+  adw_header_bar_pack_start (ADW_HEADER_BAR (header), copy_btn);
+
+  /* Reusable header-bar progress (determinate bar + inline cancel) for long ops;
+   * hidden until a copy (or a future scan/network op) drives it. */
+  build_header_progress (app);
+  adw_header_bar_pack_end (ADW_HEADER_BAR (header), app->hp_box);
 
   /* Banner (network progress) above the swappable content stack. */
   app->banner = ADW_BANNER (adw_banner_new (""));
