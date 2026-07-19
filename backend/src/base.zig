@@ -32,7 +32,16 @@ const Reader = reader_mod.Reader;
 /// re-lex distance of any window to O(interval + window).
 pub const checkpoint_interval: u64 = 2048;
 
+/// The LOCAL (mmap/gzip) open-head budget — the full 4 MiB (disk-cheap; the
+/// exact-count corpus + the ABI determinism-pin ACs depend on it byte-identically).
 pub const head_budget: u64 = api.open_head_max_bytes;
+/// The NETWORK open-head budget — deliberately small (the author: "256 KiB, row
+/// estimation secondary to speed") so a slow-link open FETCHES + INDEXES only
+/// this much (~4x faster open). SINGLE SOURCE OF TRUTH for the network head size:
+/// net_source's open prefetch reads it directly (that module is always the
+/// network path) and index.zig's headBudget() selects it when doc.net — no other
+/// site hardcodes the size or re-decides net-vs-local.
+pub const net_head_budget: u64 = 256 * 1024;
 
 // --- Small value types ------------------------------------------------------
 

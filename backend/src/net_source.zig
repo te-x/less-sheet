@@ -15,6 +15,7 @@
 
 const std = @import("std");
 const api = @import("api");
+const base = @import("base.zig");
 const source_mod = @import("source.zig");
 
 const posix = std.posix;
@@ -28,7 +29,10 @@ fn sleepMs(ms: u64) void {
 
 pub const chunk_bytes: u64 = 256 * 1024; // mirrors source.chunk_bytes
 pub const cache_ceiling: u64 = 16 * 1024 * 1024; // 16 MiB resident RAM bound (AC15)
-const open_bytes: u64 = api.open_head_max_bytes;
+// The network open-head prefetch size. net_source is ALWAYS the network path,
+// so it reads the single net-head constant directly (no net-vs-local branch here
+// — that decision lives only in index.headBudget). See base.net_head_budget.
+const open_bytes: u64 = base.net_head_budget;
 const redirect_cap: u32 = 3; // Zig std's small fixed redirect cap (AC12)
 
 /// Live-progress callback (round-2 review finding 1): invoked with the running

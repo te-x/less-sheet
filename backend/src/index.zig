@@ -29,13 +29,23 @@ const head_budget = base.head_budget;
 const madvise_release_chunk: u64 = 8 * 1024 * 1024;
 const madvise_keepback: u64 = 2 * 1024 * 1024;
 
+/// The effective O(head) budget for THIS document — the SINGLE net-vs-local
+/// decision site. NETWORK docs use the small net head (base.net_head_budget,
+/// ~256 KiB — the author's "speed over row estimation" perf choice, matching
+/// net_source's prefetch); every LOCAL mmap/gzip doc keeps the full 4 MiB
+/// head_budget byte-identically. No other site branches on doc.net for the head.
+fn headBudget(doc: *const Document) u64 {
+    return if (doc.net) base.net_head_budget else head_budget;
+}
+
 /// The O(head) SOURCE-byte scan bound shared by `root.buildShape`'s record-1
-/// decode and `headScan`: `LS_OPEN_HEAD_MAX_BYTES` minus the BOM, clamped to
+/// decode and `headScan`: the effective head budget minus the BOM, clamped to
 /// the file's true (post-BOM) content length. Obtained from the Reader (see
 /// reader.zig's `posAtByteBudget`) rather than computed here, so this stays a
 /// plain byte-COUNT-to-position request, never arithmetic on a position.
 pub fn headSourceLimit(doc: *const Document) Pos {
-    const budget: u64 = if (head_budget > doc.bom_len) head_budget - doc.bom_len else 0;
+    const hb = headBudget(doc);
+    const budget: u64 = if (hb > doc.bom_len) hb - doc.bom_len else 0;
     return doc.reader.posAtByteBudget(doc.source, doc.reader.start(doc.source), budget);
 }
 
@@ -43,14 +53,15 @@ pub fn headSourceLimit(doc: *const Document) Pos {
 /// they fit within the O(head) byte budget. Files no larger than the budget
 /// are fully indexed here (complete + exact immediately, per the ABI pin).
 pub fn headScan(doc: *Document) void {
-    const lim = headSourceLimit(doc); // == min(budget, source end)
+    const hb = headBudget(doc); // net -> ~256 KiB, local -> 4 MiB (one decision site)
+    const lim = headSourceLimit(doc); // == min(hb, source end)
     var pos = doc.data_start;
     var row: u64 = 0;
     base.beginOversizedChunk(doc);
     while (!doc.reader.atEnd(doc.source, pos)) {
         const b = doc.reader.boundsAfter(doc.source, pos, lim);
         if (b.capped) break; // record spills past the head budget: leave for later
-        if (doc.bom_len + doc.reader.bytesConsumed(doc.source, b.next) > head_budget) break; // keep bytes_scanned <= budget
+        if (doc.bom_len + doc.reader.bytesConsumed(doc.source, b.next) > hb) break; // keep bytes_scanned <= budget
         // ARCH-huge-row-budget: this row's source extent may exceed the
         // WINDOW's per-row scan cap (LS_WINDOW_ROW_SCAN_MAX_BYTES, much
         // smaller than the O(head) budget above) even though headScan itself
