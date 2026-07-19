@@ -7108,7 +7108,19 @@ test "net_ac16: dependencies & size — Zig std only (std.http.Client / std.cryp
 // trip remain human target-host probes (see contracts/api.zig NETWORK notes).
 
 const net_chunk: u64 = 256 * 1024; // net_source.chunk_bytes
-const net_head_chunks: u64 = 16; // open_head_max_bytes (4 MiB) / 256 KiB
+/// The NETWORK-only open head (perf): the author shrank it from the 4 MiB local-mmap
+/// budget to 256 KiB so a slow-link open FETCHES + INDEXES only ~256 KiB (~4x
+/// faster; "row estimation is secondary to speed"). The local mmap/gzip open head
+/// stays api.open_head_max_bytes (4 MiB, disk-cheap). The shrink is net-only and
+/// spans TWO src sites: net_source.open_bytes (the head PREFETCH) AND index.zig
+/// headScan/headSourceLimit (the head INDEX budget), both made net-aware -- see
+/// net_open_head_small (shrinking only the prefetch leaves headScan re-driving the
+/// on-demand fetch back to 4 MiB, MEASURED).
+const net_open_head: u64 = 256 * 1024;
+/// Chunks the net open head spans: with a 256 KiB head that is ONE 256 KiB chunk
+/// (was 16 at the 4 MiB head). Bounds "open streamed ~the head, not the whole
+/// body" in the netFetchCount guards below.
+const net_head_chunks: u64 = 1;
 
 /// Let any AUTO background index work run to a stable point: poll ls_index_poll
 /// until complete OR `budget_ms` elapse; return the final snapshot. On the
@@ -7150,7 +7162,7 @@ test "nfd_ac1: frozen boundary + amendments — sentinel present; local docs una
 
 test "nfd_ac2: no full download — plain CSV, no-range server streams sequentially" {
     const gpa = std.testing.allocator;
-    const body = try genFixedRows(gpa, 600_000); // ~10.8 MiB >> 4 MiB head
+    const body = try genFixedRows(gpa, 600_000); // ~10.8 MiB, far larger than any open head
     defer gpa.free(body);
     var fx: api.NetFixture = .{ .body = body, .honor_ranges = false, .advertise_length = true };
     const doc = try openFakeToDone(&fx);
@@ -7218,7 +7230,7 @@ test "nfd_ac4: no background growth — netFetchCount + frontier flat across pol
 
 test "nfd_ac5: scroll advances the frontier by a bounded amount, never to EOF" {
     const gpa = std.testing.allocator;
-    const body = try genFixedRows(gpa, 600_000); // ~44 chunks; head ~= 233k rows
+    const body = try genFixedRows(gpa, 600_000); // ~44 chunks; 256 KiB net head ~= 14.5k rows
     defer gpa.free(body);
     var fx: api.NetFixture = .{ .body = body, .honor_ranges = true, .advertise_length = true };
     const doc = try openFakeToDone(&fx);
@@ -7412,7 +7424,8 @@ test "nfd_ac13: withhold-then-release — demand beyond released stays SCANNING,
     const gpa = std.testing.allocator;
     const body = try genFixedRows(gpa, 600_000); // ~10.8 MiB
     defer gpa.free(body);
-    // Release the first 5 MiB (covers the 4 MiB head); withhold the rest.
+    // Release the first 5 MiB (far past the 256 KiB net head so the synchronous
+    // open never blocks on a withheld byte); withhold the rest.
     var gate: std.atomic.Value(u64) = .init(5 * 1024 * 1024);
     var fx: api.NetFixture = .{ .body = body, .honor_ranges = false, .advertise_length = true, .withhold = &gate };
     const doc = try openFakeToDone(&fx);
@@ -7687,7 +7700,7 @@ test "nfd_ac25: network filter parks CANCELLED and advances only on a filtered d
     // synchronous to-EOF loop / a background `.scanning` drive would fetch the whole
     // resource — exactly the finding-1 regression this AC locks.
     const gpa = std.testing.allocator;
-    const body = try genFixedRows(gpa, 600_000); // ~10.8 MiB (~42 chunks) >> 4 MiB head
+    const body = try genFixedRows(gpa, 600_000); // ~10.8 MiB (~42 chunks), far larger than the net head
     defer gpa.free(body);
     var fx: api.NetFixture = .{ .body = body, .honor_ranges = true, .advertise_length = true };
     const doc = try openFakeToDone(&fx);
@@ -7799,9 +7812,17 @@ test "net_bug_open_head_roundtrips: a range-server open assembles the head in <=
     // ROUND-TRIP COUNT (the gate-observable, shared-code half of the fix), never
     // the wall clock. The real-probe-body reuse (real transport only — the fake
     // has no probe GET) stays a human target-host probe, like the other net
-    // wall-clocks. RED now: netFetchCount == 16 at open.
+    // wall-clocks. GREEN now (2: chunk 0 + a coalesced 1..15) and after the full
+    // net-head shrink (1: a single 256 KiB head chunk). RED only on a PARTIAL shrink
+    // -- shrinking net_source.open_bytes WITHOUT making index.zig's headScan budget
+    // net-aware leaves headScan re-fetching chunks 1..15 one-by-one (span reads are
+    // 256 KiB chunk-clamped) -> netFetchCount 16 (MEASURED). So this <=2 guard also
+    // catches an incomplete shrink and preserves the O(1)-round-trips (not
+    // O(head/chunk)) guarantee -- even though the multi-chunk COALESCING branch
+    // (ensureChunkRangeLocked, run > 1 chunk) is unreached at a one-chunk head and by
+    // navigation. See net_open_head_small for the head-SIZE pin.
     const gpa = std.testing.allocator;
-    const body = try genFixedRows(gpa, 600_000); // ~10.8 MB: the 4 MiB head spans all 16 chunks
+    const body = try genFixedRows(gpa, 600_000); // ~10.8 MB; body spans ~42 chunks, the net head is one
     defer gpa.free(body);
     var fx: api.NetFixture = .{ .body = body, .honor_ranges = true, .advertise_length = true };
     const doc = try openFakeToDone(&fx);
@@ -7842,7 +7863,7 @@ test "net_bug_jump_progress_evolves: a beyond-EOF net jump-scan reports byte-fro
     const body = try genFixedRows(gpa, 600_000); // ~10.8 MB, KNOWN-length stream (~600k rows)
     defer gpa.free(body);
     const total: u64 = body.len;
-    // Open with a head-covering release (5 MiB > the 4 MiB head budget) so the
+    // Open with a head-covering release (5 MiB, far past the 256 KiB net head) so the
     // SYNCHRONOUS open never blocks on a withheld byte (matches nfd_ac13/nfd_ac22);
     // then withhold the rest so the jump-scan is demand-gated and freezable. Known
     // length (advertise_length) so reaching EOF firms `complete` at the very end.
@@ -7880,6 +7901,42 @@ test "net_bug_jump_progress_evolves: a beyond-EOF net jump-scan reports byte-fro
     gate.store(total, .release);
     const js = try waitJumpDone(doc);
     try std.testing.expectEqual(@as(f64, 1.0), js.progress);
+}
+
+test "net_open_head_small: a network open fetches AND indexes only the ~256 KiB net head, not the 4 MiB local budget (perf lock)" {
+    // the author's net-only perf decision: the network open head shrank 4 MiB -> 256 KiB
+    // so a slow-link open (FETCH + INDEX) is ~4x faster ("row estimation is secondary
+    // to speed"). This pins BOTH costs to the small head, for BOTH fill strategies.
+    //
+    // RED now (pristine 4 MiB head, MEASURED): open fetches + indexes ~4 MiB --
+    // spool_bytes 4194304, bytes_scanned 4194288 -- for range (206) AND sequential
+    // (200). GREEN after the net-only shrink (MEASURED: spool_bytes 262144,
+    // bytes_scanned 262134, one round-trip). The shrink spans net_source.open_bytes
+    // (the head PREFETCH) AND index.zig headScan/headSourceLimit (the head INDEX
+    // budget), both net-aware: shrinking ONLY the prefetch leaves headScan re-driving
+    // the on-demand fetch to 4 MiB (span reads are 256 KiB chunk-clamped), so both
+    // stay ~4 MiB and this stays RED -- forcing the COMPLETE fix. api.open_head_max_bytes
+    // (4 MiB) is UNTOUCHED: it stays the LOCAL-mmap head (the exact-count corpus +
+    // determinism-pin ACs traverse mmap, never net_source.zig, and rely on it).
+    const gpa = std.testing.allocator;
+    const body = try genFixedRows(gpa, 600_000); // ~10.8 MB, far larger than any head
+    defer gpa.free(body);
+    inline for (.{ true, false }) |honor| { // range (206) and no-range (200) servers
+        var fx: api.NetFixture = .{ .body = body, .honor_ranges = honor, .advertise_length = true };
+        const doc = try openFakeToDone(&fx);
+        defer api.ls_close(doc);
+        // (1) fetched head bytes (the NETWORK cost) bounded to ~the 256 KiB head.
+        try std.testing.expect(api.netSpoolStore(doc).bytes <= net_open_head + net_chunk);
+        // (2) indexed head bytes (the CPU/index cost) likewise bounded.
+        try std.testing.expect(api.ls_index_poll(doc).bytes_scanned <= net_open_head + net_chunk);
+        // (3) still a real streamed open, NOT driven to completion in the background.
+        try std.testing.expect(api.netFetchCount(doc) > 0);
+        try std.testing.expectEqual(false, api.ls_index_poll(doc).complete);
+        // (4) the small head still serves the first viewport (rows 0..4095 fit chunk 0).
+        winAll(doc);
+        var b: [8]u8 = undefined;
+        try expectCell(doc, 0, 0, fixedCell(&b, 0));
+    }
 }
 
 // ===========================================================================
