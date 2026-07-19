@@ -1,10 +1,10 @@
-/// Find-seek contracts (ARCH-find-seek app criteria 7–8): the search request
-/// / snapshot types shared with the bridged session (mirroring the
-/// workspace-frozen `api/lesssheet.h` search surface), the pinned numeric
-/// grammar, the frontend cell-matcher seam (highlights), and the find popup's
-/// pure view-model. The core job model (single scan slot, counts, navigation
-/// anchors) is normative in api/lesssheet.h — the doc comments here restate
-/// exactly what the frozen tests pin.
+// Find-seek contracts (ARCH-find-seek app criteria 7–8): the search request
+// / snapshot types shared with the bridged session (mirroring the
+// workspace-frozen `api/lesssheet.h` search surface), the pinned numeric
+// grammar, the frontend cell-matcher seam (highlights), and the find popup's
+// pure view-model. The core job model (single scan slot, counts, navigation
+// anchors) is normative in api/lesssheet.h — the doc comments here restate
+// exactly what the frozen tests pin.
 
 // MARK: - Requests
 
@@ -50,7 +50,7 @@ public enum SearchRequest: Equatable, Sendable {
     case text(query: String, scope: [Int]?)
     /// Single-column typed predicate. Any column may be targeted (hidden
     /// ones included — hiding is presentation state).
-    case predicate(column: Int, op: SearchOperator, value: String)
+    case predicate(column: Int, comparison: SearchOperator, value: String)
 }
 
 // MARK: - Navigation
@@ -148,38 +148,76 @@ public struct SearchSnapshot: Equatable, Sendable {
 /// (Contract-level policy, small enough to live here — like
 /// `GenericColumnName`.)
 public enum NumericGrammar {
+    /// True iff `text` fully matches the pinned numeric grammar (see above).
+    /// Composed from small single-purpose scanners over the UTF-8 bytes so the
+    /// whole grammar stays byte-for-byte identical to the core's, with each
+    /// scanner advancing a shared cursor.
     public static func isNumeric(_ text: String) -> Bool {
         let bytes = Array(text.utf8)
-        var lo = 0
-        var hi = bytes.count
-        func isWs(_ b: UInt8) -> Bool { b == 0x20 || (0x09...0x0D).contains(b) }
-        while lo < hi, isWs(bytes[lo]) { lo += 1 }
-        while hi > lo, isWs(bytes[hi - 1]) { hi -= 1 }
-        guard lo < hi else { return false }
-        var i = lo
-        func isDigit(_ b: UInt8) -> Bool { (0x30...0x39).contains(b) }
-        if bytes[i] == UInt8(ascii: "+") || bytes[i] == UInt8(ascii: "-") { i += 1 }
-        var intDigits = 0
-        while i < hi, isDigit(bytes[i]) { i += 1; intDigits += 1 }
-        var hasSignificand = intDigits > 0
-        if i < hi, bytes[i] == UInt8(ascii: ".") {
-            i += 1
-            var fracDigits = 0
-            while i < hi, isDigit(bytes[i]) { i += 1; fracDigits += 1 }
-            if intDigits == 0, fracDigits == 0 { return false } // lone '.'
-            if fracDigits > 0 { hasSignificand = true }
-        } else if intDigits == 0 {
-            return false
+        guard let body = trimmedBody(bytes) else { return false }
+        var cursor = body.lowerBound
+        consumeSign(bytes, &cursor, body.upperBound)
+        guard let hasSignificand = consumeSignificand(bytes, &cursor, body.upperBound),
+              hasSignificand else { return false }
+        guard consumeExponent(bytes, &cursor, body.upperBound) else { return false }
+        return cursor == body.upperBound
+    }
+
+    private static func isWhitespace(_ byte: UInt8) -> Bool {
+        byte == 0x20 || (0x09...0x0D).contains(byte)
+    }
+
+    private static func isDigit(_ byte: UInt8) -> Bool {
+        (0x30...0x39).contains(byte)
+    }
+
+    /// The non-empty index range left after stripping ASCII whitespace from
+    /// both ends, or nil when nothing (or only whitespace) remains.
+    private static func trimmedBody(_ bytes: [UInt8]) -> Range<Int>? {
+        var lower = 0
+        var upper = bytes.count
+        while lower < upper, isWhitespace(bytes[lower]) { lower += 1 }
+        while upper > lower, isWhitespace(bytes[upper - 1]) { upper -= 1 }
+        return lower < upper ? lower ..< upper : nil
+    }
+
+    /// Consume one optional leading `+`/`-` at `cursor`.
+    private static func consumeSign(_ bytes: [UInt8], _ cursor: inout Int, _ upper: Int) {
+        guard cursor < upper else { return }
+        if bytes[cursor] == UInt8(ascii: "+") || bytes[cursor] == UInt8(ascii: "-") { cursor += 1 }
+    }
+
+    /// Consume consecutive ASCII digits at `cursor`; returns how many.
+    private static func consumeDigits(_ bytes: [UInt8], _ cursor: inout Int, _ upper: Int) -> Int {
+        var count = 0
+        while cursor < upper, isDigit(bytes[cursor]) { cursor += 1; count += 1 }
+        return count
+    }
+
+    /// Consume the significand (integer digits then an optional `.`-fraction).
+    /// Returns true when at least one significant digit was seen, or nil when
+    /// the significand is malformed: a lone `.`, or neither integer nor
+    /// fraction digits present.
+    private static func consumeSignificand(_ bytes: [UInt8], _ cursor: inout Int, _ upper: Int) -> Bool? {
+        let intDigits = consumeDigits(bytes, &cursor, upper)
+        if cursor < upper, bytes[cursor] == UInt8(ascii: ".") {
+            cursor += 1
+            let fracDigits = consumeDigits(bytes, &cursor, upper)
+            if intDigits == 0 && fracDigits == 0 { return nil } // lone '.'
+            return true
         }
-        guard hasSignificand else { return false }
-        if i < hi, bytes[i] == UInt8(ascii: "e") || bytes[i] == UInt8(ascii: "E") {
-            i += 1
-            if i < hi, bytes[i] == UInt8(ascii: "+") || bytes[i] == UInt8(ascii: "-") { i += 1 }
-            var expDigits = 0
-            while i < hi, isDigit(bytes[i]) { i += 1; expDigits += 1 }
-            if expDigits == 0 { return false } // dangling exponent
-        }
-        return i == hi
+        return intDigits > 0 ? true : nil
+    }
+
+    /// Consume an optional exponent (`(e|E) sign? digits`). Returns false ONLY
+    /// for a dangling exponent (a marker with no digits); true when absent.
+    private static func consumeExponent(_ bytes: [UInt8], _ cursor: inout Int, _ upper: Int) -> Bool {
+        guard cursor < upper else { return true }
+        let marker = bytes[cursor]
+        guard marker == UInt8(ascii: "e") || marker == UInt8(ascii: "E") else { return true }
+        cursor += 1
+        consumeSign(bytes, &cursor, upper)
+        return consumeDigits(bytes, &cursor, upper) > 0
     }
 }
 
@@ -196,20 +234,20 @@ public struct FindDraft: Equatable, Sendable {
     public var text: String
     /// Where mode's column picker (0-based), operator, and value field.
     public var column: Int
-    public var op: SearchOperator
+    public var comparison: SearchOperator
     public var value: String
 
     public init(
         mode: FindMode = .text,
         text: String = "",
         column: Int = 0,
-        op: SearchOperator = .equals,
+        comparison: SearchOperator = .equals,
         value: String = ""
     ) {
         self.mode = mode
         self.text = text
         self.column = column
-        self.op = op
+        self.comparison = comparison
         self.value = value
     }
 

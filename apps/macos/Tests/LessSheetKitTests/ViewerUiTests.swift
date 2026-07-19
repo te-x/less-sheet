@@ -45,7 +45,7 @@ private func openFixture(
     #expect(DocumentOpenError(abiCode: Int32(LS_OK.rawValue)) == nil)
     #expect(DocumentOpenError(abiCode: Int32(LS_ERROR_NOT_FOUND.rawValue)) == .notFound)
     #expect(DocumentOpenError(abiCode: Int32(LS_ERROR_PERMISSION_DENIED.rawValue)) == .permissionDenied)
-    #expect(DocumentOpenError(abiCode: Int32(LS_ERROR_IO.rawValue)) == .io)
+    #expect(DocumentOpenError(abiCode: Int32(LS_ERROR_IO.rawValue)) == .ioFailure)
     #expect(DocumentOpenError(abiCode: Int32(LS_ERROR_INVALID_ARGUMENT.rawValue)) == .invalidArgument)
 }
 
@@ -132,7 +132,7 @@ private func openFixture(
 }
 
 @Test func forcedHeaderOffDemotesTheHeaderRecord() async throws {
-    let session = try await openFixture("people", forcing: DialectOverride(header: .off))
+    let session = try await openFixture("people", forcing: DialectOverride(header: .forcedOff))
     defer { session.close() }
     #expect(session.dialect.hasHeader == false)
     #expect(session.dialect.headerForced == true)
@@ -213,7 +213,7 @@ private func openFixture(
     }
 
     // A path that exists but is not a readable file (a directory) -> io.
-    await #expect(throws: DocumentOpenError.io) {
+    await #expect(throws: DocumentOpenError.ioFailure) {
         _ = try await opener.open(
             path: FileManager.default.temporaryDirectory.path(percentEncoded: false),
             forcing: .sniffAll
@@ -343,9 +343,9 @@ private let sniffedReport = DialectReport(
     #expect(c.compose(from: sniffedReport, changing: .quote(nil))
         == DialectOverride(separator: .sniff, quote: .none, header: .sniff))
     #expect(c.compose(from: sniffedReport, changing: .header(false))
-        == DialectOverride(separator: .sniff, quote: .sniff, header: .off))
+        == DialectOverride(separator: .sniff, quote: .sniff, header: .forcedOff))
     #expect(c.compose(from: sniffedReport, changing: .header(true))
-        == DialectOverride(separator: .sniff, quote: .sniff, header: .on))
+        == DialectOverride(separator: .sniff, quote: .sniff, header: .forcedOn))
 }
 
 @Test func composerCarriesPreviouslyForcedParametersForward() {
@@ -355,7 +355,7 @@ private let sniffedReport = DialectReport(
         separatorForced: true, quoteForced: false, headerForced: true
     )
     #expect(c.compose(from: carried, changing: .quote(0x27))
-        == DialectOverride(separator: .forced(0x3B), quote: .forced(0x27), header: .on))
+        == DialectOverride(separator: .forced(0x3B), quote: .forced(0x27), header: .forcedOn))
 
     let noneQuote = DialectReport(
         separator: 0x2C, quote: nil, hasHeader: false,

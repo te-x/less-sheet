@@ -12,13 +12,13 @@ public enum GenericColumnName {
     /// 26 -> "AA", 27 -> "AB", 701 -> "ZZ", 702 -> "AAA", …
     public static func name(at index: Int) -> String {
         precondition(index >= 0, "column index must be non-negative")
-        var n = index
+        var remaining = index
         var scalars: [Unicode.Scalar] = []
         while true {
-            let r = n % 26
-            scalars.append(Unicode.Scalar(UInt8(65 + r)))
-            n = n / 26 - 1
-            if n < 0 { break }
+            let remainder = remaining % 26
+            scalars.append(Unicode.Scalar(UInt8(65 + remainder)))
+            remaining = remaining / 26 - 1
+            if remaining < 0 { break }
         }
         return String(String.UnicodeScalarView(scalars.reversed()))
     }

@@ -91,8 +91,21 @@ public protocol SettingsLifecycleReducing: Sendable {
     func opened(columnCount: Int, restoring: Int?) -> SettingsLifecycleState
     func closed(_ state: SettingsLifecycleState) -> SettingsLifecycleState
     func columnSelected(_ state: SettingsLifecycleState, column: Int?) -> SettingsLifecycleState
-    func disclosureSet(_ state: SettingsLifecycleState, _ disclosure: SettingsDisclosure, expanded: Bool) -> SettingsLifecycleState
-    func headerAction(_ state: SettingsLifecycleState, target: Int, columnCount: Int, targetInCurrentRows: Bool) -> SettingsLifecycleState
-    func parsingReopened(_ state: SettingsLifecycleState, decision: ColumnReopenDecision, columnCount: Int) -> SettingsLifecycleState
+    func disclosureSet(
+        _ state: SettingsLifecycleState,
+        _ disclosure: SettingsDisclosure,
+        expanded: Bool
+    ) -> SettingsLifecycleState
+    func headerAction(
+        _ state: SettingsLifecycleState,
+        target: Int,
+        columnCount: Int,
+        targetInCurrentRows: Bool
+    ) -> SettingsLifecycleState
+    func parsingReopened(
+        _ state: SettingsLifecycleState,
+        decision: ColumnReopenDecision,
+        columnCount: Int
+    ) -> SettingsLifecycleState
     func documentOpened(columnCount: Int) -> SettingsLifecycleState
 }

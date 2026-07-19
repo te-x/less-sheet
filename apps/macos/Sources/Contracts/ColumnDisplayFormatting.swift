@@ -61,7 +61,7 @@ public enum ColumnDisplay: Equatable, Sendable {
     /// The text a grid draws (original spelling for `.original`/`.formatUnavailable`).
     public var text: String {
         switch self {
-        case let .original(s), let .formatted(s), let .formatUnavailable(s): return s
+        case let .original(value), let .formatted(value), let .formatUnavailable(value): return value
         }
     }
 }

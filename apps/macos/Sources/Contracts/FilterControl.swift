@@ -1,19 +1,19 @@
-/// Filtered-views contracts (ARCH-filtered-views app criteria 16–18): the
-/// filter poll-snapshot mirror and the "Filtered — N of M rows" banner
-/// view-model. The core model — a filter is an in-place VIEW MODE that remaps
-/// every row accessor, jump, and search into FILTERED coordinates, tracked by
-/// per-block counters (never a match-row list), with each match's original row
-/// number retrievable via the session's `sourceRow` — is normative in
-/// api/lesssheet.h FILTERED VIEWS and mirrored on `DocumentSession`
-/// (setFilter / clearFilter / filterStatus / sourceRow). The doc comments here
-/// restate exactly what the frozen tests pin.
-///
-/// Composing a filter reuses the Find popup verbatim (ARCH req. 10 — "no new
-/// predicate UI"): the app validates the draft through `FindControlling.submit`
-/// and, on `.run(request)`, routes the SAME `SearchRequest` to
-/// `DocumentSession.setFilter` instead of `startSearch`. There is therefore no
-/// separate filter-composition entry point; the filter surface adds only the
-/// poll mirror, the source-row mapping (on the session), and this banner.
+// Filtered-views contracts (ARCH-filtered-views app criteria 16–18): the
+// filter poll-snapshot mirror and the "Filtered — N of M rows" banner
+// view-model. The core model — a filter is an in-place VIEW MODE that remaps
+// every row accessor, jump, and search into FILTERED coordinates, tracked by
+// per-block counters (never a match-row list), with each match's original row
+// number retrievable via the session's `sourceRow` — is normative in
+// api/lesssheet.h FILTERED VIEWS and mirrored on `DocumentSession`
+// (setFilter / clearFilter / filterStatus / sourceRow). The doc comments here
+// restate exactly what the frozen tests pin.
+//
+// Composing a filter reuses the Find popup verbatim (ARCH req. 10 — "no new
+// predicate UI"): the app validates the draft through `FindControlling.submit`
+// and, on `.run(request)`, routes the SAME `SearchRequest` to
+// `DocumentSession.setFilter` instead of `startSearch`. There is therefore no
+// separate filter-composition entry point; the filter surface adds only the
+// poll mirror, the source-row mapping (on the session), and this banner.
 
 // MARK: - Filter poll snapshot
 

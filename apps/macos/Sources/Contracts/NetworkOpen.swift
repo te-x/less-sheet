@@ -57,7 +57,13 @@ public struct NetworkOpenProgress: Sendable, Equatable {
     /// The failure, valid only when `state == .failed`.
     public let error: NetworkOpenError?
 
-    public init(state: NetworkOpenState, fraction: Double?, bytesFetched: UInt64, bytesTotal: UInt64, error: NetworkOpenError?) {
+    public init(
+        state: NetworkOpenState,
+        fraction: Double?,
+        bytesFetched: UInt64,
+        bytesTotal: UInt64,
+        error: NetworkOpenError?
+    ) {
         self.state = state
         self.fraction = fraction
         self.bytesFetched = bytesFetched
@@ -67,7 +73,14 @@ public struct NetworkOpenProgress: Sendable, Equatable {
 
     /// Maps the raw ABI poll fields into a snapshot. `progress` is the ABI's
     /// double (`LS_NET_PROGRESS_UNKNOWN` == -1.0 becomes `fraction == nil`).
-    public init(abiState: Int32, progress: Double, bytesFetched: UInt64, bytesTotal: UInt64, abiError: Int32, httpStatus: Int32) {
+    public init(
+        abiState: Int32,
+        progress: Double,
+        bytesFetched: UInt64,
+        bytesTotal: UInt64,
+        abiError: Int32,
+        httpStatus: Int32
+    ) {
         self.state = NetworkOpenState(abiState: abiState) ?? .failed
         self.fraction = progress < 0 ? nil : progress
         self.bytesFetched = bytesFetched

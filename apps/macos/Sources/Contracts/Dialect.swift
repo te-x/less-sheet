@@ -31,9 +31,9 @@ public enum HeaderOverride: Equatable, Sendable {
     /// Apply the pinned suggestion grammar (LS_SNIFF).
     case sniff
     /// Force record 1 to be the header (LS_HEADER_ON).
-    case on
+    case forcedOn
     /// Force record 1 to be data row 0 (LS_HEADER_OFF).
-    case off
+    case forcedOff
 }
 
 /// The resolved source encoding the core REPORTS (mirrors the concrete
@@ -173,8 +173,8 @@ public enum DialectChange: Equatable, Sendable {
 ///   Encoding carries the same way: `.encoding(report.encoding)` when
 ///   `encodingForced`, else `.automatic` (re-detected on the re-open).
 /// - The `change` is then applied as the forced value of its parameter
-///   (header: `.on` / `.off`; encoding: the chosen `EncodingOverride`,
-///   `.automatic` included — choosing Automatic re-detects).
+///   (header: `.forcedOn` / `.forcedOff`; encoding: the chosen
+///   `EncodingOverride`, `.automatic` included — choosing Automatic re-detects).
 /// - An `.encoding` change never fails (any `EncodingOverride` is valid) and
 ///   never affects the dialect bytes; it only sets `encoding`.
 /// - Returns nil (selection rejected, no re-open) when the change is

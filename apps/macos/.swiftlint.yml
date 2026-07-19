@@ -1,0 +1,14 @@
+# less-sheet — macOS frontend SwiftLint policy.
+#
+# MAXIMAL STRICT (the author's informed choice, 2026-07): every default rule stays
+# ON at its default configuration. NOTHING is disabled and NOTHING is relaxed —
+# including identifier_name (short names are RENAMED to meaningful identifiers,
+# never whitelisted). The opt-in rule set is deliberately NOT enabled, so the
+# bar is exactly the default rule set run under `--strict` (the cleanup
+# baseline), not a larger one.
+#
+# Rule SCOPE is set by the gate command (`swiftlint lint --strict Sources`);
+# the only path config here keeps an ad-hoc bare `swiftlint` run from crawling
+# SwiftPM build artifacts. It is path scoping, not a rule relaxation.
+excluded:
+  - .build

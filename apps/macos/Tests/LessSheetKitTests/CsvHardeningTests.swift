@@ -159,7 +159,7 @@ private func matchedRows(_ session: any DocumentSession, _ request: SearchReques
         encoding: .utf8, encodingForced: false
     )
     #expect(c.compose(from: forcedSep, changing: .encoding(.windows1252))
-        == DialectOverride(separator: .forced(0x3B), quote: .sniff, header: .on, encoding: .windows1252))
+        == DialectOverride(separator: .forced(0x3B), quote: .sniff, header: .forcedOn, encoding: .windows1252))
 }
 
 // MARK: - Bridge: the reported encoding + picker surfacing (criteria 1-4, 18)

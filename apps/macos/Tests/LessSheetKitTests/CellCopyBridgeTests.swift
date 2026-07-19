@@ -22,13 +22,13 @@
 // `CoreDocumentSession` does NOT yet override `copyCell`, so it resolves to the
 // DEFAULT protocol-extension impl (DocumentSession.swift), which returns
 // `.noCell` for EVERY cell — nothing copies. The assertions below then fail on
-// behavior: `.status` is `.noCell` (not `.ok`), `.text` is "" (not the cell
+// behavior: `.status` is `.noCell` (not `.served`), `.text` is "" (not the cell
 // content). The tree still COMPILES (the default keeps every conformer building,
 // including this call site).
 //
 // RED → GREEN (implementer): OVERRIDE `copyCell` in `CoreDocumentSession` to call
 // `ls_cell_copy(doc, row, col, buf, maxBytes, &outLen, &outTruncated)` into a
-// `maxBytes` buffer and map `ls_copy_result` → `CopiedCell` (.ok/.pending/.noCell,
+// `maxBytes` buffer and map `ls_copy_result` → `CopiedCell` (.served/.pending/.noCell,
 // the written UTF-8 bytes as `text`, `outTruncated` as `truncated`); route the
 // App's Cmd+C copy through it (as the `CopyCellFetch` closure, off the main
 // thread). PENDING (a row past the frontier) is exercised by the backend suite
@@ -66,21 +66,21 @@ struct CellCopyBridgeTests {
         // Window-INDEPENDENT: copy WITHOUT any prior `setWindow`. The full cell
         // comes back — NOT the 4 KiB-capped display bytes.
         let cell = session.copyCell(row: 0, column: 0, maxBytes: 1 << 20)
-        #expect(cell.status == .ok)
+        #expect(cell.status == .served)
         #expect(cell.truncated == false)
         #expect(cell.text.count == 5000)
         #expect(cell.text == big)
 
         // A small per-cell cap → a boundary-cut prefix, flagged truncated.
         let capped = session.copyCell(row: 0, column: 0, maxBytes: 10)
-        #expect(capped.status == .ok)
+        #expect(capped.status == .served)
         #expect(capped.truncated == true)
         #expect(capped.text.utf8.count <= 10)
         #expect(big.hasPrefix(capped.text))             // a genuine prefix of the cell
 
         // The short neighbor round-trips whole.
         let short = session.copyCell(row: 0, column: 1, maxBytes: 1 << 20)
-        #expect(short.status == .ok)
+        #expect(short.status == .served)
         #expect(short.text == "short")
 
         // No such column → `.noCell` (distinct from `.pending`).

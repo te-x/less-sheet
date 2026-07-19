@@ -14,7 +14,7 @@
 public enum CopyCellStatus: Sendable, Equatable {
     /// `LS_COPY_OK` — the cell was read; `text` holds its content (empty for an
     /// empty cell), `truncated` says whether the per-cell byte cap cut it.
-    case ok
+    case served
     /// `LS_COPY_PENDING` — the row lies at/beyond the scan frontier: not yet
     /// locatable, nothing read. A PER-ROW condition (a locatable row serves every
     /// column). The builder stops at this row boundary (`.stoppedAtFrontier`);
@@ -46,7 +46,7 @@ public struct CopiedCell: Sendable, Equatable {
 
     /// An empty, servable cell (`LS_COPY_OK`, no content) — the common padding
     /// result for a short row's trailing columns.
-    public static let empty = CopiedCell(status: .ok, text: "", truncated: false)
+    public static let empty = CopiedCell(status: .served, text: "", truncated: false)
 }
 
 /// The copy TUNABLES (ARCH: "a tunable frontend constant"). `.standard` carries

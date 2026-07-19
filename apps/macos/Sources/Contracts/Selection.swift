@@ -62,7 +62,7 @@ public struct GridExtent: Equatable, Sendable {
 
 /// A single-step cursor move for arrow / shift-arrow interactions.
 public enum SelectionDirection: Sendable, Equatable {
-    case up, down, left, right
+    case upward, down, left, right
 }
 
 /// The NORMALIZED selection rectangle — the two corners sorted so `top <= bottom`

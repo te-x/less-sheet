@@ -100,7 +100,7 @@ struct SelectCopyTests {
         let atRight = Selection(anchor: GridCell(row: 0, column: 49), active: GridCell(row: 0, column: 49))
         #expect(m.move(atRight, .right, in: extent).active == GridCell(row: 0, column: 49))
         let atTop = Selection(anchor: GridCell(row: 0, column: 3), active: GridCell(row: 0, column: 3))
-        #expect(m.move(atTop, .up, in: extent).active == GridCell(row: 0, column: 3))
+        #expect(m.move(atTop, .upward, in: extent).active == GridCell(row: 0, column: 3))
     }
 
     // Shift-arrow → extend by one: anchor kept, active steps. RED: the seed's

@@ -146,7 +146,7 @@ private func waitJump(_ session: any DocumentSession) async throws -> UInt64 {
     let session = try await openFiltered()
     defer { session.close() }
     // qty (col 1) >= 2 -> source rows 0,1,2,4,6 (m = 5).
-    try #require(session.setFilter(.predicate(column: 1, op: .greaterOrEqual, value: "2")), "core rejected the filter")
+    try #require(session.setFilter(.predicate(column: 1, comparison: .greaterOrEqual, value: "2")), "core rejected the filter")
     let done = try await waitFilter(session) { $0.totalIsFinal }
     #expect(done.total == 5)
     #expect(session.rowCount() == RowCountInfo(count: 5, isExact: true))
@@ -182,7 +182,7 @@ private func waitJump(_ session: any DocumentSession) async throws -> UInt64 {
     var draft = FindDraft.empty
     draft.mode = .predicate
     draft.column = 1
-    draft.op = .greaterOrEqual
+    draft.comparison = .greaterOrEqual
     draft.value = "2"
     let composed = FindSession(draft: draft, display: FindControl().initial().display)
     guard case let .run(request) = FindControl().submit(composed, visibleColumns: [0, 1, 2], columnCount: 3) else {
@@ -238,7 +238,7 @@ private func waitJump(_ session: any DocumentSession) async throws -> UInt64 {
     let session = try await openFiltered()
     defer { session.close() }
     // Filter qty >= 2 -> source 0,1,2,4,6 (filtered 0..4).
-    try #require(session.setFilter(.predicate(column: 1, op: .greaterOrEqual, value: "2")), "core rejected the filter")
+    try #require(session.setFilter(.predicate(column: 1, comparison: .greaterOrEqual, value: "2")), "core rejected the filter")
     _ = try await waitFilter(session) { $0.totalIsFinal }
     // Find "needle" within the filter: filtered rows 0,1,2,4 match (filtered 3 =
     // source 4 "Gizmo" does not) -> total within the filter = 4.
@@ -291,7 +291,7 @@ private func waitJump(_ session: any DocumentSession) async throws -> UInt64 {
     _ = try await waitSearch(session) { $0.totalIsFinal }
     #expect(session.searchStatus() != nil)
     // ...is RESET when a filter is set (the coordinate space changed).
-    try #require(session.setFilter(.predicate(column: 1, op: .greaterOrEqual, value: "2")), "core rejected the filter")
+    try #require(session.setFilter(.predicate(column: 1, comparison: .greaterOrEqual, value: "2")), "core rejected the filter")
     #expect(session.searchStatus() == nil)
     // A find within the filter, then CLEARING the filter, resets it again.
     try #require(session.startSearch(.text(query: "needle", scope: nil)), "core rejected the search")
@@ -300,9 +300,9 @@ private func waitJump(_ session: any DocumentSession) async throws -> UInt64 {
     #expect(session.searchStatus() == nil)
     // A dialect RE-OPEN is a fresh session (new document identity): no filter,
     // no search — the state died with the old handle.
-    try #require(session.setFilter(.predicate(column: 1, op: .greaterOrEqual, value: "2")), "core rejected the filter")
+    try #require(session.setFilter(.predicate(column: 1, comparison: .greaterOrEqual, value: "2")), "core rejected the filter")
     _ = try await waitFilter(session) { $0.totalIsFinal }
-    let reopened = try await openFiltered(forcing: DialectOverride(header: .off))
+    let reopened = try await openFiltered(forcing: DialectOverride(header: .forcedOff))
     defer { reopened.close() }
     #expect(reopened.filterStatus() == nil)
     #expect(reopened.searchStatus() == nil)

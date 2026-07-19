@@ -148,10 +148,10 @@ private let sampleRequest = SearchRequest.text(query: "x", scope: nil)
     var s = c.initial()
     s.draft.mode = .predicate
     s.draft.column = 1
-    s.draft.op = .lessOrEqual
+    s.draft.comparison = .lessOrEqual
     s.draft.value = "2.5"
     #expect(c.submit(s, visibleColumns: [0, 1], columnCount: 2)
-        == .run(.predicate(column: 1, op: .lessOrEqual, value: "2.5")))
+        == .run(.predicate(column: 1, comparison: .lessOrEqual, value: "2.5")))
     // Ordering + non-numeric value -> the rejection state (blink + shake),
     // BEFORE any core call.
     s.draft.value = "abc"
@@ -161,13 +161,13 @@ private let sampleRequest = SearchRequest.text(query: "x", scope: nil)
     s.draft.value = "1,000"
     #expect(c.submit(s, visibleColumns: [0, 1], columnCount: 2) == .rejected)
     // = and ≠ accept any value — the empty one matches empty cells.
-    s.draft.op = .equals
+    s.draft.comparison = .equals
     s.draft.value = ""
     #expect(c.submit(s, visibleColumns: [0, 1], columnCount: 2)
-        == .run(.predicate(column: 1, op: .equals, value: "")))
+        == .run(.predicate(column: 1, comparison: .equals, value: "")))
     // A hidden column is a legal predicate target (the picker marks it)...
     #expect(c.submit(s, visibleColumns: [0], columnCount: 2)
-        == .run(.predicate(column: 1, op: .equals, value: "")))
+        == .run(.predicate(column: 1, comparison: .equals, value: "")))
     // ...but a column outside the document is not.
     s.draft.column = 5
     #expect(c.submit(s, visibleColumns: [0, 1], columnCount: 2) == .rejected)
@@ -434,7 +434,7 @@ private let sampleRequest = SearchRequest.text(query: "x", scope: nil)
     let session = try await openFindFixture()
     defer { session.close() }
     // qty <= 2 numerically: rows 0 (2), 2 (2.0), 3 (-3), 5 (0.5) — m = 4.
-    try #require(session.startSearch(.predicate(column: 1, op: .lessOrEqual, value: "2")))
+    try #require(session.startSearch(.predicate(column: 1, comparison: .lessOrEqual, value: "2")))
     session.navigateSearch(.fromTop)
     let first = try await waitSearch(session) {
         if case .found = $0.nav { return true } else { return false }
@@ -449,17 +449,17 @@ private let sampleRequest = SearchRequest.text(query: "x", scope: nil)
     session.navigateSearch(.fromEnd)
     #expect(session.searchStatus()?.nav == .found(SearchMatch(row: 5, column: 1), position: 4))
     // Byte-exact equality distinguishes representations ("2.0" vs "2").
-    #expect(try await matchedRows(session, .predicate(column: 1, op: .equals, value: "2.0")) == [2])
-    #expect(try await matchedRows(session, .predicate(column: 1, op: .equals, value: "2")) == [0])
+    #expect(try await matchedRows(session, .predicate(column: 1, comparison: .equals, value: "2.0")) == [2])
+    #expect(try await matchedRows(session, .predicate(column: 1, comparison: .equals, value: "2")) == [0])
     // The empty value matches the empty cell (ragged/pad rule).
-    #expect(try await matchedRows(session, .predicate(column: 0, op: .equals, value: "")) == [6])
+    #expect(try await matchedRows(session, .predicate(column: 0, comparison: .equals, value: "")) == [6])
     // Core-side enforcement mirrors the composer: rejected starts change
     // nothing (the previous search stays polled).
-    try #require(session.startSearch(.predicate(column: 1, op: .lessOrEqual, value: "2")))
+    try #require(session.startSearch(.predicate(column: 1, comparison: .lessOrEqual, value: "2")))
     _ = try await waitSearch(session) { $0.totalIsFinal }
-    #expect(session.startSearch(.predicate(column: 1, op: .lessThan, value: "abc")) == false)
+    #expect(session.startSearch(.predicate(column: 1, comparison: .lessThan, value: "abc")) == false)
     #expect(session.startSearch(.text(query: "", scope: nil)) == false)
-    #expect(session.startSearch(.predicate(column: 9, op: .equals, value: "x")) == false)
+    #expect(session.startSearch(.predicate(column: 9, comparison: .equals, value: "x")) == false)
     #expect(session.searchStatus()?.total == 4)
     #expect(session.searchStatus()?.totalIsFinal == true)
 }
@@ -484,7 +484,7 @@ private let sampleRequest = SearchRequest.text(query: "x", scope: nil)
     first.close()
     // Dialect re-open (forced header OFF): search state is gone with the old
     // handle, and the re-dialected document matches on its new data row 0.
-    let second = try await openFindFixture(forcing: DialectOverride(header: .off))
+    let second = try await openFindFixture(forcing: DialectOverride(header: .forcedOff))
     defer { second.close() }
     #expect(second.searchStatus() == nil)
     try #require(second.startSearch(.text(query: "name", scope: nil)))

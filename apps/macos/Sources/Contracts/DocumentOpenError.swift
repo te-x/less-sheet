@@ -9,7 +9,7 @@ public enum DocumentOpenError: Error, Equatable, Sendable {
     case permissionDenied
     /// LS_ERROR_IO (3): any other open/read failure, including paths that
     /// exist but cannot be read as a file (e.g. a directory).
-    case io
+    case ioFailure
     /// LS_ERROR_INVALID_ARGUMENT (4): the open options broke the API
     /// contract (a field outside its domain, or forced separator == forced
     /// quote). A correct UI never triggers this — `DialectComposing`
@@ -22,7 +22,7 @@ public enum DocumentOpenError: Error, Equatable, Sendable {
         switch abiCode {
         case 1: self = .notFound
         case 2: self = .permissionDenied
-        case 3: self = .io
+        case 3: self = .ioFailure
         case 4: self = .invalidArgument
         default: return nil
         }

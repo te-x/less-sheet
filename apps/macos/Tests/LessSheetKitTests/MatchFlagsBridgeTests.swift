@@ -89,29 +89,29 @@ private let cases: [FlagCase] = [
             1,0,1, 1,0,1, 1,0,0, 1,0,1, 0,1,1, 0,0,0, 0,0,1, 0,0,1,
           ]),
     // --- AC1: PREDICATE eq/ne (byte-exact) + numeric ordering ------------------
-    .init(name: "qty <= 2", request: .predicate(column: 1, op: .lessOrEqual, value: "2"),
+    .init(name: "qty <= 2", request: .predicate(column: 1, comparison: .lessOrEqual, value: "2"),
           firstColumn: 0, columnCount: 3, golden: [
             0,1,0, 0,0,0, 0,1,0, 0,1,0, 0,0,0, 0,1,0, 0,0,0, 0,0,0,
           ]),
-    .init(name: "qty > 2", request: .predicate(column: 1, op: .greaterThan, value: "2"),
+    .init(name: "qty > 2", request: .predicate(column: 1, comparison: .greaterThan, value: "2"),
           firstColumn: 0, columnCount: 3, golden: [
             0,0,0, 0,1,0, 0,0,0, 0,0,0, 0,1,0, 0,0,0, 0,1,0, 0,0,0,
           ]),
-    .init(name: "qty < 1e2 (== 100)", request: .predicate(column: 1, op: .lessThan, value: "1e2"),
+    .init(name: "qty < 1e2 (== 100)", request: .predicate(column: 1, comparison: .lessThan, value: "1e2"),
           firstColumn: 0, columnCount: 3, golden: [
             0,1,0, 0,1,0, 0,1,0, 0,1,0, 0,0,0, 0,1,0, 0,1,0, 0,0,0,
           ]),
     .init(name: "qty == 2.0 (byte-exact; '2' does not match)",
-          request: .predicate(column: 1, op: .equals, value: "2.0"),
+          request: .predicate(column: 1, comparison: .equals, value: "2.0"),
           firstColumn: 0, columnCount: 3, golden: [
             0,0,0, 0,0,0, 0,1,0, 0,0,0, 0,0,0, 0,0,0, 0,0,0, 0,0,0,
           ]),
-    .init(name: "qty != 10 (byte-exact)", request: .predicate(column: 1, op: .notEquals, value: "10"),
+    .init(name: "qty != 10 (byte-exact)", request: .predicate(column: 1, comparison: .notEquals, value: "10"),
           firstColumn: 0, columnCount: 3, golden: [
             0,1,0, 0,0,0, 0,1,0, 0,1,0, 0,1,0, 0,1,0, 0,1,0, 0,1,0,
           ]),
     .init(name: "name == '' (empty matches the padded/empty cell)",
-          request: .predicate(column: 0, op: .equals, value: ""),
+          request: .predicate(column: 0, comparison: .equals, value: ""),
           firstColumn: 0, columnCount: 3, golden: [
             0,0,0, 0,0,0, 0,0,0, 0,0,0, 0,0,0, 0,0,0, 1,0,0, 0,0,0,
           ]),

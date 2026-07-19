@@ -24,7 +24,7 @@ public enum NetworkOpenError: Error, Equatable, Sendable {
     /// fixed cap.
     case tooManyRedirects
     /// LS_NET_ERROR_IO (6): local spool-file creation/write failure.
-    case io
+    case ioFailure
     /// LS_NET_ERROR_CANCELLED (7): the open was cancelled before completing.
     case cancelled
 
@@ -38,7 +38,7 @@ public enum NetworkOpenError: Error, Equatable, Sendable {
         case 3: self = .timeout
         case 4: self = .httpStatus(Int(httpStatus))
         case 5: self = .tooManyRedirects
-        case 6: self = .io
+        case 6: self = .ioFailure
         case 7: self = .cancelled
         default: return nil
         }
