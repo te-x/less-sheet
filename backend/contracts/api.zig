@@ -1388,7 +1388,6 @@ comptime {
         @compileError("signature drift: ls_window_match_flags");
 }
 
-
 // ===========================================================================
 // thin-frontend-shared-core slice — Phase 2 (ARCH-thin-frontend-shared-core).
 // ADDITIVE: the core-framed streaming TSV COPY JOB family. Mirrors the appended

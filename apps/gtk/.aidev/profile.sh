@@ -36,6 +36,10 @@ CONFORMANCE_CMD='( set -e
   "$CTR" image inspect "$IMG" >/dev/null 2>&1 || "$CTR" build --platform "$PLAT" -t "$IMG" -f .ci/Dockerfile .ci
   "$CTR" run --rm --platform "$PLAT" --security-opt label=disable -v "$REPO":/src -w /src/apps/gtk "$IMG" \
     sh -c "rm -rf build && meson setup build && meson compile -C build" )'
+# QUALITY_CMD deferred: needs a project .clang-format (GNU-based, ColumnLimit tuned) + a reformat pass —
+# LLVM/GNU defaults diverge from the hand-written style (GNU=4613 hunks), so it is its own slice, not a
+# mechanical reformat. NB: -Werror compilation is ALREADY enforced above in CONFORMANCE. Host-run once configured:
+# QUALITY_CMD="clang-format --dry-run -Werror src/*.c include/*.h"
 BEHAVIOR_CMD='( set -e
   CTR="$(command -v docker || command -v podman)"
   case "$(uname -m)" in

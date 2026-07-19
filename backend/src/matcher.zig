@@ -314,9 +314,9 @@ pub const StreamCell = struct {
                 if (self.text_k == self.ctx.value.len) self.text_found = true;
             },
             .predicate => for (bytes) |b| if (self.ctx.op == .eq or self.ctx.op == .ne) {
-                    if (self.len >= self.ctx.value.len or b != self.ctx.value[self.len]) self.equal = false;
-                    self.len += 1;
-                } else self.feedNumeric(b),
+                if (self.len >= self.ctx.value.len or b != self.ctx.value[self.len]) self.equal = false;
+                self.len += 1;
+            } else self.feedNumeric(b),
         }
     }
 
@@ -343,15 +343,21 @@ pub const StreamCell = struct {
             const msd = exp +| @as(i64, @intCast(@min(self.num_int_digits, std.math.maxInt(i64)))) -| 1 -| @as(i64, @intCast(@min(self.num_first.?, std.math.maxInt(i64))));
             var magnitude: Order = if (msd != q.msd_pos) (if (msd < q.msd_pos) .lt else .gt) else self.num_order;
             if (msd == q.msd_pos and magnitude == .eq) {
-                    var i: usize = @intCast(@min(self.num_sig_seen, std.math.maxInt(usize)));
-                    while (i < q.sig_len) : (i += 1) if (q.sigDigit(i) != '0') {
-                        magnitude = .lt;
-                        break;
-                    };
+                var i: usize = @intCast(@min(self.num_sig_seen, std.math.maxInt(usize)));
+                while (i < q.sig_len) : (i += 1) if (q.sigDigit(i) != '0') {
+                    magnitude = .lt;
+                    break;
+                };
             }
             ord = if (self.num_negative) magnitude.invert() else magnitude;
         }
-        return switch (self.ctx.op) { .lt => ord == .lt, .gt => ord == .gt, .le => ord != .gt, .ge => ord != .lt, else => unreachable };
+        return switch (self.ctx.op) {
+            .lt => ord == .lt,
+            .gt => ord == .gt,
+            .le => ord != .gt,
+            .ge => ord != .lt,
+            else => unreachable,
+        };
     }
 };
 

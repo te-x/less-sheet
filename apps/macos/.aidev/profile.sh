@@ -18,5 +18,9 @@ IMPLEMENTATION_PATHS=( "Sources/LessSheetApp" "Sources/LessSheetKit" "Sources/CL
 # prerequisite). The backend build.zig generate-step covers the AC2-4 sweep; this
 # covers only the macOS UI-sample. Heavy cases stay out of the gate (on-demand perf).
 CONFORMANCE_CMD='(cd ../../backend && zig build) && rm -rf .build/*/debug/LessSheet .build/*/debug/*.xctest .build/*/release/LessSheet .build/*/release/*.xctest && swift build && python3 ../../tools/csvgen/gen.py --case unicode_emoji --case eol_crlf --case wide_100k_cols --case enc_utf16le --case happy_numeric --seed 1337 --out .build/corpus-cache'
+# QUALITY_CMD deferred: `swiftlint --strict` has a 333-violation baseline (199 identifier_name,
+# 69 line_length, plus complexity/length) — enabling needs a project .swiftlint.yml tuned to our
+# standards + a cleanup pass (its own slice), not a mechanical reformat. Command once clean:
+# QUALITY_CMD="swiftlint lint --strict Sources"
 BEHAVIOR_CMD="swift test"
 CONTRACT_HOWTO="Data types: struct/enum (Codable where crossing the wire). Signatures: protocol in Sources/Contracts; implementations declare conformance so swiftc enforces the signature, and a frozen test pins it via 'let _: any Foo = FooImpl()'. Tests: XCTest/swift-testing under Tests/. Implementations in Sources/<Target>; keep SwiftUI views thin over the protocol layer. UI-app schemes may need 'xcodebuild -scheme <App> build/test' instead of swift build/test — adjust the commands."

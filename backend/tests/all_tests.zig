@@ -1630,7 +1630,7 @@ test "f4: counts are exact on known layouts — zero, dense, and checkpoint-stra
         try expectFound(s, 9_998, 1, 9_999);
     }
     { // Matches straddling likely checkpoint boundaries: walk every match in
-      // both directions; positions stay exact across block edges.
+        // both directions; positions stay exact across block edges.
         const matches = [_]u64{ 1023, 1024, 2047, 2048, 2049, 4095, 4096, 6143, 6144, 8191, 8192 };
         const fixture = try genNeedleRows(gpa, 10_000, &matches);
         defer gpa.free(fixture);
@@ -2202,8 +2202,8 @@ test "h8: an out-of-domain encoding is a distinct usage error (file untouched)" 
     }
     // ...and every value in the domain opens.
     const good = [_]i32{
-        api.encoding_auto,      api.encoding_utf8,    api.encoding_utf16le,
-        api.encoding_utf16be,   api.encoding_latin1,  api.encoding_windows1252,
+        api.encoding_auto,    api.encoding_utf8,   api.encoding_utf16le,
+        api.encoding_utf16be, api.encoding_latin1, api.encoding_windows1252,
     };
     for (good) |enc| {
         var doc: ?*api.Doc = null;
@@ -2553,7 +2553,6 @@ const fv_fixture =
 
 /// TEXT "needle" (smart-case fold) matches source rows 0,1,2,3,6,7 (m = 6).
 /// WHERE qty(col 1) >= 2 matches source rows 0,1,2,4,6 (m = 5).
-
 fn setFilter(doc: *api.Doc, req: api.SearchRequest) !void {
     try std.testing.expectEqual(true, api.ls_filter_set(doc, &req));
 }
@@ -3946,7 +3945,6 @@ test "abi: the select-copy symbol links through extern linkage; ls_copy_result v
     try std.testing.expectEqual(api.CopyResult.no_cell, res);
 }
 
-
 // ===========================================================================
 // stream-copy slice (ARCH-stream-copy) — the BACKEND COPY CURSOR. Frozen;
 // planner-owned. ls_cell_copy is accelerated by an internal, forward, view-
@@ -4247,7 +4245,6 @@ test "sc5: backwards / re-anchor access stays correct and never slower than from
     try std.testing.expect(baseline >= 100 * n); // from-scratch backwards is interval-costly (RED seed: 0)
     try std.testing.expect(cursor <= baseline); // NEVER SLOWER than locate-from-scratch
 }
-
 
 // ===========================================================================
 // csv-gz slice (ARCH-csv-gz) — transparent, checkpointed `.csv.gz`. Frozen;
@@ -5098,7 +5095,6 @@ test "gz_ac22: uses ONLY the pinned Zig-0.16 std gzip decoder — no runtime dep
     try std.testing.expect(@TypeOf(dec_b) == flate.Decompress);
 }
 
-
 // ===========================================================================
 // window-budget slice (ARCH-window-budget). Frozen; planner-owned. Bounds the
 // SYNCHRONOUS work of ls_window_set to a fixed 8 MiB (8,388,608-byte) aggregate
@@ -5688,7 +5684,6 @@ test "wb_ac13: window retries add no leak and never touch the source file (ARCH 
     defer gpa.free(reread);
     try std.testing.expectEqual(before, std.hash.Crc32.hash(reread)); // source never written
 }
-
 
 // ===========================================================================
 // gz-filter-stream slice — REGRESSION test for a diagnosed csv-gz defect
@@ -7078,7 +7073,6 @@ test "net_ac16: dependencies & size — Zig std only (std.http.Client / std.cryp
     defer od.deinit();
     try expectDims(od.doc, 1, 2);
 }
-
 
 // ===========================================================================
 // never-full-download-streaming slice (ARCH-never-full-download-streaming) —
