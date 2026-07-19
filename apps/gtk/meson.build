@@ -31,7 +31,7 @@ core_inc = include_directories('include')
 # Compiling this under -Werror is the CONFORMANCE gate: the module sources must
 # match the frozen headers exactly or the build fails. The surface grows per
 # slice (slice 1: open/display/scroll; slice 2: find; slice 3: jump; slice 4:
-# filter).
+# filter; slice 5: streaming copy).
 # ---------------------------------------------------------------------------
 lsg_sources = files(
   'src/lsg_document.c',
@@ -42,6 +42,7 @@ lsg_sources = files(
   'src/lsg_find.c',
   'src/lsg_jump.c',
   'src/lsg_filter.c',
+  'src/lsg_copy.c',
 )
 lsgkit = static_library('lsgkit',
   lsg_sources,
@@ -181,3 +182,23 @@ test_filter = executable('test-filter',
   install : false,
 )
 test('filter', test_filter)
+
+# Streaming copy (slice 5): pure view-model (the streamCopy drive-loop FOLD +
+# CopyOutcome — MORE accumulation, byte-budget cut, cell-cap map, STALLED ->
+# advance -> resume with the filtered no-progress guard, cancel, progress) + the
+# copy bridge over the real core (open / next / close; core-framed TSV byte-
+# identical to the macOS path). Reuses find.csv and adds copyquote.csv (TAB /
+# bare-quote / embedded-LF cells) for the spreadsheet-quoting framing.
+copyquote_fixture = meson.current_source_dir() / 'tests' / 'fixtures' / 'copyquote.csv'
+test_copy = executable('test-copy',
+  'tests/test_copy.c',
+  dependencies : test_deps,
+  link_with : lsgkit,
+  include_directories : core_inc,
+  c_args : [
+    '-DFIND_FIXTURE_PATH="' + find_fixture + '"',
+    '-DCOPYQUOTE_FIXTURE_PATH="' + copyquote_fixture + '"',
+  ],
+  install : false,
+)
+test('copy', test_copy)
