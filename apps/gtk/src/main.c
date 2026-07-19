@@ -1622,6 +1622,18 @@ on_window_key (GtkEventControllerKey *ctrl, guint keyval, guint keycode,
           open_jump (app);
           return GDK_EVENT_STOP;
         }
+      /* Ctrl+O opens a local file, Ctrl+Shift+O opens a network URL — mirroring
+       * macOS ⌘O / ⌘⇧O. The two map to different actions, so the Shift modifier
+       * (not the keyval case, which is layout-dependent) selects between them.
+       * action_open / action_open_url ignore their button arg. */
+      if (keyval == GDK_KEY_o || keyval == GDK_KEY_O)
+        {
+          if (state & GDK_SHIFT_MASK)
+            action_open_url (NULL, app);
+          else
+            action_open (NULL, app);
+          return GDK_EVENT_STOP;
+        }
     }
   return GDK_EVENT_PROPAGATE;
 }
@@ -2856,10 +2868,12 @@ build_launch_page (App *app)
   GtkWidget *open = gtk_button_new_with_label ("Open File…");
   gtk_widget_add_css_class (open, "pill");
   gtk_widget_add_css_class (open, "suggested-action");
+  gtk_widget_set_tooltip_text (open, "Open File (Ctrl+O)");
   g_signal_connect (open, "clicked", G_CALLBACK (action_open), app);
 
   GtkWidget *open_url = gtk_button_new_with_label ("Open URL…");
   gtk_widget_add_css_class (open_url, "pill");
+  gtk_widget_set_tooltip_text (open_url, "Open URL (Ctrl+Shift+O)");
   g_signal_connect (open_url, "clicked", G_CALLBACK (action_open_url), app);
 
   gtk_box_append (GTK_BOX (box), open);
@@ -2988,14 +3002,14 @@ ensure_window (App *app, GtkApplication *gtk_app)
   adw_header_bar_set_title_widget (ADW_HEADER_BAR (header), GTK_WIDGET (app->title));
 
   GtkWidget *open_btn = gtk_button_new_from_icon_name ("document-open-symbolic");
-  gtk_widget_set_tooltip_text (open_btn, "Open File");
+  gtk_widget_set_tooltip_text (open_btn, "Open File (Ctrl+O)");
   g_signal_connect (open_btn, "clicked", G_CALLBACK (action_open), app);
   adw_header_bar_pack_start (ADW_HEADER_BAR (header), open_btn);
 
   /* `insert-link-symbolic` is a minimal link glyph present in current Adwaita;
    * the old `emblem-web-symbolic` was dropped from the theme and rendered blank. */
   GtkWidget *url_btn = gtk_button_new_from_icon_name ("insert-link-symbolic");
-  gtk_widget_set_tooltip_text (url_btn, "Open URL");
+  gtk_widget_set_tooltip_text (url_btn, "Open URL (Ctrl+Shift+O)");
   g_signal_connect (url_btn, "clicked", G_CALLBACK (action_open_url), app);
   adw_header_bar_pack_start (ADW_HEADER_BAR (header), url_btn);
 
