@@ -7737,6 +7737,151 @@ test "nfd_ac25: network filter parks CANCELLED and advances only on a filtered d
     // nfd_ac21 covers the local AUTO indexer staying live; not duplicated here.
 }
 
+// ---------------------------------------------------------------------------
+// Real-network CORE-path bug regressions (planner-frozen, RED-first). A
+// diagnosis root-caused three bugs in the http_range (real-transport) path that
+// the instant fake-transport gate never caught (the fake fetchInto returns
+// immediately, so it hides both the per-chunk round-trip cost and every timing-
+// dependent symptom). Two are gate-observable through EXISTING seams and are
+// frozen RED below; the implementer fixes src/ (net_source.zig / net.zig /
+// index.zig) in a later round.
+//
+// NOT frozen — diagnosis bug #1 (the RANDOM ensureSlice holds the HttpRange
+// mutex ACROSS the ~1 s network GET, so the main thread's reads block ~1 s per
+// bg fetch = the UI freeze; the SEQUENTIAL path already unlocks while waiting,
+// net_source.ensureSliceSequentialLocked, and the RANDOM path must mirror it).
+// This is NOT gate-testable from the tests-only (planner) seat: reproducing the
+// contention needs a PAUSABLE random fetchInto on the fake (a blocking gate +
+// an "entered-fetch" handshake on FakeServer in src/) that only the implementer
+// can add — a planner-only test referencing a not-yet-honored fixture field is
+// FALSE-GREEN against the current src (the fake never pauses, so no contention),
+// which fails RED-for-the-right-reason; and the two-thread "the present-byte
+// read returns without blocking on the paused fetch" assertion is a negative /
+// timing property with real flake risk. So bug #1 rests on the reviewer's
+// reasoning + the author's real-host test, the same class as the "real HTTP is
+// fake-seam-only" gotcha. (A future deliberate round COULD gate it by adding
+// that src-side pausable-fetch gate first, then a two-thread harness that starts
+// a bg fetch of a not-yet-present chunk, waits for the "entered" signal, and
+// asserts a second thread's read of an ALREADY-present chunk completes within a
+// deadline while the first fetch is held paused.)
+
+/// Poll a network doc's byte frontier until it reaches at least `target_bytes`
+/// (a released withhold high-water) or a 10 s guard, then return the final
+/// bytes_scanned. Deterministic: the fake serves released bytes instantly, so
+/// the worker drains to the gate and parks — this rides out scheduler jitter
+/// without a fixed sleep. `frontier_pos` and `jump_progress` are folded in the
+/// SAME locked section (index.zig), so once the frontier is observed the jump
+/// progress read right after is consistent with it.
+fn waitNetFrontier(doc: *api.Doc, target_bytes: u64) u64 {
+    const io = std.testing.io;
+    const t0: std.Io.Clock.Timestamp = .now(io, .awake);
+    while (true) {
+        const bs = api.ls_index_poll(doc).bytes_scanned;
+        if (bs >= target_bytes) return bs;
+        if (elapsedMs(t0) > 10_000) return bs;
+        io.sleep(.fromMilliseconds(2), .awake) catch return bs;
+    }
+}
+
+test "net_bug_open_head_roundtrips: a range-server open assembles the head in <=2 transport fetches, not one-per-chunk" {
+    // Diagnosis bug #5 (slow open ~5-7 s): opening a range-supported plain CSV
+    // fetched the 4 MiB head as ONE 256 KiB ranged GET PER CHUNK — chunk 0 for the
+    // magic, then chunks 1..15 individually (16 http_range round-trips; the real
+    // path adds the probe GET whose whole 4 MiB body is fetched then DISCARDED =
+    // ~17). Each real GET is ~a network RTT, so the open stalled for seconds. The
+    // head must instead be assembled in <=2 transport fetches (the magic probe +
+    // at most one COALESCED range GET for the contiguous remainder, or a single
+    // head-prefix GET). `netFetchCount` surfaces the http_range Source's transport
+    // round-trips (hr.fetch_count, ++ once per fetchInto) — so the fix must make
+    // that count reflect ROUND-TRIPS, not chunks.
+    //
+    // Fake-transport scope: the fake fetchInto is instant, so this pins the
+    // ROUND-TRIP COUNT (the gate-observable, shared-code half of the fix), never
+    // the wall clock. The real-probe-body reuse (real transport only — the fake
+    // has no probe GET) stays a human target-host probe, like the other net
+    // wall-clocks. RED now: netFetchCount == 16 at open.
+    const gpa = std.testing.allocator;
+    const body = try genFixedRows(gpa, 600_000); // ~10.8 MB: the 4 MiB head spans all 16 chunks
+    defer gpa.free(body);
+    var fx: api.NetFixture = .{ .body = body, .honor_ranges = true, .advertise_length = true };
+    const doc = try openFakeToDone(&fx);
+    defer api.ls_close(doc);
+    try std.testing.expectEqual(api.NetRangeMode.random_access, api.netRangeMode(doc));
+    // The whole O(head) plain-CSV prefix is fetched at open; the number of TRANSPORT
+    // ROUND-TRIPS to assemble it must collapse to <=2, not one-GET-per-256-KiB-chunk.
+    try std.testing.expect(api.netFetchCount(doc) <= 2);
+    // Sanity: the head is servable (the open actually produced a usable doc).
+    winAll(doc);
+    var b: [8]u8 = undefined;
+    try expectCell(doc, 0, 0, fixedCell(&b, 0));
+}
+
+test "net_bug_jump_progress_evolves: a beyond-EOF net jump-scan reports byte-frontier progress that climbs high, not a target-row ratio stuck near 0" {
+    // Diagnosis bug #6 (jump progress stuck at ~0%): jumping to a row far beyond a
+    // net doc's real EOF makes the core scan toward EOF (reading ~the whole
+    // resource) then clamp to the last row. index.zig `updateJump` derives the
+    // fraction as (frontier_rows - jump_start)/(jump_target - jump_start) — a ratio
+    // against the UNREACHABLE target row. For a 5,000,000-row target on a ~600k-row
+    // doc that caps near ~0.12 and creeps imperceptibly, so the UI shows ~0% for the
+    // whole multi-second scan, then the bar vanishes on the clamp. The fraction must
+    // instead track the scan's advance toward EOF, climbing high as it nears the end.
+    //
+    // Root cause is the FORMULA (source-agnostic in updateJump). Cause (a) — the #1
+    // mutex — is NOT the driver: ls_jump_poll takes only the DOC mutex, which the
+    // worker RELEASES across scanChunk (index.zig), and never the HttpRange mutex;
+    // the per-chunk step cadence is inherent to updateJump and would be unchanged by
+    // the #1 unlock fix.
+    //
+    // Gate-observable via the SEQUENTIAL withhold gate (a range source's instant
+    // fetchInto can't be frozen mid-scan): the gate freezes the frontier at chosen
+    // points so the parked jump_progress is read deterministically. The row-ratio
+    // bug is identical for range and sequential net docs (one shared updateJump), so
+    // this fully exercises it; the real-network per-chunk smoothness is a human
+    // host probe. RED now: p_near ~= 0.07, far below 0.5.
+    const gpa = std.testing.allocator;
+    const body = try genFixedRows(gpa, 600_000); // ~10.8 MB, KNOWN-length stream (~600k rows)
+    defer gpa.free(body);
+    const total: u64 = body.len;
+    // Open with a head-covering release (5 MiB > the 4 MiB head budget) so the
+    // SYNCHRONOUS open never blocks on a withheld byte (matches nfd_ac13/nfd_ac22);
+    // then withhold the rest so the jump-scan is demand-gated and freezable. Known
+    // length (advertise_length) so reaching EOF firms `complete` at the very end.
+    var gate: std.atomic.Value(u64) = .init(5 * 1024 * 1024);
+    var fx: api.NetFixture = .{ .body = body, .honor_ranges = false, .advertise_length = true, .withhold = &gate };
+    const doc = try openFakeToDone(&fx);
+    defer api.ls_close(doc); // signals sourceShutdown -> unblocks a parked worker, joins cleanly
+    try std.testing.expectEqual(api.NetRangeMode.sequential_fallback, api.netRangeMode(doc));
+
+    // Jump FAR beyond the ~600k rows that exist: the scan must run toward EOF.
+    api.ls_jump_start(doc, 5_000_000);
+
+    // Release ~half the body: the scan advances to it and parks; capture progress.
+    gate.store(total / 2, .release);
+    _ = waitNetFrontier(doc, total / 2 - net_chunk);
+    const p_mid = api.ls_jump_poll(doc).progress;
+    try std.testing.expectEqual(api.JumpState.scanning, api.ls_jump_poll(doc).state);
+
+    // Release almost the whole body — but hold back the final chunk so EOF (which
+    // would trivially force progress = 1.0 and mask the bug) never fires. The scan
+    // advances to ~97% of the resource and parks again, still SCANNING.
+    gate.store(total - net_chunk, .release);
+    _ = waitNetFrontier(doc, total - 2 * net_chunk);
+    const p_near = api.ls_jump_poll(doc).progress;
+    try std.testing.expectEqual(api.JumpState.scanning, api.ls_jump_poll(doc).state);
+
+    // BEHAVIOR: the fraction EVOLVES with the scan (advances, never stuck) and, with
+    // the frontier ~97% through the resource, reads HIGH — not the row/5,000,000
+    // ratio that caps near 0. RED now: p_near ~= 0.07, so p_near >= 0.5 fails.
+    try std.testing.expect(p_near > p_mid); // climbs as the scan advances
+    try std.testing.expect(p_near >= 0.5); // near-EOF => a high fraction (RED: ~0.07)
+
+    // Release the tail -> EOF -> the beyond-EOF jump settles DONE, clamped to the
+    // last row, progress exactly 1.0 (the JumpStatus contract invariant, unchanged).
+    gate.store(total, .release);
+    const js = try waitJumpDone(doc);
+    try std.testing.expectEqual(@as(f64, 1.0), js.progress);
+}
+
 // ===========================================================================
 // thin-frontend-shared-core slice — Phase 1: per-window MATCH FLAGS
 // (ls_window_match_flags). Semantics pinned in api/lesssheet.h "MATCH-FLAGS
