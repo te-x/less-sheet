@@ -38,3 +38,29 @@ is allowed once an open completes). False "mutually exclusive" comment corrected
 `src/main.c` only; no frozen drift; gate 10/10. #3/#6 shake+popover visuals + the net-open look are
 the author's desktop/runtime pass; the code-level correctness (banner removal, progress lifecycle, overlap
 serialization) is reviewed sound.
+
+## Follow-up: valid-deep-jump-vanishes → jump-close hardening (2 rounds, PASS)
+the author: a VALID deep jump (row 220k, which EXISTS in the 224k-row net doc) did nothing + the input
+vanished. Diagnosed: **PRIMARY = the core #1/#2 HttpRange-mutex hang** (the ~26 MB scan to row 220k
+freezes the main thread; the separate BACKEND cell fixes it → responsive scan + land). **SECONDARY =
+a pre-existing frontend gap:** `on_jump_popover_closed` (the slice-3 handler) cancelled+restored a
+SCANNING jump on ANY close, so an incidental autohide during the freeze abandoned the valid jump. NOT
+a regression of this batch (the diagnosis ruled out #3/#6/#5).
+- **R1 (preserve):** a `jump_explicit_close` flag distinguishes Escape (explicit → cancel+restore) from
+  an incidental autohide (PRESERVE the scan → the global `grid_poll_tick` timer folds it → lands). ✕
+  untouched (self-handles). Reviewer confirmed the flag lifecycle is leak/misread-free, the land path is
+  not hijacked (LANDED before `closed` fires), and doc-reset tears the scan down (no UAF).
+- **R2 (retire — reviewer's blocking `[impl]`):** preserving a scan past its popover meant it could be
+  alive when FIND or COPY takes the shared scan slot, but only FILTER had the symmetric cleanup → a
+  preserved jump + Find = a phantom-SCANNING **stuck-state** (`ls_search_start` cancels the CORE scan to
+  IDLE but `app->jump` stayed SCANNING; an IDLE poll never resets a live flow → the poll never stops AND
+  `net_drive` keeps yielding → net deep-scrolls show 0 rows, RE-introducing the symptom) + a COPY
+  mis-land. **Fixed** by retiring `app->jump = lsg_jump_initial()` when find (the `ls_search_start`/`nav`
+  slot-take) and copy take the slot, mirroring `do_apply_filter`; deliberately NOT on the empty-query
+  `ls_search_cancel` path (ABI 1256-1264: cancel leaves the jump slot unaffected → a preserved jump
+  legitimately survives a find-clear). Copy `lsg_document_jump_cancel`s + retires before its worker's
+  async `ls_jump_start`. **Reviewer PASS:** the slot-interaction set is now COMPLETE + consistent
+  (filter/find/copy retire; find-cancel + net_drive-yield preserve) — no phantom-SCANNING path remains.
+Gate 10/10, `main.c` only. The interactive deep-net-jump behavior needs the BACKEND mutex fix for its
+primary responsiveness → the author's real-host pass on the combined build. See [[gtk-frontend]] task #21
+(systematic scan-slot coordination — the ad-hoc coordination that produced this + prior findings).

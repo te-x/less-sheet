@@ -118,6 +118,10 @@ typedef struct {
   GtkButton *jump_cancel;
   GtkLabel *jump_status;
   guint jump_reject_id;              /* timeout clearing the rejection blink */
+  gboolean jump_explicit_close;     /* Escape set this before popdown -> the
+                                     * closed handler cancels+restores the scan;
+                                     * an incidental autohide (FALSE) keeps a
+                                     * live deep/net scan alive so it lands. */
 
   /* Filter-to-matches (slice 4): the pure state + the toggle + the banner. */
   LsgFilterState filter;
@@ -1419,6 +1423,13 @@ find_run_query (App *app)
   if (sub.outcome == LSG_FIND_RUN
       && lsg_document_search_start (app->doc, sub.request))
     {
+      /* ls_search_start just TOOK the shared scan slot, cancelling any jump in
+       * LS_JUMP_SCANNING to LS_JUMP_IDLE (ABI). A jump preserved past its
+       * popover (the incidental-autohide case) would now be phantom-SCANNING
+       * forever — an IDLE poll never resets a live flow, so grid_poll_tick
+       * would never stop and net_drive would keep yielding (0-row fetches).
+       * Retire it here, mirroring do_apply_filter. */
+      app->jump = lsg_jump_initial ();
       app->find = lsg_find_began (app->find);
       app->find_nav_direction = LSG_SEARCH_FORWARD;
       app->find_wrap_issued = FALSE;
@@ -1489,6 +1500,12 @@ do_find_step (App *app, LsgSearchDir direction)
   LsgSearchNav nav;
   if (lsg_find_step (app->find, direction, app->cur_top_row, &nav))
     {
+      /* A scanning nav can take the shared slot too (ABI: "a nav that must scan
+       * ... cancelling a jump in LS_JUMP_SCANNING"). Retire any preserved jump so
+       * it can't be left phantom-SCANNING. Reachable only after find_run_query
+       * (find must be active), which already retired it, so this is normally a
+       * no-op — kept for symmetry with the slot-taking find_run_query branch. */
+      app->jump = lsg_jump_initial ();
       app->find_nav_direction = direction;
       app->find_wrap_issued = FALSE;
       lsg_document_search_nav (app->doc, nav);
@@ -1911,18 +1928,51 @@ on_jump_entry_key (GtkEventControllerKey *ctrl, guint keyval, guint keycode,
    * here we only need Escape to close. */
   if (keyval == GDK_KEY_Escape)
     {
+      /* Escape is an EXPLICIT close: flag it so the closed handler cancels the
+       * in-flight scan + restores the viewport (an incidental autohide does not
+       * set this, and instead keeps a live deep/net scan running). */
+      app->jump_explicit_close = TRUE;
       gtk_popover_popdown (app->jump_popover);
       return GDK_EVENT_STOP;
     }
   return GDK_EVENT_PROPAGATE;
 }
 
-/* Close (Esc / click-away): cancel an in-flight scan + restore, reset to idle. */
+/*
+ * Close handler. There are two very different reasons the popover closes and
+ * they must NOT be conflated (this was the valid-deep-jump-vanishes gap):
+ *
+ *  - EXPLICIT close (Escape; app->jump_explicit_close == TRUE): the user is
+ *    abandoning the jump -> cancel the in-flight scan + restore the viewport +
+ *    reset to idle, as before. (The ✕ cancel button takes do_jump_cancel, which
+ *    cancels in place and leaves the popover open, so it never reaches here.)
+ *
+ *  - INCIDENTAL autohide (click-away / focus shift; flag FALSE): the popover
+ *    vanished for an unrelated reason while a legitimately slow deep/network
+ *    scan is still running (a deep net jump is real fetch time — tens of MB /
+ *    seconds). Cancelling it here would silently throw away a valid jump. So
+ *    KEEP the scan alive: do NOT cancel, restore, or reset the flow. The global
+ *    grid_poll_tick keeps folding jump_poll_fold (it is not tied to the
+ *    popover), so when the scan reaches DONE the viewport scrolls to the target
+ *    and the flow resets to idle exactly as a normal land would.
+ */
 static void
 on_jump_popover_closed (GtkPopover *popover, gpointer data)
 {
   (void) popover;
   App *app = data;
+  gboolean explicit = app->jump_explicit_close;
+  app->jump_explicit_close = FALSE;   /* consume: never leak into a later close */
+
+  if (!explicit && app->doc != NULL
+      && app->jump.kind == LSG_JUMP_FLOW_SCANNING)
+    {
+      /* Incidental autohide mid-scan: preserve the live jump so it still lands;
+       * only tidy the transient reject blink. */
+      jump_clear_feedback (app);
+      return;
+    }
+
   if (app->doc != NULL && app->jump.kind == LSG_JUMP_FLOW_SCANNING)
     {
       lsg_document_jump_cancel (app->doc);
@@ -1940,6 +1990,7 @@ on_jump_popover_show (GtkWidget *popover, gpointer data)
 {
   (void) popover;
   App *app = data;
+  app->jump_explicit_close = FALSE;   /* fresh open: default to incidental close */
   gtk_widget_grab_focus (GTK_WIDGET (app->jump_entry));
   gtk_editable_set_position (app->jump_entry, -1);
 }
@@ -2671,6 +2722,15 @@ do_copy (App *app)
   if (app->doc == NULL || app->sel_mode == SEL_NONE || app->copy_op != NULL
       || app->net != NULL)
     return;
+
+  /* The copy worker advances the shared frontier with ls_jump_start(stalled_row)
+   * on its bg thread. A jump preserved past its popover would then resolve to
+   * LANDED(stalled_row) = a wrong scroll to the copy's stall row. Retire it now,
+   * and free the core slot (jump_cancel) so the worker's ls_jump_start has it
+   * cleanly — mirrors do_apply_filter's jump retire before a view change. */
+  if (app->jump.kind == LSG_JUMP_FLOW_SCANNING)
+    lsg_document_jump_cancel (app->doc);
+  app->jump = lsg_jump_initial ();
 
   struct _CopyOp *op = g_new0 (struct _CopyOp, 1);
   op->doc = app->doc;
