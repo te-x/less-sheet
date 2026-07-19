@@ -50,7 +50,6 @@ typedef struct {
   GtkWindow *window;
   AdwWindowTitle *title;
   AdwToolbarView *toolbar;
-  AdwBanner *banner;
   GtkStack *stack;             /* "launch" / "grid" / "error" */
   AdwStatusPage *error_page;
 
@@ -88,8 +87,9 @@ typedef struct {
   guint hdr_first;
   guint hdr_count;
 
-  PangoFontDescription *font_desc;         /* data cells: small sans-serif */
+  PangoFontDescription *font_desc;         /* data cells: small monospace */
   PangoFontDescription *header_font_desc;  /* header row: bold sans-serif */
+  PangoFontDescription *gutter_font_desc;  /* row-number gutter: sans-serif */
 
   /* Network open. */
   LsgNetOpen *net;
@@ -236,6 +236,12 @@ static void do_copy (App *app);
 static void copy_stop_and_join (App *app);
 static void copy_update_affordance (App *app);
 static gboolean selection_contains (App *app, guint64 row, guint col);   /* grid_draw marquee */
+
+/* Reusable header-bar progress (defined in the copy section); the network open
+ * also drives it (unified long-op status). */
+static void header_progress_show (App *app, const char *label);
+static void header_progress_set (App *app, gdouble fraction);
+static void header_progress_hide (App *app);
 
 /* Filter helpers referenced from the earlier find section (the toggle lives in
  * the find popover); defined with the filter helpers below. */
@@ -774,6 +780,7 @@ grid_draw (GtkDrawingArea *area, cairo_t *cr, int width, int height,
   cairo_rectangle (cr, 0.0, header_h, gutter, (double) height - header_h);
   cairo_fill (cr);
   gdk_cairo_set_source_rgba (cr, &fg);
+  pango_layout_set_font_description (layout, app->gutter_font_desc);  /* sans row numbers */
   for (guint32 ri = 0; ri < got_rows; ri++)
     {
       guint64 view_row = span.first_row + ri;
@@ -791,6 +798,7 @@ grid_draw (GtkDrawingArea *area, cairo_t *cr, int width, int height,
       draw_text (cr, layout, label, pad, y, gutter - 2.0 * pad, row_h, line_h);
       g_free (label);
     }
+  pango_layout_set_font_description (layout, app->font_desc);  /* back to data cells */
   cairo_restore (cr);
 
   /* --- column header (sticky top; scrolls horizontally only) --- */
@@ -1021,19 +1029,30 @@ action_open (GtkButton *button, gpointer data)
 /* Open URL (network)                                                         */
 /* ------------------------------------------------------------------------- */
 
+/* Drive the reusable header-bar progress from a network-open poll (the unified
+ * long-op status location — same widget copy uses). Pulse while connecting /
+ * before a byte-fraction is known; determinate "Fetching N%" once head bytes
+ * arrive. This SUBSUMES the old AdwBanner "Fetching …" (one indicator, not two). */
 static void
-update_net_banner (App *app, const LsgNetProgress *p)
+update_net_progress (App *app, const LsgNetProgress *p)
 {
+  if (app->hp_bar == NULL)
+    return;
   char *text;
   if (p->has_fraction)
-    text = g_strdup_printf ("Fetching %s — %d%%",
-                            (app->pending_url != NULL) ? app->pending_url : "",
-                            (int) (p->fraction * 100.0));
+    {
+      header_progress_set (app, p->fraction);            /* determinate */
+      text = g_strdup_printf ("Fetching %d%%", (int) (p->fraction * 100.0));
+    }
   else
-    text = g_strdup_printf ("Fetching %s — %" G_GUINT64_FORMAT " bytes",
-                            (app->pending_url != NULL) ? app->pending_url : "",
-                            p->bytes_fetched);
-  adw_banner_set_title (app->banner, text);
+    {
+      header_progress_set (app, -1.0);                   /* indeterminate pulse */
+      text = (p->bytes_fetched > 0)
+                 ? g_strdup_printf ("Fetching %" G_GUINT64_FORMAT " bytes", p->bytes_fetched)
+                 : g_strdup ("Connecting…");
+    }
+  gtk_progress_bar_set_show_text (app->hp_bar, TRUE);
+  gtk_progress_bar_set_text (app->hp_bar, text);
   g_free (text);
 }
 
@@ -1064,12 +1083,14 @@ net_poll_tick (gpointer data)
     }
 
   LsgNetProgress p = lsg_net_open_poll (app->net);
-  update_net_banner (app, &p);
 
   if (!lsg_net_state_is_terminal (p.state))
-    return G_SOURCE_CONTINUE;
+    {
+      update_net_progress (app, &p);          /* moving header-bar feedback */
+      return G_SOURCE_CONTINUE;
+    }
 
-  adw_banner_set_revealed (app->banner, FALSE);
+  header_progress_hide (app);                  /* clears as rows paint / on error */
   if (p.state == LSG_NET_DONE)
     {
       LsgDocument *doc = lsg_net_open_adopt_document (app->net);
@@ -1102,15 +1123,6 @@ net_poll_tick (gpointer data)
 }
 
 static void
-on_banner_cancel (AdwBanner *banner, gpointer data)
-{
-  (void) banner;
-  App *app = data;
-  if (app->net != NULL)
-    lsg_net_open_cancel (app->net);
-}
-
-static void
 on_url_response (AdwAlertDialog *dialog, const char *response, gpointer data)
 {
   App *app = data;
@@ -1125,6 +1137,15 @@ on_url_response (AdwAlertDialog *dialog, const char *response, gpointer data)
   g_clear_pointer (&app->pending_url, g_free);
   app->pending_url = g_strdup (url);
 
+  /* A URL open replaces the current doc, so stop any copy of the OLD doc NOW —
+   * before the net open goes in flight and takes over the shared header
+   * progress. Without this, the old doc + its copy stay alive until the open
+   * reaches DONE (open_document→app_reset_document→copy_stop_and_join), so the
+   * two ops would overlap and fight over the one progress widget / ✕. Stopping
+   * here (plus the app->net gate in do_copy) makes "no copy while a net open is
+   * in flight" a hard invariant — same pattern as do_apply_filter. */
+  copy_stop_and_join (app);
+
   if (app->net != NULL)
     {
       lsg_net_open_cancel (app->net);
@@ -1138,9 +1159,10 @@ on_url_response (AdwAlertDialog *dialog, const char *response, gpointer data)
       return;
     }
 
-  adw_banner_set_title (app->banner, "Connecting…");
-  adw_banner_set_button_label (app->banner, "Cancel");
-  adw_banner_set_revealed (app->banner, TRUE);
+  /* Unified header-bar progress (pulse until a byte-fraction is known); the ✕
+   * cancels the open (routed in on_hp_cancel_clicked). */
+  header_progress_show (app, "Connecting…");
+  header_progress_set (app, -1.0);
   if (app->net_poll_id == 0)
     app->net_poll_id = g_timeout_add (POLL_INTERVAL_MS, net_poll_tick, app);
 }
@@ -1267,6 +1289,15 @@ on_area_resize (GtkDrawingArea *area, int width, int height, gpointer data)
   (void) width;
   (void) height;
   App *app = data;
+
+  /* The grid resizes with the window; re-anchor any OPEN popover to its
+   * header-bar button (GTK4 doesn't always re-anchor an already-visible popover
+   * when the parent's allocation changes on resize). */
+  if (app->find_popover != NULL && gtk_widget_get_mapped (GTK_WIDGET (app->find_popover)))
+    gtk_popover_present (app->find_popover);
+  if (app->jump_popover != NULL && gtk_widget_get_mapped (GTK_WIDGET (app->jump_popover)))
+    gtk_popover_present (app->jump_popover);
+
   if (app->doc == NULL)
     return;
   grid_update_vadjustment (app);
@@ -1984,15 +2015,18 @@ static void
 install_jump_css (void)
 {
   GtkCssProvider *css = gtk_css_provider_new ();
+  /* Shake via `transform: translate` (NOT margins): a transform is a paint-time
+   * offset that does NOT change the widget's allocation, so the parent GtkPopover
+   * never re-measures / re-anchors mid-animation (which visually detached it). */
   gtk_css_provider_load_from_string (
       css,
       "@keyframes lsg-shake {"
-      "  0%   { margin-left: 0px;  margin-right: 0px; }"
-      "  20%  { margin-left: 6px;  margin-right: -6px; }"
-      "  40%  { margin-left: -5px; margin-right: 5px; }"
-      "  60%  { margin-left: 4px;  margin-right: -4px; }"
-      "  80%  { margin-left: -2px; margin-right: 2px; }"
-      "  100% { margin-left: 0px;  margin-right: 0px; }"
+      "  0%   { transform: translateX(0px); }"
+      "  20%  { transform: translateX(6px); }"
+      "  40%  { transform: translateX(-5px); }"
+      "  60%  { transform: translateX(4px); }"
+      "  80%  { transform: translateX(-2px); }"
+      "  100% { transform: translateX(0px); }"
       "}"
       ".lsg-shake { animation: lsg-shake 300ms ease; }");
   GdkDisplay *display = gdk_display_get_default ();
@@ -2328,8 +2362,14 @@ on_hp_cancel_clicked (GtkButton *button, gpointer data)
 {
   (void) button;
   App *app = data;
+  /* The header progress is shared, but by construction only one owner is ever
+   * live: a URL open runs copy_stop_and_join before it goes in flight, and
+   * do_copy refuses to start while app->net != NULL. So at most one of copy_op
+   * / net is non-NULL here, and the copy-first check cancels the true owner. */
   if (app->copy_op != NULL)
     g_atomic_int_set (&app->copy_op->cancel, 1);   /* the worker stops promptly */
+  else if (app->net != NULL)
+    lsg_net_open_cancel (app->net);                /* the poll folds to CANCELLED */
 }
 
 static void
@@ -2624,7 +2664,12 @@ copy_tick (gpointer data)
 static void
 do_copy (App *app)
 {
-  if (app->doc == NULL || app->sel_mode == SEL_NONE || app->copy_op != NULL)
+  /* app->net != NULL: a URL open is in flight and about to replace the doc —
+   * refuse to start a copy of the doomed doc. With copy_stop_and_join at the
+   * start of the net-open flow, this closes the other overlap direction so the
+   * two never share the header progress. */
+  if (app->doc == NULL || app->sel_mode == SEL_NONE || app->copy_op != NULL
+      || app->net != NULL)
     return;
 
   struct _CopyOp *op = g_new0 (struct _CopyOp, 1);
@@ -2936,10 +2981,8 @@ ensure_window (App *app, GtkApplication *gtk_app)
   build_header_progress (app);
   adw_header_bar_pack_end (ADW_HEADER_BAR (header), app->hp_box);
 
-  /* Banner (network progress) above the swappable content stack. */
-  app->banner = ADW_BANNER (adw_banner_new (""));
-  adw_banner_set_revealed (app->banner, FALSE);
-  g_signal_connect (app->banner, "button-clicked", G_CALLBACK (on_banner_cancel), app);
+  /* Network-open progress now uses the unified header-bar progress above (no
+   * separate net banner). */
 
   app->stack = GTK_STACK (gtk_stack_new ());
   gtk_widget_set_vexpand (GTK_WIDGET (app->stack), TRUE);
@@ -2960,7 +3003,6 @@ ensure_window (App *app, GtkApplication *gtk_app)
                     G_CALLBACK (on_filter_banner_clear), app);
 
   GtkWidget *content = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
-  gtk_box_append (GTK_BOX (content), GTK_WIDGET (app->banner));
   gtk_box_append (GTK_BOX (content), GTK_WIDGET (app->filter_banner));
   gtk_box_append (GTK_BOX (content), GTK_WIDGET (app->stack));
 
@@ -3014,6 +3056,7 @@ main (int argc, char *argv[])
    * widths + macOS parity). Headers + all chrome stay sans-serif. */
   app.font_desc = pango_font_description_from_string ("Monospace 10");
   app.header_font_desc = pango_font_description_from_string ("Sans Bold 10");
+  app.gutter_font_desc = pango_font_description_from_string ("Sans 10");
 
   g_autoptr (AdwApplication) application =
       adw_application_new ("dev.lesssheet.Gtk", G_APPLICATION_HANDLES_OPEN);
@@ -3039,5 +3082,6 @@ main (int argc, char *argv[])
   g_clear_pointer (&app.hadj, g_object_unref);
   pango_font_description_free (app.font_desc);
   pango_font_description_free (app.header_font_desc);
+  pango_font_description_free (app.gutter_font_desc);
   return status;
 }
