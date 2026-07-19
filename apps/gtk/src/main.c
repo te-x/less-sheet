@@ -2116,9 +2116,12 @@ jump_glyph_draw (GtkDrawingArea *area, cairo_t *cr, int width, int height,
 #define GX(x) (ox + (x) * k)
 #define GY(y) (oy + (y) * k)
 
-  double lw = (double) height * 0.11;
-  if (lw < 1.2)
-    lw = 1.2;
+  /* Match the sibling Adwaita symbolic stroke weight (search / insert-link /
+   * edit-copy): they render a thin ~1.2-1.3px stroke at 16px. 0.11*height read
+   * heavier than them; 0.08 gives ~1.28px at the 16px glyph. */
+  double lw = (double) height * 0.08;
+  if (lw < 1.0)
+    lw = 1.0;
   cairo_set_line_width (cr, lw);
   cairo_set_line_cap (cr, CAIRO_LINE_CAP_ROUND);
   cairo_set_line_join (cr, CAIRO_LINE_JOIN_ROUND);
