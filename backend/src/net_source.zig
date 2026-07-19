@@ -398,6 +398,12 @@ pub const HttpRange = struct {
     spool_bytes: u64 = 0,
     range_mode: u8 = 1, // 1 random-access, 2 sequential
     shutdown: std.atomic.Value(bool) = .init(false),
+    // RANDOM fill: a single transport-busy guard. Set (under the mutex) while a
+    // thread holds the transport for a ranged GET with the mutex RELEASED, so
+    // present-byte reads never block behind that GET (bug #1) and concurrent
+    // fetchers serialize (one GET at a time — no double-fetch, no torn spool
+    // region, no concurrent use of the shared transport client).
+    fetching: bool = false,
     progress: ?Progress = null,
 
     pub fn lock(self: *HttpRange) void {
@@ -498,6 +504,60 @@ pub const HttpRange = struct {
             if (self.progress) |p| p.callback(p.ctx, self.spool_bytes, self.total);
         }
         self.markResidentLocked(c_idx);
+    }
+
+    /// Ensure chunks [first, last] are present, COALESCING each contiguous run of
+    /// missing chunks into ONE ranged fetchInto (a single transport round-trip,
+    /// so the O(head) open assembles in <=2 GETs, not one-per-256-KiB-chunk —
+    /// bug #5), and releasing the document mutex ACROSS that network GET so
+    /// concurrent present-byte reads / polls never block behind it (bug #1). The
+    /// `fetching` guard serializes transport access while the mutex is down: a
+    /// second thread that wants a byte covered by an in-flight GET waits WITHOUT
+    /// the mutex (so unrelated present-byte reads still proceed) and re-checks
+    /// when it frees — never a double-fetch, a torn spool region, or a concurrent
+    /// transport call. Honors `shutdown`. Caller holds the mutex on entry+exit.
+    fn ensureChunkRangeLocked(self: *HttpRange, first: usize, last: usize) void {
+        var ci = first;
+        while (ci <= last) {
+            if (self.shutdown.load(.acquire)) return;
+            if (self.present[ci]) {
+                self.markResidentLocked(ci); // LRU touch (may evict), bytes retained
+                ci += 1;
+                continue;
+            }
+            if (self.fetching) {
+                // Another thread holds the transport: wait mutex-free, re-check.
+                self.unlock();
+                sleepMs(2);
+                self.lock();
+                continue;
+            }
+            // Coalesce the contiguous missing run and fetch it in ONE GET. No
+            // other thread can mutate present[]/fetching while we hold the mutex
+            // here, so the run is stable until we publish it below.
+            var run_end = ci + 1;
+            while (run_end <= last and !self.present[run_end]) run_end += 1;
+            const start = @as(u64, ci) * chunk_bytes;
+            const stop = @min(self.total, @as(u64, run_end) * chunk_bytes);
+            const dest = self.spool[@intCast(start)..@intCast(stop)];
+            self.fetching = true;
+            self.unlock();
+            const ok = self.transport.fetchInto(dest, start); // ~1 RTT, mutex down
+            self.lock();
+            self.fetching = false;
+            if (!ok) return; // failed GET: leave the run not-present (short slice)
+            self.fetch_count += 1; // ROUND-TRIPS, not chunks
+            var k = ci;
+            while (k < run_end) : (k += 1) {
+                if (!self.present[k]) {
+                    self.present[k] = true;
+                    self.spool_bytes += self.chunkLen(k);
+                }
+                self.markResidentLocked(k);
+            }
+            if (self.progress) |p| p.callback(p.ctx, self.spool_bytes, self.total);
+            ci = run_end;
+        }
     }
 
     fn markResidentLocked(self: *HttpRange, c_idx: usize) void {
@@ -615,13 +675,14 @@ pub const HttpRange = struct {
         defer self.unlock();
         if (self.spool.len == 0) return &.{};
         if (self.range_mode == 2) return self.ensureSliceSequentialLocked(internal, want);
-        // RANDOM fill: presized spool, ranged GET per chunk.
+        // RANDOM fill: presized spool, contiguous missing chunks fetched in ONE
+        // coalesced ranged GET (bug #5), with the mutex released across it (#1).
         if (internal >= self.total) return &.{};
         const end = @min(self.total, internal + want);
         if (end <= internal) return &.{};
-        var ci = internal / chunk_bytes;
+        const first = internal / chunk_bytes;
         const last = (end - 1) / chunk_bytes;
-        while (ci <= last) : (ci += 1) self.ensureChunkLocked(ci);
+        self.ensureChunkRangeLocked(@intCast(first), @intCast(last));
         return self.spool[@intCast(internal)..@intCast(end)];
     }
 

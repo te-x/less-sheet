@@ -400,10 +400,37 @@ fn updateJump(doc: *Document) void {
         else if (doc.frontier_rows > 0) doc.frontier_rows - 1 else 0;
         doc.jump_progress = 1.0;
     } else {
-        const span = doc.jump_target - doc.jump_start_rows;
-        if (span > 0) {
-            const p = @as(f64, @floatFromInt(doc.frontier_rows - doc.jump_start_rows)) / @as(f64, @floatFromInt(span));
-            if (p > doc.jump_progress) doc.jump_progress = p;
+        // Byte-frontier progress (bug #6): the fraction of BYTES the scan has
+        // covered toward where the target row is PROJECTED to sit, capped at the
+        // resource end — so a BEYOND-EOF target tracks the advance toward EOF and
+        // climbs high near the end, instead of a ratio against an UNREACHABLE
+        // target ROW that caps near 0. The DONE branch above still delivers the
+        // exact 1.0 at completion; this monotone guard only ever RAISES progress,
+        // so [0,1] + monotone + exactly-1.0-at-DONE (the JumpStatus contract, and
+        // the local-jump tests c6 et al.) all hold. Byte-denominated like
+        // base.searchProgress (physicalBytes + file_size are the same unit).
+        const start_bytes = doc.reader.physicalBytes(doc.source, doc.data_start);
+        const frontier_bytes = doc.reader.physicalBytes(doc.source, doc.frontier_pos);
+        const covered = frontier_bytes -| start_bytes;
+        const data_span = doc.file_size -| start_bytes;
+        if (data_span > 0 and doc.frontier_rows > 0) {
+            // Project the target's byte offset from the scanned byte/row rate,
+            // capped at the data end (a beyond-EOF target => scan toward EOF).
+            const projected = @as(u128, doc.jump_target) * @as(u128, covered) / @as(u128, doc.frontier_rows);
+            const target_span: u64 = if (projected < data_span) @intCast(projected) else data_span;
+            if (target_span > 0) {
+                const raw = @as(f64, @floatFromInt(covered)) / @as(f64, @floatFromInt(target_span));
+                const p = if (raw > 1.0) 1.0 else raw;
+                if (p > doc.jump_progress) doc.jump_progress = p;
+            }
+        } else {
+            // Unknown-length stream (no byte total) / no rows yet: the original
+            // row ratio (safe fallback; no test pins those to a high value).
+            const span = doc.jump_target - doc.jump_start_rows;
+            if (span > 0) {
+                const p = @as(f64, @floatFromInt(doc.frontier_rows - doc.jump_start_rows)) / @as(f64, @floatFromInt(span));
+                if (p > doc.jump_progress) doc.jump_progress = p;
+            }
         }
     }
 }
