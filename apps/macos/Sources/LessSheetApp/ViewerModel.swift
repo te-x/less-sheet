@@ -645,8 +645,17 @@ final class DocumentModel {
             self.firstVisibleRow = 0
             self.lastVisibleCount = 40   // sensible default until the first geometry callback
             materialize(start: 0, count: GridMetrics.scrollBufferRows)
+            // The header width must be part of the column widths AT OPEN, not
+            // applied by a later refine that races the first-paint marker —
+            // otherwise it pops in on the user's first interaction (a top-edge
+            // scroll bounce, say). The real header labels are already available:
+            // the `materialize` above ran `refreshWindowLabels`, fetching them
+            // synchronously into `windowColumnLabels` for the just-fetched column
+            // range (core sessions); a legacy session carries them in
+            // `headerCells`. Feed those to the measurement so it sizes each
+            // header in the semibold font it is drawn in.
             self.columnWidths = Self.measureColumnWidths(
-                header: self.headerCells,
+                headerLabels: openHeaderLabels(for: session),
                 sample: window.rows,
                 columnCount: session.columnCount
             )
@@ -1117,7 +1126,6 @@ final class DocumentModel {
 
         let bodyFont = NSFont.monospacedSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
         let headFont = NSFont.systemFont(ofSize: NSFont.systemFontSize, weight: .semibold)
-        let refineHeaderWidths = markedGeneration != openGeneration
         // Keyed by VISIBLE POSITION (an index into `cachedLayoutWidths`, the
         // SAME array `horizontalViewportChanged` feeds `ColumnLayouting.
         // window`) rather than absolute column index — `grown` doesn't care
@@ -1136,7 +1144,15 @@ final class DocumentModel {
             // exactly as the user set them until they clear/auto-fit it.
             guard manualColumnWidths[c] == nil else { continue }
             let rel = c - base
-            var w = refineHeaderWidths ? Self.textWidth(columnLabel(c), headFont) : 0
+            // Always measure the header (its accurate semibold width), not just
+            // until the first-paint marker: `measureColumnWidths` already baked
+            // the header into every column's OPEN width (so for the initial
+            // window this max-merge is an idempotent no-op — no widening pops in
+            // on the first interaction), and a column scrolled into view LATER
+            // (past the open-time fetch range on a wide document) still gets its
+            // header width the moment it enters the window, monotone. Cheap:
+            // O(visible columns) of `.size()`, never O(columnCount).
+            var w = Self.textWidth(columnLabel(c), headFont)
             for r in lo..<hi {
                 let idx = r - start
                 if idx < window.oversized.count, window.oversized[idx] { continue }
@@ -3129,43 +3145,60 @@ final class DocumentModel {
         pollTask = nil
     }
 
+    /// The real header labels available at open, keyed by ABSOLUTE column, for
+    /// `measureColumnWidths` (the header-width-at-open fix). Core sessions expose
+    /// them through `windowColumnLabels`, just populated by the open-time
+    /// `materialize`→`refreshWindowLabels` for the fetched column range; a legacy
+    /// in-memory session carries them all in `headerCells`. Empty when the
+    /// document has no header row (so the measurement adds no header component).
+    private func openHeaderLabels(for session: any DocumentSession) -> [Int: String] {
+        guard session.dialect.hasHeader else { return [:] }
+        if session is CoreDocumentSession { return windowColumnLabels }
+        guard let cells = session.headerCells else { return [:] }
+        var labels: [Int: String] = [:]
+        for (c, label) in cells.enumerated() where !label.isEmpty { labels[c] = label }
+        return labels
+    }
+
     // MARK: - Column width measurement (head sample; O(head) arithmetic, no
     // per-cell text layout — ARCH-column-windowing)
 
-    /// Establishes EVERY column's width from the head sample in O(head) —
-    /// cheap character-count arithmetic, NEVER a `.size(withAttributes:)` call
-    /// per cell (100k text-layout calls across 100k columns is exactly what
-    /// made a wide document's cold-open take 3+ s; ARCH-column-windowing). The
-    /// data font is monospaced (`SheetRowView.font`, `== bodyFont` here), so
-    /// for ordinary text a column's pixel width is (its widest display-cell
-    /// count over the head sample, header included) times the font's own
-    /// advance width — arithmetic, not layout — plus padding, capped exactly
-    /// as before. This gives every column a REAL, independent width up front
-    /// (never a placeholder that pops in later) but is an ESTIMATE for exotic
-    /// glyphs (emoji/CJK/combining, whose rendered advance can differ from a
-    /// plain scalar's): `growColumnWidthsToFitWindow` gives every column an
-    /// ACCURATE `.size()` correction (its header included) the moment it
-    /// first enters the horizontal column window, monotone, so a
-    /// viewport-fitting file — every column in the window from the very first
-    /// layout — refines immediately to the exact widths an unwindowed
-    /// measurement would have given it (ARCH AC4); only a wide document's
-    /// off-screen columns keep the estimate until scrolled into view.
-    static func measureColumnWidths(header: [String]?, sample: [[String]], columnCount: Int) -> [CGFloat] {
+    /// Establishes EVERY column's width up front, in ONE O(head) pass. The
+    /// BODY cells are sized by cheap character-count arithmetic — the
+    /// monospaced data font's per-character advance (`SheetRowView.font, ==
+    /// bodyFont`) times the widest display-cell count over the head sample —
+    /// NEVER a `.size(withAttributes:)` per cell (100k text-layout calls across
+    /// 100k columns is exactly what made a wide document's cold-open take 3+ s;
+    /// ARCH-column-windowing). The HEADER label, in contrast, is measured
+    /// ACCURATELY with the SEMIBOLD header font it is actually drawn in (via
+    /// `.size()`), so each column includes its header width DETERMINISTICALLY at
+    /// open — no header-driven widening pops in on the user's first interaction
+    /// (the top-edge scroll-bounce resize). That `.size()` is bounded to the
+    /// columns whose real labels have already been fetched (`headerLabels` —
+    /// only the leftmost `initialColumnFetchCount` at a fresh open; see
+    /// `columnFetchRange`), so it is O(fetched) text layout, never
+    /// O(columnCount). This gives every column a REAL, independent width up
+    /// front (never a placeholder that pops in later); the body estimate remains
+    /// an estimate for exotic glyphs (emoji/CJK/combining), and a wide
+    /// document's off-window columns keep it until `growColumnWidthsToFitWindow`
+    /// gives them the ACCURATE `.size()` correction (body AND header) the moment
+    /// they enter the horizontal column window, monotone (ARCH AC4).
+    static func measureColumnWidths(headerLabels: [Int: String], sample: [[String]], columnCount: Int) -> [CGFloat] {
         guard columnCount > 0 else { return [] }
         let bodyFont = NSFont.monospacedSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
+        let headFont = NSFont.systemFont(ofSize: NSFont.systemFontSize, weight: .semibold)
         // One O(1) measurement (not per-column, not per-cell) gives the exact
         // per-character advance of the monospaced data font.
         let advance = max(textWidth("0", bodyFont), 1)
         let minW = GridMetrics.minColumnWidth
         let maxW = GridMetrics.maxColumnWidth
         let padding = GridMetrics.cellHPadding * 2
-        // Hoisted out of the loop: `header` is unwrapped ONCE (not per
-        // column), and `sample`'s row count is read once — this loop runs
-        // `columnCount` times (up to 100k on a wide document) so anything
-        // paid per-iteration, however small, is worth hoisting.
-        let headerCells = header ?? []
-        let headerCount = headerCells.count
+        // Hoisted out of the loop (read once, not per column): this loop runs
+        // `columnCount` times (up to 100k on a wide document) so anything paid
+        // per-iteration, however small, is worth hoisting. `hasHeaderLabels`
+        // lets a no-header document skip the per-column dictionary probe below.
         let sampleCount = sample.count
+        let hasHeaderLabels = !headerLabels.isEmpty
 
         var widths = [CGFloat](repeating: minW, count: columnCount)
         // `.utf8.count` (a stored length on a native Swift String, O(1)) is a
@@ -3175,8 +3208,11 @@ final class DocumentModel {
         // `.size()` refine the moment a column enters the horizontal window.
         widths.withUnsafeMutableBufferPointer { buf in
             for c in 0..<columnCount {
-                let label = (c < headerCount && !headerCells[c].isEmpty) ? headerCells[c] : GenericColumnName.name(at: c)
-                var cells = label.utf8.count
+                // Body cells + the generic A/B/C… name floor (the label shown
+                // when a column has no real header; narrow enough that the
+                // min-width floor dominates, so measuring it by arithmetic —
+                // not `.size()` — costs nothing on a wide no-header document).
+                var cells = GenericColumnName.name(at: c).utf8.count
                 var r = 0
                 while r < sampleCount {
                     let row = sample[r]
@@ -3186,8 +3222,14 @@ final class DocumentModel {
                     }
                     r += 1
                 }
-                let estimate = CGFloat(cells) * advance + padding
-                buf[c] = min(max(estimate, minW), maxW)
+                var textW = CGFloat(cells) * advance
+                // Real header label: measured with the semibold header font it
+                // is drawn in, so the header width is baked into the column AT
+                // OPEN (bounded to the fetched range — see the doc above).
+                if hasHeaderLabels, let label = headerLabels[c], !label.isEmpty {
+                    textW = max(textW, textWidth(label, headFont))
+                }
+                buf[c] = min(max(textW + padding, minW), maxW)
             }
         }
         return widths

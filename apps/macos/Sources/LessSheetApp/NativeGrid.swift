@@ -175,6 +175,16 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
     private var built = false
     private var landingApplyScheduled = false
     private var pendingCellToggle: GridCell?
+    /// The visible-window identity the last scroll-driven column fit acted on:
+    /// the clamped top data row, the visible row count, and the horizontal clip
+    /// (x offset + width). The row-window paging, the horizontal column window,
+    /// and the table/filler width are a pure function of exactly these — so a
+    /// clip-bounds tick that leaves all four unchanged (a top/bottom elastic
+    /// bounce that cannot move the viewport, say) must NOT re-derive them:
+    /// re-deriving is the only thing that could churn an established column
+    /// width (the "columns resize on first interaction" bug). `nil` until the
+    /// first tick, and reset on a re-open so the new document always re-fits.
+    private var lastFitViewport: (top: Int, length: Int, x: CGFloat, width: CGFloat)?
 
     init(model: DocumentModel) {
         self.model = model
@@ -465,6 +475,10 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
             let preToggleTop = headerShift != nil ? currentTopDataRow() : 0
 
             lastOpenGeneration = model.openGeneration
+            // New document identity: the previous document's fit-viewport
+            // identity is meaningless here (a matching row/x/width must not
+            // suppress the new document's first fit), so re-arm it.
+            lastFitViewport = nil
             refreshLayoutMetrics()
             lastVisibleColumns = model.visibleColumns
             lastColumnWidths = model.columnWidths
@@ -859,43 +873,78 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
     @objc private func clipBoundsChanged() {
         let clip = scroll.contentView
 
-        // Page the core window to the visible span (O(1) setWindow off the
-        // scroll path; hysteresis lives in the model).
+        // Gate the scroll-driven column fit on REAL viewport movement. The
+        // row-window paging (`viewportChanged`), the horizontal column window
+        // (`refreshColumnWindow`), and the table/filler width
+        // (`refreshColumnWidth`) are a pure function of the visible-window
+        // identity below — so a clip-bounds tick that moves none of it (a
+        // top/bottom/side elastic bounce, whose whole travel is past a hard
+        // edge) must not re-derive them: that re-derivation is the only thing
+        // that could churn an established column width (the reported
+        // "columns resize on first interaction" when already at the top). The
+        // overscroll bail makes the same point explicitly for the in-flight
+        // bounce: while the viewport is pinned past an edge it cannot reveal
+        // new rows/columns, so the fit is deferred to the settling tick that
+        // lands back in range. The downstream window/width guards are no-ops on
+        // an unchanged window too, but gating here keeps the bounce from ever
+        // reaching `growColumnWidthsToFitWindow` in the first place.
         let visible = table.rows(in: table.visibleRect)
-        if visible.length > 0 {
-            let first = min(visible.location, max(0, dataRowCount - 1))
-            model.viewportChanged(firstVisibleRow: first, visibleRowCount: visible.length)
+        let over = overscrollAxes()
+        let identity = (top: currentTopDataRow(), length: visible.length,
+                        x: clip.bounds.origin.x, width: clip.bounds.width)
+        let moved: Bool = {
+            guard let last = lastFitViewport else { return true }
+            return last.top != identity.top || last.length != identity.length
+                || abs(last.x - identity.x) > 0.5 || abs(last.width - identity.width) > 0.5
+        }()
+        let fitViewport = moved && !over.x && !over.y
+
+        if fitViewport {
+            lastFitViewport = identity
+            // Page the core window to the visible span (O(1) setWindow off the
+            // scroll path; hysteresis lives in the model).
+            if visible.length > 0 {
+                let first = min(visible.location, max(0, dataRowCount - 1))
+                model.viewportChanged(firstVisibleRow: first, visibleRowCount: visible.length)
+            }
         }
 
         // The row-number gutter may widen when bigger numbers scroll in — a
-        // full relayout (frames + column/filler width) when it does.
+        // full relayout (frames + column/filler width) when it does. Runs
+        // regardless of the fit gate above: a gutter change IS a real geometry
+        // change, and `layoutContainer` re-derives the window/width itself.
         let gw = model.rowNumberColumnWidth()
         if abs(gw - gutterWidth) > 0.5 {
             gutterWidth = gw
             layoutContainer()
         }
-        // The clip's OWN width can also change independent of the gutter — e.g.
-        // a vertical scroller inserting/removing itself as the row-count
-        // estimate crosses its need threshold (this can settle a tick AFTER
-        // `layoutContainer` last read `scroll.contentView.bounds.width`, since
-        // that read races the scroller's own internal tile — PROVEN by
-        // LESSSHEET_LOG_COLWIDTH: a "layout" reading can show `colwidth` matching
-        // a since-shrunk `viewport` one tick later). Re-sync the column/filler
-        // width to the FRESH, now-settled clip width on every scroll/bounds tick
-        // (cheap: O(visibleColumns)) so a stale, too-wide `column.width` can
-        // never linger and force a spurious horizontal scroller (or hide a
-        // genuine one) — `layoutContainer` already covers this when the gutter
-        // branch above ran; harmless to re-run.
-        //
-        // Re-derive the horizontal column window for the CURRENT scroll x, so
-        // a horizontal drag/fling reveals newly-in-window columns (measured,
-        // fetched, drawn) exactly like `viewportChanged` does for a vertical
-        // one — O(window), never O(columnCount) (ARCH-column-windowing); a
-        // no-op once the window and widths settle. Already re-derived by
-        // `layoutContainer` when the gutter branch above ran; harmless (cheap)
-        // to re-run against the settled clip.
-        refreshColumnWindow()
-        refreshColumnWidth(site: "scroll")
+        if fitViewport {
+            // The clip's OWN width can also change independent of the gutter —
+            // e.g. a vertical scroller inserting/removing itself as the
+            // row-count estimate crosses its need threshold (this can settle a
+            // tick AFTER `layoutContainer` last read
+            // `scroll.contentView.bounds.width`, since that read races the
+            // scroller's own internal tile — PROVEN by LESSSHEET_LOG_COLWIDTH: a
+            // "layout" reading can show `colwidth` matching a since-shrunk
+            // `viewport` one tick later; that width change moves `identity.width`
+            // above, so this branch runs). Re-sync the column/filler width to
+            // the FRESH, now-settled clip width (cheap: O(visibleColumns)) so a
+            // stale, too-wide `column.width` can never linger and force a
+            // spurious horizontal scroller (or hide a genuine one) —
+            // `layoutContainer` already covers this when the gutter branch above
+            // ran; harmless to re-run.
+            //
+            // Re-derive the horizontal column window for the CURRENT scroll x,
+            // so a horizontal drag/fling reveals newly-in-window columns
+            // (measured, fetched, drawn) exactly like `viewportChanged` does for
+            // a vertical one — O(window), never O(columnCount)
+            // (ARCH-column-windowing); a no-op once the window and widths
+            // settle. Already re-derived by `layoutContainer` when the gutter
+            // branch above ran; harmless (cheap) to re-run against the settled
+            // clip.
+            refreshColumnWindow()
+            refreshColumnWidth(site: "scroll")
+        }
 
         header.contentOffsetX = clip.bounds.origin.x
         header.needsDisplay = true
