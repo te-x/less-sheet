@@ -1,0 +1,9 @@
+# less-sheet GTK4 / libadwaita frontend — C coding style.
+#
+# Canonical GNOME/GTK C style: BasedOnStyle GNU (2-space indent, braces on their
+# own indented line, space before call parens, ~79-col lines). This is the correct
+# high-quality standard for GTK C, not a low-churn pick. Enforced by the apps/gtk
+# quality gate: `clang-format --dry-run -Werror` over src/*.c + the real
+# include/lsg_*.h headers (the include/lesssheet.h symlink to the root api/ header
+# is deliberately NOT covered here — it is owned by the root api/ surface).
+BasedOnStyle: GNU

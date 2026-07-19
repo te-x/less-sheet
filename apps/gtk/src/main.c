@@ -2,32 +2,34 @@
  * less-sheet GTK frontend — the slice-1 viewer ("open + display + scroll").
  *
  * This is the GTK glue + drawing; ALL logic lives in the display-free lsg_*
- * modules (the C analogs of the macOS frontend): lsg_document (windowed session
- * over the Zig core), lsg_grid_geometry (the O(viewport) row/column/scrollbar
- * math), lsg_window_poll (the ~100 ms materialize/keep-polling decision),
- * lsg_net_open (the network-open drive), lsg_formatter (the lossless cell
- * formatter). main.c owns only the AdwApplicationWindow + AdwHeaderBar chrome,
- * the launch / error AdwStatusPages, the AdwBanner for network progress, and the
- * custom grid: a GtkDrawingArea painted with Cairo + Pango, driven by a
- * hand-managed GtkAdjustment + GtkScrollbar, materializing ONLY the visible
- * window (+ scroll buffer) via lsg_document_set_window — never O(file).
+ * modules (the C analogs of the macOS frontend): lsg_document (windowed
+ * session over the Zig core), lsg_grid_geometry (the O(viewport)
+ * row/column/scrollbar math), lsg_window_poll (the ~100 ms
+ * materialize/keep-polling decision), lsg_net_open (the network-open drive),
+ * lsg_formatter (the lossless cell formatter). main.c owns only the
+ * AdwApplicationWindow + AdwHeaderBar chrome, the launch / error
+ * AdwStatusPages, the AdwBanner for network progress, and the custom grid: a
+ * GtkDrawingArea painted with Cairo + Pango, driven by a hand-managed
+ * GtkAdjustment + GtkScrollbar, materializing ONLY the visible window (+
+ * scroll buffer) via lsg_document_set_window — never O(file).
  *
- * The GNOME toolchain (GTK 4.16+/libadwaita 1.6+, decision 7) is required; this
- * binary is compiled by the gate but run by the author on a real GNOME desktop.
+ * The GNOME toolchain (GTK 4.16+/libadwaita 1.6+, decision 7) is required;
+ * this binary is compiled by the gate but run by the author on a real GNOME
+ * desktop.
  */
 #include <adwaita.h>
-#include <pango/pangocairo.h>
 #include <gdk/gdkkeysyms.h>
+#include <pango/pangocairo.h>
 
-#include <lsg_document.h>
-#include <lsg_net_open.h>
-#include <lsg_grid_geometry.h>
-#include <lsg_window_poll.h>
-#include <lsg_formatter.h>
-#include <lsg_find.h>
-#include <lsg_jump.h>
-#include <lsg_filter.h>
 #include <lsg_copy.h>
+#include <lsg_document.h>
+#include <lsg_filter.h>
+#include <lsg_find.h>
+#include <lsg_formatter.h>
+#include <lsg_grid_geometry.h>
+#include <lsg_jump.h>
+#include <lsg_net_open.h>
+#include <lsg_window_poll.h>
 
 #include <string.h>
 
@@ -40,39 +42,41 @@
 #define WIDTH_SAMPLE_COLS 256
 #define WIDTH_SAMPLE_ROWS 64
 /* Frontend byte budget for one clipboard copy (the macOS CopyBudget.standard
- * ~64 MiB analog); the core's LS_COPY_MAX_CELLS still bounds a pathological rect. */
+ * ~64 MiB analog); the core's LS_COPY_MAX_CELLS still bounds a pathological
+ * rect. */
 #define COPY_BUDGET_BYTES (64u * 1024u * 1024u)
 /* Per-pull chunk the copy worker frames. */
 #define COPY_CHUNK_BYTES (1u << 16)
 
-typedef struct {
+typedef struct
+{
   AdwApplication *app;
   GtkWindow *window;
   AdwWindowTitle *title;
   AdwToolbarView *toolbar;
-  GtkStack *stack;             /* "launch" / "grid" / "error" */
+  GtkStack *stack; /* "launch" / "grid" / "error" */
   AdwStatusPage *error_page;
 
   /* Grid widgets. */
   GtkDrawingArea *area;
   GtkAdjustment *vadj;
   GtkAdjustment *hadj;
-  GtkWidget *hscroll;          /* auto-hidden when all columns fit the viewport */
+  GtkWidget *hscroll; /* auto-hidden when all columns fit the viewport */
 
   /* Open document + derived view state. */
   LsgDocument *doc;
-  LsgWindow *win;              /* current materialized window (owned) */
+  LsgWindow *win; /* current materialized window (owned) */
   guint32 n_cols;
   gboolean has_header;
-  double *col_widths;          /* n_cols pixel widths */
-  double char_advance;         /* monospaced per-char pixel advance */
-  double line_h;               /* text line height (pixels) */
-  double row_h;                /* uniform row height (pixels) */
-  double header_h;             /* header strip height (pixels) */
-  double gutter_w;             /* row-number gutter width (pixels) */
-  guint64 row_estimate;        /* current row-count estimate (>= 1 when non-empty) */
-  gboolean window_short;       /* last materialize came back short */
-  guint poll_id;               /* frontier poll source */
+  double *col_widths;    /* n_cols pixel widths */
+  double char_advance;   /* monospaced per-char pixel advance */
+  double line_h;         /* text line height (pixels) */
+  double row_h;          /* uniform row height (pixels) */
+  double header_h;       /* header strip height (pixels) */
+  double gutter_w;       /* row-number gutter width (pixels) */
+  guint64 row_estimate;  /* current row-count estimate (>= 1 when non-empty) */
+  gboolean window_short; /* last materialize came back short */
+  guint poll_id;         /* frontier poll source */
 
   /* Paint geometry cached by grid_materialize, consumed by grid_draw. */
   guint64 cur_top_row;
@@ -80,16 +84,17 @@ typedef struct {
   LsgColumnWindow cur_colwin;
   LsgRowSpan cur_span;
 
-  /* Header labels for the CURRENT column window only (lazy; O(visible columns),
-   * never O(column_count) — mirrors the macOS per-column-window header fetch).
-   * `hdr_labels[i]` is the label of absolute column `hdr_first + i`. */
+  /* Header labels for the CURRENT column window only (lazy; O(visible
+   * columns), never O(column_count) — mirrors the macOS per-column-window
+   * header fetch). `hdr_labels[i]` is the label of absolute column `hdr_first
+   * + i`. */
   char **hdr_labels;
   guint hdr_first;
   guint hdr_count;
 
-  PangoFontDescription *font_desc;         /* data cells: small monospace */
-  PangoFontDescription *header_font_desc;  /* header row: bold sans-serif */
-  PangoFontDescription *gutter_font_desc;  /* row-number gutter: sans-serif */
+  PangoFontDescription *font_desc;        /* data cells: small monospace */
+  PangoFontDescription *header_font_desc; /* header row: bold sans-serif */
+  PangoFontDescription *gutter_font_desc; /* row-number gutter: sans-serif */
 
   /* Network open. */
   LsgNetOpen *net;
@@ -99,15 +104,17 @@ typedef struct {
   /* Find (slice 2): the pure view-model session + the popover widgets + the
    * current window's highlight mask (owned; refreshed each materialize). */
   LsgFindSession find;
-  LsgSearchDir find_nav_direction;   /* direction of the outstanding navigation */
-  gboolean find_wrap_issued;         /* the wrap follow-up nav has been issued */
-  LsgMatchFlags mask;                /* per-visible-cell match flags (OWNED) */
+  LsgSearchDir
+      find_nav_direction;    /* direction of the outstanding navigation */
+  gboolean find_wrap_issued; /* the wrap follow-up nav has been issued */
+  LsgMatchFlags mask;        /* per-visible-cell match flags (OWNED) */
   GtkMenuButton *find_button;
   GtkPopover *find_popover;
   GtkEditable *find_entry;
   GtkLabel *find_status;
-  LsgFindNotice find_sticky_notice;  /* a briefly-lingering wrap notice for the label */
-  guint find_notice_id;              /* timeout clearing the sticky notice */
+  LsgFindNotice
+      find_sticky_notice; /* a briefly-lingering wrap notice for the label */
+  guint find_notice_id;   /* timeout clearing the sticky notice */
 
   /* Jump-to-row (slice 3): the pure flow + the popover widgets. */
   LsgJumpFlow jump;
@@ -117,39 +124,41 @@ typedef struct {
   GtkProgressBar *jump_progress;
   GtkButton *jump_cancel;
   GtkLabel *jump_status;
-  guint jump_reject_id;              /* timeout clearing the rejection blink */
-  gboolean jump_explicit_close;     /* Escape set this before popdown -> the
-                                     * closed handler cancels+restores the scan;
-                                     * an incidental autohide (FALSE) keeps a
-                                     * live deep/net scan alive so it lands. */
+  guint jump_reject_id;         /* timeout clearing the rejection blink */
+  gboolean jump_explicit_close; /* Escape set this before popdown -> the
+                                 * closed handler cancels+restores the scan;
+                                 * an incidental autohide (FALSE) keeps a
+                                 * live deep/net scan alive so it lands. */
 
   /* Filter-to-matches (slice 4): the pure state + the toggle + the banner. */
   LsgFilterState filter;
   GtkToggleButton *filter_toggle;
   AdwBanner *filter_banner;
-  gboolean filter_ui_guard;          /* re-entrancy guard for programmatic toggle */
+  gboolean filter_ui_guard; /* re-entrancy guard for programmatic toggle */
 
   /* Network doc (http_range): the core is DEMAND-DRIVEN — a bare ls_window_set
    * fetches nothing, so every viewport landing beyond the fetched frontier
    * (filter-apply, filter/deep scroll) must be driven through ls_jump_start.
-   * `net_drive_active` guards an in-flight fetch-drive (async over the tick). */
+   * `net_drive_active` guards an in-flight fetch-drive (async over the tick).
+   */
   gboolean is_network;
   gboolean net_drive_active;
 
   /* Streaming copy (slice 5). Selection is two corners in VIEW row coords
-   * (filtered-aware, like the window) + physical column indices; the mode chooses
-   * cells / whole-rows / whole-columns. The copy runs on an OFF-MAIN worker so the
-   * grid keeps scrolling; the header progress widget shows determinate progress +
-   * a cancel while it streams. */
-  int sel_mode;                /* SEL_* */
+   * (filtered-aware, like the window) + physical column indices; the mode
+   * chooses cells / whole-rows / whole-columns. The copy runs on an OFF-MAIN
+   * worker so the grid keeps scrolling; the header progress widget shows
+   * determinate progress + a cancel while it streams. */
+  int sel_mode; /* SEL_* */
   guint64 sel_a_row, sel_b_row;
   guint sel_a_col, sel_b_col;
-  gboolean selecting;          /* a drag is in progress */
+  gboolean selecting; /* a drag is in progress */
   GtkButton *copy_button;
 
   GThread *copy_thread;
-  struct _CopyOp *copy_op;     /* shared worker state (defined in the copy section) */
-  guint copy_poll_id;          /* main-thread progress/completion poll */
+  struct _CopyOp
+      *copy_op;       /* shared worker state (defined in the copy section) */
+  guint copy_poll_id; /* main-thread progress/completion poll */
 
   /* Reusable header-bar progress widget (the author's unified title-bar progress:
    * determinate bar + inline cancel; other long ops can drive it later). */
@@ -160,18 +169,25 @@ typedef struct {
   /* Env-gated timing instrumentation (LESSSHEET_GTK_TIMING). Entirely inert —
    * no output, no measurable cost — unless `timing` is set. */
   gboolean timing;
-  gint64 t_start;              /* main() entry (monotonic µs) */
-  gboolean ui_shown_reported;  /* one-shot: window first mapped */
-  gint64 t_open_begin;         /* file-open begin (monotonic µs) */
-  gboolean first_frame_pending;/* one-shot: awaiting the first painted grid frame */
+  gint64 t_start;               /* main() entry (monotonic µs) */
+  gboolean ui_shown_reported;   /* one-shot: window first mapped */
+  gint64 t_open_begin;          /* file-open begin (monotonic µs) */
+  gboolean first_frame_pending; /* one-shot: awaiting the first painted grid
+                                   frame */
 } App;
 
 /* Selection modes (slice 5): a cell rectangle, whole rows (gutter drag), or
  * whole columns (header drag). */
-enum { SEL_NONE = 0, SEL_CELLS, SEL_ROWS, SEL_COLS };
+enum
+{
+  SEL_NONE = 0,
+  SEL_CELLS,
+  SEL_ROWS,
+  SEL_COLS
+};
 
 /* ------------------------------------------------------------------------- */
-/* Small helpers                                                              */
+/* Small helpers */
 /* ------------------------------------------------------------------------- */
 
 static guint
@@ -189,7 +205,8 @@ digits_of (guint64 v)
 static gboolean
 is_saturated (const App *app)
 {
-  return ((double) app->row_estimate * app->row_h) > LSG_GRID_MAX_ADJUSTMENT_UPPER;
+  return ((double)app->row_estimate * app->row_h)
+         > LSG_GRID_MAX_ADJUSTMENT_UPPER;
 }
 
 static void
@@ -226,20 +243,22 @@ static void jump_poll_fold (App *app);
  * with the filter helpers below; the poll loop calls it while filtered. */
 static void filter_poll_fold (App *app);
 
-/* Network demand-drive: on an http_range doc, fetch the frontier to `target_row`
- * via ls_jump_start so a subsequent window materialize serves real rows (a bare
- * ls_window_set fetches nothing). Defined with the jump helpers; called from the
- * scroll handler, the filter-apply, and the poll loop. */
+/* Network demand-drive: on an http_range doc, fetch the frontier to
+ * `target_row` via ls_jump_start so a subsequent window materialize serves
+ * real rows (a bare ls_window_set fetches nothing). Defined with the jump
+ * helpers; called from the scroll handler, the filter-apply, and the poll
+ * loop. */
 static void net_drive_begin (App *app, guint64 target_row);
 static void net_drive_poll (App *app);
 
-/* Streaming copy (slice 5): start a copy of the current selection; stop+join the
- * worker before any document teardown (leaf-before-root). Defined in the copy
- * section; called from the key handlers and app_reset_document. */
+/* Streaming copy (slice 5): start a copy of the current selection; stop+join
+ * the worker before any document teardown (leaf-before-root). Defined in the
+ * copy section; called from the key handlers and app_reset_document. */
 static void do_copy (App *app);
 static void copy_stop_and_join (App *app);
 static void copy_update_affordance (App *app);
-static gboolean selection_contains (App *app, guint64 row, guint col);   /* grid_draw marquee */
+static gboolean selection_contains (App *app, guint64 row,
+                                    guint col); /* grid_draw marquee */
 
 /* Reusable header-bar progress (defined in the copy section); the network open
  * also drives it (unified long-op status). */
@@ -265,14 +284,14 @@ static void open_jump_with_digit (App *app, char digit);
 static void open_jump (App *app);
 
 /* ------------------------------------------------------------------------- */
-/* View teardown                                                              */
+/* View teardown */
 /* ------------------------------------------------------------------------- */
 
 static void
 app_reset_document (App *app)
 {
-  /* LEAF BEFORE ROOT: stop + join any copy worker (and close its job) BEFORE the
-   * document is closed below — a job must never outlive its document. */
+  /* LEAF BEFORE ROOT: stop + join any copy worker (and close its job) BEFORE
+   * the document is closed below — a job must never outlive its document. */
   copy_stop_and_join (app);
   app->sel_mode = SEL_NONE;
   app->selecting = FALSE;
@@ -292,7 +311,8 @@ app_reset_document (App *app)
   app->window_short = FALSE;
 
   /* The old document's search state died with its core handle: clear the find
-   * display + highlights (the DRAFT is retained, so re-running is one Enter). */
+   * display + highlights (the DRAFT is retained, so re-running is one Enter).
+   */
   if (app->find_notice_id != 0)
     {
       g_source_remove (app->find_notice_id);
@@ -319,7 +339,7 @@ app_reset_document (App *app)
 }
 
 /* ------------------------------------------------------------------------- */
-/* Error / launch pages                                                       */
+/* Error / launch pages */
 /* ------------------------------------------------------------------------- */
 
 static void
@@ -336,16 +356,21 @@ open_error_text (LsgOpenError e)
 {
   switch (e)
     {
-    case LSG_OPEN_NOT_FOUND:          return "The file could not be found.";
-    case LSG_OPEN_PERMISSION_DENIED:  return "Permission to read the file was denied.";
-    case LSG_OPEN_IO:                 return "The file could not be read.";
-    case LSG_OPEN_INVALID_ARGUMENT:   return "The parse options were invalid.";
-    default:                          return "The file could not be opened.";
+    case LSG_OPEN_NOT_FOUND:
+      return "The file could not be found.";
+    case LSG_OPEN_PERMISSION_DENIED:
+      return "Permission to read the file was denied.";
+    case LSG_OPEN_IO:
+      return "The file could not be read.";
+    case LSG_OPEN_INVALID_ARGUMENT:
+      return "The parse options were invalid.";
+    default:
+      return "The file could not be opened.";
     }
 }
 
 /* ------------------------------------------------------------------------- */
-/* Grid geometry glue                                                         */
+/* Grid geometry glue */
 /* ------------------------------------------------------------------------- */
 
 static void
@@ -354,7 +379,7 @@ grid_update_gutter (App *app)
   guint d = digits_of (app->row_estimate);
   if (d < 4)
     d = 4;
-  app->gutter_w = app->char_advance * (double) (d + 1) + 16.0;
+  app->gutter_w = app->char_advance * (double)(d + 1) + 16.0;
 }
 
 static void
@@ -362,7 +387,7 @@ grid_update_vadjustment (App *app)
 {
   double content_h = lsg_grid_content_height (app->row_estimate, app->row_h);
   int h = gtk_widget_get_height (GTK_WIDGET (app->area));
-  double page = (double) h - app->header_h;
+  double page = (double)h - app->header_h;
   if (page < app->row_h)
     page = app->row_h;
   if (content_h < page)
@@ -381,7 +406,7 @@ grid_update_hadjustment (App *app)
   for (guint32 i = 0; i < app->n_cols; i++)
     content += (app->col_widths[i] > 0.0) ? app->col_widths[i] : 0.0;
   int w = gtk_widget_get_width (GTK_WIDGET (app->area));
-  double page = (double) w - app->gutter_w;
+  double page = (double)w - app->gutter_w;
   if (page < 0.0)
     page = 0.0;
 
@@ -400,7 +425,8 @@ grid_update_hadjustment (App *app)
 }
 
 /* Fetch header labels for the current column window only — O(visible columns),
- * never O(column_count). `first`/`count` are the materialized column window. */
+ * never O(column_count). `first`/`count` are the materialized column window.
+ */
 static void
 grid_window_headers (App *app, guint first, guint count)
 {
@@ -415,8 +441,8 @@ grid_window_headers (App *app, guint first, guint count)
 }
 
 /*
- * Auto-fit: monotonically GROW the visible columns' established widths from the
- * cells actually materialized this window (+ their header labels), via the
+ * Auto-fit: monotonically GROW the visible columns' established widths from
+ * the cells actually materialized this window (+ their header labels), via the
  * frozen monotone max-merge. O(visible cells), never O(rows)/O(column_count).
  * Only the columns IN the window are candidates, and the merge never lowers a
  * width, so an established column can never churn on scroll and the prefix sum
@@ -443,8 +469,8 @@ grid_autofit_widths (App *app, LsgColumnWindow colwin, LsgWindow *win)
       const char *hdr = (app->hdr_labels != NULL && ci < app->hdr_count)
                             ? app->hdr_labels[ci]
                             : NULL;
-      double wpx = lsg_grid_column_width_estimate (buf, cnt, hdr, app->char_advance,
-                                                   app->char_advance * 2.0 + 12.0);
+      double wpx = lsg_grid_column_width_estimate (
+          buf, cnt, hdr, app->char_advance, app->char_advance * 2.0 + 12.0);
       if (wpx > max_w)
         wpx = max_w;
       cand[ci] = wpx;
@@ -453,8 +479,9 @@ grid_autofit_widths (App *app, LsgColumnWindow colwin, LsgWindow *win)
 
   gdouble *out = g_new (gdouble, app->n_cols);
   lsg_grid_grow_widths (app->col_widths, app->n_cols, cols, cand, gc, out);
-  gboolean changed =
-      memcmp (out, app->col_widths, (gsize) app->n_cols * sizeof (gdouble)) != 0;
+  gboolean changed
+      = memcmp (out, app->col_widths, (gsize)app->n_cols * sizeof (gdouble))
+        != 0;
   g_free (app->col_widths);
   app->col_widths = out;
 
@@ -463,7 +490,8 @@ grid_autofit_widths (App *app, LsgColumnWindow colwin, LsgWindow *win)
   g_free (buf);
 
   if (changed)
-    grid_update_hadjustment (app);   /* only grows the upper; never re-materializes */
+    grid_update_hadjustment (
+        app); /* only grows the upper; never re-materializes */
 }
 
 /* Choose the visible row/column window and materialize it (O(viewport)). */
@@ -477,8 +505,8 @@ grid_materialize (App *app)
   if (w <= 0 || h <= 0)
     return;
 
-  double cell_area_w = (double) w - app->gutter_w;
-  double cell_area_h = (double) h - app->header_h;
+  double cell_area_w = (double)w - app->gutter_w;
+  double cell_area_h = (double)h - app->header_h;
   if (cell_area_w < 0.0)
     cell_area_w = 0.0;
   if (cell_area_h < 0.0)
@@ -486,28 +514,31 @@ grid_materialize (App *app)
 
   double vval = gtk_adjustment_get_value (app->vadj);
   double vupper = gtk_adjustment_get_upper (app->vadj);
-  guint64 top =
-      lsg_grid_top_row_for_offset (vval, vupper, app->row_estimate, app->row_h);
+  guint64 top = lsg_grid_top_row_for_offset (vval, vupper, app->row_estimate,
+                                             app->row_h);
 
   /* Sub-row pixel offset only makes sense in direct (unsaturated) mode; in the
-   * filler regime one scrollbar pixel spans many rows, so snap to whole rows. */
-  double pixel_off = is_saturated (app) ? 0.0 : (vval - (double) top * app->row_h);
+   * filler regime one scrollbar pixel spans many rows, so snap to whole rows.
+   */
+  double pixel_off
+      = is_saturated (app) ? 0.0 : (vval - (double)top * app->row_h);
   if (pixel_off < 0.0)
     pixel_off = 0.0;
 
-  /* Feed the frozen row-window math a synthetic pixel offset for the mapped top
-   * row, so the same function serves both the direct and filler regimes. */
-  double scroll_y_synth = (double) top * app->row_h;
-  LsgRowSpan span = lsg_grid_row_window (scroll_y_synth, cell_area_h, app->row_h,
-                                         GRID_OVERSCAN, app->row_estimate);
+  /* Feed the frozen row-window math a synthetic pixel offset for the mapped
+   * top row, so the same function serves both the direct and filler regimes.
+   */
+  double scroll_y_synth = (double)top * app->row_h;
+  LsgRowSpan span
+      = lsg_grid_row_window (scroll_y_synth, cell_area_h, app->row_h,
+                             GRID_OVERSCAN, app->row_estimate);
 
   double hval = gtk_adjustment_get_value (app->hadj);
-  LsgColumnWindow colwin =
-      lsg_grid_column_window (app->col_widths, app->n_cols, hval, cell_area_w, 1);
+  LsgColumnWindow colwin = lsg_grid_column_window (
+      app->col_widths, app->n_cols, hval, cell_area_w, 1);
 
-  LsgWindow *nw = lsg_document_set_window (app->doc, span.first_row,
-                                           span.row_count, colwin.first,
-                                           colwin.count);
+  LsgWindow *nw = lsg_document_set_window (
+      app->doc, span.first_row, span.row_count, colwin.first, colwin.count);
   g_clear_pointer (&app->win, lsg_window_free);
   app->win = nw;
   app->cur_top_row = top;
@@ -515,19 +546,22 @@ grid_materialize (App *app)
   app->cur_colwin = colwin;
   app->cur_span = span;
 
-  /* Lazily fetch this window's header labels, then auto-fit the visible columns
-   * (both O(visible), using the actual materialized window). */
+  /* Lazily fetch this window's header labels, then auto-fit the visible
+   * columns (both O(visible), using the actual materialized window). */
   grid_window_headers (app, colwin.first, colwin.count);
   grid_autofit_widths (app, colwin, nw);
 
-  /* Refresh the per-visible-cell find highlight mask for THIS window (O(viewport)
-   * — only the visible column range is evaluated by the core). Empty when no
-   * search is active. Fetched right after set_window (window lane). */
+  /* Refresh the per-visible-cell find highlight mask for THIS window
+   * (O(viewport) — only the visible column range is evaluated by the core).
+   * Empty when no search is active. Fetched right after set_window (window
+   * lane). */
   find_clear_mask (app);
   if (app->find.display.active)
-    app->mask = lsg_document_window_match_flags (app->doc, colwin.first, colwin.count);
+    app->mask = lsg_document_window_match_flags (app->doc, colwin.first,
+                                                 colwin.count);
 
-  /* Short => rows beyond the frontier are not yet servable; re-issue on poll. */
+  /* Short => rows beyond the frontier are not yet servable; re-issue on poll.
+   */
   app->window_short = (lsg_window_row_count (nw) < span.row_count);
 }
 
@@ -541,7 +575,7 @@ grid_update_title_counts (App *app, LsgRowCount rc, LsgScanProgress prog)
     {
       double frac = lsg_scan_progress_fraction (prog);
       sub = g_strdup_printf ("~%" G_GUINT64_FORMAT " rows · indexing %d%%",
-                             rc.count, (int) (frac * 100.0));
+                             rc.count, (int)(frac * 100.0));
     }
   adw_window_title_set_subtitle (app->title, sub);
   g_free (sub);
@@ -597,10 +631,11 @@ grid_poll_tick (gpointer data)
         keep = TRUE;
     }
 
-  /* Keep ticking while a filter-scan is not yet final (the "N of M" banner grows
-   * and the grid materializes the widening filtered view). Under LS_INDEX_AUTO a
-   * CANCELLED scan (a jump/find took the slot) auto-resumes to DONE without
-   * caller input, so `!total_exact` is more robust than `phase == SCANNING`. */
+  /* Keep ticking while a filter-scan is not yet final (the "N of M" banner
+   * grows and the grid materializes the widening filtered view). Under
+   * LS_INDEX_AUTO a CANCELLED scan (a jump/find took the slot) auto-resumes to
+   * DONE without caller input, so `!total_exact` is more robust than `phase ==
+   * SCANNING`. */
   if (app->filter.active)
     {
       filter_poll_fold (app);
@@ -625,19 +660,19 @@ grid_poll_tick (gpointer data)
 }
 
 /* ------------------------------------------------------------------------- */
-/* Drawing                                                                    */
+/* Drawing */
 /* ------------------------------------------------------------------------- */
 
 /* Set `layout`'s text and ellipsize width, then paint it left-aligned and
  * vertically centered in the row at (x, y). */
 static void
-draw_text (cairo_t *cr, PangoLayout *layout, const char *text,
-           double x, double y, double avail_w, double row_h, double line_h)
+draw_text (cairo_t *cr, PangoLayout *layout, const char *text, double x,
+           double y, double avail_w, double row_h, double line_h)
 {
   if (avail_w < 1.0)
     return;
   pango_layout_set_text (layout, (text != NULL) ? text : "", -1);
-  pango_layout_set_width (layout, (int) (avail_w * PANGO_SCALE));
+  pango_layout_set_width (layout, (int)(avail_w * PANGO_SCALE));
   cairo_move_to (cr, x, y + (row_h - line_h) / 2.0);
   pango_cairo_show_layout (cr, layout);
 }
@@ -657,8 +692,9 @@ grid_draw (GtkDrawingArea *area, cairo_t *cr, int width, int height,
     {
       app->first_frame_pending = FALSE;
       gint64 dt = g_get_monotonic_time () - app->t_open_begin;
-      g_printerr ("[timing] window-fill (open begin -> first frame): %.1f ms\n",
-                  (double) dt / 1000.0);
+      g_printerr (
+          "[timing] window-fill (open begin -> first frame): %.1f ms\n",
+          (double)dt / 1000.0);
     }
 
   /* All colors resolve from the active theme — no literal color constants. */
@@ -696,7 +732,8 @@ grid_draw (GtkDrawingArea *area, cairo_t *cr, int width, int height,
   gboolean have_accent = FALSE;
   if (app->find.display.active)
     {
-      GdkRGBA *a = adw_style_manager_get_accent_color_rgba (adw_style_manager_get_default ());
+      GdkRGBA *a = adw_style_manager_get_accent_color_rgba (
+          adw_style_manager_get_default ());
       if (a != NULL)
         {
           accent = *a;
@@ -707,16 +744,17 @@ grid_draw (GtkDrawingArea *area, cairo_t *cr, int width, int height,
 
   /* --- cells (clipped to the scrolling body region) --- */
   cairo_save (cr);
-  cairo_rectangle (cr, gutter, header_h, (double) width - gutter,
-                   (double) height - header_h);
+  cairo_rectangle (cr, gutter, header_h, (double)width - gutter,
+                   (double)height - header_h);
   cairo_clip (cr);
   gdk_cairo_set_source_rgba (cr, &fg);
 
   for (guint32 ri = 0; ri < got_rows; ri++)
     {
       guint64 view_row = span.first_row + ri;
-      double y = header_h + (double) ((gint64) (view_row - top)) * row_h - pixel_off;
-      if (y + row_h < header_h || y > (double) height)
+      double y
+          = header_h + (double)((gint64)(view_row - top)) * row_h - pixel_off;
+      if (y + row_h < header_h || y > (double)height)
         continue;
 
       double x = gutter + (cw.first_x - hval);
@@ -728,8 +766,8 @@ grid_draw (GtkDrawingArea *area, cairo_t *cr, int width, int height,
                             : 0.0;
 
           /* Selection marquee: a MUTED-GRAY fill (the macOS NSColor.systemGray
-           * equivalent, theme-derived from fg so it reads in light + dark), drawn
-           * BEHIND the accent find highlight (which stays accent). */
+           * equivalent, theme-derived from fg so it reads in light + dark),
+           * drawn BEHIND the accent find highlight (which stays accent). */
           if (selection_contains (app, view_row, col))
             {
               GdkRGBA sel = fg;
@@ -744,21 +782,23 @@ grid_draw (GtkDrawingArea *area, cairo_t *cr, int width, int height,
            * current match cell gets a stronger tint. */
           if (have_accent && app->mask.flags != NULL && ri < app->mask.rows
               && ci < app->mask.cols
-              && app->mask.flags[(gsize) ri * app->mask.cols + ci])
+              && app->mask.flags[(gsize)ri * app->mask.cols + ci])
             {
-              gboolean is_current = app->find.display.has_current
-                                    && app->find.display.current.row == view_row
-                                    && app->find.display.current.column == col;
+              gboolean is_current
+                  = app->find.display.has_current
+                    && app->find.display.current.row == view_row
+                    && app->find.display.current.column == col;
               GdkRGBA h = accent;
               h.alpha = is_current ? 0.55 : 0.28;
               gdk_cairo_set_source_rgba (cr, &h);
               cairo_rectangle (cr, x, y, colw, row_h);
               cairo_fill (cr);
-              gdk_cairo_set_source_rgba (cr, &fg);   /* restore for the text */
+              gdk_cairo_set_source_rgba (cr, &fg); /* restore for the text */
             }
 
           const char *text = lsg_window_cell (app->win, ri, ci);
-          draw_text (cr, layout, text, x + pad, y, colw - 2.0 * pad, row_h, line_h);
+          draw_text (cr, layout, text, x + pad, y, colw - 2.0 * pad, row_h,
+                     line_h);
           x += colw;
         }
     }
@@ -769,27 +809,30 @@ grid_draw (GtkDrawingArea *area, cairo_t *cr, int width, int height,
   for (guint32 ri = 0; ri < got_rows; ri++)
     {
       guint64 view_row = span.first_row + ri;
-      double y = header_h + (double) ((gint64) (view_row - top + 1)) * row_h - pixel_off;
+      double y = header_h + (double)((gint64)(view_row - top + 1)) * row_h
+                 - pixel_off;
       cairo_move_to (cr, gutter, y + 0.5);
-      cairo_line_to (cr, (double) width, y + 0.5);
+      cairo_line_to (cr, (double)width, y + 0.5);
     }
   cairo_stroke (cr);
   cairo_restore (cr);
 
   /* --- row-number gutter (sticky left; scrolls vertically only) --- */
   cairo_save (cr);
-  cairo_rectangle (cr, 0.0, header_h, gutter, (double) height - header_h);
+  cairo_rectangle (cr, 0.0, header_h, gutter, (double)height - header_h);
   cairo_clip (cr);
   gdk_cairo_set_source_rgba (cr, &tint);
-  cairo_rectangle (cr, 0.0, header_h, gutter, (double) height - header_h);
+  cairo_rectangle (cr, 0.0, header_h, gutter, (double)height - header_h);
   cairo_fill (cr);
   gdk_cairo_set_source_rgba (cr, &fg);
-  pango_layout_set_font_description (layout, app->gutter_font_desc);  /* sans row numbers */
+  pango_layout_set_font_description (
+      layout, app->gutter_font_desc); /* sans row numbers */
   for (guint32 ri = 0; ri < got_rows; ri++)
     {
       guint64 view_row = span.first_row + ri;
-      double y = header_h + (double) ((gint64) (view_row - top)) * row_h - pixel_off;
-      if (y + row_h < header_h || y > (double) height)
+      double y
+          = header_h + (double)((gint64)(view_row - top)) * row_h - pixel_off;
+      if (y + row_h < header_h || y > (double)height)
         continue;
       guint64 src = lsg_window_source_row (app->win, ri);
       char *label;
@@ -802,33 +845,37 @@ grid_draw (GtkDrawingArea *area, cairo_t *cr, int width, int height,
       draw_text (cr, layout, label, pad, y, gutter - 2.0 * pad, row_h, line_h);
       g_free (label);
     }
-  pango_layout_set_font_description (layout, app->font_desc);  /* back to data cells */
+  pango_layout_set_font_description (layout,
+                                     app->font_desc); /* back to data cells */
   cairo_restore (cr);
 
   /* --- column header (sticky top; scrolls horizontally only) --- */
   cairo_save (cr);
-  cairo_rectangle (cr, gutter, 0.0, (double) width - gutter, header_h);
+  cairo_rectangle (cr, gutter, 0.0, (double)width - gutter, header_h);
   cairo_clip (cr);
   gdk_cairo_set_source_rgba (cr, &tint);
-  cairo_rectangle (cr, gutter, 0.0, (double) width - gutter, header_h);
+  cairo_rectangle (cr, gutter, 0.0, (double)width - gutter, header_h);
   cairo_fill (cr);
   if (app->has_header && app->hdr_labels != NULL)
     {
       gdk_cairo_set_source_rgba (cr, &fg);
-      pango_layout_set_font_description (layout, app->header_font_desc);  /* bold */
+      pango_layout_set_font_description (layout,
+                                         app->header_font_desc); /* bold */
       double x = gutter + (cw.first_x - hval);
       for (guint32 ci = 0; ci < cw.count; ci++)
         {
           guint col = cw.first + ci;
           if (col >= app->n_cols)
             break;
-          double colw = (app->col_widths[col] > 0.0) ? app->col_widths[col] : 0.0;
+          double colw
+              = (app->col_widths[col] > 0.0) ? app->col_widths[col] : 0.0;
           const char *label = (ci < app->hdr_count) ? app->hdr_labels[ci] : "";
-          draw_text (cr, layout, label, x + pad, 0.0,
-                     colw - 2.0 * pad, header_h, line_h);
+          draw_text (cr, layout, label, x + pad, 0.0, colw - 2.0 * pad,
+                     header_h, line_h);
           x += colw;
         }
-      pango_layout_set_font_description (layout, app->font_desc);  /* back to cells */
+      pango_layout_set_font_description (layout,
+                                         app->font_desc); /* back to cells */
     }
   cairo_restore (cr);
 
@@ -839,16 +886,16 @@ grid_draw (GtkDrawingArea *area, cairo_t *cr, int width, int height,
   gdk_cairo_set_source_rgba (cr, &line);
   cairo_set_line_width (cr, 1.0);
   cairo_move_to (cr, 0.0, header_h + 0.5);
-  cairo_line_to (cr, (double) width, header_h + 0.5);
+  cairo_line_to (cr, (double)width, header_h + 0.5);
   cairo_move_to (cr, gutter + 0.5, 0.0);
-  cairo_line_to (cr, gutter + 0.5, (double) height);
+  cairo_line_to (cr, gutter + 0.5, (double)height);
   cairo_stroke (cr);
 
   g_object_unref (layout);
 }
 
 /* ------------------------------------------------------------------------- */
-/* Open a document into the grid                                              */
+/* Open a document into the grid */
 /* ------------------------------------------------------------------------- */
 
 static void
@@ -861,10 +908,10 @@ measure_font (App *app)
   int descent = pango_font_metrics_get_descent (m);
   pango_font_metrics_unref (m);
 
-  app->char_advance = (double) char_w / PANGO_SCALE;
+  app->char_advance = (double)char_w / PANGO_SCALE;
   if (app->char_advance < 1.0)
     app->char_advance = 8.0;
-  app->line_h = (double) (ascent + descent) / PANGO_SCALE;
+  app->line_h = (double)(ascent + descent) / PANGO_SCALE;
   if (app->line_h < 1.0)
     app->line_h = 16.0;
   app->row_h = app->line_h + 10.0;
@@ -874,16 +921,16 @@ measure_font (App *app)
 static void
 sample_column_widths (App *app)
 {
-  guint32 sample_cols = (app->n_cols < WIDTH_SAMPLE_COLS) ? app->n_cols
-                                                          : WIDTH_SAMPLE_COLS;
+  guint32 sample_cols
+      = (app->n_cols < WIDTH_SAMPLE_COLS) ? app->n_cols : WIDTH_SAMPLE_COLS;
   double default_w = app->char_advance * 12.0 + 12.0;
   for (guint32 c = 0; c < app->n_cols; c++)
     app->col_widths[c] = default_w;
   if (sample_cols == 0)
     return;
 
-  LsgWindow *sw =
-      lsg_document_set_window (app->doc, 0, WIDTH_SAMPLE_ROWS, 0, sample_cols);
+  LsgWindow *sw = lsg_document_set_window (app->doc, 0, WIDTH_SAMPLE_ROWS, 0,
+                                           sample_cols);
   guint32 got = lsg_window_row_count (sw);
   guint32 gotc = lsg_window_col_count (sw);
 
@@ -897,10 +944,10 @@ sample_column_widths (App *app)
         cells[cnt++] = lsg_window_cell (sw, r, c);
       /* Header dup is fetched locally and freed — bounded to the sampled
        * (head) columns, so open stays O(head), never O(column_count). */
-      char *hdr = app->has_header ? lsg_document_header_cell_dup (app->doc, c) : NULL;
-      double wpx = lsg_grid_column_width_estimate (cells, cnt, hdr,
-                                                   app->char_advance,
-                                                   app->char_advance * 2.0 + 12.0);
+      char *hdr = app->has_header ? lsg_document_header_cell_dup (app->doc, c)
+                                  : NULL;
+      double wpx = lsg_grid_column_width_estimate (
+          cells, cnt, hdr, app->char_advance, app->char_advance * 2.0 + 12.0);
       g_free (hdr);
       if (wpx < min_w)
         wpx = min_w;
@@ -912,7 +959,8 @@ sample_column_widths (App *app)
 }
 
 static void
-open_document (App *app, LsgDocument *doc, const char *title, gboolean is_network)
+open_document (App *app, LsgDocument *doc, const char *title,
+               gboolean is_network)
 {
   /* Arm the window-fill timer if an outer caller (open_file) has not already —
    * e.g. the network-adopt path enters here directly. */
@@ -924,7 +972,7 @@ open_document (App *app, LsgDocument *doc, const char *title, gboolean is_networ
 
   app_reset_document (app);
   app->doc = doc;
-  app->is_network = is_network;   /* gates the demand-driven fetch (net-park) */
+  app->is_network = is_network; /* gates the demand-driven fetch (net-park) */
 
   app->n_cols = lsg_document_column_count (doc);
   app->has_header = lsg_document_has_header (doc);
@@ -945,20 +993,21 @@ open_document (App *app, LsgDocument *doc, const char *title, gboolean is_networ
   gtk_adjustment_set_value (app->vadj, 0.0);
   gtk_adjustment_set_value (app->hadj, 0.0);
 
-  adw_window_title_set_title (app->title, (title != NULL) ? title : "less-sheet");
+  adw_window_title_set_title (app->title,
+                              (title != NULL) ? title : "less-sheet");
   grid_update_title_counts (app, rc, lsg_document_index_progress (doc));
 
   gtk_stack_set_visible_child_name (app->stack, "grid");
   grid_materialize (app);
   gtk_widget_queue_draw (GTK_WIDGET (app->area));
-  filter_sync_ui (app);            /* the reset cleared any prior filter */
+  filter_sync_ui (app); /* the reset cleared any prior filter */
 
   if (app->poll_id == 0)
     app->poll_id = g_timeout_add (POLL_INTERVAL_MS, grid_poll_tick, app);
 }
 
 /* ------------------------------------------------------------------------- */
-/* Open local file                                                            */
+/* Open local file */
 /* ------------------------------------------------------------------------- */
 
 /* Open one local GFile into the grid (or an error page). Does NOT take
@@ -994,7 +1043,7 @@ open_file (App *app, GFile *file)
           app->t_open_begin = begin;
           app->first_frame_pending = TRUE;
         }
-      open_document (app, doc, base, FALSE);   /* local file */
+      open_document (app, doc, base, FALSE); /* local file */
     }
 
   g_free (path);
@@ -1006,8 +1055,8 @@ on_file_opened (GObject *source, GAsyncResult *res, gpointer data)
 {
   App *app = data;
   GError *error = NULL;
-  GFile *file =
-      gtk_file_dialog_open_finish (GTK_FILE_DIALOG (source), res, &error);
+  GFile *file
+      = gtk_file_dialog_open_finish (GTK_FILE_DIALOG (source), res, &error);
   if (file == NULL)
     {
       /* User cancellation is not an error to surface. */
@@ -1021,7 +1070,7 @@ on_file_opened (GObject *source, GAsyncResult *res, gpointer data)
 static void
 action_open (GtkButton *button, gpointer data)
 {
-  (void) button;
+  (void)button;
   App *app = data;
   GtkFileDialog *dialog = gtk_file_dialog_new ();
   gtk_file_dialog_set_title (dialog, "Open Delimited File");
@@ -1030,13 +1079,14 @@ action_open (GtkButton *button, gpointer data)
 }
 
 /* ------------------------------------------------------------------------- */
-/* Open URL (network)                                                         */
+/* Open URL (network) */
 /* ------------------------------------------------------------------------- */
 
 /* Drive the reusable header-bar progress from a network-open poll (the unified
  * long-op status location — same widget copy uses). Pulse while connecting /
  * before a byte-fraction is known; determinate "Fetching N%" once head bytes
- * arrive. This SUBSUMES the old AdwBanner "Fetching …" (one indicator, not two). */
+ * arrive. This SUBSUMES the old AdwBanner "Fetching …" (one indicator, not
+ * two). */
 static void
 update_net_progress (App *app, const LsgNetProgress *p)
 {
@@ -1045,14 +1095,15 @@ update_net_progress (App *app, const LsgNetProgress *p)
   char *text;
   if (p->has_fraction)
     {
-      header_progress_set (app, p->fraction);            /* determinate */
-      text = g_strdup_printf ("Fetching %d%%", (int) (p->fraction * 100.0));
+      header_progress_set (app, p->fraction); /* determinate */
+      text = g_strdup_printf ("Fetching %d%%", (int)(p->fraction * 100.0));
     }
   else
     {
-      header_progress_set (app, -1.0);                   /* indeterminate pulse */
+      header_progress_set (app, -1.0); /* indeterminate pulse */
       text = (p->bytes_fetched > 0)
-                 ? g_strdup_printf ("Fetching %" G_GUINT64_FORMAT " bytes", p->bytes_fetched)
+                 ? g_strdup_printf ("Fetching %" G_GUINT64_FORMAT " bytes",
+                                    p->bytes_fetched)
                  : g_strdup ("Connecting…");
     }
   gtk_progress_bar_set_show_text (app->hp_bar, TRUE);
@@ -1065,14 +1116,22 @@ net_error_text (LsgNetError e)
 {
   switch (e)
     {
-    case LSG_NET_ERROR_INVALID_ARGUMENT:   return "The URL or scheme is not valid (use http:// or https://).";
-    case LSG_NET_ERROR_UNREACHABLE:        return "The host could not be reached.";
-    case LSG_NET_ERROR_TIMEOUT:            return "The connection timed out.";
-    case LSG_NET_ERROR_HTTP_STATUS:        return "The server returned an error status.";
-    case LSG_NET_ERROR_TOO_MANY_REDIRECTS: return "The redirect chain was too long.";
-    case LSG_NET_ERROR_IO:                 return "A local spool-file error occurred.";
-    case LSG_NET_ERROR_CANCELLED:          return "The open was cancelled.";
-    default:                               return "The network document could not be opened.";
+    case LSG_NET_ERROR_INVALID_ARGUMENT:
+      return "The URL or scheme is not valid (use http:// or https://).";
+    case LSG_NET_ERROR_UNREACHABLE:
+      return "The host could not be reached.";
+    case LSG_NET_ERROR_TIMEOUT:
+      return "The connection timed out.";
+    case LSG_NET_ERROR_HTTP_STATUS:
+      return "The server returned an error status.";
+    case LSG_NET_ERROR_TOO_MANY_REDIRECTS:
+      return "The redirect chain was too long.";
+    case LSG_NET_ERROR_IO:
+      return "A local spool-file error occurred.";
+    case LSG_NET_ERROR_CANCELLED:
+      return "The open was cancelled.";
+    default:
+      return "The network document could not be opened.";
     }
 }
 
@@ -1090,11 +1149,11 @@ net_poll_tick (gpointer data)
 
   if (!lsg_net_state_is_terminal (p.state))
     {
-      update_net_progress (app, &p);          /* moving header-bar feedback */
+      update_net_progress (app, &p); /* moving header-bar feedback */
       return G_SOURCE_CONTINUE;
     }
 
-  header_progress_hide (app);                  /* clears as rows paint / on error */
+  header_progress_hide (app); /* clears as rows paint / on error */
   if (p.state == LSG_NET_DONE)
     {
       LsgDocument *doc = lsg_net_open_adopt_document (app->net);
@@ -1102,7 +1161,8 @@ net_poll_tick (gpointer data)
       app->net = NULL;
       if (doc != NULL)
         open_document (app, doc,
-                       (app->pending_url != NULL) ? app->pending_url : "URL", TRUE);
+                       (app->pending_url != NULL) ? app->pending_url : "URL",
+                       TRUE);
       else
         show_error (app, "Could not open URL",
                     "The network document could not be adopted.");
@@ -1146,8 +1206,8 @@ on_url_response (AdwAlertDialog *dialog, const char *response, gpointer data)
    * progress. Without this, the old doc + its copy stay alive until the open
    * reaches DONE (open_document→app_reset_document→copy_stop_and_join), so the
    * two ops would overlap and fight over the one progress widget / ✕. Stopping
-   * here (plus the app->net gate in do_copy) makes "no copy while a net open is
-   * in flight" a hard invariant — same pattern as do_apply_filter. */
+   * here (plus the app->net gate in do_copy) makes "no copy while a net open
+   * is in flight" a hard invariant — same pattern as do_apply_filter. */
   copy_stop_and_join (app);
 
   if (app->net != NULL)
@@ -1159,7 +1219,8 @@ on_url_response (AdwAlertDialog *dialog, const char *response, gpointer data)
   app->net = lsg_net_open_start (url, NULL);
   if (app->net == NULL)
     {
-      show_error (app, "Could not open URL", "The open job could not be started.");
+      show_error (app, "Could not open URL",
+                  "The open job could not be started.");
       return;
     }
 
@@ -1174,20 +1235,23 @@ on_url_response (AdwAlertDialog *dialog, const char *response, gpointer data)
 static void
 action_open_url (GtkButton *button, gpointer data)
 {
-  (void) button;
+  (void)button;
   App *app = data;
 
   AdwDialog *dialog = adw_alert_dialog_new ("Open URL", NULL);
-  adw_alert_dialog_set_body (ADW_ALERT_DIALOG (dialog),
-                             "Enter an http:// or https:// address of a .csv or .csv.gz file.");
+  adw_alert_dialog_set_body (
+      ADW_ALERT_DIALOG (dialog),
+      "Enter an http:// or https:// address of a .csv or .csv.gz file.");
 
   GtkWidget *entry = gtk_entry_new ();
   gtk_entry_set_input_purpose (GTK_ENTRY (entry), GTK_INPUT_PURPOSE_URL);
-  gtk_entry_set_placeholder_text (GTK_ENTRY (entry), "https://example.com/data.csv");
+  gtk_entry_set_placeholder_text (GTK_ENTRY (entry),
+                                  "https://example.com/data.csv");
   adw_alert_dialog_set_extra_child (ADW_ALERT_DIALOG (dialog), entry);
   g_object_set_data (G_OBJECT (dialog), "url-entry", entry);
 
-  adw_alert_dialog_add_response (ADW_ALERT_DIALOG (dialog), "cancel", "Cancel");
+  adw_alert_dialog_add_response (ADW_ALERT_DIALOG (dialog), "cancel",
+                                 "Cancel");
   adw_alert_dialog_add_response (ADW_ALERT_DIALOG (dialog), "open", "Open");
   adw_alert_dialog_set_response_appearance (ADW_ALERT_DIALOG (dialog), "open",
                                             ADW_RESPONSE_SUGGESTED);
@@ -1199,23 +1263,23 @@ action_open_url (GtkButton *button, gpointer data)
 }
 
 /* ------------------------------------------------------------------------- */
-/* Scroll / keyboard input on the grid                                        */
+/* Scroll / keyboard input on the grid */
 /* ------------------------------------------------------------------------- */
 
 static gboolean
 on_scroll (GtkEventControllerScroll *ctrl, double dx, double dy, gpointer data)
 {
-  (void) ctrl;
+  (void)ctrl;
   App *app = data;
   if (app->doc == NULL)
     return GDK_EVENT_PROPAGATE;
 
   if (dy != 0.0)
-    gtk_adjustment_set_value (app->vadj,
-                              gtk_adjustment_get_value (app->vadj) + dy * app->row_h * 3.0);
+    gtk_adjustment_set_value (app->vadj, gtk_adjustment_get_value (app->vadj)
+                                             + dy * app->row_h * 3.0);
   if (dx != 0.0)
-    gtk_adjustment_set_value (app->hadj,
-                              gtk_adjustment_get_value (app->hadj) + dx * app->char_advance * 6.0);
+    gtk_adjustment_set_value (app->hadj, gtk_adjustment_get_value (app->hadj)
+                                             + dx * app->char_advance * 6.0);
   return GDK_EVENT_STOP;
 }
 
@@ -1223,16 +1287,17 @@ static gboolean
 on_key_pressed (GtkEventControllerKey *ctrl, guint keyval, guint keycode,
                 GdkModifierType state, gpointer data)
 {
-  (void) ctrl;
-  (void) keycode;
+  (void)ctrl;
+  (void)keycode;
   App *app = data;
   if (app->doc == NULL)
     return GDK_EVENT_PROPAGATE;
 
   /* Ctrl+C copies the current selection (grid-focused only, so a text entry's
-   * own Ctrl+C is untouched — that's why this lives on the grid controller, not
-   * a window-capture one). */
-  if ((state & GDK_CONTROL_MASK) && (keyval == GDK_KEY_c || keyval == GDK_KEY_C))
+   * own Ctrl+C is untouched — that's why this lives on the grid controller,
+   * not a window-capture one). */
+  if ((state & GDK_CONTROL_MASK)
+      && (keyval == GDK_KEY_c || keyval == GDK_KEY_C))
     {
       do_copy (app);
       return GDK_EVENT_STOP;
@@ -1243,12 +1308,12 @@ on_key_pressed (GtkEventControllerKey *ctrl, guint keyval, guint keycode,
     {
       if (keyval >= GDK_KEY_0 && keyval <= GDK_KEY_9)
         {
-          open_jump_with_digit (app, (char) ('0' + (keyval - GDK_KEY_0)));
+          open_jump_with_digit (app, (char)('0' + (keyval - GDK_KEY_0)));
           return GDK_EVENT_STOP;
         }
       if (keyval >= GDK_KEY_KP_0 && keyval <= GDK_KEY_KP_9)
         {
-          open_jump_with_digit (app, (char) ('0' + (keyval - GDK_KEY_KP_0)));
+          open_jump_with_digit (app, (char)('0' + (keyval - GDK_KEY_KP_0)));
           return GDK_EVENT_STOP;
         }
     }
@@ -1257,31 +1322,45 @@ on_key_pressed (GtkEventControllerKey *ctrl, guint keyval, guint keycode,
   double page = gtk_adjustment_get_page_size (app->vadj);
   switch (keyval)
     {
-    case GDK_KEY_Down:      gtk_adjustment_set_value (app->vadj, v + app->row_h); return GDK_EVENT_STOP;
-    case GDK_KEY_Up:        gtk_adjustment_set_value (app->vadj, v - app->row_h); return GDK_EVENT_STOP;
-    case GDK_KEY_Page_Down: gtk_adjustment_set_value (app->vadj, v + page);       return GDK_EVENT_STOP;
-    case GDK_KEY_Page_Up:   gtk_adjustment_set_value (app->vadj, v - page);       return GDK_EVENT_STOP;
-    case GDK_KEY_Home:      gtk_adjustment_set_value (app->vadj, 0.0);            return GDK_EVENT_STOP;
-    case GDK_KEY_End:       gtk_adjustment_set_value (app->vadj,
-                                                      gtk_adjustment_get_upper (app->vadj)); return GDK_EVENT_STOP;
-    default:                return GDK_EVENT_PROPAGATE;
+    case GDK_KEY_Down:
+      gtk_adjustment_set_value (app->vadj, v + app->row_h);
+      return GDK_EVENT_STOP;
+    case GDK_KEY_Up:
+      gtk_adjustment_set_value (app->vadj, v - app->row_h);
+      return GDK_EVENT_STOP;
+    case GDK_KEY_Page_Down:
+      gtk_adjustment_set_value (app->vadj, v + page);
+      return GDK_EVENT_STOP;
+    case GDK_KEY_Page_Up:
+      gtk_adjustment_set_value (app->vadj, v - page);
+      return GDK_EVENT_STOP;
+    case GDK_KEY_Home:
+      gtk_adjustment_set_value (app->vadj, 0.0);
+      return GDK_EVENT_STOP;
+    case GDK_KEY_End:
+      gtk_adjustment_set_value (app->vadj,
+                                gtk_adjustment_get_upper (app->vadj));
+      return GDK_EVENT_STOP;
+    default:
+      return GDK_EVENT_PROPAGATE;
     }
 }
 
 static void
 on_adjustment_changed (GtkAdjustment *adj, gpointer data)
 {
-  (void) adj;
+  (void)adj;
   App *app = data;
   if (app->doc == NULL)
     return;
   grid_materialize (app);
   gtk_widget_queue_draw (GTK_WIDGET (app->area));
   /* Net-park: a scroll landing beyond the fetched frontier comes back SHORT (a
-   * bare ls_window_set fetched nothing) — drive the fetch to the top row so the
-   * target rows appear. Identity view: cur_top_row is an original row. Filtered:
-   * it is a filtered index driven as an original row, which still advances the
-   * filter frontier (best-effort; a monotone scroll converges). */
+   * bare ls_window_set fetched nothing) — drive the fetch to the top row so
+   * the target rows appear. Identity view: cur_top_row is an original row.
+   * Filtered: it is a filtered index driven as an original row, which still
+   * advances the filter frontier (best-effort; a monotone scroll converges).
+   */
   if (app->is_network && app->window_short && !app->net_drive_active)
     net_drive_begin (app, app->cur_top_row);
 }
@@ -1289,17 +1368,19 @@ on_adjustment_changed (GtkAdjustment *adj, gpointer data)
 static void
 on_area_resize (GtkDrawingArea *area, int width, int height, gpointer data)
 {
-  (void) area;
-  (void) width;
-  (void) height;
+  (void)area;
+  (void)width;
+  (void)height;
   App *app = data;
 
   /* The grid resizes with the window; re-anchor any OPEN popover to its
-   * header-bar button (GTK4 doesn't always re-anchor an already-visible popover
-   * when the parent's allocation changes on resize). */
-  if (app->find_popover != NULL && gtk_widget_get_mapped (GTK_WIDGET (app->find_popover)))
+   * header-bar button (GTK4 doesn't always re-anchor an already-visible
+   * popover when the parent's allocation changes on resize). */
+  if (app->find_popover != NULL
+      && gtk_widget_get_mapped (GTK_WIDGET (app->find_popover)))
     gtk_popover_present (app->find_popover);
-  if (app->jump_popover != NULL && gtk_widget_get_mapped (GTK_WIDGET (app->jump_popover)))
+  if (app->jump_popover != NULL
+      && gtk_widget_get_mapped (GTK_WIDGET (app->jump_popover)))
     gtk_popover_present (app->jump_popover);
 
   if (app->doc == NULL)
@@ -1311,7 +1392,7 @@ on_area_resize (GtkDrawingArea *area, int width, int height, gpointer data)
 }
 
 /* ------------------------------------------------------------------------- */
-/* Find (slice 2): the popover UI + highlight glue over lsg_find               */
+/* Find (slice 2): the popover UI + highlight glue over lsg_find */
 /* ------------------------------------------------------------------------- */
 
 static void
@@ -1343,11 +1424,12 @@ find_update_labels (App *app)
   else if (d->active)
     {
       if (d->has_current)
-        owned = g_strdup_printf ("%" G_GUINT64_FORMAT " of %" G_GUINT64_FORMAT "%s",
-                                 d->position, d->total, d->total_final ? "" : "…");
+        owned = g_strdup_printf (
+            "%" G_GUINT64_FORMAT " of %" G_GUINT64_FORMAT "%s", d->position,
+            d->total, d->total_final ? "" : "…");
       else if (d->total > 0)
-        owned = g_strdup_printf ("%" G_GUINT64_FORMAT " matches%s",
-                                 d->total, d->total_final ? "" : "…");
+        owned = g_strdup_printf ("%" G_GUINT64_FORMAT " matches%s", d->total,
+                                 d->total_final ? "" : "…");
       else
         text = "Searching…";
     }
@@ -1363,13 +1445,15 @@ scroll_to_match (App *app, guint64 row)
   int h = gtk_widget_get_height (GTK_WIDGET (app->area));
   if (h <= 0 || app->row_h <= 0.0)
     return;
-  double visible = ((double) h - app->header_h) / app->row_h;
-  if (row >= app->cur_top_row && (double) (row - app->cur_top_row) < visible - 1.0)
-    return;                                   /* already on screen */
-  guint64 target = (row > 2) ? row - 2 : 0;   /* leave a small top margin */
+  double visible = ((double)h - app->header_h) / app->row_h;
+  if (row >= app->cur_top_row
+      && (double)(row - app->cur_top_row) < visible - 1.0)
+    return;                                 /* already on screen */
+  guint64 target = (row > 2) ? row - 2 : 0; /* leave a small top margin */
   double upper = gtk_adjustment_get_upper (app->vadj);
-  double off = lsg_grid_offset_for_top_row (target, upper, app->row_estimate, app->row_h);
-  gtk_adjustment_set_value (app->vadj, off);  /* fires materialize + repaint */
+  double off = lsg_grid_offset_for_top_row (target, upper, app->row_estimate,
+                                            app->row_h);
+  gtk_adjustment_set_value (app->vadj, off); /* fires materialize + repaint */
 }
 
 /* Re-anchor the viewport so `row` is exactly the first visible row (the
@@ -1378,8 +1462,9 @@ static void
 scroll_to_first_row (App *app, guint64 row)
 {
   double upper = gtk_adjustment_get_upper (app->vadj);
-  double off = lsg_grid_offset_for_top_row (row, upper, app->row_estimate, app->row_h);
-  gtk_adjustment_set_value (app->vadj, off);  /* fires materialize + repaint */
+  double off = lsg_grid_offset_for_top_row (row, upper, app->row_estimate,
+                                            app->row_h);
+  gtk_adjustment_set_value (app->vadj, off); /* fires materialize + repaint */
 }
 
 static gboolean
@@ -1401,25 +1486,29 @@ find_set_sticky_notice (App *app, LsgFindNotice notice)
   app->find_notice_id = g_timeout_add (2500, find_notice_clear, app);
 }
 
-/* (Re)run the current entry text as a live TEXT search, or clear when empty. */
+/* (Re)run the current entry text as a live TEXT search, or clear when empty.
+ */
 static void
 find_run_query (App *app)
 {
   if (app->doc == NULL)
     return;
-  /* A find's ls_search_start / ls_search_nav ALSO take the shared core scan slot
-   * and would cancel a running copy's frontier-advance jump -> the copy times out
-   * at FRONTIER = a TRUNCATED copy (the same slot-contention class as jump). Yield
-   * the slot to a live copy (bounded + ✕-cancellable). See also do_find_step. */
+  /* A find's ls_search_start / ls_search_nav ALSO take the shared core scan
+   * slot and would cancel a running copy's frontier-advance jump -> the copy
+   * times out at FRONTIER = a TRUNCATED copy (the same slot-contention class
+   * as jump). Yield the slot to a live copy (bounded + ✕-cancellable). See
+   * also do_find_step. */
   if (app->copy_op != NULL)
     return;
 
   app->find.draft.mode = LSG_FIND_TEXT;
-  app->find.draft.text = gtk_editable_get_text (app->find_entry); /* borrowed */
+  app->find.draft.text
+      = gtk_editable_get_text (app->find_entry); /* borrowed */
 
   /* Slice-2 UI is text find over ALL columns (no column hiding yet): the whole
    * column set is visible, so the composed scope is NULL. */
-  LsgFindSubmit sub = lsg_find_submit (app->find, NULL, app->n_cols, app->n_cols);
+  LsgFindSubmit sub
+      = lsg_find_submit (app->find, NULL, app->n_cols, app->n_cols);
   if (sub.outcome == LSG_FIND_RUN
       && lsg_document_search_start (app->doc, sub.request))
     {
@@ -1443,9 +1532,10 @@ find_run_query (App *app)
       app->find = lsg_find_closed (app->find);
     }
 
-  grid_materialize (app);          /* refresh (or clear) the highlight mask */
+  grid_materialize (app); /* refresh (or clear) the highlight mask */
   find_update_labels (app);
-  filter_update_toggle_sensitivity (app);   /* canApplyFilter follows the query */
+  filter_update_toggle_sensitivity (
+      app); /* canApplyFilter follows the query */
   gtk_widget_queue_draw (GTK_WIDGET (app->area));
 }
 
@@ -1459,12 +1549,14 @@ find_poll_fold (App *app)
   gboolean prev_has = app->find.display.has_current;
   guint64 prev_row = prev_has ? app->find.display.current.row : 0;
 
-  app->find = lsg_find_resolved (app->find, has, snap, app->find_nav_direction);
+  app->find
+      = lsg_find_resolved (app->find, has, snap, app->find_nav_direction);
 
-  /* A wrap notice asks for a follow-up navigation (issued once); it self-clears
-   * when the wrap lands as a FOUND poll. Suppress it while a copy runs — an
-   * ls_search_nav here would also take the shared scan slot from the copy's jump
-   * (deferred, not lost: it re-issues on the next tick once the copy is done). */
+  /* A wrap notice asks for a follow-up navigation (issued once); it
+   * self-clears when the wrap lands as a FOUND poll. Suppress it while a copy
+   * runs — an ls_search_nav here would also take the shared scan slot from the
+   * copy's jump (deferred, not lost: it re-issues on the next tick once the
+   * copy is done). */
   LsgSearchNav wnav;
   if (app->copy_op == NULL && lsg_find_wrap_nav (app->find, &wnav))
     {
@@ -1485,7 +1577,7 @@ find_poll_fold (App *app)
       && (!prev_has || app->find.display.current.row != prev_row))
     scroll_to_match (app, app->find.display.current.row);
 
-  grid_materialize (app);          /* refresh the highlight mask as the scan advances */
+  grid_materialize (app); /* refresh the highlight mask as the scan advances */
   find_update_labels (app);
   gtk_widget_queue_draw (GTK_WIDGET (app->area));
 }
@@ -1495,16 +1587,18 @@ do_find_step (App *app, LsgSearchDir direction)
 {
   if (app->doc == NULL || !app->find.display.active)
     return;
-  if (app->copy_op != NULL)               /* yield the scan slot to a live copy */
+  if (app->copy_op != NULL) /* yield the scan slot to a live copy */
     return;
   LsgSearchNav nav;
   if (lsg_find_step (app->find, direction, app->cur_top_row, &nav))
     {
-      /* A scanning nav can take the shared slot too (ABI: "a nav that must scan
-       * ... cancelling a jump in LS_JUMP_SCANNING"). Retire any preserved jump so
-       * it can't be left phantom-SCANNING. Reachable only after find_run_query
-       * (find must be active), which already retired it, so this is normally a
-       * no-op — kept for symmetry with the slot-taking find_run_query branch. */
+      /* A scanning nav can take the shared slot too (ABI: "a nav that must
+       * scan
+       * ... cancelling a jump in LS_JUMP_SCANNING"). Retire any preserved jump
+       * so it can't be left phantom-SCANNING. Reachable only after
+       * find_run_query (find must be active), which already retired it, so
+       * this is normally a no-op — kept for symmetry with the slot-taking
+       * find_run_query branch. */
       app->jump = lsg_jump_initial ();
       app->find_nav_direction = direction;
       app->find_wrap_issued = FALSE;
@@ -1516,30 +1610,30 @@ do_find_step (App *app, LsgSearchDir direction)
 static void
 on_find_search_changed (GtkSearchEntry *entry, gpointer data)
 {
-  (void) entry;
-  find_run_query ((App *) data);
+  (void)entry;
+  find_run_query ((App *)data);
 }
 
 static void
 on_find_next_clicked (GtkButton *button, gpointer data)
 {
-  (void) button;
-  do_find_step ((App *) data, LSG_SEARCH_FORWARD);
+  (void)button;
+  do_find_step ((App *)data, LSG_SEARCH_FORWARD);
 }
 
 static void
 on_find_prev_clicked (GtkButton *button, gpointer data)
 {
-  (void) button;
-  do_find_step ((App *) data, LSG_SEARCH_BACKWARD);
+  (void)button;
+  do_find_step ((App *)data, LSG_SEARCH_BACKWARD);
 }
 
 static gboolean
 on_find_entry_key (GtkEventControllerKey *ctrl, guint keyval, guint keycode,
                    GdkModifierType state, gpointer data)
 {
-  (void) ctrl;
-  (void) keycode;
+  (void)ctrl;
+  (void)keycode;
   App *app = data;
   switch (keyval)
     {
@@ -1556,11 +1650,12 @@ on_find_entry_key (GtkEventControllerKey *ctrl, guint keyval, guint keycode,
     }
 }
 
-/* Esc / click-away: cancel the core search + clear highlights; keep the draft. */
+/* Esc / click-away: cancel the core search + clear highlights; keep the draft.
+ */
 static void
 on_find_popover_closed (GtkPopover *popover, gpointer data)
 {
-  (void) popover;
+  (void)popover;
   App *app = data;
   if (app->doc != NULL)
     lsg_document_search_cancel (app->doc);
@@ -1581,11 +1676,12 @@ on_find_popover_closed (GtkPopover *popover, gpointer data)
     }
 }
 
-/* Opening (re)focuses the entry and re-runs any retained query to re-highlight. */
+/* Opening (re)focuses the entry and re-runs any retained query to
+ * re-highlight. */
 static void
 on_find_popover_show (GtkWidget *popover, gpointer data)
 {
-  (void) popover;
+  (void)popover;
   App *app = data;
   gtk_widget_grab_focus (GTK_WIDGET (app->find_entry));
   const char *text = gtk_editable_get_text (app->find_entry);
@@ -1605,8 +1701,8 @@ static gboolean
 on_window_key (GtkEventControllerKey *ctrl, guint keyval, guint keycode,
                GdkModifierType state, gpointer data)
 {
-  (void) ctrl;
-  (void) keycode;
+  (void)ctrl;
+  (void)keycode;
   App *app = data;
   if (state & GDK_CONTROL_MASK)
     {
@@ -1616,16 +1712,17 @@ on_window_key (GtkEventControllerKey *ctrl, guint keyval, guint keycode,
           return GDK_EVENT_STOP;
         }
       /* Ctrl+G / Ctrl+L both open jump-to-row (go to line). */
-      if (keyval == GDK_KEY_g || keyval == GDK_KEY_G
-          || keyval == GDK_KEY_l || keyval == GDK_KEY_L)
+      if (keyval == GDK_KEY_g || keyval == GDK_KEY_G || keyval == GDK_KEY_l
+          || keyval == GDK_KEY_L)
         {
           open_jump (app);
           return GDK_EVENT_STOP;
         }
-      /* Ctrl+O opens a local file, Ctrl+Shift+O opens a network URL — mirroring
-       * macOS ⌘O / ⌘⇧O. The two map to different actions, so the Shift modifier
-       * (not the keyval case, which is layout-dependent) selects between them.
-       * action_open / action_open_url ignore their button arg. */
+      /* Ctrl+O opens a local file, Ctrl+Shift+O opens a network URL —
+       * mirroring macOS ⌘O / ⌘⇧O. The two map to different actions, so the
+       * Shift modifier (not the keyval case, which is layout-dependent)
+       * selects between them. action_open / action_open_url ignore their
+       * button arg. */
       if (keyval == GDK_KEY_o || keyval == GDK_KEY_O)
         {
           if (state & GDK_SHIFT_MASK)
@@ -1678,17 +1775,19 @@ build_find_popover (App *app)
   gtk_popover_set_child (GTK_POPOVER (pop), box);
   app->find_popover = GTK_POPOVER (pop);
 
-  g_signal_connect (entry, "search-changed", G_CALLBACK (on_find_search_changed), app);
+  g_signal_connect (entry, "search-changed",
+                    G_CALLBACK (on_find_search_changed), app);
   g_signal_connect (prev, "clicked", G_CALLBACK (on_find_prev_clicked), app);
   g_signal_connect (next, "clicked", G_CALLBACK (on_find_next_clicked), app);
   g_signal_connect (pop, "closed", G_CALLBACK (on_find_popover_closed), app);
   g_signal_connect (pop, "show", G_CALLBACK (on_find_popover_show), app);
 
-  /* CAPTURE phase so Enter/Shift+Enter/Esc reach us BEFORE the entry's internal
-   * GtkText consumes Return (its "activate") — that's why Enter did nothing. In
-   * capture we see Return first and return STOP, so Enter advances to the next
-   * match (Shift+Enter → previous), the popover stays open for repeated Enter,
-   * and Esc still closes. Other keys PROPAGATE so typing/search-changed work. */
+  /* CAPTURE phase so Enter/Shift+Enter/Esc reach us BEFORE the entry's
+   * internal GtkText consumes Return (its "activate") — that's why Enter did
+   * nothing. In capture we see Return first and return STOP, so Enter advances
+   * to the next match (Shift+Enter → previous), the popover stays open for
+   * repeated Enter, and Esc still closes. Other keys PROPAGATE so
+   * typing/search-changed work. */
   GtkEventController *keys = gtk_event_controller_key_new ();
   gtk_event_controller_set_propagation_phase (keys, GTK_PHASE_CAPTURE);
   g_signal_connect (keys, "key-pressed", G_CALLBACK (on_find_entry_key), app);
@@ -1696,7 +1795,7 @@ build_find_popover (App *app)
 }
 
 /* ------------------------------------------------------------------------- */
-/* Jump-to-row (slice 3): the popover UI over lsg_jump                          */
+/* Jump-to-row (slice 3): the popover UI over lsg_jump */
 /* ------------------------------------------------------------------------- */
 
 /* Show progress + cancel only while scanning; keep the fraction current. */
@@ -1776,24 +1875,25 @@ jump_poll_fold (App *app)
     return;
 
   LsgJumpStatus st = lsg_document_jump_poll (app->doc);
-  /* Composition: a filtered short-land LANDS (filtered index vs original target
-   * are not comparable), never rejects. */
+  /* Composition: a filtered short-land LANDS (filtered index vs original
+   * target are not comparable), never rejects. */
   app->jump = lsg_jump_resolve (app->jump, st, app->filter.active);
 
   switch (app->jump.kind)
     {
     case LSG_JUMP_FLOW_LANDED:
       scroll_to_first_row (app, app->jump.landed_row);
-      gtk_popover_popdown (app->jump_popover);   /* closes -> resets to idle */
+      gtk_popover_popdown (app->jump_popover); /* closes -> resets to idle */
       break;
     case LSG_JUMP_FLOW_REJECTED:
       if (app->jump.has_restore)
         scroll_to_first_row (app, app->jump.restore_first_row);
       jump_reject_feedback (app);
-      /* Keep the field open + re-armed; the flow is terminal (not scanning). */
+      /* Keep the field open + re-armed; the flow is terminal (not scanning).
+       */
       break;
     default:
-      break;   /* still SCANNING: progress updated below */
+      break; /* still SCANNING: progress updated below */
     }
   jump_update_ui (app);
 }
@@ -1803,10 +1903,11 @@ jump_poll_fold (App *app)
  * advances the fetch/filter frontier ONLY when the frontend issues an
  * ls_jump_start / ls_search_nav; a bare ls_window_set fetches nothing. So any
  * viewport landing beyond the fetched frontier — filter-apply, filter scroll,
- * deep scroll — must first drive a jump to the target row. This is the plumbing;
- * it deliberately does NOT touch the user's jump-popover flow (`app->jump`). It
- * is a no-op on local documents (their frontier is already ahead), and it is not
- * gate-testable (no fake network at the C ABI) — verified on a real desktop.
+ * deep scroll — must first drive a jump to the target row. This is the
+ * plumbing; it deliberately does NOT touch the user's jump-popover flow
+ * (`app->jump`). It is a no-op on local documents (their frontier is already
+ * ahead), and it is not gate-testable (no fake network at the C ABI) —
+ * verified on a real desktop.
  */
 static void
 net_drive_begin (App *app, guint64 target_row)
@@ -1814,21 +1915,23 @@ net_drive_begin (App *app, guint64 target_row)
   if (!app->is_network || app->doc == NULL)
     return;
   /* The user's manual jump owns the single core scan slot; a net fetch-drive
-   * (from a scroll or filter-apply) must NOT retarget it to `target_row` mid-scan
-   * and mis-land the user's jump. Filter-apply resets the jump to IDLE before it
-   * drives, so this only suppresses a scroll-drive during a live user jump. */
+   * (from a scroll or filter-apply) must NOT retarget it to `target_row`
+   * mid-scan and mis-land the user's jump. Filter-apply resets the jump to
+   * IDLE before it drives, so this only suppresses a scroll-drive during a
+   * live user jump. */
   if (app->jump.kind == LSG_JUMP_FLOW_SCANNING)
     return;
   /* A streaming copy also drives the shared frontier (to its own stalled_row);
-   * a scroll-drive that retargets the slot BELOW that row would leave the copy's
-   * frontier short -> a re-stall on the same row -> a TRUNCATED copy. Yield: the
-   * copy advances the frontier itself; scrolling far ahead just waits for it. */
+   * a scroll-drive that retargets the slot BELOW that row would leave the
+   * copy's frontier short -> a re-stall on the same row -> a TRUNCATED copy.
+   * Yield: the copy advances the frontier itself; scrolling far ahead just
+   * waits for it. */
   if (app->copy_op != NULL)
     return;
   app->net_drive_active = TRUE;
   lsg_document_jump_start (app->doc, target_row);
-  /* Fold the immediate poll (a behind-frontier / small fetch completes at once);
-   * otherwise the ~100 ms tick keeps folding until DONE. */
+  /* Fold the immediate poll (a behind-frontier / small fetch completes at
+   * once); otherwise the ~100 ms tick keeps folding until DONE. */
   net_drive_poll (app);
   if (app->net_drive_active)
     ensure_poll (app);
@@ -1843,7 +1946,7 @@ net_drive_poll (App *app)
   if (st.state == LSG_JUMP_DONE)
     {
       app->net_drive_active = FALSE;
-      grid_materialize (app);          /* the target rows are now fetched */
+      grid_materialize (app); /* the target rows are now fetched */
       gtk_widget_queue_draw (GTK_WIDGET (app->area));
     }
 }
@@ -1855,11 +1958,12 @@ do_jump_submit (App *app)
   if (app->doc == NULL)
     return;
 
-  /* A streaming copy owns the shared core scan slot (it advances the frontier to
-   * its own stalled_row from the worker). A user jump's ls_jump_start would
+  /* A streaming copy owns the shared core scan slot (it advances the frontier
+   * to its own stalled_row from the worker). A user jump's ls_jump_start would
    * retarget that slot and TRUNCATE the copy (and the copy's bg jump would
-   * mis-land this one). Deny while a copy runs — it is bounded + has a ✕ cancel;
-   * signal the denial with the field's reject blink ("cancel the copy first"). */
+   * mis-land this one). Deny while a copy runs — it is bounded + has a ✕
+   * cancel; signal the denial with the field's reject blink ("cancel the copy
+   * first"). */
   if (app->copy_op != NULL)
     {
       jump_reject_feedback (app);
@@ -1867,26 +1971,27 @@ do_jump_submit (App *app)
     }
 
   const char *text = gtk_editable_get_text (app->jump_entry);
-  /* Composition: while filtered the jump box takes ORIGINAL row numbers, so hint
-   * with the base document count M and drive the frozen jump with filtered=TRUE
-   * (which suppresses its out-of-range reject). */
-  LsgRowCount rc = lsg_filter_jump_rowcount (app->filter,
-                                             lsg_document_row_count (app->doc));
-  LsgJumpSubmit sub = lsg_jump_submit (text, rc, app->filter.active, app->cur_top_row);
+  /* Composition: while filtered the jump box takes ORIGINAL row numbers, so
+   * hint with the base document count M and drive the frozen jump with
+   * filtered=TRUE (which suppresses its out-of-range reject). */
+  LsgRowCount rc = lsg_filter_jump_rowcount (
+      app->filter, lsg_document_row_count (app->doc));
+  LsgJumpSubmit sub
+      = lsg_jump_submit (text, rc, app->filter.active, app->cur_top_row);
   app->jump = sub.flow;
 
   if (sub.outcome == LSG_JUMP_RUN)
     {
       lsg_document_jump_start (app->doc, sub.target);
-      /* A behind-frontier / clamped target completes before the start returns —
-       * fold the immediate poll so it lands without a tick. */
+      /* A behind-frontier / clamped target completes before the start returns
+       * — fold the immediate poll so it lands without a tick. */
       jump_poll_fold (app);
       if (app->jump.kind == LSG_JUMP_FLOW_SCANNING)
         ensure_poll (app);
     }
   else
     {
-      jump_reject_feedback (app);      /* upfront reject: no scan, no move */
+      jump_reject_feedback (app); /* upfront reject: no scan, no move */
     }
   jump_update_ui (app);
 }
@@ -1907,8 +2012,8 @@ do_jump_cancel (App *app)
 static void
 on_jump_go_clicked (GtkButton *button, gpointer data)
 {
-  (void) button;
-  do_jump_submit ((App *) data);
+  (void)button;
+  do_jump_submit ((App *)data);
 }
 
 /* Enter in the jump entry submits (a plain GtkEntry consumes Return as its
@@ -1916,24 +2021,24 @@ on_jump_go_clicked (GtkButton *button, gpointer data)
 static void
 on_jump_activate (GtkEntry *entry, gpointer data)
 {
-  (void) entry;
-  do_jump_submit ((App *) data);
+  (void)entry;
+  do_jump_submit ((App *)data);
 }
 
 static void
 on_jump_cancel_clicked (GtkButton *button, gpointer data)
 {
-  (void) button;
-  do_jump_cancel ((App *) data);
+  (void)button;
+  do_jump_cancel ((App *)data);
 }
 
 static gboolean
 on_jump_entry_key (GtkEventControllerKey *ctrl, guint keyval, guint keycode,
                    GdkModifierType state, gpointer data)
 {
-  (void) ctrl;
-  (void) keycode;
-  (void) state;
+  (void)ctrl;
+  (void)keycode;
+  (void)state;
   App *app = data;
   /* Enter is handled by the entry's "activate" signal (the internal GtkText
    * consumes Return before this bubble-phase controller — that was the bug);
@@ -1941,8 +2046,8 @@ on_jump_entry_key (GtkEventControllerKey *ctrl, guint keyval, guint keycode,
   if (keyval == GDK_KEY_Escape)
     {
       /* Escape is an EXPLICIT close: flag it so the closed handler cancels the
-       * in-flight scan + restores the viewport (an incidental autohide does not
-       * set this, and instead keeps a live deep/net scan running). */
+       * in-flight scan + restores the viewport (an incidental autohide does
+       * not set this, and instead keeps a live deep/net scan running). */
       app->jump_explicit_close = TRUE;
       gtk_popover_popdown (app->jump_popover);
       return GDK_EVENT_STOP;
@@ -1956,31 +2061,33 @@ on_jump_entry_key (GtkEventControllerKey *ctrl, guint keyval, guint keycode,
  *
  *  - EXPLICIT close (Escape; app->jump_explicit_close == TRUE): the user is
  *    abandoning the jump -> cancel the in-flight scan + restore the viewport +
- *    reset to idle, as before. (The ✕ cancel button takes do_jump_cancel, which
- *    cancels in place and leaves the popover open, so it never reaches here.)
+ *    reset to idle, as before. (The ✕ cancel button takes do_jump_cancel,
+ * which cancels in place and leaves the popover open, so it never reaches
+ * here.)
  *
  *  - INCIDENTAL autohide (click-away / focus shift; flag FALSE): the popover
  *    vanished for an unrelated reason while a legitimately slow deep/network
  *    scan is still running (a deep net jump is real fetch time — tens of MB /
  *    seconds). Cancelling it here would silently throw away a valid jump. So
- *    KEEP the scan alive: do NOT cancel, restore, or reset the flow. The global
- *    grid_poll_tick keeps folding jump_poll_fold (it is not tied to the
- *    popover), so when the scan reaches DONE the viewport scrolls to the target
- *    and the flow resets to idle exactly as a normal land would.
+ *    KEEP the scan alive: do NOT cancel, restore, or reset the flow. The
+ * global grid_poll_tick keeps folding jump_poll_fold (it is not tied to the
+ *    popover), so when the scan reaches DONE the viewport scrolls to the
+ * target and the flow resets to idle exactly as a normal land would.
  */
 static void
 on_jump_popover_closed (GtkPopover *popover, gpointer data)
 {
-  (void) popover;
+  (void)popover;
   App *app = data;
   gboolean explicit = app->jump_explicit_close;
-  app->jump_explicit_close = FALSE;   /* consume: never leak into a later close */
+  app->jump_explicit_close
+      = FALSE; /* consume: never leak into a later close */
 
   if (!explicit && app->doc != NULL
       && app->jump.kind == LSG_JUMP_FLOW_SCANNING)
     {
-      /* Incidental autohide mid-scan: preserve the live jump so it still lands;
-       * only tidy the transient reject blink. */
+      /* Incidental autohide mid-scan: preserve the live jump so it still
+       * lands; only tidy the transient reject blink. */
       jump_clear_feedback (app);
       return;
     }
@@ -2000,9 +2107,10 @@ on_jump_popover_closed (GtkPopover *popover, gpointer data)
 static void
 on_jump_popover_show (GtkWidget *popover, gpointer data)
 {
-  (void) popover;
+  (void)popover;
   App *app = data;
-  app->jump_explicit_close = FALSE;   /* fresh open: default to incidental close */
+  app->jump_explicit_close
+      = FALSE; /* fresh open: default to incidental close */
   gtk_widget_grab_focus (GTK_WIDGET (app->jump_entry));
   gtk_editable_set_position (app->jump_entry, -1);
 }
@@ -2063,10 +2171,12 @@ build_jump_popover (App *app)
   app->jump_popover = GTK_POPOVER (pop);
 
   g_signal_connect (go, "clicked", G_CALLBACK (on_jump_go_clicked), app);
-  g_signal_connect (cancel, "clicked", G_CALLBACK (on_jump_cancel_clicked), app);
+  g_signal_connect (cancel, "clicked", G_CALLBACK (on_jump_cancel_clicked),
+                    app);
   g_signal_connect (pop, "closed", G_CALLBACK (on_jump_popover_closed), app);
   g_signal_connect (pop, "show", G_CALLBACK (on_jump_popover_show), app);
-  g_signal_connect (entry, "activate", G_CALLBACK (on_jump_activate), app);   /* Enter = Go */
+  g_signal_connect (entry, "activate", G_CALLBACK (on_jump_activate),
+                    app); /* Enter = Go */
 
   GtkEventController *keys = gtk_event_controller_key_new ();
   g_signal_connect (keys, "key-pressed", G_CALLBACK (on_jump_entry_key), app);
@@ -2078,24 +2188,25 @@ static void
 install_jump_css (void)
 {
   GtkCssProvider *css = gtk_css_provider_new ();
-  /* Shake via `transform: translate` (NOT margins): a transform is a paint-time
-   * offset that does NOT change the widget's allocation, so the parent GtkPopover
-   * never re-measures / re-anchors mid-animation (which visually detached it). */
+  /* Shake via `transform: translate` (NOT margins): a transform is a
+   * paint-time offset that does NOT change the widget's allocation, so the
+   * parent GtkPopover never re-measures / re-anchors mid-animation (which
+   * visually detached it). */
   gtk_css_provider_load_from_string (
-      css,
-      "@keyframes lsg-shake {"
-      "  0%   { transform: translateX(0px); }"
-      "  20%  { transform: translateX(6px); }"
-      "  40%  { transform: translateX(-5px); }"
-      "  60%  { transform: translateX(4px); }"
-      "  80%  { transform: translateX(-2px); }"
-      "  100% { transform: translateX(0px); }"
-      "}"
-      ".lsg-shake { animation: lsg-shake 300ms ease; }");
+      css, "@keyframes lsg-shake {"
+           "  0%   { transform: translateX(0px); }"
+           "  20%  { transform: translateX(6px); }"
+           "  40%  { transform: translateX(-5px); }"
+           "  60%  { transform: translateX(4px); }"
+           "  80%  { transform: translateX(-2px); }"
+           "  100% { transform: translateX(0px); }"
+           "}"
+           ".lsg-shake { animation: lsg-shake 300ms ease; }");
   GdkDisplay *display = gdk_display_get_default ();
   if (display != NULL)
     gtk_style_context_add_provider_for_display (
-        display, GTK_STYLE_PROVIDER (css), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+        display, GTK_STYLE_PROVIDER (css),
+        GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
   g_object_unref (css);
 }
 
@@ -2103,35 +2214,36 @@ install_jump_css (void)
  * The jump-to-row button glyph — a Cairo replication of the macOS
  * `JumpArrowGlyph` (OverlayView.swift): two small circles (a "here" and a
  * "there") joined by a right-bulging circular arc that arrows south-west into
- * the lower circle. the author finds this clearer than the stock `go-jump-symbolic`.
- * Design bbox x[19,56] y[7,93], mapped/centred into the drawing area; the
- * fixed-geometry angles and unit vectors are hardcoded so the app needs no libm.
- * Tinted with the widget's current foreground color (gtk_widget_get_color), so
- * it reads correctly in both light and dark, like the accent handling elsewhere.
+ * the lower circle. the author finds this clearer than the stock
+ * `go-jump-symbolic`. Design bbox x[19,56] y[7,93], mapped/centred into the
+ * drawing area; the fixed-geometry angles and unit vectors are hardcoded so
+ * the app needs no libm. Tinted with the widget's current foreground color
+ * (gtk_widget_get_color), so it reads correctly in both light and dark, like
+ * the accent handling elsewhere.
  */
 static void
 jump_glyph_draw (GtkDrawingArea *area, cairo_t *cr, int width, int height,
                  gpointer data)
 {
-  (void) data;
+  (void)data;
   GdkRGBA fg;
   gtk_widget_get_color (GTK_WIDGET (area), &fg);
   gdk_cairo_set_source_rgba (cr, &fg);
 
   const double b_min_x = 19.0, b_max_x = 56.0, b_min_y = 7.0, b_max_y = 93.0;
   const double bw = b_max_x - b_min_x, bh = b_max_y - b_min_y;
-  const double fill = 0.88;                     /* leave the stroke a small margin */
-  double kx = (double) width / bw, ky = (double) height / bh;
+  const double fill = 0.88; /* leave the stroke a small margin */
+  double kx = (double)width / bw, ky = (double)height / bh;
   double k = (kx < ky ? kx : ky) * fill;
-  double ox = ((double) width - bw * k) / 2.0 - b_min_x * k;
-  double oy = ((double) height - bh * k) / 2.0 - b_min_y * k;
+  double ox = ((double)width - bw * k) / 2.0 - b_min_x * k;
+  double oy = ((double)height - bh * k) / 2.0 - b_min_y * k;
 #define GX(x) (ox + (x) * k)
 #define GY(y) (oy + (y) * k)
 
   /* Match the sibling Adwaita symbolic stroke weight (search / insert-link /
    * edit-copy): they render a thin ~1.2-1.3px stroke at 16px. 0.11*height read
    * heavier than them; 0.08 gives ~1.28px at the 16px glyph. */
-  double lw = (double) height * 0.08;
+  double lw = (double)height * 0.08;
   if (lw < 1.0)
     lw = 1.0;
   cairo_set_line_width (cr, lw);
@@ -2157,20 +2269,20 @@ jump_glyph_draw (GtkDrawingArea *area, cairo_t *cr, int width, int height,
   /* Arrowhead at the arc's arrival: barbs the unit back-vector (12/13, -5/13)
    * rotated by ±0.55 rad, opening SW into the lower circle. */
   const double bxu = 12.0 / 13.0, byu = -5.0 / 13.0;
-  const double ca = 0.85252452, sa = 0.52268723;   /* cos/sin(0.55) */
+  const double ca = 0.85252452, sa = 0.52268723; /* cos/sin(0.55) */
   double barb = 12.0 * k;
   cairo_move_to (cr, ex + barb * (bxu * ca - byu * sa),
-                     ey + barb * (bxu * sa + byu * ca));
+                 ey + barb * (bxu * sa + byu * ca));
   cairo_line_to (cr, ex, ey);
   cairo_line_to (cr, ex + barb * (bxu * ca + byu * sa),
-                     ey + barb * (-bxu * sa + byu * ca));
+                 ey + barb * (-bxu * sa + byu * ca));
   cairo_stroke (cr);
 #undef GX
 #undef GY
 }
 
 /* ------------------------------------------------------------------------- */
-/* Filter-to-matches (slice 4): the toggle + banner over lsg_filter             */
+/* Filter-to-matches (slice 4): the toggle + banner over lsg_filter */
 /* ------------------------------------------------------------------------- */
 
 /* The toggle may turn ON only when the current find draft is filterable
@@ -2209,13 +2321,14 @@ filter_update_banner (App *app)
   if (b.is_empty_result)
     text = g_strdup ("Filtered — no matching rows");
   else if (b.has_progress)
-    text = g_strdup_printf (
-        "Filtered — %" G_GUINT64_FORMAT " of %s%" G_GUINT64_FORMAT " rows · %d%%",
-        b.matching, tilde, b.document_rows, (int) (b.progress * 100.0));
+    text = g_strdup_printf ("Filtered — %" G_GUINT64_FORMAT
+                            " of %s%" G_GUINT64_FORMAT " rows · %d%%",
+                            b.matching, tilde, b.document_rows,
+                            (int)(b.progress * 100.0));
   else
-    text = g_strdup_printf (
-        "Filtered — %" G_GUINT64_FORMAT " of %s%" G_GUINT64_FORMAT " rows",
-        b.matching, tilde, b.document_rows);
+    text = g_strdup_printf ("Filtered — %" G_GUINT64_FORMAT
+                            " of %s%" G_GUINT64_FORMAT " rows",
+                            b.matching, tilde, b.document_rows);
 
   adw_banner_set_title (app->filter_banner, text);
   adw_banner_set_button_label (app->filter_banner, "Clear");
@@ -2233,7 +2346,8 @@ filter_set_toggle (App *app, gboolean active)
   app->filter_ui_guard = FALSE;
 }
 
-/* Sync the whole filter UI (toggle position + sensitivity + banner) to state. */
+/* Sync the whole filter UI (toggle position + sensitivity + banner) to state.
+ */
 static void
 filter_sync_ui (App *app)
 {
@@ -2259,8 +2373,8 @@ capture_top_source_row (App *app)
 }
 
 /* Reflect a filtered/identity row-count change into the grid geometry and land
- * the viewport on `first_row` (filtered row 0 on apply, the captured source row
- * on clear). */
+ * the viewport on `first_row` (filtered row 0 on apply, the captured source
+ * row on clear). */
 static void
 filter_rebuild_grid (App *app, guint64 first_row)
 {
@@ -2268,7 +2382,7 @@ filter_rebuild_grid (App *app, guint64 first_row)
   app->row_estimate = (rc.count > 0) ? rc.count : 1;
   grid_update_gutter (app);
   grid_update_vadjustment (app);
-  scroll_to_first_row (app, first_row);   /* fires materialize + repaint */
+  scroll_to_first_row (app, first_row); /* fires materialize + repaint */
   grid_materialize (app);
   gtk_widget_queue_draw (GTK_WIDGET (app->area));
 }
@@ -2283,27 +2397,31 @@ do_apply_filter (App *app)
 
   app->find.draft.mode = LSG_FIND_TEXT;
   app->find.draft.text = gtk_editable_get_text (app->find_entry);
-  LsgFindSubmit sub = lsg_find_submit (app->find, NULL, app->n_cols, app->n_cols);
+  LsgFindSubmit sub
+      = lsg_find_submit (app->find, NULL, app->n_cols, app->n_cols);
   if (sub.outcome != LSG_FIND_RUN)
     {
-      filter_set_toggle (app, FALSE);   /* not filterable (empty / rejected) */
+      filter_set_toggle (app, FALSE); /* not filterable (empty / rejected) */
       return;
     }
 
   /* A filter changes the copy job's coordinate space (identity <-> filtered),
-   * which the frozen contract says invalidates an open job ("close this job and
-   * open a fresh one"). STOP any in-flight copy BEFORE the view change — a mid-
-   * copy filter would otherwise pull ls_copy_next in the wrong coordinate space. */
+   * which the frozen contract says invalidates an open job ("close this job
+   * and open a fresh one"). STOP any in-flight copy BEFORE the view change — a
+   * mid- copy filter would otherwise pull ls_copy_next in the wrong coordinate
+   * space. */
   copy_stop_and_join (app);
 
-  LsgRowCount id_rc = lsg_document_row_count (app->doc);   /* base M (first apply) */
+  LsgRowCount id_rc
+      = lsg_document_row_count (app->doc); /* base M (first apply) */
   if (!lsg_document_filter_set (app->doc, sub.request))
     {
-      filter_set_toggle (app, FALSE);   /* the core rejected it */
+      filter_set_toggle (app, FALSE); /* the core rejected it */
       return;
     }
 
-  /* The guaranteed non-idle post-set poll makes the banner correct immediately. */
+  /* The guaranteed non-idle post-set poll makes the banner correct
+   * immediately. */
   LsgFilterSnapshot snap = { LSG_FILTER_PHASE_SCANNING, 0.0, 0, FALSE };
   lsg_document_filter_poll (app->doc, &snap);
   app->filter = lsg_filter_applied (app->filter, id_rc, snap);
@@ -2316,25 +2434,26 @@ do_apply_filter (App *app)
   find_clear_mask (app);
   app->jump = lsg_jump_initial ();
 
-  filter_rebuild_grid (app, 0);         /* land on filtered row 0 */
-  /* Net-park (Bug 2): ls_filter_set parks the filter-scan immediately (count 0);
-   * the filtered frontier advances ONLY via a filtered ls_jump_start. Drive it
-   * to original row 0 so the first matching rows are fetched and the view is not
-   * empty (a bare ls_window_set fetched nothing). No-op on a local doc. */
+  filter_rebuild_grid (app, 0); /* land on filtered row 0 */
+  /* Net-park (Bug 2): ls_filter_set parks the filter-scan immediately (count
+   * 0); the filtered frontier advances ONLY via a filtered ls_jump_start.
+   * Drive it to original row 0 so the first matching rows are fetched and the
+   * view is not empty (a bare ls_window_set fetched nothing). No-op on a local
+   * doc. */
   net_drive_begin (app, 0);
   filter_update_banner (app);
   filter_update_toggle_sensitivity (app);
   ensure_poll (app);
 }
 
-/* Clear the active filter, restoring the identity view re-anchored near the row
- * that was on screen. */
+/* Clear the active filter, restoring the identity view re-anchored near the
+ * row that was on screen. */
 static void
 do_clear_filter (App *app)
 {
   if (app->doc == NULL || !app->filter.active)
     {
-      app->filter = lsg_filter_cleared (app->filter);   /* no-op */
+      app->filter = lsg_filter_cleared (app->filter); /* no-op */
       filter_update_banner (app);
       return;
     }
@@ -2343,7 +2462,7 @@ do_clear_filter (App *app)
    * -> identity) — stop any in-flight copy first (same rule as apply). */
   copy_stop_and_join (app);
 
-  guint64 restore = capture_top_source_row (app);        /* BEFORE clearing */
+  guint64 restore = capture_top_source_row (app); /* BEFORE clearing */
   lsg_document_filter_clear (app->doc);
   app->filter = lsg_filter_cleared (app->filter);
 
@@ -2352,7 +2471,7 @@ do_clear_filter (App *app)
   find_clear_mask (app);
   app->jump = lsg_jump_initial ();
 
-  filter_rebuild_grid (app, restore);   /* identity view, re-anchored */
+  filter_rebuild_grid (app, restore); /* identity view, re-anchored */
   filter_update_banner (app);
   filter_update_toggle_sensitivity (app);
 }
@@ -2367,9 +2486,9 @@ filter_poll_fold (App *app)
   gboolean has = lsg_document_filter_poll (app->doc, &snap);
   app->filter = lsg_filter_resolved (app->filter, has, snap);
   filter_update_banner (app);
-  /* The filtered row count m grows as the scan advances (row_estimate is already
-   * refreshed at the top of the poll tick); re-materialize so the widening view
-   * paints. */
+  /* The filtered row count m grows as the scan advances (row_estimate is
+   * already refreshed at the top of the poll tick); re-materialize so the
+   * widening view paints. */
   if (app->filter.snapshot.phase == LSG_FILTER_PHASE_SCANNING)
     {
       grid_materialize (app);
@@ -2382,7 +2501,7 @@ on_filter_toggled (GtkToggleButton *toggle, gpointer data)
 {
   App *app = data;
   if (app->filter_ui_guard)
-    return;                             /* programmatic set: ignore */
+    return; /* programmatic set: ignore */
   if (gtk_toggle_button_get_active (toggle))
     do_apply_filter (app);
   else
@@ -2392,7 +2511,7 @@ on_filter_toggled (GtkToggleButton *toggle, gpointer data)
 static void
 on_filter_banner_clear (AdwBanner *banner, gpointer data)
 {
-  (void) banner;
+  (void)banner;
   App *app = data;
   /* Route through the toggle (fires on_filter_toggled -> do_clear_filter). */
   if (app->filter_toggle != NULL)
@@ -2400,42 +2519,45 @@ on_filter_banner_clear (AdwBanner *banner, gpointer data)
 }
 
 /* ------------------------------------------------------------------------- */
-/* Streaming copy (slice 5): selection + off-main worker + clipboard + the      */
-/* reusable header-bar progress widget                                          */
+/* Streaming copy (slice 5): selection + off-main worker + clipboard + the */
+/* reusable header-bar progress widget */
 /* ------------------------------------------------------------------------- */
 
 /* The off-main copy worker's shared state (defined up-front so the cancel
  * affordance and the drive can both reach it). */
-struct _CopyOp {
-  LsgDocument *doc;            /* captured at launch (stable per leaf-before-root) */
+struct _CopyOp
+{
+  LsgDocument *doc; /* captured at launch (stable per leaf-before-root) */
   LsgCopyRect rect;
   guint64 budget;
-  gint cancel;                 /* g_atomic; set by the main thread */
-  GMutex lock;                 /* guards `progress` / `finished` / results */
+  gint cancel; /* g_atomic; set by the main thread */
+  GMutex lock; /* guards `progress` / `finished` / results */
   gdouble progress;
   gboolean finished;
-  GByteArray *blob;            /* worker-owned; read by main after join */
+  GByteArray *blob; /* worker-owned; read by main after join */
   LsgCopyOutcome outcome;
   guint64 rows_done;
 };
 
 /* --- reusable header-bar progress: a determinate bar + inline cancel. Hidden
- *     by default; any long op (copy now, scan/index/network later) drives it via
- *     header_progress_show / _set / _hide. --- */
+ *     by default; any long op (copy now, scan/index/network later) drives it
+ * via header_progress_show / _set / _hide. --- */
 
 static void
 on_hp_cancel_clicked (GtkButton *button, gpointer data)
 {
-  (void) button;
+  (void)button;
   App *app = data;
   /* The header progress is shared, but by construction only one owner is ever
    * live: a URL open runs copy_stop_and_join before it goes in flight, and
    * do_copy refuses to start while app->net != NULL. So at most one of copy_op
-   * / net is non-NULL here, and the copy-first check cancels the true owner. */
+   * / net is non-NULL here, and the copy-first check cancels the true owner.
+   */
   if (app->copy_op != NULL)
-    g_atomic_int_set (&app->copy_op->cancel, 1);   /* the worker stops promptly */
+    g_atomic_int_set (&app->copy_op->cancel,
+                      1); /* the worker stops promptly */
   else if (app->net != NULL)
-    lsg_net_open_cancel (app->net);                /* the poll folds to CANCELLED */
+    lsg_net_open_cancel (app->net); /* the poll folds to CANCELLED */
 }
 
 static void
@@ -2492,7 +2614,8 @@ header_progress_hide (App *app)
 
 /* --- selection algebra (view rows + physical columns) --- */
 
-/* Normalize the two selection corners (+ mode) into the half-open copy rect. */
+/* Normalize the two selection corners (+ mode) into the half-open copy rect.
+ */
 static LsgCopyRect
 selection_rect (App *app)
 {
@@ -2505,10 +2628,16 @@ selection_rect (App *app)
   guint c0 = MIN (app->sel_a_col, app->sel_b_col);
   guint c1 = MAX (app->sel_a_col, app->sel_b_col);
 
-  if (app->sel_mode == SEL_ROWS)                  /* whole rows -> all columns */
-    { c0 = 0; c1 = app->n_cols - 1; }
-  if (app->sel_mode == SEL_COLS)                  /* whole columns -> all rows */
-    { r0 = 0; r1 = (app->row_estimate > 0) ? app->row_estimate - 1 : 0; }
+  if (app->sel_mode == SEL_ROWS) /* whole rows -> all columns */
+    {
+      c0 = 0;
+      c1 = app->n_cols - 1;
+    }
+  if (app->sel_mode == SEL_COLS) /* whole columns -> all rows */
+    {
+      r0 = 0;
+      r1 = (app->row_estimate > 0) ? app->row_estimate - 1 : 0;
+    }
 
   r.first_row = r0;
   r.row_count = r1 - r0 + 1;
@@ -2528,9 +2657,15 @@ selection_contains (App *app, guint64 row, guint col)
   guint c0 = MIN (app->sel_a_col, app->sel_b_col);
   guint c1 = MAX (app->sel_a_col, app->sel_b_col);
   if (app->sel_mode == SEL_ROWS)
-    { c0 = 0; c1 = app->n_cols - 1; }
+    {
+      c0 = 0;
+      c1 = app->n_cols - 1;
+    }
   if (app->sel_mode == SEL_COLS)
-    { r0 = 0; r1 = G_MAXUINT64; }
+    {
+      r0 = 0;
+      r1 = G_MAXUINT64;
+    }
   return row >= r0 && row <= r1 && col >= c0 && col <= c1;
 }
 
@@ -2545,7 +2680,7 @@ hit_test (App *app, double x, double y, guint64 *out_row, guint *out_col)
   double yy = y - app->header_h + app->cur_pixel_off;
   if (yy < 0.0)
     yy = 0.0;
-  guint64 row = app->cur_top_row + (guint64) (yy / app->row_h);
+  guint64 row = app->cur_top_row + (guint64)(yy / app->row_h);
   if (app->row_estimate > 0 && row > app->row_estimate - 1)
     row = app->row_estimate - 1;
 
@@ -2605,14 +2740,15 @@ copy_worker (gpointer data)
           break;
         }
 
-      /* A stall (row past the demand-driven / still-indexing frontier): advance
-       * the shared frontier via a jump, bounded (~2 s), then pull again. The
-       * fold's no-progress guard turns a re-stall on the same row into FRONTIER. */
+      /* A stall (row past the demand-driven / still-indexing frontier):
+       * advance the shared frontier via a jump, bounded (~2 s), then pull
+       * again. The fold's no-progress guard turns a re-stall on the same row
+       * into FRONTIER. */
       if (flow.kind == LSG_COPY_FLOW_STALLED)
         {
           lsg_document_jump_start (doc, flow.stalled_row);
           gboolean settled = FALSE;
-          for (int i = 0; i < 40; i++)   /* 40 * 50 ms = ~2 s */
+          for (int i = 0; i < 40; i++) /* 40 * 50 ms = ~2 s */
             {
               if (g_atomic_int_get (&op->cancel))
                 break;
@@ -2646,7 +2782,7 @@ copy_worker (gpointer data)
     }
 
   if (job != NULL)
-    lsg_document_copy_close (job);       /* leaf: close the job before the doc */
+    lsg_document_copy_close (job); /* leaf: close the job before the doc */
   g_free (buf);
 
   g_mutex_lock (&op->lock);
@@ -2659,8 +2795,8 @@ copy_worker (gpointer data)
   return NULL;
 }
 
-/* Join the worker and free the op — NO widget access, so it is safe both during
- * a normal open-new-file reset and at window destroy / process exit. */
+/* Join the worker and free the op — NO widget access, so it is safe both
+ * during a normal open-new-file reset and at window destroy / process exit. */
 static void
 copy_dispose (App *app)
 {
@@ -2695,23 +2831,24 @@ copy_tick (gpointer data)
   gboolean finished = op->finished;
   g_mutex_unlock (&op->lock);
 
-  header_progress_set (app, prog);       /* determinate rows_done / row_count */
+  header_progress_set (app, prog); /* determinate rows_done / row_count */
   if (!finished)
     return G_SOURCE_CONTINUE;
 
-  /* Deliver the payload to the clipboard (widgets alive on this path — the timer
-   * is stopped at teardown before the window is gone); a cancelled copy drops
-   * its partial. */
+  /* Deliver the payload to the clipboard (widgets alive on this path — the
+   * timer is stopped at teardown before the window is gone); a cancelled copy
+   * drops its partial. */
   if (op->outcome != LSG_COPY_OUTCOME_CANCELLED && op->blob != NULL
       && op->blob->len > 0 && app->window != NULL)
     {
       GdkClipboard *clip = gtk_widget_get_clipboard (GTK_WIDGET (app->window));
       /* NUL-terminate the payload IN PLACE (one appended byte) so it can go
-       * straight to the clipboard — avoids a second ~64 MiB g_strndup copy of the
-       * blob; gdk_clipboard_set_text makes its own internal copy of the TSV. */
+       * straight to the clipboard — avoids a second ~64 MiB g_strndup copy of
+       * the blob; gdk_clipboard_set_text makes its own internal copy of the
+       * TSV. */
       guint8 nul = 0;
       g_byte_array_append (op->blob, &nul, 1);
-      gdk_clipboard_set_text (clip, (const char *) op->blob->data);
+      gdk_clipboard_set_text (clip, (const char *)op->blob->data);
       if (app->title != NULL)
         {
           char *note = g_strdup_printf ("Copied %" G_GUINT64_FORMAT " rows",
@@ -2726,7 +2863,8 @@ copy_tick (gpointer data)
   return G_SOURCE_REMOVE;
 }
 
-/* Forward-declared: start a copy of the current selection on the off-main worker. */
+/* Forward-declared: start a copy of the current selection on the off-main
+ * worker. */
 static void
 do_copy (App *app)
 {
@@ -2738,11 +2876,12 @@ do_copy (App *app)
       || app->net != NULL)
     return;
 
-  /* The copy worker advances the shared frontier with ls_jump_start(stalled_row)
-   * on its bg thread. A jump preserved past its popover would then resolve to
-   * LANDED(stalled_row) = a wrong scroll to the copy's stall row. Retire it now,
-   * and free the core slot (jump_cancel) so the worker's ls_jump_start has it
-   * cleanly — mirrors do_apply_filter's jump retire before a view change. */
+  /* The copy worker advances the shared frontier with
+   * ls_jump_start(stalled_row) on its bg thread. A jump preserved past its
+   * popover would then resolve to LANDED(stalled_row) = a wrong scroll to the
+   * copy's stall row. Retire it now, and free the core slot (jump_cancel) so
+   * the worker's ls_jump_start has it cleanly — mirrors do_apply_filter's jump
+   * retire before a view change. */
   if (app->jump.kind == LSG_JUMP_FLOW_SCANNING)
     lsg_document_jump_cancel (app->doc);
   app->jump = lsg_jump_initial ();
@@ -2778,9 +2917,9 @@ copy_stop_and_join (App *app)
       g_source_remove (app->copy_poll_id);
       app->copy_poll_id = 0;
     }
-  copy_dispose (app);                    /* join + free (no widgets) */
-  header_progress_hide (app);            /* NULL-guarded */
-  copy_update_affordance (app);          /* NULL-guarded */
+  copy_dispose (app);           /* join + free (no widgets) */
+  header_progress_hide (app);   /* NULL-guarded */
+  copy_update_affordance (app); /* NULL-guarded */
 }
 
 /* --- drag-to-select + the copy affordance --- */
@@ -2788,7 +2927,7 @@ copy_stop_and_join (App *app)
 static void
 on_sel_drag_begin (GtkGestureDrag *gesture, double x, double y, gpointer data)
 {
-  (void) gesture;
+  (void)gesture;
   App *app = data;
   if (app->doc == NULL)
     return;
@@ -2796,7 +2935,7 @@ on_sel_drag_begin (GtkGestureDrag *gesture, double x, double y, gpointer data)
   guint64 row;
   guint col;
   int region = hit_test (app, x, y, &row, &col);
-  if (region == 3)                       /* the corner clears the selection */
+  if (region == 3) /* the corner clears the selection */
     {
       app->sel_mode = SEL_NONE;
       app->selecting = FALSE;
@@ -2808,14 +2947,17 @@ on_sel_drag_begin (GtkGestureDrag *gesture, double x, double y, gpointer data)
   app->selecting = TRUE;
   app->sel_a_row = app->sel_b_row = row;
   app->sel_a_col = app->sel_b_col = col;
-  app->sel_mode = (region == 1) ? SEL_ROWS : (region == 2) ? SEL_COLS : SEL_CELLS;
-  gtk_widget_grab_focus (GTK_WIDGET (app->area));   /* so grid Ctrl+C fires */
+  app->sel_mode = (region == 1)   ? SEL_ROWS
+                  : (region == 2) ? SEL_COLS
+                                  : SEL_CELLS;
+  gtk_widget_grab_focus (GTK_WIDGET (app->area)); /* so grid Ctrl+C fires */
   copy_update_affordance (app);
   gtk_widget_queue_draw (GTK_WIDGET (app->area));
 }
 
 static void
-on_sel_drag_update (GtkGestureDrag *gesture, double ox, double oy, gpointer data)
+on_sel_drag_update (GtkGestureDrag *gesture, double ox, double oy,
+                    gpointer data)
 {
   App *app = data;
   if (!app->selecting)
@@ -2833,9 +2975,9 @@ on_sel_drag_update (GtkGestureDrag *gesture, double ox, double oy, gpointer data
 static void
 on_sel_drag_end (GtkGestureDrag *gesture, double ox, double oy, gpointer data)
 {
-  (void) gesture;
-  (void) ox;
-  (void) oy;
+  (void)gesture;
+  (void)ox;
+  (void)oy;
   App *app = data;
   app->selecting = FALSE;
   copy_update_affordance (app);
@@ -2844,12 +2986,12 @@ on_sel_drag_end (GtkGestureDrag *gesture, double ox, double oy, gpointer data)
 static void
 on_copy_button_clicked (GtkButton *button, gpointer data)
 {
-  (void) button;
-  do_copy ((App *) data);
+  (void)button;
+  do_copy ((App *)data);
 }
 
 /* ------------------------------------------------------------------------- */
-/* UI construction                                                            */
+/* UI construction */
 /* ------------------------------------------------------------------------- */
 
 static GtkWidget *
@@ -2859,8 +3001,9 @@ build_launch_page (App *app)
   adw_status_page_set_icon_name (ADW_STATUS_PAGE (status),
                                  "x-office-spreadsheet-symbolic");
   adw_status_page_set_title (ADW_STATUS_PAGE (status), "less-sheet");
-  adw_status_page_set_description (ADW_STATUS_PAGE (status),
-                                   "Open a delimited file, or a CSV over the network.");
+  adw_status_page_set_description (
+      ADW_STATUS_PAGE (status),
+      "Open a delimited file, or a CSV over the network.");
 
   GtkWidget *box = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 12);
   gtk_widget_set_halign (box, GTK_ALIGN_CENTER);
@@ -2898,14 +3041,17 @@ build_grid_page (App *app)
   g_signal_connect (app->area, "resize", G_CALLBACK (on_area_resize), app);
 
   GtkWidget *vscroll = gtk_scrollbar_new (GTK_ORIENTATION_VERTICAL, app->vadj);
-  GtkWidget *hscroll = gtk_scrollbar_new (GTK_ORIENTATION_HORIZONTAL, app->hadj);
+  GtkWidget *hscroll
+      = gtk_scrollbar_new (GTK_ORIENTATION_HORIZONTAL, app->hadj);
   app->hscroll = hscroll;
 
-  g_signal_connect (app->vadj, "value-changed", G_CALLBACK (on_adjustment_changed), app);
-  g_signal_connect (app->hadj, "value-changed", G_CALLBACK (on_adjustment_changed), app);
+  g_signal_connect (app->vadj, "value-changed",
+                    G_CALLBACK (on_adjustment_changed), app);
+  g_signal_connect (app->hadj, "value-changed",
+                    G_CALLBACK (on_adjustment_changed), app);
 
-  GtkEventController *scroll =
-      gtk_event_controller_scroll_new (GTK_EVENT_CONTROLLER_SCROLL_BOTH_AXES);
+  GtkEventController *scroll = gtk_event_controller_scroll_new (
+      GTK_EVENT_CONTROLLER_SCROLL_BOTH_AXES);
   g_signal_connect (scroll, "scroll", G_CALLBACK (on_scroll), app);
   gtk_widget_add_controller (GTK_WIDGET (app->area), scroll);
 
@@ -2919,7 +3065,8 @@ build_grid_page (App *app)
   g_signal_connect (drag, "drag-begin", G_CALLBACK (on_sel_drag_begin), app);
   g_signal_connect (drag, "drag-update", G_CALLBACK (on_sel_drag_update), app);
   g_signal_connect (drag, "drag-end", G_CALLBACK (on_sel_drag_end), app);
-  gtk_widget_add_controller (GTK_WIDGET (app->area), GTK_EVENT_CONTROLLER (drag));
+  gtk_widget_add_controller (GTK_WIDGET (app->area),
+                             GTK_EVENT_CONTROLLER (drag));
 
   gtk_grid_attach (GTK_GRID (grid), GTK_WIDGET (app->area), 0, 0, 1, 1);
   gtk_grid_attach (GTK_GRID (grid), vscroll, 1, 0, 1, 1);
@@ -2932,14 +3079,14 @@ build_grid_page (App *app)
 static void
 on_window_map (GtkWidget *widget, gpointer data)
 {
-  (void) widget;
+  (void)widget;
   App *app = data;
   if (!app->timing || app->ui_shown_reported)
     return;
   app->ui_shown_reported = TRUE;
   gint64 dt = g_get_monotonic_time () - app->t_start;
   g_printerr ("[timing] ui cold-start (main -> window mapped): %.1f ms\n",
-              (double) dt / 1000.0);
+              (double)dt / 1000.0);
 }
 
 /* On window destroy (app quit): stop timers + JOIN the copy worker while the
@@ -2948,12 +3095,28 @@ on_window_map (GtkWidget *widget, gpointer data)
 static void
 on_window_destroy (GtkWidget *widget, gpointer data)
 {
-  (void) widget;
+  (void)widget;
   App *app = data;
-  if (app->poll_id != 0)        { g_source_remove (app->poll_id);        app->poll_id = 0; }
-  if (app->net_poll_id != 0)    { g_source_remove (app->net_poll_id);    app->net_poll_id = 0; }
-  if (app->find_notice_id != 0) { g_source_remove (app->find_notice_id); app->find_notice_id = 0; }
-  if (app->jump_reject_id != 0) { g_source_remove (app->jump_reject_id); app->jump_reject_id = 0; }
+  if (app->poll_id != 0)
+    {
+      g_source_remove (app->poll_id);
+      app->poll_id = 0;
+    }
+  if (app->net_poll_id != 0)
+    {
+      g_source_remove (app->net_poll_id);
+      app->net_poll_id = 0;
+    }
+  if (app->find_notice_id != 0)
+    {
+      g_source_remove (app->find_notice_id);
+      app->find_notice_id = 0;
+    }
+  if (app->jump_reject_id != 0)
+    {
+      g_source_remove (app->jump_reject_id);
+      app->jump_reject_id = 0;
+    }
   app->window = NULL;
   app->title = NULL;
   app->area = NULL;
@@ -2961,11 +3124,11 @@ on_window_destroy (GtkWidget *widget, gpointer data)
   app->hp_bar = NULL;
   app->hp_cancel = NULL;
   app->copy_button = NULL;
-  copy_stop_and_join (app);     /* joins the worker; widget calls now no-op */
+  copy_stop_and_join (app); /* joins the worker; widget calls now no-op */
 }
 
-/* Build the single window once (idempotent). Shared by "activate" (no file) and
- * "open" (a file passed on the command line / by the file manager). */
+/* Build the single window once (idempotent). Shared by "activate" (no file)
+ * and "open" (a file passed on the command line / by the file manager). */
 static void
 ensure_window (App *app, GtkApplication *gtk_app)
 {
@@ -2987,9 +3150,9 @@ ensure_window (App *app, GtkApplication *gtk_app)
   gtk_window_set_title (app->window, "less-sheet");
   gtk_window_set_default_size (app->window, 1024, 720);
 
-  /* App logo: register the embedded GResource icon (compiled into the binary as
-   * a hicolor-laid-out resource) so the running app shows it without an install,
-   * then name the window's icon after the app id. */
+  /* App logo: register the embedded GResource icon (compiled into the binary
+   * as a hicolor-laid-out resource) so the running app shows it without an
+   * install, then name the window's icon after the app id. */
   GdkDisplay *display = gdk_display_get_default ();
   if (display != NULL)
     gtk_icon_theme_add_resource_path (gtk_icon_theme_get_for_display (display),
@@ -2999,15 +3162,18 @@ ensure_window (App *app, GtkApplication *gtk_app)
   /* Header bar: Open + Open URL on the left, filename title in the center. */
   GtkWidget *header = adw_header_bar_new ();
   app->title = ADW_WINDOW_TITLE (adw_window_title_new ("less-sheet", ""));
-  adw_header_bar_set_title_widget (ADW_HEADER_BAR (header), GTK_WIDGET (app->title));
+  adw_header_bar_set_title_widget (ADW_HEADER_BAR (header),
+                                   GTK_WIDGET (app->title));
 
-  GtkWidget *open_btn = gtk_button_new_from_icon_name ("document-open-symbolic");
+  GtkWidget *open_btn
+      = gtk_button_new_from_icon_name ("document-open-symbolic");
   gtk_widget_set_tooltip_text (open_btn, "Open File (Ctrl+O)");
   g_signal_connect (open_btn, "clicked", G_CALLBACK (action_open), app);
   adw_header_bar_pack_start (ADW_HEADER_BAR (header), open_btn);
 
   /* `insert-link-symbolic` is a minimal link glyph present in current Adwaita;
-   * the old `emblem-web-symbolic` was dropped from the theme and rendered blank. */
+   * the old `emblem-web-symbolic` was dropped from the theme and rendered
+   * blank. */
   GtkWidget *url_btn = gtk_button_new_from_icon_name ("insert-link-symbolic");
   gtk_widget_set_tooltip_text (url_btn, "Open URL (Ctrl+Shift+O)");
   g_signal_connect (url_btn, "clicked", G_CALLBACK (action_open_url), app);
@@ -3015,33 +3181,37 @@ ensure_window (App *app, GtkApplication *gtk_app)
 
   /* Find: a menu button on the right whose popover is the find UI (Ctrl+F). */
   GtkWidget *find_btn = gtk_menu_button_new ();
-  gtk_menu_button_set_icon_name (GTK_MENU_BUTTON (find_btn), "edit-find-symbolic");
+  gtk_menu_button_set_icon_name (GTK_MENU_BUTTON (find_btn),
+                                 "edit-find-symbolic");
   gtk_widget_set_tooltip_text (find_btn, "Find (Ctrl+F)");
   app->find_button = GTK_MENU_BUTTON (find_btn);
   build_find_popover (app);
-  gtk_menu_button_set_popover (GTK_MENU_BUTTON (find_btn), GTK_WIDGET (app->find_popover));
+  gtk_menu_button_set_popover (GTK_MENU_BUTTON (find_btn),
+                               GTK_WIDGET (app->find_popover));
   adw_header_bar_pack_end (ADW_HEADER_BAR (header), find_btn);
 
   /* Jump-to-row: a menu button whose popover is the jump UI (Ctrl+G / Ctrl+L,
-   * or type a digit on the grid). Its icon is the custom macOS-style jump glyph
-   * (drawn into a 16px GtkDrawingArea child, tinting with the theme fg). */
+   * or type a digit on the grid). Its icon is the custom macOS-style jump
+   * glyph (drawn into a 16px GtkDrawingArea child, tinting with the theme fg).
+   */
   GtkWidget *jump_btn = gtk_menu_button_new ();
   /* Flat like the other header-bar buttons (background only on hover/active).
-   * GtkMenuButton defaults has-frame TRUE, and a custom `set_child` icon doesn't
-   * get the `image-button` flattening `set_icon_name` gives the find button, so
-   * without this the jump button looks permanently highlighted. */
+   * GtkMenuButton defaults has-frame TRUE, and a custom `set_child` icon
+   * doesn't get the `image-button` flattening `set_icon_name` gives the find
+   * button, so without this the jump button looks permanently highlighted. */
   gtk_menu_button_set_has_frame (GTK_MENU_BUTTON (jump_btn), FALSE);
   GtkWidget *jump_glyph = gtk_drawing_area_new ();
   gtk_widget_set_size_request (jump_glyph, 16, 16);
   gtk_widget_set_halign (jump_glyph, GTK_ALIGN_CENTER);
   gtk_widget_set_valign (jump_glyph, GTK_ALIGN_CENTER);
-  gtk_drawing_area_set_draw_func (GTK_DRAWING_AREA (jump_glyph), jump_glyph_draw,
-                                  NULL, NULL);
+  gtk_drawing_area_set_draw_func (GTK_DRAWING_AREA (jump_glyph),
+                                  jump_glyph_draw, NULL, NULL);
   gtk_menu_button_set_child (GTK_MENU_BUTTON (jump_btn), jump_glyph);
   gtk_widget_set_tooltip_text (jump_btn, "Jump to row (Ctrl+G)");
   app->jump_button = GTK_MENU_BUTTON (jump_btn);
   build_jump_popover (app);
-  gtk_menu_button_set_popover (GTK_MENU_BUTTON (jump_btn), GTK_WIDGET (app->jump_popover));
+  gtk_menu_button_set_popover (GTK_MENU_BUTTON (jump_btn),
+                               GTK_WIDGET (app->jump_popover));
   adw_header_bar_pack_end (ADW_HEADER_BAR (header), jump_btn);
 
   /* Copy affordance: a header-bar Copy button (Ctrl+C on the grid also works),
@@ -3050,11 +3220,12 @@ ensure_window (App *app, GtkApplication *gtk_app)
   gtk_widget_set_tooltip_text (copy_btn, "Copy selection (Ctrl+C)");
   gtk_widget_set_sensitive (copy_btn, FALSE);
   app->copy_button = GTK_BUTTON (copy_btn);
-  g_signal_connect (copy_btn, "clicked", G_CALLBACK (on_copy_button_clicked), app);
+  g_signal_connect (copy_btn, "clicked", G_CALLBACK (on_copy_button_clicked),
+                    app);
   adw_header_bar_pack_start (ADW_HEADER_BAR (header), copy_btn);
 
-  /* Reusable header-bar progress (determinate bar + inline cancel) for long ops;
-   * hidden until a copy (or a future scan/network op) drives it. */
+  /* Reusable header-bar progress (determinate bar + inline cancel) for long
+   * ops; hidden until a copy (or a future scan/network op) drives it. */
   build_header_progress (app);
   adw_header_bar_pack_end (ADW_HEADER_BAR (header), app->hp_box);
 
@@ -3067,7 +3238,8 @@ ensure_window (App *app, GtkApplication *gtk_app)
   gtk_stack_add_named (app->stack, build_grid_page (app), "grid");
 
   GtkWidget *error = adw_status_page_new ();
-  adw_status_page_set_icon_name (ADW_STATUS_PAGE (error), "dialog-error-symbolic");
+  adw_status_page_set_icon_name (ADW_STATUS_PAGE (error),
+                                 "dialog-error-symbolic");
   app->error_page = ADW_STATUS_PAGE (error);
   gtk_stack_add_named (app->stack, error, "error");
 
@@ -3110,7 +3282,7 @@ static void
 on_open (GApplication *gapp, GFile **files, gint n_files, const char *hint,
          gpointer data)
 {
-  (void) hint;
+  (void)hint;
   App *app = data;
   ensure_window (app, GTK_APPLICATION (gapp));
   gtk_window_present (app->window);
@@ -3122,7 +3294,7 @@ int
 main (int argc, char *argv[])
 {
   App app = { 0 };
-  app.t_start = g_get_monotonic_time ();            /* capture entry ASAP */
+  app.t_start = g_get_monotonic_time (); /* capture entry ASAP */
   app.timing = (g_getenv ("LESSSHEET_GTK_TIMING") != NULL);
   app.row_estimate = 1;
   app.find = lsg_find_initial ();
@@ -3135,8 +3307,8 @@ main (int argc, char *argv[])
   app.header_font_desc = pango_font_description_from_string ("Sans Bold 10");
   app.gutter_font_desc = pango_font_description_from_string ("Sans 10");
 
-  g_autoptr (AdwApplication) application =
-      adw_application_new ("dev.lesssheet.Gtk", G_APPLICATION_HANDLES_OPEN);
+  g_autoptr (AdwApplication) application
+      = adw_application_new ("dev.lesssheet.Gtk", G_APPLICATION_HANDLES_OPEN);
   g_signal_connect (application, "activate", G_CALLBACK (on_activate), &app);
   g_signal_connect (application, "open", G_CALLBACK (on_open), &app);
   int status = g_application_run (G_APPLICATION (application), argc, argv);

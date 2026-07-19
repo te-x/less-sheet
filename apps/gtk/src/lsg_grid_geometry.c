@@ -3,18 +3,20 @@
  * MATH (lsg_grid_geometry.h). Pure arithmetic over plain numbers; the C analog
  * of the macOS `ColumnLayouting` + the NSTableView geometry that NSTableView
  * owned implicitly. Uniform row height => O(1) vertical geometry; the column
- * half walks only as far as the answer's last column (never a forced full pass).
+ * half walks only as far as the answer's last column (never a forced full
+ * pass).
  *
- * Deliberately uses NO <math.h> (floor/ceil): the frozen meson.build links glib
- * but not libm, and every value here is non-negative, so a cast-to-integer IS
- * floor and the ceil cases are handled by a multiply-back boundary check.
+ * Deliberately uses NO <math.h> (floor/ceil): the frozen meson.build links
+ * glib but not libm, and every value here is non-negative, so a
+ * cast-to-integer IS floor and the ceil cases are handled by a multiply-back
+ * boundary check.
  */
+#include <lesssheet.h> /* LS_WINDOW_MAX_ROWS (the row-window clamp) */
 #include <lsg_grid_geometry.h>
-#include <lesssheet.h>   /* LS_WINDOW_MAX_ROWS (the row-window clamp) */
 #include <string.h>
 
 /* ------------------------------------------------------------------------- */
-/* Vertical: the row window a paint must materialize                          */
+/* Vertical: the row window a paint must materialize */
 /* ------------------------------------------------------------------------- */
 
 LsgRowSpan
@@ -28,15 +30,17 @@ lsg_grid_row_window (gdouble scroll_y, gdouble viewport_h, gdouble row_h,
   if (scroll_y < 0.0)
     scroll_y = 0.0;
 
-  /* First visible row: floor(scroll_y / row_h) (non-negative -> cast == floor). */
-  guint64 first_visible = (guint64) (scroll_y / row_h);
+  /* First visible row: floor(scroll_y / row_h) (non-negative -> cast ==
+   * floor). */
+  guint64 first_visible = (guint64)(scroll_y / row_h);
 
   /* Last visible row: the largest i whose pixel span [i*row_h, (i+1)*row_h)
    * still begins before the viewport bottom. A row starting exactly at the
-   * bottom edge (exclusive) is NOT visible, so decrement on an exact landing. */
+   * bottom edge (exclusive) is NOT visible, so decrement on an exact landing.
+   */
   gdouble bottom = scroll_y + viewport_h;
-  guint64 last_visible = (guint64) (bottom / row_h);
-  if (last_visible > 0 && (gdouble) last_visible * row_h >= bottom)
+  guint64 last_visible = (guint64)(bottom / row_h);
+  if (last_visible > 0 && (gdouble)last_visible * row_h >= bottom)
     last_visible -= 1;
 
   /* Overscan (the scroll buffer) on each side, then clamp to [0, estimate). */
@@ -54,12 +58,12 @@ lsg_grid_row_window (gdouble scroll_y, gdouble viewport_h, gdouble row_h,
     count = LS_WINDOW_MAX_ROWS;
 
   span.first_row = first;
-  span.row_count = (guint32) count;
+  span.row_count = (guint32)count;
   return span;
 }
 
 /* ------------------------------------------------------------------------- */
-/* Vertical: estimate <-> scrollbar mapping (filler-row math)                 */
+/* Vertical: estimate <-> scrollbar mapping (filler-row math) */
 /* ------------------------------------------------------------------------- */
 
 gdouble
@@ -67,8 +71,9 @@ lsg_grid_content_height (guint64 row_estimate, gdouble row_h)
 {
   if (row_estimate == 0 || row_h <= 0.0)
     return 0.0;
-  gdouble h = (gdouble) row_estimate * row_h;
-  return (h <= LSG_GRID_MAX_ADJUSTMENT_UPPER) ? h : LSG_GRID_MAX_ADJUSTMENT_UPPER;
+  gdouble h = (gdouble)row_estimate * row_h;
+  return (h <= LSG_GRID_MAX_ADJUSTMENT_UPPER) ? h
+                                              : LSG_GRID_MAX_ADJUSTMENT_UPPER;
 }
 
 /* The content height would overflow the sane adjustment range -> the scrollbar
@@ -76,7 +81,7 @@ lsg_grid_content_height (guint64 row_estimate, gdouble row_h)
 static gboolean
 is_saturated (guint64 row_estimate, gdouble row_h)
 {
-  return ((gdouble) row_estimate * row_h) > LSG_GRID_MAX_ADJUSTMENT_UPPER;
+  return ((gdouble)row_estimate * row_h) > LSG_GRID_MAX_ADJUSTMENT_UPPER;
 }
 
 guint64
@@ -93,13 +98,14 @@ lsg_grid_top_row_for_offset (gdouble offset, gdouble upper,
     {
       if (row_h <= 0.0)
         return 0;
-      row = (guint64) (offset / row_h);              /* direct: floor(offset/row_h) */
+      row = (guint64)(offset / row_h); /* direct: floor(offset/row_h) */
     }
   else
     {
       if (upper <= 0.0)
         return 0;
-      row = (guint64) ((offset / upper) * (gdouble) row_estimate); /* proportional */
+      row = (guint64)((offset / upper)
+                      * (gdouble)row_estimate); /* proportional */
     }
 
   if (row > row_estimate - 1)
@@ -108,17 +114,17 @@ lsg_grid_top_row_for_offset (gdouble offset, gdouble upper,
 }
 
 gdouble
-lsg_grid_offset_for_top_row (guint64 row, gdouble upper,
-                             guint64 row_estimate, gdouble row_h)
+lsg_grid_offset_for_top_row (guint64 row, gdouble upper, guint64 row_estimate,
+                             gdouble row_h)
 {
   if (row_estimate == 0)
     return 0.0;
 
   gdouble offset;
   if (!is_saturated (row_estimate, row_h))
-    offset = (gdouble) row * row_h;                          /* direct */
+    offset = (gdouble)row * row_h; /* direct */
   else
-    offset = ((gdouble) row / (gdouble) row_estimate) * upper; /* proportional */
+    offset = ((gdouble)row / (gdouble)row_estimate) * upper; /* proportional */
 
   if (offset < 0.0)
     offset = 0.0;
@@ -132,20 +138,20 @@ lsg_grid_should_apply_estimate (guint64 old_estimate, guint64 new_estimate,
                                 gboolean is_overscrolling)
 {
   if (new_estimate == old_estimate)
-    return FALSE;               /* nothing to do */
+    return FALSE; /* nothing to do */
   if (is_overscrolling)
-    return FALSE;               /* defer until the kinetic/elastic scroll settles */
+    return FALSE; /* defer until the kinetic/elastic scroll settles */
   return TRUE;
 }
 
 /* ------------------------------------------------------------------------- */
-/* Horizontal: the column window a paint must touch (mirrors ColumnLayouting) */
+/* Horizontal: the column window a paint must touch (mirrors ColumnLayouting)
+ */
 /* ------------------------------------------------------------------------- */
 
 LsgColumnWindow
-lsg_grid_column_window (const gdouble *widths, guint n,
-                        gdouble viewport_x, gdouble viewport_w,
-                        guint overscan)
+lsg_grid_column_window (const gdouble *widths, guint n, gdouble viewport_x,
+                        gdouble viewport_w, guint overscan)
 {
   LsgColumnWindow win = { 0, 0, 0.0 };
   if (widths == NULL || n == 0 || viewport_w <= 0.0)
@@ -156,15 +162,16 @@ lsg_grid_column_window (const gdouble *widths, guint n,
 
   guint first_idx = 0, last_idx = 0;
   gboolean found = FALSE;
-  gdouble x = 0.0;         /* running prefix sum of preceding widths */
-  gdouble first_x = 0.0;   /* x-offset of the first intersecting column */
+  gdouble x = 0.0;       /* running prefix sum of preceding widths */
+  gdouble first_x = 0.0; /* x-offset of the first intersecting column */
 
   for (guint i = 0; i < n; i++)
     {
       gdouble w = (widths[i] > 0.0) ? widths[i] : 0.0;
       gdouble x_end = x + w;
 
-      /* Column i intersects the viewport iff [x, x_end) overlaps [vstart, vend). */
+      /* Column i intersects the viewport iff [x, x_end) overlaps [vstart,
+       * vend). */
       if (x_end > vstart && x < vend)
         {
           if (!found)
@@ -177,14 +184,14 @@ lsg_grid_column_window (const gdouble *widths, guint n,
         }
       else if (found && x >= vend)
         {
-          break;              /* past the viewport; columns are left-to-right */
+          break; /* past the viewport; columns are left-to-right */
         }
 
       x = x_end;
     }
 
   if (!found)
-    return win;               /* no column intersects -> {0, 0, 0} */
+    return win; /* no column intersects -> {0, 0, 0} */
 
   /* Overscan on each side, clamped to [0, n). */
   guint fi = (first_idx > overscan) ? first_idx - overscan : 0;
@@ -192,7 +199,8 @@ lsg_grid_column_window (const gdouble *widths, guint n,
   if (li > n - 1)
     li = n - 1;
 
-  /* first_x of the overscanned first column: back out the widths in [fi, first_idx). */
+  /* first_x of the overscanned first column: back out the widths in [fi,
+   * first_idx). */
   gdouble fx = first_x;
   for (guint i = fi; i < first_idx; i++)
     fx -= (widths[i] > 0.0) ? widths[i] : 0.0;
@@ -206,14 +214,13 @@ lsg_grid_column_window (const gdouble *widths, guint n,
 }
 
 void
-lsg_grid_grow_widths (const gdouble *current, guint n,
-                      const guint *cols, const gdouble *candidates, guint m,
-                      gdouble *out)
+lsg_grid_grow_widths (const gdouble *current, guint n, const guint *cols,
+                      const gdouble *candidates, guint m, gdouble *out)
 {
   if (out == NULL || n == 0)
     return;
   if (current != NULL)
-    memcpy (out, current, (gsize) n * sizeof (gdouble));
+    memcpy (out, current, (gsize)n * sizeof (gdouble));
 
   if (cols == NULL || candidates == NULL)
     return;
@@ -222,16 +229,16 @@ lsg_grid_grow_widths (const gdouble *current, guint n,
     {
       guint col = cols[j];
       if (col >= n)
-        continue;                          /* out-of-range pair ignored */
+        continue; /* out-of-range pair ignored */
       if (candidates[j] > out[col])
-        out[col] = candidates[j];          /* monotone: never lowered */
+        out[col] = candidates[j]; /* monotone: never lowered */
     }
 }
 
 gdouble
 lsg_grid_column_width_estimate (const char *const *cells, guint n_cells,
-                                const char *header,
-                                gdouble advance, gdouble padding)
+                                const char *header, gdouble advance,
+                                gdouble padding)
 {
   glong max_chars = 0;
 
@@ -239,7 +246,7 @@ lsg_grid_column_width_estimate (const char *const *cells, guint n_cells,
     {
       if (cells != NULL && cells[i] != NULL)
         {
-          glong len = g_utf8_strlen (cells[i], -1);   /* CHARACTERS, not bytes */
+          glong len = g_utf8_strlen (cells[i], -1); /* CHARACTERS, not bytes */
           if (len > max_chars)
             max_chars = len;
         }
@@ -252,5 +259,5 @@ lsg_grid_column_width_estimate (const char *const *cells, guint n_cells,
         max_chars = len;
     }
 
-  return advance * (gdouble) max_chars + padding;
+  return advance * (gdouble)max_chars + padding;
 }

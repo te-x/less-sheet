@@ -8,10 +8,10 @@
  * (`ls_open_url_start` -> `ls_net_open_poll` -> `ls_net_open_release`). This
  * module wraps that lifecycle and folds each raw poll snapshot into an owned,
  * C-free `LsgNetProgress` the frontend paints into its always-visible banner
- * (the <500 ms cold-start budget does NOT apply to a network open — see the ABI
- * NETWORK SOURCE EXTENSION). On DONE the produced `ls_doc` is adopted into a
- * normal `LsgDocument` (see <lsg_document.h>), thereafter identical to a local
- * document through every viewer accessor.
+ * (the <500 ms cold-start budget does NOT apply to a network open — see the
+ * ABI NETWORK SOURCE EXTENSION). On DONE the produced `ls_doc` is adopted into
+ * a normal `LsgDocument` (see <lsg_document.h>), thereafter identical to a
+ * local document through every viewer accessor.
  *
  * GATE COVERAGE (honest): the pure mappers + reducer
  * (`lsg_net_state_from_abi` / `lsg_net_error_from_abi` /
@@ -37,55 +37,64 @@
 G_BEGIN_DECLS
 
 /* The async open-job state, mirroring `ls_net_open_state` 1:1. */
-typedef enum {
-  LSG_NET_PENDING = 0,   /* LS_NET_OPEN_PENDING — probing range support */
-  LSG_NET_FETCHING = 1,  /* LS_NET_OPEN_FETCHING — head / sequential fetch in flight */
-  LSG_NET_DONE = 2,      /* LS_NET_OPEN_DONE — the document is open (terminal) */
-  LSG_NET_FAILED = 3,    /* LS_NET_OPEN_FAILED — see the error (terminal) */
-  LSG_NET_CANCELLED = 4, /* LS_NET_OPEN_CANCELLED — cancelled before DONE (terminal) */
+typedef enum
+{
+  LSG_NET_PENDING = 0, /* LS_NET_OPEN_PENDING — probing range support */
+  LSG_NET_FETCHING
+  = 1, /* LS_NET_OPEN_FETCHING — head / sequential fetch in flight */
+  LSG_NET_DONE = 2,   /* LS_NET_OPEN_DONE — the document is open (terminal) */
+  LSG_NET_FAILED = 3, /* LS_NET_OPEN_FAILED — see the error (terminal) */
+  LSG_NET_CANCELLED
+  = 4, /* LS_NET_OPEN_CANCELLED — cancelled before DONE (terminal) */
 } LsgNetState;
 
 /* Map a raw `ls_net_open_state` value; an unrecognized code maps to
  * LSG_NET_FAILED (mirrors the macOS `?? .failed` fallback). */
 LsgNetState lsg_net_state_from_abi (gint32 abi_state);
 
-/* Whether a state is terminal (polling can stop): DONE / FAILED / CANCELLED. */
+/* Whether a state is terminal (polling can stop): DONE / FAILED / CANCELLED.
+ */
 gboolean lsg_net_state_is_terminal (LsgNetState state);
 
 /* Network-open outcome, mirroring `ls_net_status` 1:1 (with an explicit OK).
  * A materially different taxonomy from local-file `LsgOpenError` — kept
- * separate exactly as the ABI keeps `ls_net_status` distinct from `ls_status`. */
-typedef enum {
-  LSG_NET_OK = 0,                        /* LS_NET_OK — no error */
-  LSG_NET_ERROR_INVALID_ARGUMENT = 1,    /* bad scheme / URL / option (rejected synchronously) */
-  LSG_NET_ERROR_UNREACHABLE = 2,         /* DNS / TCP / TLS connection failure */
-  LSG_NET_ERROR_TIMEOUT = 3,             /* no forward progress within the timeout */
-  LSG_NET_ERROR_HTTP_STATUS = 4,         /* non-2xx (http_status carries the code) */
-  LSG_NET_ERROR_TOO_MANY_REDIRECTS = 5,  /* redirect chain exceeded the cap */
-  LSG_NET_ERROR_IO = 6,                  /* local spool-file failure */
-  LSG_NET_ERROR_CANCELLED = 7,           /* cancelled before DONE */
+ * separate exactly as the ABI keeps `ls_net_status` distinct from `ls_status`.
+ */
+typedef enum
+{
+  LSG_NET_OK = 0, /* LS_NET_OK — no error */
+  LSG_NET_ERROR_INVALID_ARGUMENT
+  = 1, /* bad scheme / URL / option (rejected synchronously) */
+  LSG_NET_ERROR_UNREACHABLE = 2, /* DNS / TCP / TLS connection failure */
+  LSG_NET_ERROR_TIMEOUT = 3,     /* no forward progress within the timeout */
+  LSG_NET_ERROR_HTTP_STATUS = 4, /* non-2xx (http_status carries the code) */
+  LSG_NET_ERROR_TOO_MANY_REDIRECTS = 5, /* redirect chain exceeded the cap */
+  LSG_NET_ERROR_IO = 6,                 /* local spool-file failure */
+  LSG_NET_ERROR_CANCELLED = 7,          /* cancelled before DONE */
 } LsgNetError;
 
 /* Map a raw `ls_net_status` value; 0 -> LSG_NET_OK, 1..7 -> the codes above.
  * An unrecognized code maps to LSG_NET_OK (mirrors the macOS `nil` for an
- * unknown/absent error; the reducer only reads the error when state==FAILED). */
+ * unknown/absent error; the reducer only reads the error when state==FAILED).
+ */
 LsgNetError lsg_net_error_from_abi (gint32 abi_error);
 
 /*
  * One network-open progress snapshot (mirrors `ls_net_open_status`, minus the
  * core-owned `doc` pointer the drive consumes internally). `has_fraction` is
- * false when the ABI reports LS_NET_PROGRESS_UNKNOWN (-1.0) — the UI then shows
- * an indeterminate spinner plus the live `bytes_fetched` counter. `error` /
- * `http_status` are meaningful only when `state == LSG_NET_FAILED`.
+ * false when the ABI reports LS_NET_PROGRESS_UNKNOWN (-1.0) — the UI then
+ * shows an indeterminate spinner plus the live `bytes_fetched` counter.
+ * `error` / `http_status` are meaningful only when `state == LSG_NET_FAILED`.
  */
-typedef struct {
+typedef struct
+{
   LsgNetState state;
   gboolean has_fraction;
-  gdouble fraction;       /* valid iff has_fraction; in [0.0, 1.0] */
+  gdouble fraction; /* valid iff has_fraction; in [0.0, 1.0] */
   guint64 bytes_fetched;
-  guint64 bytes_total;    /* 0 when unknown */
+  guint64 bytes_total; /* 0 when unknown */
   LsgNetError error;
-  gint32 http_status;     /* valid iff error == LSG_NET_ERROR_HTTP_STATUS */
+  gint32 http_status; /* valid iff error == LSG_NET_ERROR_HTTP_STATUS */
 } LsgNetProgress;
 
 /* PURE reducer: fold a raw `ls_net_open_status` (non-NULL) into an
@@ -104,7 +113,8 @@ typedef struct _LsgNetOpen LsgNetOpen;
  * LSG_NET_FAILED / LSG_NET_ERROR_INVALID_ARGUMENT, touching no network. The
  * caller MUST eventually `lsg_net_open_release` the handle.
  */
-LsgNetOpen *lsg_net_open_start (const char *url, const ls_open_options *options);
+LsgNetOpen *lsg_net_open_start (const char *url,
+                                const ls_open_options *options);
 
 /* Fold the job's current `ls_net_open_poll` snapshot into an `LsgNetProgress`.
  * Never blocks; safe from any thread. */
@@ -115,10 +125,11 @@ LsgNetProgress lsg_net_open_poll (LsgNetOpen *job);
 void lsg_net_open_cancel (LsgNetOpen *job);
 
 /*
- * On DONE, adopt the produced `ls_doc` into a new OWNED `LsgDocument` (the same
- * type a local open returns), returning it; the adopted document then follows
- * the normal `lsg_document_close` lifecycle, INDEPENDENT of releasing this job.
- * Returns NULL if the job is not (yet) DONE, or if it was already adopted.
+ * On DONE, adopt the produced `ls_doc` into a new OWNED `LsgDocument` (the
+ * same type a local open returns), returning it; the adopted document then
+ * follows the normal `lsg_document_close` lifecycle, INDEPENDENT of releasing
+ * this job. Returns NULL if the job is not (yet) DONE, or if it was already
+ * adopted.
  */
 LsgDocument *lsg_net_open_adopt_document (LsgNetOpen *job);
 

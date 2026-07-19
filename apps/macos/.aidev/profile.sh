@@ -17,7 +17,7 @@ IMPLEMENTATION_PATHS=( "Sources/LessSheetApp" "Sources/LessSheetKit" "Sources/CL
 # deterministic (fixed seed); the clean-room generator is stdlib-Python (a gate
 # prerequisite). The backend build.zig generate-step covers the AC2-4 sweep; this
 # covers only the macOS UI-sample. Heavy cases stay out of the gate (on-demand perf).
-CONFORMANCE_CMD='(cd ../../backend && zig build) && rm -rf .build/*/debug/LessSheet .build/*/debug/*.xctest .build/*/release/LessSheet .build/*/release/*.xctest && swift build && python3 ../../tools/csvgen/gen.py --case unicode_emoji --case eol_crlf --case wide_100k_cols --case enc_utf16le --case happy_numeric --seed 1337 --out .build/corpus-cache'
+CONFORMANCE_CMD='(cd ../../backend && zig build) && rm -rf .build/*/debug/LessSheet .build/*/debug/*.xctest .build/*/release/LessSheet .build/*/release/*.xctest && swift build -Xswiftc -warnings-as-errors && python3 ../../tools/csvgen/gen.py --case unicode_emoji --case eol_crlf --case wide_100k_cols --case enc_utf16le --case happy_numeric --seed 1337 --out .build/corpus-cache'
 # QUALITY_CMD deferred: `swiftlint --strict` has a 333-violation baseline (199 identifier_name,
 # 69 line_length, plus complexity/length) — enabling needs a project .swiftlint.yml tuned to our
 # standards + a cleanup pass (its own slice), not a mechanical reformat. Command once clean:

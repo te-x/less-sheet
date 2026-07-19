@@ -1,23 +1,24 @@
 /*
  * lsg_formatter.c — the GTK frontend's display-free CELL FORMATTER engine
  * (lsg_formatter.h). The C analog of the macOS `ColumnDisplayFormatting`,
- * reproduced per ARCH decision 8 with GLib + the C-library locale, NOT ICU. The
- * exact-decimal losslessness macOS gets from Foundation `Decimal.FormatStyle`
- * is reproduced here in base-10 ARITHMETIC over digit strings — never binary
- * floating point — so a value formats to an EXACT round trip or falls back to
- * the raw spelling (UNAVAILABLE), never a rounded lie.
+ * reproduced per ARCH decision 8 with GLib + the C-library locale, NOT ICU.
+ * The exact-decimal losslessness macOS gets from Foundation
+ * `Decimal.FormatStyle` is reproduced here in base-10 ARITHMETIC over digit
+ * strings — never binary floating point — so a value formats to an EXACT round
+ * trip or falls back to the raw spelling (UNAVAILABLE), never a rounded lie.
  */
 #include <lsg_formatter.h>
 
-#include <locale.h>
 #include <limits.h>
+#include <locale.h>
 #include <string.h>
 
 /* ------------------------------------------------------------------------- */
-/* Small ASCII helpers (locale-independent, exactly the pinned v1 grammar)    */
+/* Small ASCII helpers (locale-independent, exactly the pinned v1 grammar) */
 /* ------------------------------------------------------------------------- */
 
-/* The numeric grammar's whitespace set: 0x09..0x0D and 0x20 (see HEADER RULE). */
+/* The numeric grammar's whitespace set: 0x09..0x0D and 0x20 (see HEADER RULE).
+ */
 static gboolean
 is_ws (char c)
 {
@@ -45,12 +46,13 @@ trim (const char *s, gsize len, const char **begin, const char **end)
 }
 
 /* ------------------------------------------------------------------------- */
-/* Strict lexical KIND gate                                                   */
+/* Strict lexical KIND gate */
 /* ------------------------------------------------------------------------- */
 
 /* Match the numeric grammar over [p, end):
  *   sign? ( digits ('.' digits?)? | '.' digits ) (('e'|'E') sign? digits)?
- * On a full match, *is_decimal is set TRUE iff a '.' or exponent is present. */
+ * On a full match, *is_decimal is set TRUE iff a '.' or exponent is present.
+ */
 static gboolean
 match_numeric (const char *p, const char *end, gboolean *is_decimal)
 {
@@ -78,7 +80,8 @@ match_numeric (const char *p, const char *end, gboolean *is_decimal)
         }
     }
 
-  /* Mantissa must carry at least one digit somewhere; "." / "" / "+.e5" fail. */
+  /* Mantissa must carry at least one digit somewhere; "." / "" / "+.e5" fail.
+   */
   if (!int_digits && !frac_digits)
     return FALSE;
 
@@ -92,11 +95,11 @@ match_numeric (const char *p, const char *end, gboolean *is_decimal)
       while (p < end && is_digit (*p))
         p++;
       if (p == e_start)
-        return FALSE;         /* exponent needs at least one digit ("1e" fails) */
+        return FALSE; /* exponent needs at least one digit ("1e" fails) */
     }
 
   if (p != end)
-    return FALSE;             /* trailing garbage ("1,000", "0x1F", "1 2") */
+    return FALSE; /* trailing garbage ("1,000", "0x1F", "1 2") */
 
   *is_decimal = has_dot || has_exp;
   return TRUE;
@@ -105,7 +108,7 @@ match_numeric (const char *p, const char *end, gboolean *is_decimal)
 static gboolean
 match_bool (const char *p, const char *end)
 {
-  gsize n = (gsize) (end - p);
+  gsize n = (gsize)(end - p);
   if (n == 4)
     return g_ascii_strncasecmp (p, "true", 4) == 0;
   if (n == 5)
@@ -122,7 +125,8 @@ is_leap (int y)
 static int
 days_in_month (int y, int m)
 {
-  static const int d[13] = { 0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+  static const int d[13]
+      = { 0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
   if (m < 1 || m > 12)
     return 0;
   if (m == 2 && is_leap (y))
@@ -143,7 +147,8 @@ match_date_prefix (const char *s, gsize len)
       || !is_digit (s[8]) || !is_digit (s[9]))
     return FALSE;
 
-  int y = (s[0] - '0') * 1000 + (s[1] - '0') * 100 + (s[2] - '0') * 10 + (s[3] - '0');
+  int y = (s[0] - '0') * 1000 + (s[1] - '0') * 100 + (s[2] - '0') * 10
+          + (s[3] - '0');
   int mo = (s[5] - '0') * 10 + (s[6] - '0');
   int dy = (s[8] - '0') * 10 + (s[9] - '0');
   int dim = days_in_month (y, mo);
@@ -184,7 +189,7 @@ match_datetime (const char *s, gsize len)
       while (i < len && is_digit (s[i]))
         i++;
       if (i == f0)
-        return LSG_KIND_NONE;          /* '.' with no fractional digits */
+        return LSG_KIND_NONE; /* '.' with no fractional digits */
     }
 
   if (i < len)
@@ -197,7 +202,7 @@ match_datetime (const char *s, gsize len)
       else if (s[i] == '+' || s[i] == '-')
         {
           if (i + 5 >= len)
-            return LSG_KIND_NONE;       /* need sign HH ':' MM */
+            return LSG_KIND_NONE; /* need sign HH ':' MM */
           if (!is_digit (s[i + 1]) || !is_digit (s[i + 2]) || s[i + 3] != ':'
               || !is_digit (s[i + 4]) || !is_digit (s[i + 5]))
             return LSG_KIND_NONE;
@@ -206,12 +211,12 @@ match_datetime (const char *s, gsize len)
         }
       else
         {
-          return LSG_KIND_NONE;         /* trailing garbage */
+          return LSG_KIND_NONE; /* trailing garbage */
         }
     }
 
   if (i != len)
-    return LSG_KIND_NONE;               /* garbage after the zone */
+    return LSG_KIND_NONE; /* garbage after the zone */
 
   return zoned ? LSG_KIND_DATETIME_ZONED : LSG_KIND_DATETIME_NAIVE;
 }
@@ -227,7 +232,7 @@ lsg_scalar_kind (const char *raw)
 
   /* v1 grammar is ASCII-only: any byte >= 0x80 is text (LSG_KIND_NONE). */
   for (gsize i = 0; i < len; i++)
-    if ((guchar) raw[i] >= 0x80)
+    if ((guchar)raw[i] >= 0x80)
       return LSG_KIND_NONE;
 
   /* Boolean / numeric trim edge whitespace; date / datetime do NOT. */
@@ -252,7 +257,7 @@ lsg_scalar_kind (const char *raw)
 }
 
 /* ------------------------------------------------------------------------- */
-/* Locale glyphs (the only platform-sourced presentation, kept separate)      */
+/* Locale glyphs (the only platform-sourced presentation, kept separate) */
 /* ------------------------------------------------------------------------- */
 
 LsgLocaleGlyphs
@@ -268,26 +273,27 @@ lsg_locale_glyphs_current (void)
   if (lc->thousands_sep != NULL && lc->thousands_sep[0] != '\0')
     g.grouping_sep = g_utf8_get_char_validated (lc->thousands_sep, -1);
 
-  /* localeconv grouping is a CHAR_MAX-terminated list of group sizes; the first
-   * entry is the least-significant group. 0 or an empty/absent list => none. */
+  /* localeconv grouping is a CHAR_MAX-terminated list of group sizes; the
+   * first entry is the least-significant group. 0 or an empty/absent list =>
+   * none. */
   if (lc->grouping != NULL && lc->grouping[0] != '\0'
       && lc->grouping[0] != CHAR_MAX && lc->grouping[0] > 0)
-    g.grouping_size = (guint) lc->grouping[0];
+    g.grouping_size = (guint)lc->grouping[0];
   else
     g.grouping_size = 0;
 
-  /* g_utf8_get_char_validated can report -1/-2 for a non-UTF-8 locale byte; fall
-   * back to sane ASCII so the arithmetic never emits an invalid glyph. */
-  if ((gint) g.decimal_point < 0)
+  /* g_utf8_get_char_validated can report -1/-2 for a non-UTF-8 locale byte;
+   * fall back to sane ASCII so the arithmetic never emits an invalid glyph. */
+  if ((gint)g.decimal_point < 0)
     g.decimal_point = '.';
-  if ((gint) g.grouping_sep < 0)
+  if ((gint)g.grouping_sep < 0)
     g.grouping_sep = ',';
 
   return g;
 }
 
 /* ------------------------------------------------------------------------- */
-/* Display result lifetime                                                    */
+/* Display result lifetime */
 /* ------------------------------------------------------------------------- */
 
 void
@@ -312,29 +318,32 @@ make_display (LsgDisplayKind kind, char *owned_text)
 static LsgDisplay
 unavailable (const char *raw)
 {
-  return make_display (LSG_DISPLAY_UNAVAILABLE, g_strdup (raw != NULL ? raw : ""));
+  return make_display (LSG_DISPLAY_UNAVAILABLE,
+                       g_strdup (raw != NULL ? raw : ""));
 }
 
 /* ------------------------------------------------------------------------- */
-/* Exact base-10 decimal value: parse -> guard -> render                      */
+/* Exact base-10 decimal value: parse -> guard -> render */
 /* ------------------------------------------------------------------------- */
 
 /*
  * A parsed exact value. `digits` is the full mantissa digit string (integer +
  * fraction digits concatenated, no sign, no dot, leading/trailing zeros kept);
- * `point` is the number of `digits` that lie BEFORE the decimal point after the
- * scientific exponent is folded in (may be <= 0 or > len(digits)); `negative`
- * is the sign. The exact value is:
+ * `point` is the number of `digits` that lie BEFORE the decimal point after
+ * the scientific exponent is folded in (may be <= 0 or > len(digits));
+ * `negative` is the sign. The exact value is:
  *      (-1)^negative * digits * 10^(point - strlen(digits))
  */
-typedef struct {
+typedef struct
+{
   GString *digits;
   gint64 point;
   gboolean negative;
 } ExactDec;
 
 /* Parse a DECIMAL/INTEGER-kind spelling into an ExactDec. Returns FALSE (and
- * frees nothing) if the spelling is not numeric (defensive; the caller gates). */
+ * frees nothing) if the spelling is not numeric (defensive; the caller gates).
+ */
 static gboolean
 parse_exact (const char *raw, ExactDec *out)
 {
@@ -393,7 +402,8 @@ parse_exact (const char *raw, ExactDec *out)
       gint64 mag = 0;
       while (b < e && is_digit (*b))
         {
-          /* Saturate rather than overflow; a huge exponent fails the guard below. */
+          /* Saturate rather than overflow; a huge exponent fails the guard
+           * below. */
           if (mag < (G_GINT64_CONSTANT (1) << 40))
             mag = mag * 10 + (*b - '0');
           b++;
@@ -414,7 +424,7 @@ parse_exact (const char *raw, ExactDec *out)
   /* The decimal point sits after (int-digit-count) mantissa digits; the
    * exponent shifts it. int-digit-count = total mantissa digits - frac_len. */
   out->digits = mant;
-  out->point = (gint64) mant->len - frac_len + exp;
+  out->point = (gint64)mant->len - frac_len + exp;
   out->negative = negative;
   return TRUE;
 }
@@ -447,9 +457,10 @@ significance (const ExactDec *v, gsize *num_sig, gint64 *lsd_exp)
       return;
     }
   *num_sig = last - first + 1;
-  /* value = digits * 10^(point - n); dropping trailing zeros past `last` raises
-   * the exponent of the least-significant significant digit accordingly. */
-  *lsd_exp = (v->point - (gint64) n) + (gint64) (n - 1 - last);
+  /* value = digits * 10^(point - n); dropping trailing zeros past `last`
+   * raises the exponent of the least-significant significant digit
+   * accordingly. */
+  *lsd_exp = (v->point - (gint64)n) + (gint64)(n - 1 - last);
 }
 
 /* Insert `sep` every `size` digits (from the right) into the digit string
@@ -460,7 +471,7 @@ append_grouped (GString *dst, const char *digits, gsize dlen,
 {
   if (!grouping || size == 0 || dlen == 0)
     {
-      g_string_append_len (dst, digits, (gssize) dlen);
+      g_string_append_len (dst, digits, (gssize)dlen);
       return;
     }
   char sepbuf[8];
@@ -468,7 +479,7 @@ append_grouped (GString *dst, const char *digits, gsize dlen,
 
   for (gsize i = 0; i < dlen; i++)
     {
-      gsize remaining = dlen - i;      /* digits still to emit including this one */
+      gsize remaining = dlen - i; /* digits still to emit including this one */
       if (i != 0 && remaining % size == 0)
         g_string_append_len (dst, sepbuf, seplen);
       g_string_append_c (dst, digits[i]);
@@ -477,16 +488,16 @@ append_grouped (GString *dst, const char *digits, gsize dlen,
 
 /*
  * Render an ExactDec that has PASSED the representability guard, honoring
- * `fraction_digits` (>=0 fixes the length with HALF-EVEN rounding; <0 preserves
- * the source fractional length) and `grouping`/`glyphs`. Returns an owned
- * string.
+ * `fraction_digits` (>=0 fixes the length with HALF-EVEN rounding; <0
+ * preserves the source fractional length) and `grouping`/`glyphs`. Returns an
+ * owned string.
  */
 static char *
 render_exact (const ExactDec *v, gboolean grouping, gint fraction_digits,
               LsgLocaleGlyphs glyphs)
 {
   const char *md = v->digits->str;
-  gint64 n = (gint64) v->digits->len;
+  gint64 n = (gint64)v->digits->len;
   gint64 point = v->point;
 
   /* Split the mantissa into integer and fraction digit strings around `point`,
@@ -499,34 +510,34 @@ render_exact (const ExactDec *v, gboolean grouping, gint fraction_digits,
       g_string_append (int_part, "0");
       for (gint64 i = 0; i < -point; i++)
         g_string_append_c (frac_part, '0');
-      g_string_append_len (frac_part, md, (gssize) n);
+      g_string_append_len (frac_part, md, (gssize)n);
     }
   else if (point >= n)
     {
-      g_string_append_len (int_part, md, (gssize) n);
+      g_string_append_len (int_part, md, (gssize)n);
       for (gint64 i = 0; i < point - n; i++)
         g_string_append_c (int_part, '0');
     }
   else
     {
-      g_string_append_len (int_part, md, (gssize) point);
-      g_string_append_len (frac_part, md + point, (gssize) (n - point));
+      g_string_append_len (int_part, md, (gssize)point);
+      g_string_append_len (frac_part, md + point, (gssize)(n - point));
     }
 
   /* Apply the requested fractional length. */
   if (fraction_digits >= 0)
     {
-      gsize want = (gsize) fraction_digits;
+      gsize want = (gsize)fraction_digits;
       if (frac_part->len <= want)
         {
           while (frac_part->len < want)
-            g_string_append_c (frac_part, '0');   /* pad exactly */
+            g_string_append_c (frac_part, '0'); /* pad exactly */
         }
       else
         {
-          /* Round the exact value to `want` fraction digits, HALF-EVEN. The kept
-           * integer is (int_part + frac_part[0..want)); the dropped tail decides
-           * the rounding. */
+          /* Round the exact value to `want` fraction digits, HALF-EVEN. The
+           * kept integer is (int_part + frac_part[0..want)); the dropped tail
+           * decides the rounding. */
           char round_digit = frac_part->str[want];
           gboolean tail_nonzero = FALSE;
           for (gsize i = want + 1; i < frac_part->len; i++)
@@ -546,18 +557,17 @@ render_exact (const ExactDec *v, gboolean grouping, gint fraction_digits,
             {
               /* Exactly halfway: round to even. Last kept digit is the final
                * fraction digit, or the last integer digit when want == 0. */
-              char last_kept = (want > 0)
-                                   ? frac_part->str[want - 1]
-                                   : int_part->str[int_part->len - 1];
+              char last_kept = (want > 0) ? frac_part->str[want - 1]
+                                          : int_part->str[int_part->len - 1];
               round_up = ((last_kept - '0') % 2) != 0;
             }
 
           if (round_up)
             {
-              /* Increment the (int_part . frac_part) digit sequence by 1 unit in
-               * the last fraction place, propagating the carry leftward. */
+              /* Increment the (int_part . frac_part) digit sequence by 1 unit
+               * in the last fraction place, propagating the carry leftward. */
               gboolean carry = TRUE;
-              for (gssize i = (gssize) frac_part->len - 1; i >= 0 && carry; i--)
+              for (gssize i = (gssize)frac_part->len - 1; i >= 0 && carry; i--)
                 {
                   if (frac_part->str[i] == '9')
                     frac_part->str[i] = '0';
@@ -567,7 +577,7 @@ render_exact (const ExactDec *v, gboolean grouping, gint fraction_digits,
                       carry = FALSE;
                     }
                 }
-              for (gssize i = (gssize) int_part->len - 1; i >= 0 && carry; i--)
+              for (gssize i = (gssize)int_part->len - 1; i >= 0 && carry; i--)
                 {
                   if (int_part->str[i] == '9')
                     int_part->str[i] = '0';
@@ -578,7 +588,7 @@ render_exact (const ExactDec *v, gboolean grouping, gint fraction_digits,
                     }
                 }
               if (carry)
-                g_string_prepend_c (int_part, '1');   /* e.g. 999 -> 1000 */
+                g_string_prepend_c (int_part, '1'); /* e.g. 999 -> 1000 */
             }
         }
     }
@@ -608,7 +618,7 @@ render_exact (const ExactDec *v, gboolean grouping, gint fraction_digits,
       char dpbuf[8];
       gint dplen = g_unichar_to_utf8 (glyphs.decimal_point, dpbuf);
       g_string_append_len (out, dpbuf, dplen);
-      g_string_append_len (out, frac_part->str, (gssize) frac_part->len);
+      g_string_append_len (out, frac_part->str, (gssize)frac_part->len);
     }
 
   g_string_free (int_part, TRUE);
@@ -617,8 +627,8 @@ render_exact (const ExactDec *v, gboolean grouping, gint fraction_digits,
 }
 
 LsgDisplay
-lsg_format_decimal (const char *raw, gboolean grouping,
-                    gint fraction_digits, LsgLocaleGlyphs glyphs)
+lsg_format_decimal (const char *raw, gboolean grouping, gint fraction_digits,
+                    LsgLocaleGlyphs glyphs)
 {
   ExactDec v;
   if (!parse_exact (raw, &v))
@@ -628,12 +638,13 @@ lsg_format_decimal (const char *raw, gboolean grouping,
   gint64 lsd_exp;
   significance (&v, &num_sig, &lsd_exp);
 
-  /* Representability guard, mirroring Foundation Decimal's exact range: at most
-   * LSG_DECIMAL_MAX_SIG_DIGITS significant digits AND a base-10 exponent within
-   * the exact [-128, 127] range. A value beyond it is not a safe round trip. */
-  gboolean representable =
-      (num_sig <= LSG_DECIMAL_MAX_SIG_DIGITS)
-      && (num_sig == 0 || (lsd_exp >= -128 && lsd_exp <= 127));
+  /* Representability guard, mirroring Foundation Decimal's exact range: at
+   * most LSG_DECIMAL_MAX_SIG_DIGITS significant digits AND a base-10 exponent
+   * within the exact [-128, 127] range. A value beyond it is not a safe round
+   * trip. */
+  gboolean representable
+      = (num_sig <= LSG_DECIMAL_MAX_SIG_DIGITS)
+        && (num_sig == 0 || (lsd_exp >= -128 && lsd_exp <= 127));
 
   if (!representable)
     {
@@ -650,7 +661,8 @@ LsgDisplay
 lsg_format_integer (const char *raw, gboolean grouping, LsgLocaleGlyphs glyphs)
 {
   if (!grouping)
-    return make_display (LSG_DISPLAY_ORIGINAL, g_strdup (raw != NULL ? raw : ""));
+    return make_display (LSG_DISPLAY_ORIGINAL,
+                         g_strdup (raw != NULL ? raw : ""));
 
   ExactDec v;
   if (!parse_exact (raw, &v))
@@ -659,16 +671,17 @@ lsg_format_integer (const char *raw, gboolean grouping, LsgLocaleGlyphs glyphs)
   gsize num_sig;
   gint64 lsd_exp;
   significance (&v, &num_sig, &lsd_exp);
-  gboolean representable =
-      (num_sig <= LSG_DECIMAL_MAX_SIG_DIGITS)
-      && (num_sig == 0 || (lsd_exp >= -128 && lsd_exp <= 127));
+  gboolean representable
+      = (num_sig <= LSG_DECIMAL_MAX_SIG_DIGITS)
+        && (num_sig == 0 || (lsd_exp >= -128 && lsd_exp <= 127));
   if (!representable)
     {
       g_string_free (v.digits, TRUE);
       return unavailable (raw);
     }
 
-  /* An integer preserves its (zero-length) source fraction: fraction_digits<0. */
+  /* An integer preserves its (zero-length) source fraction: fraction_digits<0.
+   */
   char *text = render_exact (&v, TRUE, -1, glyphs);
   g_string_free (v.digits, TRUE);
   return make_display (LSG_DISPLAY_FORMATTED, text);

@@ -6,7 +6,7 @@ IMPLEMENTATION_PATHS=( "src" )
 # Protected build/dependency files. meson.build is the build graph; .ci/Dockerfile
 # PINS the toolchain image (GTK/libadwaita versions = ARCH decision-7 floor), so an
 # implementer may not silently change the gate environment. No globs; both exist.
-DEPENDENCY_PATHS=( "meson.build" ".ci/Dockerfile" )
+DEPENDENCY_PATHS=( "meson.build" ".ci/Dockerfile" ".clang-format" )
 
 # THE WHOLE GATE RUNS IN A PINNED LINUX GNOME CONTAINER (ARCH gtk-frontend
 # decision 5/6 + the 2026-07-17 amendment): the dev Mac has no GTK/Meson
@@ -36,10 +36,10 @@ CONFORMANCE_CMD='( set -e
   "$CTR" image inspect "$IMG" >/dev/null 2>&1 || "$CTR" build --platform "$PLAT" -t "$IMG" -f .ci/Dockerfile .ci
   "$CTR" run --rm --platform "$PLAT" --security-opt label=disable -v "$REPO":/src -w /src/apps/gtk "$IMG" \
     sh -c "rm -rf build && meson setup build && meson compile -C build" )'
-# QUALITY_CMD deferred: needs a project .clang-format (GNU-based, ColumnLimit tuned) + a reformat pass —
-# LLVM/GNU defaults diverge from the hand-written style (GNU=4613 hunks), so it is its own slice, not a
-# mechanical reformat. NB: -Werror compilation is ALREADY enforced above in CONFORMANCE. Host-run once configured:
-# QUALITY_CMD="clang-format --dry-run -Werror src/*.c include/*.h"
+# Strict formatting gate: GNU/GNOME style (.clang-format) over gtk's own C — src/*.c + the real
+# include/lsg_*.h headers (the include/lesssheet.h symlink to the root api/ header is excluded, owned by
+# the root). Runs host-side; -Werror compilation is also enforced above in CONFORMANCE.
+QUALITY_CMD="clang-format --dry-run -Werror src/*.c include/lsg_*.h"
 BEHAVIOR_CMD='( set -e
   CTR="$(command -v docker || command -v podman)"
   case "$(uname -m)" in

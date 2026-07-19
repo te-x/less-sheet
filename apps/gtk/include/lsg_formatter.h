@@ -11,10 +11,11 @@
  * the platform LOCALE GLYPHS. The slice-1 grid renders raw cell spelling
  * (AUTO), so these engines are frozen + unit-pinned now (decision 8 is a
  * confirmed slice-1 technology choice and the biggest cross-frontend
- * correctness risk), but the SETTINGS UI that drives non-AUTO options (grouping
- * / fraction digits / type override) and localized DATE-PRESET formatting are
- * LATER slices (column-config); this header intentionally does NOT freeze a
- * `type + options`-driven dispatcher or date-preset formatting yet.
+ * correctness risk), but the SETTINGS UI that drives non-AUTO options
+ * (grouping / fraction digits / type override) and localized DATE-PRESET
+ * formatting are LATER slices (column-config); this header intentionally does
+ * NOT freeze a `type + options`-driven dispatcher or date-preset formatting
+ * yet.
  *
  * The core serves RAW cells; nothing here mutates the source, and it is never
  * used by find / filter / copy (those keep the raw value — the ABI's rule).
@@ -44,7 +45,8 @@ G_BEGIN_DECLS
  *   - DATETIME: exactly YYYY-MM-DDTHH:MM:SS[.f][Z|+/-HH:MM] — NAIVE with no
  *     offset, ZONED with Z or an explicit offset.
  */
-typedef enum {
+typedef enum
+{
   LSG_KIND_NONE = 0,
   LSG_KIND_BOOLEAN,
   LSG_KIND_INTEGER,
@@ -60,19 +62,22 @@ LsgScalarKind lsg_scalar_kind (const char *raw);
 /*
  * Locale presentation glyphs — the ONLY thing taken from the platform (the
  * C-library locale), kept separate from the arithmetic so the formatters are
- * deterministic under `g_test` (tests inject an explicit glyph set). Reproduces
- * `localeconv`'s decimal point / thousands separator / grouping size.
+ * deterministic under `g_test` (tests inject an explicit glyph set).
+ * Reproduces `localeconv`'s decimal point / thousands separator / grouping
+ * size.
  */
-typedef struct {
+typedef struct
+{
   gunichar decimal_point; /* e.g. '.' (en) or ',' (de) */
   gunichar grouping_sep;  /* e.g. ',' (en) or '.' (de) */
-  guint grouping_size;    /* digits per group (typically 3); 0 disables grouping */
+  guint
+      grouping_size; /* digits per group (typically 3); 0 disables grouping */
 } LsgLocaleGlyphs;
 
 /* The current process locale's glyphs, read from `localeconv` (the thin
- * platform adapter; its C-locale sourcing is exercised by the human/real-locale
- * pass, the arithmetic by the injected-glyph unit tests). A locale with no
- * grouping information yields `grouping_size == 0`. */
+ * platform adapter; its C-locale sourcing is exercised by the
+ * human/real-locale pass, the arithmetic by the injected-glyph unit tests). A
+ * locale with no grouping information yields `grouping_size == 0`. */
 LsgLocaleGlyphs lsg_locale_glyphs_current (void);
 
 /*
@@ -85,16 +90,20 @@ LsgLocaleGlyphs lsg_locale_glyphs_current (void);
 #define LSG_DECIMAL_MAX_SIG_DIGITS (38)
 
 /* The display outcome for one cell (mirrors `ColumnDisplay`). */
-typedef enum {
-  LSG_DISPLAY_ORIGINAL = 0,    /* show the source spelling exactly */
-  LSG_DISPLAY_FORMATTED = 1,   /* show this exact formatted string (an exact round trip) */
-  LSG_DISPLAY_UNAVAILABLE = 2, /* NOT safely representable -> show the raw spelling, no lie */
+typedef enum
+{
+  LSG_DISPLAY_ORIGINAL = 0, /* show the source spelling exactly */
+  LSG_DISPLAY_FORMATTED
+  = 1, /* show this exact formatted string (an exact round trip) */
+  LSG_DISPLAY_UNAVAILABLE
+  = 2, /* NOT safely representable -> show the raw spelling, no lie */
 } LsgDisplayKind;
 
-/* A formatter result. `text` is an OWNED, NUL-terminated UTF-8 string (free via
- * `lsg_display_clear`, or g_free directly). For ORIGINAL / UNAVAILABLE it is
- * the raw spelling verbatim. */
-typedef struct {
+/* A formatter result. `text` is an OWNED, NUL-terminated UTF-8 string (free
+ * via `lsg_display_clear`, or g_free directly). For ORIGINAL / UNAVAILABLE it
+ * is the raw spelling verbatim. */
+typedef struct
+{
   LsgDisplayKind kind;
   char *text;
 } LsgDisplay;
@@ -114,9 +123,9 @@ void lsg_display_clear (LsgDisplay *display);
  *     fractional length;
  *   - the locale `decimal_point` glyph separates the fraction.
  * Returns LSG_DISPLAY_FORMATTED with the rendered text when the value is
- * exactly representable (<= LSG_DECIMAL_MAX_SIG_DIGITS significant digits and a
- * base-10 exponent within the exact range), else LSG_DISPLAY_UNAVAILABLE with
- * `raw` (e.g. "1e400", or a 39+-significant-digit value). Never returns
+ * exactly representable (<= LSG_DECIMAL_MAX_SIG_DIGITS significant digits and
+ * a base-10 exponent within the exact range), else LSG_DISPLAY_UNAVAILABLE
+ * with `raw` (e.g. "1e400", or a 39+-significant-digit value). Never returns
  * ORIGINAL (the caller chooses AUTO before calling).
  */
 LsgDisplay lsg_format_decimal (const char *raw, gboolean grouping,
@@ -129,7 +138,8 @@ LsgDisplay lsg_format_decimal (const char *raw, gboolean grouping,
  * `lsg_format_decimal`; an over-long integer -> LSG_DISPLAY_UNAVAILABLE(raw)).
  * With `grouping` FALSE returns LSG_DISPLAY_ORIGINAL(raw) (nothing to do).
  */
-LsgDisplay lsg_format_integer (const char *raw, gboolean grouping, LsgLocaleGlyphs glyphs);
+LsgDisplay lsg_format_integer (const char *raw, gboolean grouping,
+                               LsgLocaleGlyphs glyphs);
 
 G_END_DECLS
 
