@@ -714,15 +714,17 @@ typedef struct ls_jump_status {
 
 /* The two match kinds of ls_search_request. */
 typedef enum ls_search_kind {
-    /* Substring text match over a set of columns, with smart case. */
+    /* Substring text match over a set of columns; ASCII case folding per the
+     * request's case_sensitive flag (see ls_search_request). */
     LS_SEARCH_TEXT = 0,
     /* Single-column typed predicate (operator + value). */
     LS_SEARCH_PREDICATE = 1,
 } ls_search_kind;
 
 /*
- * Predicate operators. EQ/NE compare BYTE-EXACTLY; LT/GT/LE/GE compare
- * NUMERICALLY (see ls_search_request for the pinned semantics).
+ * Predicate operators. EQ/NE test (in)equality, folding ASCII case per the
+ * request's case_sensitive flag; LT/GT/LE/GE compare NUMERICALLY and ignore
+ * case_sensitive (see ls_search_request for the pinned semantics).
  */
 typedef enum ls_search_op {
     LS_SEARCH_OP_EQ = 0, /* =  */
@@ -776,16 +778,16 @@ typedef enum ls_search_nav_state {
  * only for the DURATION of the ls_search_start call: the core copies what it
  * keeps; the caller retains ownership. `request` semantics:
  *
- *   kind == LS_SEARCH_TEXT — substring match with SMART CASE:
+ *   kind == LS_SEARCH_TEXT — substring match, case folding per case_sensitive:
  *     - value_ptr/value_len: the UTF-8 query bytes (len > 0 required; the
  *       empty query means "no search" and is rejected).
  *     - A cell matches when the query occurs as a byte substring of the cell
- *       text. If the query contains at least one ASCII uppercase byte
- *       (0x41..0x5A) the comparison is byte-exact. Otherwise it is
+ *       text. When case_sensitive == false (the default) the comparison is
  *       case-insensitive over ASCII ONLY: bytes 0x41..0x5A compare equal to
  *       their lowercase forms; every other byte — including all bytes >=
- *       0x80, i.e. all non-ASCII UTF-8 — compares exactly. (Full Unicode
- *       folding is out of scope; ASCII smart case is the pinned v1 rule.)
+ *       0x80, i.e. all non-ASCII UTF-8 — compares exactly. When
+ *       case_sensitive == true the comparison is byte-exact. (Full Unicode
+ *       folding is out of scope; ASCII-only folding is the pinned v1 rule.)
  *     - scope_ptr/scope_len: the set of column indices to evaluate (each <
  *       ls_column_count; duplicates permitted and redundant). NULL scope_ptr
  *       means ALL columns. A non-NULL scope with scope_len == 0, or any
@@ -799,10 +801,14 @@ typedef enum ls_search_nav_state {
  *       column may be targeted (hidden ones included — hiding is a frontend
  *       presentation concept).
  *     - value_ptr/value_len: the comparison value bytes.
- *     - LS_SEARCH_OP_EQ / NE: the cell matches iff its bytes are exactly
- *       equal / not equal to the value bytes. NO case folding, NO whitespace
- *       trimming. The empty value is legal (EQ matches empty cells,
- *       including the padded cells of ragged records).
+ *     - LS_SEARCH_OP_EQ / NE: the cell matches iff its bytes are equal / not
+ *       equal to the value bytes, with case folding per case_sensitive.
+ *       case_sensitive == false (the default) folds ASCII (bytes 0x41..0x5A
+ *       equal their lowercase forms; every byte >= 0x80 compares exactly, the
+ *       same invariant as the TEXT rule); case_sensitive == true is byte-exact.
+ *       NO whitespace trimming in either mode. The empty value is legal (EQ
+ *       matches empty cells, including the padded cells of ragged records),
+ *       independent of case_sensitive. NE is the exact complement of EQ.
  *     - LS_SEARCH_OP_LT / GT / LE / GE: numeric. The cell matches iff BOTH
  *       the cell and the value parse under the pinned numeric grammar (see
  *       HEADER RULE — the same grammar, verbatim) AND the parsed values
@@ -818,6 +824,10 @@ typedef enum ls_search_nav_state {
  *     - scope_ptr/scope_len are ignored.
  *
  *   value_ptr may be NULL only when value_len is 0.
+ *
+ *   case_sensitive (below) selects the ASCII case-folding rule for both
+ *   LS_SEARCH_TEXT and predicate EQ/NE, as detailed per-field; ordering
+ *   predicates ignore it.
  */
 typedef struct ls_search_request {
     ls_search_kind kind;
@@ -827,6 +837,14 @@ typedef struct ls_search_request {
     size_t value_len;
     const uint32_t *scope_ptr;
     size_t scope_len;
+    /* ASCII case folding for LS_SEARCH_TEXT substring matching and predicate
+     * LS_SEARCH_OP_EQ / NE. false (the default / zero-init) = case-INSENSITIVE
+     * (bytes 0x41..0x5A fold to their lowercase forms; every byte >= 0x80
+     * compares exactly); true = byte-exact. Ordering predicates
+     * (LS_SEARCH_OP_LT / GT / LE / GE) are numeric and ignore this field.
+     * Honored identically by ls_search_start, ls_filter_set, ls_search_nav,
+     * and ls_window_match_flags (which reuse the active request). */
+    bool case_sensitive;
 } ls_search_request;
 
 /*
@@ -1221,6 +1239,11 @@ ls_jump_status ls_jump_poll(const ls_doc *doc);
  *   navigation: issue ls_search_nav(doc, 0, LS_SEARCH_FORWARD) for
  *   "first match in the file".
  *
+ * The request's case_sensitive flag (see ls_search_request) governs TEXT
+ * substring and predicate EQ/NE case folding; the match-scan, every
+ * ls_search_nav it serves, and ls_window_match_flags all inherit it from this
+ * one request.
+ *
  * May allocate (count storage sized by the index checkpoints — O(index
  * checkpoints) regardless of match density; see SEARCH).
  */
@@ -1279,7 +1302,11 @@ ls_search_status ls_search_poll(const ls_doc *doc);
  * Set (or replace) the document's active FILTER from `request` (non-NULL;
  * borrowed only for this call — the core copies what it keeps). The request is
  * validated EXACTLY as ls_search_start validates it (same TEXT / PREDICATE
- * grammar and rejection rules; see ls_search_request and ls_search_start).
+ * grammar and rejection rules; see ls_search_request and ls_search_start). It
+ * honors the request's case_sensitive flag identically to ls_search_start, so
+ * the filter row-set and its counts — and, while the filter is active,
+ * ls_search_nav and ls_window_match_flags — all fold ASCII case iff
+ * case_sensitive == false.
  *
  *   returns false — request rejected, and NOTHING changes: the current view
  *   (filtered or identity), any active search, and a running jump are all
@@ -1338,11 +1365,24 @@ uint64_t ls_source_row(const ls_doc *doc, uint64_t row);
  * bounded, lazy CSV column TYPE INFERENCE, an explicit per-session type/null-
  * sentinel/format configuration model, and stable conflict/proposal state,
  * plus a zero-allocation batch way to read that metadata and copy header
- * labels — all WITHOUT touching one existing byte above. Every constant, enum,
- * struct, and prototype defined before this block keeps its exact value,
- * layout, signature, allocation behavior, threading lane, and borrow lifetime;
- * a client compiled against the pre-column-config header links and behaves
- * identically. No existing enum gains a case and no existing struct grows.
+ * labels — all WITHOUT touching one existing byte above. Adding THIS
+ * column-config extension changed nothing above it: every constant, enum,
+ * struct, and prototype defined before this block kept its exact value,
+ * layout, signature, allocation behavior, threading lane, and borrow lifetime,
+ * and no existing enum gained a case or existing struct grew.
+ *
+ * FROZEN-SURFACE AMENDMENT — search-case-mode (v1). The additive /
+ * byte-identical discipline stated by this and the later extension blocks
+ * (never-full-download-streaming, match-flags, streaming-copy) describes each
+ * block's OWN additivity; it is NOT a whole-header external-ABI guarantee. The
+ * later search-case-mode change deliberately GROWS ls_search_request by one
+ * `bool case_sensitive` and rewrites its case-folding prose (smart case is
+ * deleted). That is a clean, audited frozen-surface edit — sound because the
+ * whole workspace statically links the core and rebuilds LOCK-STEP from this
+ * one header, with no external pinned-binary ABI consumer and no compat path.
+ * Only ls_search_request changed shape; every other symbol's layout is
+ * unchanged. See ls_search_request and
+ * docs/architecture/ARCH-search-case-mode.md.
  *
  * WHAT IT DOES NOT CHANGE. The document / window / index / jump / row-count /
  * search / filter / raw-cell / full-cell-copy surface above is untouched. This
@@ -2058,9 +2098,12 @@ void ls_net_open_release(ls_net_open_job *job);
  * NEVER-FULL-DOWNLOAD STREAMING (lazy / demand-driven network) EXTENSION
  * =========================================================================
  * (never-full-download-streaming slice — THREE documentation / sentinel
- * amendments; struct/enum/signature LAYOUT is BYTE-IDENTICAL to every prior
- * revision of this header. Two-key root-planner freeze; the author's sign-off
- * relayed 2026-07-15. See docs/architecture/ARCH-never-full-download-streaming.md.)
+ * amendments; struct/enum/signature LAYOUT was BYTE-IDENTICAL to every prior
+ * revision of this header WHEN THIS BLOCK WAS ADDED. (The later search-case-mode
+ * v1 amendment then grew ls_search_request by one `case_sensitive` bool under
+ * lock-step rebuild — see that struct and the FROZEN-SURFACE AMENDMENT note
+ * above.) Two-key root-planner freeze; the author's sign-off relayed 2026-07-15.
+ * See docs/architecture/ARCH-never-full-download-streaming.md.)
  *
  * This block adds exactly ONE new sentinel #define (LS_BYTES_TOTAL_UNKNOWN)
  * plus documentation of how the EXISTING network surface (NETWORK SOURCE
@@ -2139,9 +2182,12 @@ void ls_net_open_release(ls_net_open_job *job);
  * MATCH-FLAGS EXTENSION (thin-frontend-shared-core slice, Phase 1) — ADDITIVE
  * =========================================================================
  * (thin-frontend-shared-core slice — ONE additive, read-only entry point;
- * struct / enum / signature / constant LAYOUT above this block is
- * BYTE-IDENTICAL to every prior revision of this header. Two-key root-planner
- * freeze; the author's sign-off relayed 2026-07-15. See
+ * struct / enum / signature / constant LAYOUT above this block was
+ * BYTE-IDENTICAL to every prior revision of this header WHEN THIS BLOCK WAS
+ * ADDED. (The later search-case-mode v1 amendment grew ls_search_request by
+ * one `case_sensitive` bool under lock-step rebuild — see that struct and the
+ * FROZEN-SURFACE AMENDMENT note above.) Two-key root-planner freeze; the author's
+ * sign-off relayed 2026-07-15. See
  * docs/architecture/ARCH-thin-frontend-shared-core.md, Phase 1. The
  * LS_BYTES_TOTAL_UNKNOWN amendment above is the additive-amendment precedent.)
  *
@@ -2153,7 +2199,7 @@ void ls_net_open_release(ls_net_open_job *job);
  * WHY. Every frontend that paints find / predicate highlights needs, per
  * visible cell, the SAME verdict the core's matcher already computes for
  * ls_search_* (see SEARCH and ls_search_request). Re-deriving it in each
- * frontend duplicates the smart-case substring + exact-decimal grammar
+ * frontend duplicates the case_sensitive substring + exact-decimal grammar
  * byte-for-byte. This call hands the frontend that verdict for the current
  * window as a borrowed byte array, so a frontend paints highlights with ZERO
  * matching logic of its own and NO per-cell round-trip, and every future
@@ -2194,12 +2240,13 @@ void ls_net_open_release(ls_net_open_job *job);
  * THE WINDOW (the same bytes ls_cell serves — display-capped; a match lying past
  * the display cap is not flagged, matching what the frontend can paint):
  *   - LS_SEARCH_TEXT: a byte is 1 iff the column is IN SCOPE (a NULL scope_ptr
- *     means all columns) AND the smart-case substring rule holds for that cell;
- *     a cell in an out-of-scope column is always 0.
+ *     means all columns) AND the active request's case_sensitive substring rule
+ *     holds for that cell; a cell in an out-of-scope column is always 0.
  *   - LS_SEARCH_PREDICATE: a byte is 1 only on the request's target `column`
  *     (every other column is 0), and there iff the cell satisfies the operator
- *     (EQ / NE byte-exact; LT / GT / LE / GE the EXACT-decimal comparison — a
- *     non-numeric cell never matches an ordering op; the empty value is legal).
+ *     (EQ / NE per the request's case_sensitive rule; LT / GT / LE / GE the
+ *     EXACT-decimal comparison — a non-numeric cell never matches an ordering
+ *     op; the empty value is legal).
  * A FILTER changes only WHICH data rows the window holds (filtered coordinates,
  * see FILTERED VIEWS), never the per-cell verdict: a materialized row's flags
  * are computed from that row's cells regardless of the view mode. The effective
@@ -2236,9 +2283,12 @@ ls_str ls_window_match_flags(const ls_doc *doc, uint32_t first_col, uint32_t col
  * =========================================================================
  * (thin-frontend-shared-core slice — ONE additive, core-framed streaming TSV
  * COPY JOB family; struct / enum / signature / constant / prototype LAYOUT
- * above this block — including the Phase 1 MATCH-FLAGS EXTENSION — is
- * BYTE-IDENTICAL to every prior revision of this header. Two-key root-planner
- * freeze; the author's sign-off relayed 2026-07-15. See
+ * above this block — including the Phase 1 MATCH-FLAGS EXTENSION — was
+ * BYTE-IDENTICAL to every prior revision of this header WHEN THIS BLOCK WAS
+ * ADDED. (The later search-case-mode v1 amendment grew ls_search_request by
+ * one `case_sensitive` bool under lock-step rebuild — see that struct and the
+ * FROZEN-SURFACE AMENDMENT note above.) Two-key root-planner freeze; the author's
+ * sign-off relayed 2026-07-15. See
  * docs/architecture/ARCH-thin-frontend-shared-core.md, Phase 2. The Phase 1
  * MATCH-FLAGS EXTENSION and the LS_BYTES_TOTAL_UNKNOWN amendment above are the
  * additive-amendment precedents.)
