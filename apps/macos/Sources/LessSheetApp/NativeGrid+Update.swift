@@ -88,13 +88,13 @@ extension NativeGridController {
     }
 
     /// Re-open / dialect re-open: columns + widths reset; reload from the top,
-    /// preserving the viewport across a header on/off toggle's ±1 data-row shift.
+    /// preserving the viewport across a header on/off toggle by DATA-ROW INDEX.
     private func applyReopen() {
         // A header on/off toggle keeps its place instead of flashing to row 0:
         // capture the EXACT top data row from the current (pre-reload) scroll
-        // BEFORE anything resets it, then re-land on the SAME file record after
-        // the ±1 data-row shift (O(viewport) — the anchor row is at/near the
-        // already-scanned frontier, so there is no scan and no stall).
+        // BEFORE anything resets it, then re-land on the SAME data-row index
+        // (O(viewport) — the anchor row is at/near the already-scanned frontier,
+        // so there is no scan and no stall).
         let headerShift = model.consumePendingHeaderShift()
         let preToggleTop = headerShift != nil ? currentTopDataRow() : 0
 
@@ -113,12 +113,17 @@ extension NativeGridController {
         table.reloadData()
         lastRowCount = numberOfRows(in: table)
         if let shift = headerShift {
-            // At the very top, stay at the top of data; otherwise carry the top
-            // row across the shift. Clamp to the (possibly ±1) new data range.
-            let target = preToggleTop == 0 ? 0 : max(0, preToggleTop + shift)
+            // Preserve the viewport by DATA-ROW INDEX (no ±1 record shift): keep
+            // the same top data row across the re-open. At the very top this is
+            // data row 0 — so a header→data toggle REVEALS the former-header row
+            // there, and a data→header toggle shows the new data row 0. When
+            // scrolled, the top data-row index is left unchanged and only the
+            // header labels re-render (values ↔ A/B/C). Clamp to the (possibly
+            // ±1) new data range.
+            let target = preToggleTop
             let landed = min(target, max(0, dataRowCount - 1))
             scrollToTopLeft()        // reset the horizontal offset + baseline
-            landOn(row: landed)      // re-anchor vertically to the same record
+            landOn(row: landed)      // re-anchor vertically to the same data row
             HeaderToggleProbe.toggled(oldTop: preToggleTop, newTop: landed,
                                       newHasHeader: model.dialect.hasHeader, shift: shift)
         } else if model.pendingScrollRow == nil {
