@@ -68,7 +68,7 @@ pub const MatchCtx = struct {
     kind: api.SearchKind = .text,
     op: api.SearchOp = .eq,
     column: u32 = 0,
-    fold: bool = false, // TEXT: fold ASCII case (all-lowercase query)
+    fold: bool = false, // fold ASCII case for TEXT substring + predicate EQ/NE (== !case_sensitive)
     value: []const u8 = &.{},
     value_dec: Decimal = .{}, // pre-parsed value (ordering predicates)
     scope_mask: []const bool = &.{}, // empty == all columns; else len == column_count
@@ -223,7 +223,7 @@ pub const Document = struct {
     search_column: u32,
     search_value: []u8, // owned query / comparison bytes
     search_value_dec: Decimal, // pre-parsed value (ordering predicates)
-    search_fold: bool, // TEXT smart-case: fold ASCII case (all-lowercase query)
+    search_fold: bool, // fold ASCII case (== !request.case_sensitive): TEXT substring + predicate EQ/NE
     search_failure: []usize,
     scope_mask: []bool, // owned; empty == all columns (NULL scope); else len == column_count
     // Per-index-block match counters (owned): block b == rows
@@ -264,7 +264,7 @@ pub const Document = struct {
     filter_column: u32,
     filter_value: []u8,
     filter_value_dec: Decimal,
-    filter_fold: bool,
+    filter_fold: bool, // fold ASCII case (== !request.case_sensitive): TEXT substring + predicate EQ/NE
     filter_failure: []usize,
     filter_scope_mask: []bool,
     // Per-index-block filter-match counters (owned): O(checkpoints) always,

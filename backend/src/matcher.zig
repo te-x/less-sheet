@@ -194,12 +194,6 @@ pub fn asciiLower(b: u8) u8 {
     return if (b >= 'A' and b <= 'Z') b + 32 else b;
 }
 
-/// True iff the query has NO ASCII uppercase byte (then smart-case folds ASCII).
-pub fn queryFolds(q: []const u8) bool {
-    for (q) |b| if (b >= 'A' and b <= 'Z') return false;
-    return true;
-}
-
 pub fn buildFailure(gpa: std.mem.Allocator, query: []const u8, fold: bool) std.mem.Allocator.Error![]usize {
     if (query.len == 0) return gpa.alloc(usize, 0);
     const table = try gpa.alloc(usize, query.len);
@@ -314,7 +308,7 @@ pub const StreamCell = struct {
                 if (self.text_k == self.ctx.value.len) self.text_found = true;
             },
             .predicate => for (bytes) |b| if (self.ctx.op == .eq or self.ctx.op == .ne) {
-                if (self.len >= self.ctx.value.len or b != self.ctx.value[self.len]) self.equal = false;
+                if (self.len >= self.ctx.value.len or !self.eqByte(b, self.ctx.value[self.len])) self.equal = false;
                 self.len += 1;
             } else self.feedNumeric(b),
         }
@@ -366,8 +360,18 @@ pub fn streamSupported(ctx: MatchCtx) bool {
     return true;
 }
 
-/// Substring match with smart case: fold ASCII case iff `fold`, else byte-exact.
-/// Bytes >= 0x80 (all non-ASCII) always compare exactly.
+/// ASCII-case-aware byte equality for the predicate EQ/NE match: byte-exact when
+/// `!fold`; when `fold` (case-insensitive), ASCII letters compare case-folded
+/// while every byte >= 0x80 stays exact (asciiLower is identity outside 'A'..'Z').
+fn bytesEqual(a: []const u8, b: []const u8, fold: bool) bool {
+    if (a.len != b.len) return false;
+    if (!fold) return std.mem.eql(u8, a, b);
+    for (a, b) |x, y| if (asciiLower(x) != asciiLower(y)) return false;
+    return true;
+}
+
+/// Substring match: fold ASCII case iff `fold` (case-insensitive), else
+/// byte-exact. Bytes >= 0x80 (all non-ASCII) always compare exactly.
 fn textMatch(cell: []const u8, query: []const u8, fold: bool) bool {
     if (query.len == 0) return true;
     if (query.len > cell.len) return false;
@@ -394,7 +398,8 @@ fn textMatch(cell: []const u8, query: []const u8, fold: bool) bool {
 ///   * TEXT: 1 iff `col` is IN SCOPE (empty scope_mask == all columns) AND the
 ///     smart-case substring rule holds; an out-of-scope column is always 0.
 ///   * PREDICATE: 1 only on the target `ctx.column` (every other column 0), and
-///     there iff the operator holds — EQ/NE byte-exact, LT/GT/LE/GE the
+///     there iff the operator holds — EQ/NE ASCII-folded per `ctx.fold`
+///     (byte-exact when case-sensitive), LT/GT/LE/GE the
 ///     exact-decimal comparison (a non-numeric cell never matches an ordering
 ///     op; the empty value is legal).
 /// Allocation-free; pure over the passed bytes.
@@ -407,8 +412,8 @@ pub fn cellMatches(ctx: MatchCtx, col: u32, cell: []const u8) bool {
         .predicate => {
             if (col != ctx.column) return false;
             return switch (ctx.op) {
-                .eq => std.mem.eql(u8, cell, ctx.value),
-                .ne => !std.mem.eql(u8, cell, ctx.value),
+                .eq => bytesEqual(cell, ctx.value, ctx.fold),
+                .ne => !bytesEqual(cell, ctx.value, ctx.fold),
                 .lt, .gt, .le, .ge => blk: {
                     const cd = parseDecimal(cell);
                     if (!cd.valid) break :blk false; // non-numeric cell never matches ordering

@@ -307,7 +307,10 @@ pub fn setFilter(d: *Document, request: *const api.SearchRequest) bool {
     if (kind_i != 0 and kind_i != 1) return false;
     if (req.value_ptr == null and req.value_len != 0) return false;
     const value: []const u8 = if (req.value_ptr) |vp| vp[0..req.value_len] else &[_]u8{};
-    var fold = false;
+    // Case folding is driven SOLELY by the request flag (smart-case retired):
+    // insensitive (case_sensitive == false) folds ASCII case for the TEXT
+    // substring and predicate EQ/NE; ordering predicates ignore it.
+    const fold = !req.case_sensitive;
     if (kind_i == 0) { // TEXT
         if (value.len == 0) return false; // empty query means "no filter"
         if (req.scope_ptr) |sp| {
@@ -315,7 +318,6 @@ pub fn setFilter(d: *Document, request: *const api.SearchRequest) bool {
             var i: usize = 0;
             while (i < req.scope_len) : (i += 1) if (sp[i] >= d.column_count) return false;
         }
-        fold = matcher.queryFolds(value);
     } else { // PREDICATE
         if (req.column >= d.column_count) return false;
         const op_i = @intFromEnum(req.op);
