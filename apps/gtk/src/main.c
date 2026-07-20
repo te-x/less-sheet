@@ -39,6 +39,11 @@
 #define GRID_OVERSCAN 4
 /* Poll cadence for the frontier / network drive. */
 #define POLL_INTERVAL_MS 100
+/* Auto-dismiss delay for the in-app AdwToast notices (single source of truth —
+ * every toast goes through settings_toast, which sets this). */
+#define TOAST_TIMEOUT_SECONDS 3
+/* Poll cadence for the Columns page's async type-inference refresh. */
+#define INFER_POLL_INTERVAL_MS 80
 /* Bound the per-open width sample so a wide (100k-col) document stays O(head):
  * only these leading columns are measured; the rest take a default width. */
 #define WIDTH_SAMPLE_COLS 256
@@ -205,6 +210,9 @@ typedef struct
   GtkWidget
       *prefs_columns_status;  /* a status/overflow/no-such-column label row */
   GtkWidget *prefs_infer_row; /* inference-progress row */
+  guint prefs_infer_poll_id;  /* timer refreshing detected types (0 == none) */
+  guint64
+      prefs_infer_gen; /* last-seen metadata generation (change => refresh) */
 
   /* Pending dialect re-open state (captured before the re-open, applied in
    * open_document AFTER adoption, so the local + network re-open paths share
@@ -539,9 +547,11 @@ grid_autofit_widths (App *app, LsgColumnWindow colwin, LsgWindow *win)
     {
       guint32 abscol = colwin.first + ci;
       /* A user-set manual width is authoritative — never let the monotone
-       * auto-fit grow re-widen it (Finding 3). */
+       * auto-fit grow re-widen it (Finding 3). A HIDDEN column is pinned to
+       * width 0 (its hide mechanism), so never grow it either. */
       if (app->col_settings != NULL && abscol < app->n_cols
-          && app->col_settings[abscol].has_manual_width)
+          && (app->col_settings[abscol].has_manual_width
+              || app->col_settings[abscol].hidden))
         continue;
       guint cnt = 0;
       for (guint32 r = 0; r < gr; r++)
@@ -3360,6 +3370,11 @@ on_window_destroy (GtkWidget *widget, gpointer data)
       g_source_remove (app->jump_reject_id);
       app->jump_reject_id = 0;
     }
+  if (app->prefs_infer_poll_id != 0)
+    {
+      g_source_remove (app->prefs_infer_poll_id);
+      app->prefs_infer_poll_id = 0;
+    }
   app->window = NULL;
   app->title = NULL;
   app->area = NULL;
@@ -3368,6 +3383,9 @@ on_window_destroy (GtkWidget *widget, gpointer data)
   app->hp_cancel = NULL;
   app->copy_button = NULL;
   app->header_toggle = NULL;
+  app->header_glyph = NULL;
+  app->sep_glyph_label = NULL;
+  app->quote_glyph_label = NULL;
   app->sep_button = NULL;
   app->quote_button = NULL;
   app->toasts = NULL;
@@ -3409,7 +3427,12 @@ static void
 settings_toast (App *app, const char *text)
 {
   if (app->toasts != NULL)
-    adw_toast_overlay_add_toast (app->toasts, adw_toast_new (text));
+    {
+      AdwToast *t = adw_toast_new (text);
+      adw_toast_set_timeout (t,
+                             TOAST_TIMEOUT_SECONDS); /* one place, one knob */
+      adw_toast_overlay_add_toast (app->toasts, t);
+    }
 }
 
 /* Set an AdwComboRow's string model (set_model is transfer-none, so drop our
@@ -3695,6 +3718,8 @@ settings_reopen_apply (App *app)
             {
               LsgColumnUserSettings s = app->reopen_snapshot[i];
               app->col_settings[i] = s; /* format / hidden / width */
+              if (s.hidden && app->col_widths != NULL)
+                app->col_widths[i] = 0.0; /* keep hidden cols out of layout */
               if (s.has_override)
                 {
                   ls_column_type t = lsg_column_override_type (
@@ -3926,18 +3951,12 @@ on_header_toggle_toggled (GtkToggleButton *btn, gpointer data)
 }
 
 /*
- * A separator/quote option ROW was clicked in a header-bar dropdown.
- *
- * The dropdown is a plain (autohide) GtkPopover holding a GtkListBox — NOT a
- * GtkPopoverMenu / menu-model, so a row activation NEVER auto-dismisses the
- * popover (that auto-close is a menu-model behavior; a plain popover only
- * closes on Escape or a click OUTSIDE it). So the dismiss is fully under our
- * control here: a normal pick applies the change and calls popdown; the
- * "Custom…" row ONLY reveals the inline entry and DELIBERATELY does not
- * popdown — the whole point of this fix — so the user can type a byte, which
- * is applied on the entry's Enter (on_dialect_custom_activate). (The previous
- * design used grouped GtkCheckButton radios; replacing them with plain
- * activatable list rows also removes the radio toggle/activation path.)
+ * A separator/quote preset ROW was clicked in a header-bar dropdown. The
+ * dropdown is a plain (autohide) GtkPopover holding a GtkListBox of presets
+ * plus an always-visible "Custom" entry below the list; a preset applies the
+ * change and popdowns, while a custom byte is typed into the entry and applied
+ * on its Enter (on_dialect_custom_activate). No GtkPopoverMenu / menu-model
+ * and no radios, so nothing auto-dismisses on activation.
  */
 static void
 on_dialect_row_activated (GtkListBox *list, GtkListBoxRow *row, gpointer data)
@@ -3949,22 +3968,7 @@ on_dialect_row_activated (GtkListBox *list, GtkListBoxRow *row, gpointer data)
   GtkWidget *pop
       = gtk_widget_get_ancestor (GTK_WIDGET (list), GTK_TYPE_POPOVER);
   int kind = GPOINTER_TO_INT (g_object_get_data (G_OBJECT (row), "lsg-kind"));
-  gboolean is_custom
-      = g_object_get_data (G_OBJECT (row), "lsg-custom") != NULL;
   gboolean is_none = g_object_get_data (G_OBJECT (row), "lsg-none") != NULL;
-
-  if (is_custom)
-    {
-      /* Reveal the inline single-char entry + focus it; NO popdown (the byte
-       * is applied on Enter). This is what keeps "Custom…" from dismissing. */
-      GtkWidget *entry = g_object_get_data (G_OBJECT (row), "lsg-entry");
-      if (entry != NULL)
-        {
-          gtk_widget_set_visible (entry, TRUE);
-          gtk_widget_grab_focus (entry);
-        }
-      return;
-    }
 
   if (kind == DIALECT_KIND_SEP)
     {
@@ -4005,13 +4009,13 @@ on_dialect_custom_activate (GtkWidget *entry, gpointer data)
   /* An invalid byte is a silent no-op (F3b) — leave the entry for a retry. */
 }
 
-/* Append one clickable option ROW to the dropdown list (no radios). `markup`
+/* Append one clickable preset ROW to the dropdown list (no radios). `markup`
  * is Pango markup so the glyph reads primary and the (Name) is dimmed; the row
  * is activatable, so Adwaita highlights it on hover to signal it is clickable.
  */
 static void
 add_dialect_row (GtkWidget *list, const char *markup, int kind, int byte,
-                 gboolean is_none, gboolean is_custom, GtkWidget *entry)
+                 gboolean is_none)
 {
   GtkWidget *row = gtk_list_box_row_new ();
   GtkWidget *lbl = gtk_label_new (NULL);
@@ -4026,11 +4030,6 @@ add_dialect_row (GtkWidget *list, const char *markup, int kind, int byte,
   g_object_set_data (G_OBJECT (row), "lsg-byte", GINT_TO_POINTER (byte));
   if (is_none)
     g_object_set_data (G_OBJECT (row), "lsg-none", GINT_TO_POINTER (1));
-  if (is_custom)
-    {
-      g_object_set_data (G_OBJECT (row), "lsg-custom", GINT_TO_POINTER (1));
-      g_object_set_data (G_OBJECT (row), "lsg-entry", entry);
-    }
   gtk_list_box_append (GTK_LIST_BOX (list), row);
 }
 
@@ -4044,20 +4043,12 @@ build_dialect_dropdown_popover (App *app, int kind)
   gtk_widget_set_margin_start (box, 6);
   gtk_widget_set_margin_end (box, 6);
 
-  GtkWidget *entry = gtk_entry_new ();
-  gtk_entry_set_max_length (GTK_ENTRY (entry), 1);
-  gtk_entry_set_placeholder_text (GTK_ENTRY (entry), "One character");
-  gtk_widget_set_visible (entry, FALSE);
-  g_object_set_data (G_OBJECT (entry), "lsg-kind", GINT_TO_POINTER (kind));
-  g_signal_connect (entry, "activate", G_CALLBACK (on_dialect_custom_activate),
-                    app);
-
-  /* A plain clickable list (hover-highlighted rows), NOT radios and NOT a
-   * menu-model: selecting a row runs on_dialect_row_activated, which keeps the
-   * popover open for "Custom…" (see that handler). */
+  /* A plain clickable presets list (hover-highlighted rows), NOT radios and
+   * NOT a menu-model, and NO custom CSS class — Adwaita's default popover/list
+   * styling shows through. A preset applies + popdowns via
+   * on_dialect_row_activated. */
   GtkWidget *list = gtk_list_box_new ();
   gtk_list_box_set_selection_mode (GTK_LIST_BOX (list), GTK_SELECTION_NONE);
-  gtk_widget_add_css_class (list, "menu");
   g_signal_connect (list, "row-activated",
                     G_CALLBACK (on_dialect_row_activated), app);
 
@@ -4065,26 +4056,34 @@ build_dialect_dropdown_popover (App *app, int kind)
     {
       const guint8 *s = lsg_dialect_separator_candidates ();
       add_dialect_row (list, ", <span alpha='55%'>(Comma)</span>", kind, s[0],
-                       FALSE, FALSE, NULL);
+                       FALSE);
       add_dialect_row (list, "; <span alpha='55%'>(Semicolon)</span>", kind,
-                       s[1], FALSE, FALSE, NULL);
+                       s[1], FALSE);
       add_dialect_row (list, "⇥ <span alpha='55%'>(Tab)</span>", kind, s[2],
-                       FALSE, FALSE, NULL);
+                       FALSE);
       add_dialect_row (list, "| <span alpha='55%'>(Pipe)</span>", kind, s[3],
-                       FALSE, FALSE, NULL);
-      add_dialect_row (list, "Custom…", kind, 0, FALSE, TRUE, entry);
+                       FALSE);
     }
   else
     {
       const guint8 *q = lsg_dialect_quote_candidates ();
       add_dialect_row (list, "\" <span alpha='55%'>(Double)</span>", kind,
-                       q[0], FALSE, FALSE, NULL);
+                       q[0], FALSE);
       add_dialect_row (list, "' <span alpha='55%'>(Single)</span>", kind, q[1],
-                       FALSE, FALSE, NULL);
+                       FALSE);
       add_dialect_row (list, "∅ <span alpha='55%'>(None)</span>", kind, 0,
-                       TRUE, FALSE, NULL);
-      add_dialect_row (list, "Custom…", kind, 0, FALSE, TRUE, entry);
+                       TRUE);
     }
+
+  /* An ALWAYS-visible one-char custom entry below the presets: placeholder
+   * "Custom" (vanishes on type); Enter parses + applies via the compose funnel
+   * (on_dialect_custom_activate). No separate "Custom…" row. */
+  GtkWidget *entry = gtk_entry_new ();
+  gtk_entry_set_max_length (GTK_ENTRY (entry), 1);
+  gtk_entry_set_placeholder_text (GTK_ENTRY (entry), "Custom");
+  g_object_set_data (G_OBJECT (entry), "lsg-kind", GINT_TO_POINTER (kind));
+  g_signal_connect (entry, "activate", G_CALLBACK (on_dialect_custom_activate),
+                    app);
 
   gtk_box_append (GTK_BOX (box), list);
   gtk_box_append (GTK_BOX (box), entry);
@@ -4194,6 +4193,13 @@ on_prefs_closed (AdwDialog *dialog, gpointer data)
 {
   (void)dialog;
   App *app = data;
+  if (app->prefs_infer_poll_id != 0)
+    {
+      g_source_remove (app->prefs_infer_poll_id);
+      app->prefs_infer_poll_id = 0;
+    }
+  if (app->doc != NULL)
+    lsg_document_column_inference_cancel (app->doc); /* free the core job */
   app->prefs = NULL;
   app->prefs_header_row = NULL;
   app->prefs_sep_row = NULL;
@@ -4466,6 +4472,103 @@ column_apply_type (App *app, guint32 col)
   column_cache_effective (app, col);
 }
 
+/* A one-line summary of column `col`'s CURRENT settings, for the collapsed
+ * row subtitle (seen at a glance before expanding): the effective/forced type,
+ * then any format / visibility / width / null-sentinel that is set. OWNED
+ * (g_free). */
+static char *
+column_summary_dup (App *app, guint32 col)
+{
+  static const char *kn[]
+      = { "Unknown", "Unsupported", "Text", "Boolean",
+          "Integer", "Decimal",     "Date", "Date & time" };
+  static const char *dp[] = { "Original", "Short", "Medium", "Long" };
+  LsgColumnUserSettings *s = &app->col_settings[col];
+  ls_column_type_kind kind = s->has_override
+                                 ? (ls_column_type_kind)s->override.kind
+                                 : app->col_kind[col];
+  guint ki = (guint)kind;
+  GString *g = g_string_new (NULL);
+  if (s->has_override)
+    g_string_append_printf (g, "%s (forced)",
+                            (ki < G_N_ELEMENTS (kn)) ? kn[ki] : "Text");
+  else if (kind >= LS_COLUMN_TYPE_TEXT && ki < G_N_ELEMENTS (kn))
+    g_string_append (g, kn[ki]);
+  else
+    g_string_append (g, "Auto");
+  if (s->hidden)
+    g_string_append (g, " · Hidden");
+  if (s->format.grouping)
+    g_string_append (g, " · grouping");
+  if (s->format.has_fraction_digits)
+    g_string_append_printf (g, " · %d frac", s->format.fraction_digits);
+  if ((kind == LS_COLUMN_TYPE_DATE || kind == LS_COLUMN_TYPE_DATETIME)
+      && (guint)s->format.date_preset > 0
+      && (guint)s->format.date_preset < G_N_ELEMENTS (dp))
+    g_string_append_printf (g, " · %s", dp[(guint)s->format.date_preset]);
+  if (s->has_null_sentinel)
+    {
+      if (s->null_sentinel_len > 0)
+        {
+          char *v
+              = lsg_utf8_sanitize_dup (s->null_sentinel, s->null_sentinel_len);
+          g_string_append_printf (g, " · null=%s", v);
+          g_free (v);
+        }
+      else
+        g_string_append (g, " · null=empty");
+    }
+  if (s->has_manual_width)
+    g_string_append_printf (g, " · %.0fpx", s->manual_width);
+  return g_string_free (g, FALSE);
+}
+
+/* Refresh the collapsed-row settings summary of every displayed column (the
+ * subtitle on each expander). Cheap — O(<=10 displayed rows). */
+static void
+columns_refresh_summaries (App *app)
+{
+  if (app->prefs_columns_group == NULL)
+    return;
+  GPtrArray *rows
+      = g_object_get_data (G_OBJECT (app->prefs_columns_group), "lsg-rows");
+  if (rows == NULL)
+    return;
+  for (guint i = 0; i < rows->len; i++)
+    {
+      GtkWidget *exp = g_ptr_array_index (rows, i);
+      guint32 col
+          = GPOINTER_TO_UINT (g_object_get_data (G_OBJECT (exp), "lsg-col"));
+      if (col >= app->n_cols)
+        continue;
+      char *sum = column_summary_dup (app, col);
+      adw_expander_row_set_subtitle (ADW_EXPANDER_ROW (exp), sum);
+      g_free (sum);
+    }
+}
+
+/* Set column `col`'s visibility. A hidden column is removed from the grid by
+ * pinning its layout width to 0 (the frozen lsg_grid_column_window treats a
+ * 0/negative width as contributing no space, so following columns close the
+ * gap and the contiguous fetch just draws it at zero width); showing it again
+ * restores its manual width, else re-samples the auto width. O(1) per column
+ * (plus one head-window sample on show) — no per-frame O(column_count) work.
+ */
+static void
+set_column_hidden (App *app, guint32 col, gboolean hidden)
+{
+  if (app->col_settings == NULL || app->col_widths == NULL
+      || col >= app->n_cols)
+    return;
+  app->col_settings[col].hidden = hidden;
+  if (hidden)
+    app->col_widths[col] = 0.0;
+  else if (app->col_settings[col].has_manual_width)
+    app->col_widths[col] = app->col_settings[col].manual_width;
+  else
+    sample_one_column_width (app, col); /* restore the auto width */
+}
+
 static void
 on_col_visibility (GtkCheckButton *check, gpointer data)
 {
@@ -4475,8 +4578,10 @@ on_col_visibility (GtkCheckButton *check, gpointer data)
   guint32 col = col_of (GTK_WIDGET (check));
   if (col < app->n_cols)
     {
-      app->col_settings[col].hidden = !gtk_check_button_get_active (check);
-      column_repaint (app);
+      set_column_hidden (app, col, !gtk_check_button_get_active (check));
+      grid_update_hadjustment (app); /* total width changed */
+      column_repaint (app); /* F13 synchronous poke — hide/show live */
+      columns_refresh_summaries (app);
     }
 }
 
@@ -4692,6 +4797,9 @@ on_col_expanded (GObject *expander, GParamSpec *pspec, gpointer data)
   App *app = data;
   if (app->dialect_ui_guard)
     return;
+  /* Any expand/collapse is a natural moment to refresh the collapsed-row
+   * settings summaries (so edits made in a row show once it collapses). */
+  columns_refresh_summaries (app);
   if (!adw_expander_row_get_expanded (ADW_EXPANDER_ROW (expander)))
     return;
   /* Auto-collapse the previously-open row (F11: at most one usefully open). */
@@ -4765,6 +4873,11 @@ build_column_row (App *app, guint32 col)
   adw_preferences_row_set_title (ADW_PREFERENCES_ROW (exp), title);
   g_free (title);
   g_object_set_data (G_OBJECT (exp), "lsg-col", GUINT_TO_POINTER (col));
+  {
+    char *sum = column_summary_dup (app, col); /* current-settings summary */
+    adw_expander_row_set_subtitle (ADW_EXPANDER_ROW (exp), sum);
+    g_free (sum);
+  }
 
   /* Visibility check as the row prefix. */
   GtkWidget *vis = gtk_check_button_new ();
@@ -4803,6 +4916,8 @@ build_column_row (App *app, guint32 col)
                                  (ki < G_N_ELEMENTS (kn)) ? kn[ki]
                                                           : "Unknown");
   }
+  g_object_set_data (G_OBJECT (exp), "row-detected",
+                     guessed); /* async refresh */
   adw_expander_row_add_row (ADW_EXPANDER_ROW (exp), guessed);
 
   /* Datetime semantics. */
@@ -4939,6 +5054,114 @@ on_columns_search_changed (GtkEditable *entry, gpointer data)
   (void)entry;
   App *app = data;
   columns_group_rebuild (app);
+}
+
+/* BUG A: re-read the RESOLVED type of each displayed column and refresh its
+ * "Detected type" subtitle, its kind-dependent rows, and its collapsed
+ * summary. Called from the inference poll once the core commits a generation,
+ * so the initial "Unknown" is replaced by the real inferred kind. */
+static void
+columns_refresh_types (App *app)
+{
+  if (app->prefs_columns_group == NULL)
+    return;
+  GPtrArray *rows
+      = g_object_get_data (G_OBJECT (app->prefs_columns_group), "lsg-rows");
+  if (rows == NULL)
+    return;
+  static const char *kn[]
+      = { "Unknown", "Unsupported", "Text", "Boolean",
+          "Integer", "Decimal",     "Date", "Date & time" };
+  for (guint i = 0; i < rows->len; i++)
+    {
+      GtkWidget *exp = g_ptr_array_index (rows, i);
+      guint32 col
+          = GPOINTER_TO_UINT (g_object_get_data (G_OBJECT (exp), "lsg-col"));
+      if (col >= app->n_cols)
+        continue;
+      column_cache_effective (app,
+                              col); /* re-read effective (inferred) kind */
+      GtkWidget *det = g_object_get_data (G_OBJECT (exp), "row-detected");
+      if (det != NULL)
+        {
+          guint ki = (guint)app->col_kind[col];
+          adw_action_row_set_subtitle (ADW_ACTION_ROW (det),
+                                       (ki < G_N_ELEMENTS (kn)) ? kn[ki]
+                                                                : "Unknown");
+        }
+      column_row_sync (app, exp, col); /* reveal kind-dependent format rows */
+    }
+  columns_refresh_summaries (app);
+}
+
+/* Poll the core's async type-inference job while the Columns page is open;
+ * refresh the displayed types whenever the metadata generation advances, and
+ * stop once the job settles (BUG A wiring). */
+static gboolean
+prefs_infer_poll_cb (gpointer data)
+{
+  App *app = data;
+  if (app->doc == NULL || app->prefs == NULL)
+    {
+      app->prefs_infer_poll_id = 0;
+      return G_SOURCE_REMOVE;
+    }
+  ls_column_inference_status st;
+  if (lsg_document_column_metadata_poll (app->doc, &st) != LS_COLUMN_OK)
+    {
+      app->prefs_infer_poll_id = 0;
+      return G_SOURCE_REMOVE;
+    }
+  if (st.metadata_generation != app->prefs_infer_gen)
+    {
+      app->prefs_infer_gen = st.metadata_generation;
+      columns_refresh_types (app);
+      column_repaint (app); /* typed cell formatting for displayed columns */
+    }
+  if (app->prefs_infer_row != NULL)
+    {
+      char *sub = (st.state == LS_COLUMN_JOB_QUEUED
+                   || st.state == LS_COLUMN_JOB_RUNNING)
+                      ? g_strdup_printf ("Detecting types… %u of %u",
+                                         st.completed_column_count,
+                                         st.requested_column_count)
+                      : g_strdup ("Type detection complete");
+      adw_action_row_set_subtitle (ADW_ACTION_ROW (app->prefs_infer_row), sub);
+      g_free (sub);
+    }
+  if (st.state != LS_COLUMN_JOB_QUEUED && st.state != LS_COLUMN_JOB_RUNNING)
+    {
+      app->prefs_infer_poll_id = 0;
+      return G_SOURCE_REMOVE; /* settled */
+    }
+  return G_SOURCE_CONTINUE;
+}
+
+/* Request type inference for exactly the currently-displayed columns and
+ * (re)start the poll that refreshes their types. O(<=10) IDs (N2). */
+static void
+columns_request_inference (App *app)
+{
+  GtkWidget *grp = app->prefs_columns_group;
+  if (grp == NULL || app->doc == NULL)
+    return;
+  GPtrArray *rows = g_object_get_data (G_OBJECT (grp), "lsg-rows");
+  if (rows == NULL || rows->len == 0)
+    return;
+  guint32 *ids = g_new (guint32, rows->len);
+  guint32 n = 0;
+  for (guint i = 0; i < rows->len; i++)
+    {
+      GtkWidget *exp = g_ptr_array_index (rows, i);
+      ids[n++]
+          = GPOINTER_TO_UINT (g_object_get_data (G_OBJECT (exp), "lsg-col"));
+    }
+  lsg_document_column_inference_request (app->doc, ids, n);
+  g_free (ids);
+  app->prefs_infer_gen = 0; /* force a refresh on the next poll tick */
+  if (app->prefs_infer_poll_id == 0)
+    app->prefs_infer_poll_id
+        = g_timeout_add (INFER_POLL_INTERVAL_MS, prefs_infer_poll_cb, app);
 }
 
 /* (Re)populate the Columns page's per-column group from the discovery mode +
@@ -5080,6 +5303,10 @@ columns_group_rebuild (App *app)
       else
         gtk_widget_set_visible (app->prefs_columns_status, FALSE);
     }
+
+  /* BUG A: infer the types of exactly these displayed columns, then poll +
+   * refresh their "Detected type" as the core commits. */
+  columns_request_inference (app);
 }
 
 static void
@@ -5088,7 +5315,9 @@ on_show_all_columns (GtkButton *btn, gpointer data)
   (void)btn;
   App *app = data;
   for (guint32 c = 0; c < app->n_cols; c++)
-    app->col_settings[c].hidden = FALSE;
+    if (app->col_settings[c].hidden)
+      set_column_hidden (app, c, FALSE); /* restore width + clear hidden */
+  grid_update_hadjustment (app);         /* total width changed */
   column_repaint (app);
   columns_group_rebuild (app);
 }
