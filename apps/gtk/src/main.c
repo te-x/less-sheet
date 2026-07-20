@@ -182,8 +182,12 @@ typedef struct
    * state (the effective report), the same state the Preferences "Parsing"
    * page drives, through the one lsg_dialect_compose funnel. */
   GtkToggleButton *header_toggle;
+  GtkWidget *header_glyph; /* GtkDrawingArea: the macOS-style "H" glyph */
   GtkMenuButton *sep_button;
   GtkMenuButton *quote_button;
+  GtkLabel *sep_glyph_label; /* the CHARACTER line of the stacked Sep button */
+  GtkLabel
+      *quote_glyph_label; /* the CHARACTER line of the stacked Quote button */
   gboolean
       dialect_ui_guard; /* re-entrancy guard for programmatic control sync */
 
@@ -208,8 +212,10 @@ typedef struct
   gboolean reopen_pending;
   gboolean reopen_header_change; /* the change was a header on/off */
   gboolean reopen_header_now;    /* the new header state (for the F3 toast) */
-  gint reopen_shift;             /* header re-anchor shift (F5) */
-  guint64 reopen_top_source;     /* source row to re-anchor to */
+  guint64 reopen_top_view;       /* top DATA-row index before the re-open (F5:
+                                  * a header toggle keeps this same index — no
+                                  * ±1 shift; at top (0) this reveals the
+                                  * former-header row as data row 0) */
   guint32 reopen_old_count;
   LsgColumnUserSettings *reopen_snapshot; /* OWNED; reopen_old_count entries */
   LsgColumnLabel *reopen_old_labels;      /* OWNED old identities; or NULL */
@@ -492,11 +498,17 @@ static void
 grid_window_headers (App *app, guint first, guint count)
 {
   free_window_headers (app);
-  if (!app->has_header || count == 0)
+  if (count == 0)
     return;
+  /* With a header, the column labels are its cells; with NO header they are
+   * the generic spreadsheet letters A, B, C, … (macOS parity —
+   * GenericColumnName), so the sticky header row is never blank. Still
+   * O(visible columns). */
   app->hdr_labels = g_new0 (char *, count);
   for (guint i = 0; i < count; i++)
-    app->hdr_labels[i] = lsg_document_header_cell_dup (app->doc, first + i);
+    app->hdr_labels[i]
+        = app->has_header ? lsg_document_header_cell_dup (app->doc, first + i)
+                          : lsg_column_generic_name (first + i);
   app->hdr_first = first;
   app->hdr_count = count;
 }
@@ -943,7 +955,7 @@ grid_draw (GtkDrawingArea *area, cairo_t *cr, int width, int height,
   gdk_cairo_set_source_rgba (cr, &tint);
   cairo_rectangle (cr, gutter, 0.0, (double)width - gutter, header_h);
   cairo_fill (cr);
-  if (app->has_header && app->hdr_labels != NULL)
+  if (app->hdr_labels != NULL)
     {
       gdk_cairo_set_source_rgba (cr, &fg);
       pango_layout_set_font_description (layout,
@@ -2445,6 +2457,80 @@ jump_glyph_draw (GtkDrawingArea *area, cairo_t *cr, int width, int height,
 #undef GY
 }
 
+/*
+ * The header on/off glyph — a macOS-parity "H" (see the macOS `HeaderGlyph`).
+ * When the first row IS a header the "H" is drawn solid; when it is DATA the
+ * "H" fades to ~0.3 and a FULL-strength diagonal slash crosses it, so the
+ * slash (not the H) carries the "not a header" meaning. Theme-tinted via
+ * `gtk_widget_get_color`, so it reads in light and dark. Reads the live state
+ * from `app->header_toggle`; the caller queue_draws it whenever that flips.
+ */
+static void
+header_glyph_draw (GtkDrawingArea *area, cairo_t *cr, int width, int height,
+                   gpointer data)
+{
+  App *app = data;
+  gboolean on = (app->header_toggle != NULL)
+                    ? gtk_toggle_button_get_active (app->header_toggle)
+                    : TRUE;
+  GdkRGBA fg;
+  gtk_widget_get_color (GTK_WIDGET (area), &fg);
+
+  /* The "H", centred, semibold, sized to the glyph box. */
+  PangoLayout *layout
+      = gtk_widget_create_pango_layout (GTK_WIDGET (area), "H");
+  PangoFontDescription *fd = pango_font_description_new ();
+  pango_font_description_set_weight (fd, PANGO_WEIGHT_SEMIBOLD);
+  pango_font_description_set_absolute_size (fd, (double)height * 0.72
+                                                    * PANGO_SCALE);
+  pango_layout_set_font_description (layout, fd);
+  pango_font_description_free (fd);
+
+  int lw, lh;
+  pango_layout_get_pixel_size (layout, &lw, &lh);
+  GdkRGBA hcol = fg;
+  hcol.alpha = on ? fg.alpha : fg.alpha * 0.3; /* faint H in the data state */
+  gdk_cairo_set_source_rgba (cr, &hcol);
+  cairo_move_to (cr, ((double)width - lw) / 2.0, ((double)height - lh) / 2.0);
+  pango_cairo_show_layout (cr, layout);
+  g_object_unref (layout);
+
+  if (!on)
+    {
+      /* Full-strength forward slash (macOS: a 3x24 capsule rotated 45deg). */
+      gdk_cairo_set_source_rgba (cr, &fg);
+      double lwp = (double)height * 0.14;
+      if (lwp < 2.0)
+        lwp = 2.0;
+      cairo_set_line_width (cr, lwp);
+      cairo_set_line_cap (cr, CAIRO_LINE_CAP_ROUND);
+      cairo_move_to (cr, (double)width * 0.22, (double)height * 0.82);
+      cairo_line_to (cr, (double)width * 0.78, (double)height * 0.18);
+      cairo_stroke (cr);
+    }
+}
+
+/*
+ * A 2-line header-bar menu-button child: a small, dimmed CATEGORY word ("Sep"
+ * / "Quote") stacked over the current CHARACTER glyph (kept up to date by
+ * dialect_sync_quick_controls via `*out_glyph`). Using set_child (not
+ * set_label) also drops the GtkMenuButton dropdown arrow.
+ */
+static GtkWidget *
+build_dialect_button_child (const char *category, GtkLabel **out_glyph)
+{
+  GtkWidget *box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
+  gtk_widget_set_valign (box, GTK_ALIGN_CENTER);
+  GtkWidget *cat = gtk_label_new (category);
+  gtk_widget_add_css_class (cat, "caption");   /* small */
+  gtk_widget_add_css_class (cat, "dim-label"); /* muted */
+  GtkWidget *glyph = gtk_label_new ("");
+  gtk_box_append (GTK_BOX (box), cat);
+  gtk_box_append (GTK_BOX (box), glyph);
+  *out_glyph = GTK_LABEL (glyph);
+  return box;
+}
+
 /* ------------------------------------------------------------------------- */
 /* Filter-to-matches (slice 4): the toggle + banner over lsg_filter */
 /* ------------------------------------------------------------------------- */
@@ -3525,10 +3611,12 @@ dialect_apply_change (App *app, LsgDialectChange change)
   app->reopen_pending = TRUE;
   app->reopen_header_change = header_change;
   app->reopen_header_now = new_header;
-  app->reopen_shift
-      = header_change ? lsg_dialect_header_shift (report.header, new_header)
-                      : 0;
-  app->reopen_top_source = capture_top_source_row (app);
+  /* F5 (header toggle): re-anchor to the SAME top data-row index across the
+   * re-open — no ±1 record shift. At the top (index 0) this keeps data row 0
+   * pinned, so header->data REVEALS the former-header row as the new data row
+   * 0 (it used to be shifted out of view just above the top); when scrolled
+   * (index > 0) the scroll position is preserved and only the labels flip. */
+  app->reopen_top_view = app->cur_top_row;
   app->reopen_old_count = app->n_cols;
 
   /* Snapshot the user column settings + (for a byte change over a headered
@@ -3555,13 +3643,10 @@ settings_reopen_apply (App *app)
 {
   app->reopen_pending = FALSE;
 
-  /* --- F5: viewport re-anchor --- */
+  /* --- F5: viewport re-anchor (header toggle only; no ±1 shift) --- */
   if (app->reopen_header_change)
     {
-      gint64 target = (gint64)app->reopen_top_source + app->reopen_shift;
-      if (target < 0)
-        target = 0;
-      guint64 row = (guint64)target;
+      guint64 row = app->reopen_top_view;
       scroll_to_first_row (app, row);
       grid_materialize (app);
       gtk_widget_queue_draw (GTK_WIDGET (app->area));
@@ -3814,11 +3899,14 @@ dialect_sync_quick_controls (App *app)
   app->dialect_ui_guard = TRUE;
   if (app->header_toggle != NULL)
     gtk_toggle_button_set_active (app->header_toggle, d.header);
-  if (app->sep_button != NULL)
-    gtk_menu_button_set_label (app->sep_button, sep_glyph (d.separator));
-  if (app->quote_button != NULL)
-    gtk_menu_button_set_label (app->quote_button,
-                               quote_glyph (d.has_quote, d.quote));
+  if (app->header_glyph != NULL)
+    gtk_widget_queue_draw (
+        app->header_glyph); /* solid H <-> faint H + slash */
+  if (app->sep_glyph_label != NULL)
+    gtk_label_set_text (app->sep_glyph_label, sep_glyph (d.separator));
+  if (app->quote_glyph_label != NULL)
+    gtk_label_set_text (app->quote_glyph_label,
+                        quote_glyph (d.has_quote, d.quote));
   parsing_page_sync (app, d);
   app->dialect_ui_guard = FALSE;
 }
@@ -3829,32 +3917,47 @@ static void
 on_header_toggle_toggled (GtkToggleButton *btn, gpointer data)
 {
   App *app = data;
+  if (app->header_glyph != NULL)
+    gtk_widget_queue_draw (app->header_glyph); /* reflect the new H/slash */
   if (app->dialect_ui_guard)
     return;
   dialect_apply_change (
       app, lsg_dialect_change_header (gtk_toggle_button_get_active (btn)));
 }
 
-/* A separator/quote radio was chosen in a header-bar dropdown. */
+/*
+ * A separator/quote option ROW was clicked in a header-bar dropdown.
+ *
+ * The dropdown is a plain (autohide) GtkPopover holding a GtkListBox — NOT a
+ * GtkPopoverMenu / menu-model, so a row activation NEVER auto-dismisses the
+ * popover (that auto-close is a menu-model behavior; a plain popover only
+ * closes on Escape or a click OUTSIDE it). So the dismiss is fully under our
+ * control here: a normal pick applies the change and calls popdown; the
+ * "Custom…" row ONLY reveals the inline entry and DELIBERATELY does not
+ * popdown — the whole point of this fix — so the user can type a byte, which
+ * is applied on the entry's Enter (on_dialect_custom_activate). (The previous
+ * design used grouped GtkCheckButton radios; replacing them with plain
+ * activatable list rows also removes the radio toggle/activation path.)
+ */
 static void
-on_dialect_radio_toggled (GtkCheckButton *check, gpointer data)
+on_dialect_row_activated (GtkListBox *list, GtkListBoxRow *row, gpointer data)
 {
   App *app = data;
-  if (app->dialect_ui_guard || !gtk_check_button_get_active (check))
+  if (app->dialect_ui_guard)
     return;
 
   GtkWidget *pop
-      = gtk_widget_get_ancestor (GTK_WIDGET (check), GTK_TYPE_POPOVER);
-  int kind
-      = GPOINTER_TO_INT (g_object_get_data (G_OBJECT (check), "lsg-kind"));
+      = gtk_widget_get_ancestor (GTK_WIDGET (list), GTK_TYPE_POPOVER);
+  int kind = GPOINTER_TO_INT (g_object_get_data (G_OBJECT (row), "lsg-kind"));
   gboolean is_custom
-      = g_object_get_data (G_OBJECT (check), "lsg-custom") != NULL;
-  gboolean is_none = g_object_get_data (G_OBJECT (check), "lsg-none") != NULL;
+      = g_object_get_data (G_OBJECT (row), "lsg-custom") != NULL;
+  gboolean is_none = g_object_get_data (G_OBJECT (row), "lsg-none") != NULL;
 
   if (is_custom)
     {
-      /* Reveal the in-popover custom entry; the byte is applied on Enter. */
-      GtkWidget *entry = g_object_get_data (G_OBJECT (check), "lsg-entry");
+      /* Reveal the inline single-char entry + focus it; NO popdown (the byte
+       * is applied on Enter). This is what keeps "Custom…" from dismissing. */
+      GtkWidget *entry = g_object_get_data (G_OBJECT (row), "lsg-entry");
       if (entry != NULL)
         {
           gtk_widget_set_visible (entry, TRUE);
@@ -3866,7 +3969,7 @@ on_dialect_radio_toggled (GtkCheckButton *check, gpointer data)
   if (kind == DIALECT_KIND_SEP)
     {
       guint8 b = (guint8)GPOINTER_TO_INT (
-          g_object_get_data (G_OBJECT (check), "lsg-byte"));
+          g_object_get_data (G_OBJECT (row), "lsg-byte"));
       dialect_apply_change (app, lsg_dialect_change_separator (b));
     }
   else if (is_none)
@@ -3874,11 +3977,11 @@ on_dialect_radio_toggled (GtkCheckButton *check, gpointer data)
   else
     {
       guint8 b = (guint8)GPOINTER_TO_INT (
-          g_object_get_data (G_OBJECT (check), "lsg-byte"));
+          g_object_get_data (G_OBJECT (row), "lsg-byte"));
       dialect_apply_change (app, lsg_dialect_change_quote (b));
     }
   if (pop != NULL)
-    gtk_popover_popdown (GTK_POPOVER (pop));
+    gtk_popover_popdown (GTK_POPOVER (pop)); /* only a VALID pick dismisses */
 }
 
 static void
@@ -3902,39 +4005,40 @@ on_dialect_custom_activate (GtkWidget *entry, gpointer data)
   /* An invalid byte is a silent no-op (F3b) — leave the entry for a retry. */
 }
 
-/* Add one radio row to a dropdown box; returns the check button. `markup` is
- * Pango markup so the glyph reads primary and the (Name) is dimmed. */
-static GtkCheckButton *
-add_dialect_radio (GtkWidget *box, GtkCheckButton *group, const char *markup,
-                   int kind, int byte, gboolean is_none, gboolean is_custom,
-                   GtkWidget *entry, App *app)
+/* Append one clickable option ROW to the dropdown list (no radios). `markup`
+ * is Pango markup so the glyph reads primary and the (Name) is dimmed; the row
+ * is activatable, so Adwaita highlights it on hover to signal it is clickable.
+ */
+static void
+add_dialect_row (GtkWidget *list, const char *markup, int kind, int byte,
+                 gboolean is_none, gboolean is_custom, GtkWidget *entry)
 {
-  GtkWidget *c = gtk_check_button_new ();
+  GtkWidget *row = gtk_list_box_row_new ();
   GtkWidget *lbl = gtk_label_new (NULL);
   gtk_label_set_markup (GTK_LABEL (lbl), markup);
   gtk_label_set_xalign (GTK_LABEL (lbl), 0.0);
-  gtk_check_button_set_child (GTK_CHECK_BUTTON (c), lbl);
-  if (group != NULL)
-    gtk_check_button_set_group (GTK_CHECK_BUTTON (c), group);
-  g_object_set_data (G_OBJECT (c), "lsg-kind", GINT_TO_POINTER (kind));
-  g_object_set_data (G_OBJECT (c), "lsg-byte", GINT_TO_POINTER (byte));
+  gtk_widget_set_margin_start (lbl, 10);
+  gtk_widget_set_margin_end (lbl, 10);
+  gtk_widget_set_margin_top (lbl, 6);
+  gtk_widget_set_margin_bottom (lbl, 6);
+  gtk_list_box_row_set_child (GTK_LIST_BOX_ROW (row), lbl);
+  g_object_set_data (G_OBJECT (row), "lsg-kind", GINT_TO_POINTER (kind));
+  g_object_set_data (G_OBJECT (row), "lsg-byte", GINT_TO_POINTER (byte));
   if (is_none)
-    g_object_set_data (G_OBJECT (c), "lsg-none", GINT_TO_POINTER (1));
+    g_object_set_data (G_OBJECT (row), "lsg-none", GINT_TO_POINTER (1));
   if (is_custom)
     {
-      g_object_set_data (G_OBJECT (c), "lsg-custom", GINT_TO_POINTER (1));
-      g_object_set_data (G_OBJECT (c), "lsg-entry", entry);
+      g_object_set_data (G_OBJECT (row), "lsg-custom", GINT_TO_POINTER (1));
+      g_object_set_data (G_OBJECT (row), "lsg-entry", entry);
     }
-  g_signal_connect (c, "toggled", G_CALLBACK (on_dialect_radio_toggled), app);
-  gtk_box_append (GTK_BOX (box), c);
-  return GTK_CHECK_BUTTON (c);
+  gtk_list_box_append (GTK_LIST_BOX (list), row);
 }
 
 static GtkWidget *
 build_dialect_dropdown_popover (App *app, int kind)
 {
   GtkWidget *pop = gtk_popover_new ();
-  GtkWidget *box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 4);
+  GtkWidget *box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 6);
   gtk_widget_set_margin_top (box, 6);
   gtk_widget_set_margin_bottom (box, 6);
   gtk_widget_set_margin_start (box, 6);
@@ -3948,36 +4052,41 @@ build_dialect_dropdown_popover (App *app, int kind)
   g_signal_connect (entry, "activate", G_CALLBACK (on_dialect_custom_activate),
                     app);
 
-  GtkCheckButton *group = NULL;
+  /* A plain clickable list (hover-highlighted rows), NOT radios and NOT a
+   * menu-model: selecting a row runs on_dialect_row_activated, which keeps the
+   * popover open for "Custom…" (see that handler). */
+  GtkWidget *list = gtk_list_box_new ();
+  gtk_list_box_set_selection_mode (GTK_LIST_BOX (list), GTK_SELECTION_NONE);
+  gtk_widget_add_css_class (list, "menu");
+  g_signal_connect (list, "row-activated",
+                    G_CALLBACK (on_dialect_row_activated), app);
+
   if (kind == DIALECT_KIND_SEP)
     {
       const guint8 *s = lsg_dialect_separator_candidates ();
-      group
-          = add_dialect_radio (box, NULL, ", <span alpha='55%'>(Comma)</span>",
-                               kind, s[0], FALSE, FALSE, NULL, app);
-      add_dialect_radio (box, group, "; <span alpha='55%'>(Semicolon)</span>",
-                         kind, s[1], FALSE, FALSE, NULL, app);
-      add_dialect_radio (box, group, "⇥ <span alpha='55%'>(Tab)</span>", kind,
-                         s[2], FALSE, FALSE, NULL, app);
-      add_dialect_radio (box, group, "| <span alpha='55%'>(Pipe)</span>", kind,
-                         s[3], FALSE, FALSE, NULL, app);
-      add_dialect_radio (box, group, "Custom…", kind, 0, FALSE, TRUE, entry,
-                         app);
+      add_dialect_row (list, ", <span alpha='55%'>(Comma)</span>", kind, s[0],
+                       FALSE, FALSE, NULL);
+      add_dialect_row (list, "; <span alpha='55%'>(Semicolon)</span>", kind,
+                       s[1], FALSE, FALSE, NULL);
+      add_dialect_row (list, "⇥ <span alpha='55%'>(Tab)</span>", kind, s[2],
+                       FALSE, FALSE, NULL);
+      add_dialect_row (list, "| <span alpha='55%'>(Pipe)</span>", kind, s[3],
+                       FALSE, FALSE, NULL);
+      add_dialect_row (list, "Custom…", kind, 0, FALSE, TRUE, entry);
     }
   else
     {
       const guint8 *q = lsg_dialect_quote_candidates ();
-      group = add_dialect_radio (box, NULL,
-                                 "\" <span alpha='55%'>(Double)</span>", kind,
-                                 q[0], FALSE, FALSE, NULL, app);
-      add_dialect_radio (box, group, "' <span alpha='55%'>(Single)</span>",
-                         kind, q[1], FALSE, FALSE, NULL, app);
-      add_dialect_radio (box, group, "∅ <span alpha='55%'>(None)</span>", kind,
-                         0, TRUE, FALSE, NULL, app);
-      add_dialect_radio (box, group, "Custom…", kind, 0, FALSE, TRUE, entry,
-                         app);
+      add_dialect_row (list, "\" <span alpha='55%'>(Double)</span>", kind,
+                       q[0], FALSE, FALSE, NULL);
+      add_dialect_row (list, "' <span alpha='55%'>(Single)</span>", kind, q[1],
+                       FALSE, FALSE, NULL);
+      add_dialect_row (list, "∅ <span alpha='55%'>(None)</span>", kind, 0,
+                       TRUE, FALSE, NULL);
+      add_dialect_row (list, "Custom…", kind, 0, FALSE, TRUE, entry);
     }
 
+  gtk_box_append (GTK_BOX (box), list);
   gtk_box_append (GTK_BOX (box), entry);
   gtk_popover_set_child (GTK_POPOVER (pop), box);
   return pop;
@@ -5149,14 +5258,22 @@ ensure_window (App *app, GtkApplication *gtk_app)
    * driving the ONE lsg_dialect_compose funnel and reflecting the effective
    * report (kept in sync by dialect_sync_quick_controls after every open). */
   GtkWidget *hdr_toggle = gtk_toggle_button_new ();
-  gtk_button_set_icon_name (GTK_BUTTON (hdr_toggle), "view-list-symbolic");
   gtk_widget_set_tooltip_text (hdr_toggle, "First row is a header");
   app->header_toggle = GTK_TOGGLE_BUTTON (hdr_toggle);
+  app->header_glyph = gtk_drawing_area_new ();
+  gtk_widget_set_size_request (app->header_glyph, 16, 16);
+  gtk_widget_set_halign (app->header_glyph, GTK_ALIGN_CENTER);
+  gtk_widget_set_valign (app->header_glyph, GTK_ALIGN_CENTER);
+  gtk_drawing_area_set_draw_func (GTK_DRAWING_AREA (app->header_glyph),
+                                  header_glyph_draw, app, NULL);
+  gtk_button_set_child (GTK_BUTTON (hdr_toggle), app->header_glyph);
   g_signal_connect (hdr_toggle, "toggled",
                     G_CALLBACK (on_header_toggle_toggled), app);
 
   GtkWidget *sep_btn = gtk_menu_button_new ();
-  gtk_menu_button_set_label (GTK_MENU_BUTTON (sep_btn), "Separator");
+  gtk_menu_button_set_child (
+      GTK_MENU_BUTTON (sep_btn),
+      build_dialect_button_child ("Sep", &app->sep_glyph_label));
   gtk_widget_set_tooltip_text (sep_btn, "Field separator");
   app->sep_button = GTK_MENU_BUTTON (sep_btn);
   gtk_menu_button_set_popover (
@@ -5164,7 +5281,9 @@ ensure_window (App *app, GtkApplication *gtk_app)
       GTK_WIDGET (build_dialect_dropdown_popover (app, DIALECT_KIND_SEP)));
 
   GtkWidget *quote_btn = gtk_menu_button_new ();
-  gtk_menu_button_set_label (GTK_MENU_BUTTON (quote_btn), "Quote");
+  gtk_menu_button_set_child (
+      GTK_MENU_BUTTON (quote_btn),
+      build_dialect_button_child ("Quote", &app->quote_glyph_label));
   gtk_widget_set_tooltip_text (quote_btn, "Quote character");
   app->quote_button = GTK_MENU_BUTTON (quote_btn);
   gtk_menu_button_set_popover (
