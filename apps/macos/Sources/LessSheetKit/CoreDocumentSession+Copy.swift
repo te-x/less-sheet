@@ -57,7 +57,7 @@ extension CoreDocumentSession {
         }
         switch result.rawValue {
         case ls_copy_result.RawValue(LS_COPY_OK.rawValue):
-            let text = outLen > 0 ? (String(bytes: copyBuffer[0..<outLen], encoding: .utf8) ?? "") : ""
+            let text = outLen > 0 ? String(lossyUTF8: copyBuffer[0..<outLen]) : ""
             return CopiedCell(status: .served, text: text, truncated: outTruncated)
         case ls_copy_result.RawValue(LS_COPY_PENDING.rawValue):
             return CopiedCell(status: .pending, text: "", truncated: false)

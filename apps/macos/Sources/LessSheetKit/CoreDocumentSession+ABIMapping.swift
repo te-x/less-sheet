@@ -117,13 +117,13 @@ extension CoreDocumentSession {
         return value
     }
 
-    /// Copies borrowed core bytes into an owned String. The core pre-transcodes
-    /// every cell to valid UTF-8 (invalid input becomes U+FFFD at the core
-    /// boundary), so the failable `String(bytes:encoding:)` does not actually
-    /// fail here; the `?? ""` preserves the empty-on-failure fallback. The empty
-    /// borrow (`len == 0`) copies to "".
+    /// Copies borrowed core bytes into an owned String, decoding lossily so
+    /// invalid UTF-8 becomes U+FFFD rather than being dropped. The core's UTF-8
+    /// path passes raw, un-validated file bytes (`api/lesssheet.h` "Option A"),
+    /// so this substitution is the ABI-mandated display-boundary obligation —
+    /// see `String(lossyUTF8:)`. The empty borrow (`len == 0`) copies to "".
     static func copyCell(_ str: ls_str) -> String {
         guard str.len > 0, let ptr = str.ptr else { return "" }
-        return String(bytes: UnsafeBufferPointer(start: ptr, count: str.len), encoding: .utf8) ?? ""
+        return String(lossyUTF8: UnsafeBufferPointer(start: ptr, count: str.len))
     }
 }

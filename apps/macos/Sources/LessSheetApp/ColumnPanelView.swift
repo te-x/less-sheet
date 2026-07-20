@@ -154,7 +154,7 @@ struct ColumnSettingsSection: View {
                 let values = core.columnLabels(ids)
                 let candidates = zip(ids, values).map { id, value in
                     ColumnLabelCandidate(column: id,
-                                         label: value.map { String(bytes: $0.bytes, encoding: .utf8) ?? "" })
+                                         label: value.map { String(lossyUTF8: $0.bytes) })
                 }
                 return searcher.matches(query: needle, in: candidates, locale: locale)
             }.value

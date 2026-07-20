@@ -140,7 +140,7 @@ extension DocumentModel {
                 break pull
             }
         }
-        let text = String(bytes: blob, encoding: .utf8) ?? ""
+        let text = String(lossyUTF8: blob)
         return CopyReport(text: text, byteCount: blob.count, rowCount: rowsDone, outcome: outcome, lossyCells: false)
     }
 

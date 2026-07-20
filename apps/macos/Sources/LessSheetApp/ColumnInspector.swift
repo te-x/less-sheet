@@ -90,7 +90,7 @@ struct ColumnInspector: View {
         .task(id: "\(column):\(model.openGeneration)") {
             let setting = model.userSettings(for: column)
             nullEnabled = setting.nullSentinel != nil
-            nullText = setting.nullSentinel.map { String(bytes: $0, encoding: .utf8) ?? "" } ?? ""
+            nullText = setting.nullSentinel.map { String(lossyUTF8: $0) } ?? ""
             model.setPanelSelection(column)
         }
     }

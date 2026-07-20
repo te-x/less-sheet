@@ -2,22 +2,6 @@ import CLessSheet
 import Contracts
 import Foundation
 
-/// One compact, length-only header record from `columnLabelMetrics(_:)` — a
-/// named replacement for the former `(length:truncated:present:)` tuple (same
-/// three fields, same values), so the length-only preflight has a first-class
-/// element type instead of a large tuple.
-public struct ColumnLabelMetric: Sendable, Equatable {
-    public let length: Int
-    public let truncated: Bool
-    public let present: Bool
-
-    public init(length: Int, truncated: Bool, present: Bool) {
-        self.length = length
-        self.truncated = truncated
-        self.present = present
-    }
-}
-
 // MARK: - Column metadata bridge (labels / inference / overrides).
 // Split out of CoreDocumentSession.swift as a same-module extension (pure code
 // motion) so the primary type body stays within budget; reaches the session's
@@ -74,38 +58,6 @@ extension CoreDocumentSession {
             return ColumnHeaderIdentity(
                 bytes: Array(arena[offset..<(offset + length)]),
                 truncated: span.flags & UInt32(LS_COLUMN_LABEL_TRUNCATED) != 0
-            )
-        }
-    }
-
-    /// Length-only header preflight. This is the first pass of the label-copy
-    /// ABI with no arena allocation: one compact scalar record per requested ID,
-    /// suitable for stable all-column width estimates at open.
-    public func columnLabelMetrics(_ ids: [UInt32]) -> [ColumnLabelMetric] {
-        guard ids.count <= Int(LS_COLUMN_BATCH_MAX) else { return [] }
-        copyBufferLock.lock()
-        defer { copyBufferLock.unlock() }
-        guard !isClosed else { return [] }
-        var spans = [ls_column_label_span](repeating: ls_column_label_span(), count: ids.count)
-        for index in spans.indices {
-            spans[index].struct_size = UInt32(MemoryLayout<ls_column_label_span>.size)
-            spans[index].abi_version = UInt32(LS_COLUMN_METADATA_ABI_VERSION)
-        }
-        var required = 0
-        let capacity = UInt32(spans.count)
-        let result = ids.withUnsafeBufferPointer { idBuffer in
-            spans.withUnsafeMutableBufferPointer { spanBuffer in
-                ls_column_labels_copy_many(doc, idBuffer.baseAddress, UInt32(ids.count),
-                                           spanBuffer.baseAddress, capacity,
-                                           nil, 0, &required)
-            }
-        }
-        guard result.rawValue == LS_COLUMN_OK.rawValue else { return [] }
-        return spans.map { span in
-            ColumnLabelMetric(
-                length: Int(clamping: span.len),
-                truncated: span.flags & UInt32(LS_COLUMN_LABEL_TRUNCATED) != 0,
-                present: span.flags & UInt32(LS_COLUMN_LABEL_PRESENT) != 0
             )
         }
     }

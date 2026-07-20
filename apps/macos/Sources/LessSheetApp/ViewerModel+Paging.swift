@@ -216,7 +216,7 @@ extension DocumentModel {
             let snapshots = core.columnMetadata(ids)
             for (offset, value) in values.enumerated() {
                 guard let value, !value.bytes.isEmpty else { continue }
-                labels[start + offset] = String(bytes: value.bytes, encoding: .utf8) ?? ""
+                labels[start + offset] = String(lossyUTF8: value.bytes)
                 if value.truncated { truncatedLabels.insert(start + offset) }
             }
             for snapshot in snapshots { metadata[snapshot.column] = snapshot }
@@ -255,7 +255,7 @@ extension DocumentModel {
             var labels: [Int: PanelColumnLabel] = [:]
             for (offset, id) in bounded.enumerated() {
                 guard offset < snapshot.0.count, let value = snapshot.0[offset], !value.bytes.isEmpty else { continue }
-                labels[Int(id)] = PanelColumnLabel(text: String(bytes: value.bytes, encoding: .utf8) ?? "",
+                labels[Int(id)] = PanelColumnLabel(text: String(lossyUTF8: value.bytes),
                                                    truncated: value.truncated)
             }
             self.panelLabels = labels
