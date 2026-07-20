@@ -207,8 +207,9 @@ pub const SearchKind = enum(c_int) {
     predicate = 1,
 };
 
-/// Mirrors `ls_search_op`: eq/ne are byte-exact; lt/gt/le/ge are numeric
-/// under the pinned grammar with EXACT mathematical comparison (see the
+/// Mirrors `ls_search_op`: eq/ne test (in)equality with ASCII case folding per
+/// the request's `case_sensitive` flag; lt/gt/le/ge are numeric under the
+/// pinned grammar with EXACT mathematical comparison and ignore case (see the
 /// header's ls_search_request).
 pub const SearchOp = enum(c_int) {
     eq = 0,
@@ -245,8 +246,9 @@ pub const SearchNavState = enum(c_int) {
 
 /// Mirrors `ls_search_request`. Borrowed only for the duration of
 /// `ls_search_start` (the core copies what it keeps). Validity rules and the
-/// pinned per-kind matching semantics (smart case, byte-exact eq/ne, exact
-/// numeric ordering, scope) are in api/lesssheet.h.
+/// pinned per-kind matching semantics (ASCII case folding per `case_sensitive`
+/// for TEXT substring and predicate EQ/NE; exact numeric ordering; scope) are
+/// in api/lesssheet.h.
 pub const SearchRequest = extern struct {
     kind: SearchKind,
     op: SearchOp = .eq,
@@ -255,6 +257,15 @@ pub const SearchRequest = extern struct {
     value_len: usize = 0,
     scope_ptr: ?[*]const u32 = null,
     scope_len: usize = 0,
+    /// ASCII case folding for `LS_SEARCH_TEXT` substring matching and predicate
+    /// `LS_SEARCH_OP_EQ`/`NE`. false (the default / zero-init) = case-INSENSITIVE
+    /// (bytes 0x41..0x5A fold to their lowercase forms; every byte >= 0x80
+    /// compares exactly); true = byte-exact. Ordering predicates
+    /// (`LS_SEARCH_OP_LT`/`GT`/`LE`/`GE`) are numeric and ignore this field.
+    /// Honored identically by `ls_search_start`, `ls_filter_set`,
+    /// `ls_search_nav`, and `ls_window_match_flags` (which reuse the active
+    /// request). Appended after `scope_len`, matching the C struct.
+    case_sensitive: bool = false,
 };
 
 /// Mirrors `ls_search_status` (see it for every field's validity rule).

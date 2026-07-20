@@ -1176,7 +1176,13 @@ test "abi: the exported C symbols are callable through extern linkage" {
 const manualNoHeader: api.OpenOptions = .{ .header = api.header_off, .index_mode = api.index_manual };
 
 fn textReq(query: []const u8) api.SearchRequest {
-    return .{ .kind = .text, .value_ptr = query.ptr, .value_len = query.len };
+    return textReqCase(query, false);
+}
+
+/// TEXT request with an explicit case_sensitive flag (false = the insensitive
+/// default; true = byte-exact).
+fn textReqCase(query: []const u8, case_sensitive: bool) api.SearchRequest {
+    return .{ .kind = .text, .value_ptr = query.ptr, .value_len = query.len, .case_sensitive = case_sensitive };
 }
 
 fn textReqScoped(query: []const u8, scope: []const u32) api.SearchRequest {
@@ -1186,11 +1192,18 @@ fn textReqScoped(query: []const u8, scope: []const u32) api.SearchRequest {
         .value_len = query.len,
         .scope_ptr = scope.ptr,
         .scope_len = scope.len,
+        .case_sensitive = false,
     };
 }
 
 fn predReq(column: u32, op: api.SearchOp, value: []const u8) api.SearchRequest {
-    return .{ .kind = .predicate, .op = op, .column = column, .value_ptr = value.ptr, .value_len = value.len };
+    return predReqCase(column, op, value, false);
+}
+
+/// PREDICATE request with an explicit case_sensitive flag (governs EQ/NE only;
+/// ordering ops ignore it). false = the insensitive default; true = byte-exact.
+fn predReqCase(column: u32, op: api.SearchOp, value: []const u8, case_sensitive: bool) api.SearchRequest {
+    return .{ .kind = .predicate, .op = op, .column = column, .value_ptr = value.ptr, .value_len = value.len, .case_sensitive = case_sensitive };
 }
 
 fn startSearch(doc: *api.Doc, req: api.SearchRequest) !void {
@@ -1281,35 +1294,10 @@ fn ascending(gpa: std.mem.Allocator, n: u64, step: u64) ![]u64 {
 }
 
 // ---------------------------------------------------------------------------
-// f1 — text matcher: smart case, substring positions, byte-exact non-ASCII,
-// header exclusion, scope, request validation.
+// f1 — text matcher: substring positions, header exclusion, scope, request
+// validation. (Case-mode behavior — the case_sensitive flag — is in section
+// fc; non-ASCII folding is fc3.)
 // ---------------------------------------------------------------------------
-
-test "f1: smart case — lowercase query folds ASCII; any uppercase byte demands exact bytes" {
-    var od = try openBytes("w\nHello\nHELLO\nhello\nshell\nhelp\n");
-    defer od.deinit();
-    // All-lowercase query: ASCII-case-insensitive substring match.
-    try std.testing.expectEqual(@as(u64, 3), try searchTotal(od.doc, textReq("hello")));
-    var s = try navAndWait(od.doc, 0, .forward);
-    try expectFound(s, 0, 0, 1); // "Hello"
-    s = try navAndWait(od.doc, 1, .forward);
-    try expectFound(s, 1, 0, 2); // "HELLO"
-    s = try navAndWait(od.doc, 2, .forward);
-    try expectFound(s, 2, 0, 3); // "hello"
-    s = try navAndWait(od.doc, 3, .forward);
-    try std.testing.expectEqual(api.SearchNavState.exhausted, s.nav); // "shell", "help" lack "hello"
-    // One ASCII uppercase byte -> the whole query is byte-exact.
-    try std.testing.expectEqual(@as(u64, 1), try searchTotal(od.doc, textReq("Hello")));
-    s = try navAndWait(od.doc, 0, .forward);
-    try expectFound(s, 0, 0, 1);
-    try std.testing.expectEqual(@as(u64, 1), try searchTotal(od.doc, textReq("HELLO")));
-    s = try navAndWait(od.doc, 0, .forward);
-    try expectFound(s, 1, 0, 1);
-    // Exact mode matching nothing: zero total, exact, no movement to offer.
-    try std.testing.expectEqual(@as(u64, 0), try searchTotal(od.doc, textReq("hELLO")));
-    s = try navAndWait(od.doc, 0, .forward);
-    try std.testing.expectEqual(api.SearchNavState.exhausted, s.nav);
-}
 
 test "f1: substring matches at cell start, middle, and end" {
     var od = try openBytes("h\nneedle-start\nmid-needle-mid\nend-needle\nno-match\n");
@@ -1321,20 +1309,6 @@ test "f1: substring matches at cell start, middle, and end" {
     try expectFound(s, 1, 0, 2);
     s = try navAndWait(od.doc, 2, .forward);
     try expectFound(s, 2, 0, 3);
-}
-
-test "f1: UTF-8 beyond ASCII matches byte-exactly in both smart-case modes" {
-    var od = try openBytes("h\ncafé\nCAFÉ\ncafe\nCAFE\n");
-    defer od.deinit();
-    // Lowercase mode folds the ASCII c/a/f; the é bytes never fold, so the
-    // all-lowercase query "café" does NOT match "CAFÉ".
-    try std.testing.expectEqual(@as(u64, 1), try searchTotal(od.doc, textReq("café")));
-    const s = try navAndWait(od.doc, 0, .forward);
-    try expectFound(s, 0, 0, 1);
-    // A plain-ASCII lowercase query folds against both ASCII casings.
-    try std.testing.expectEqual(@as(u64, 2), try searchTotal(od.doc, textReq("cafe")));
-    // ASCII uppercase C/A/F flips the query to exact mode: only "CAFÉ".
-    try std.testing.expectEqual(@as(u64, 1), try searchTotal(od.doc, textReq("CAFÉ")));
 }
 
 test "f1: the header record is never searched" {
@@ -1399,22 +1373,31 @@ test "f1: invalid requests are rejected with zero state change" {
 }
 
 // ---------------------------------------------------------------------------
-// f2 — predicate matcher: byte-exact =/≠, numeric ordering under the pinned
+// f2 — predicate matcher: =/≠ (byte-exact when case_sensitive, else ASCII-
+// folded — the case matrix is section fc), numeric ordering under the pinned
 // grammar with EXACT comparison, non-numeric-never-matches, value validation.
 // ---------------------------------------------------------------------------
 
-test "f2: = and ≠ compare byte-exactly (no folding, no trimming); = '' matches empty and padded cells" {
+test "f2: sensitive =/≠ is byte-exact; insensitive folds ASCII; = '' matches empty and padded cells" {
     var od = try openBytes("h1,h2\nx,abc\ny,Abc\nz, abc\nw,abc\nv\n");
     defer od.deinit();
-    try std.testing.expectEqual(@as(u64, 2), try searchTotal(od.doc, predReq(1, .eq, "abc"))); // rows 0, 3
+    // SENSITIVE (case_sensitive = true): byte-exact, no trimming. "= abc" is
+    // rows 0, 3 only; "Abc" (case) and " abc" (leading space) are unequal bytes.
+    try std.testing.expectEqual(@as(u64, 2), try searchTotal(od.doc, predReqCase(1, .eq, "abc", true))); // rows 0, 3
     var s = try navAndWait(od.doc, 0, .forward);
     try expectFound(s, 0, 1, 1);
     s = try navAndWait(od.doc, 1, .forward);
     try expectFound(s, 3, 1, 2);
-    // "Abc" (case) and " abc" (padding) are unequal bytes -> they are ≠.
-    try std.testing.expectEqual(@as(u64, 3), try searchTotal(od.doc, predReq(1, .ne, "abc")));
-    // The ragged row 4 pads column 1 with the empty cell: = "" finds it.
+    try std.testing.expectEqual(@as(u64, 3), try searchTotal(od.doc, predReqCase(1, .ne, "abc", true))); // complement {1,2,4}
+    // INSENSITIVE (the default): "Abc" now folds onto "abc" -> rows 0, 1, 3;
+    // " abc" is still unequal (leading space is never trimmed, only ASCII case
+    // folds), so ≠ is its exact complement {2, 4}.
+    try std.testing.expectEqual(@as(u64, 3), try searchTotal(od.doc, predReq(1, .eq, "abc"))); // rows 0, 1, 3
+    try std.testing.expectEqual(@as(u64, 2), try searchTotal(od.doc, predReq(1, .ne, "abc"))); // rows 2, 4
+    // The ragged row 4 pads column 1 with the empty cell: = "" finds it, and
+    // the empty value is case-independent (identical in both modes).
     try std.testing.expectEqual(@as(u64, 1), try searchTotal(od.doc, predReq(1, .eq, "")));
+    try std.testing.expectEqual(@as(u64, 1), try searchTotal(od.doc, predReqCase(1, .eq, "", true)));
     s = try navAndWait(od.doc, 0, .forward);
     try expectFound(s, 4, 1, 1);
 }
@@ -1493,6 +1476,125 @@ test "f2: ordering with a non-numeric value is rejected; the predicate column mu
     try std.testing.expectEqual(@as(u64, 1), try searchTotal(od.doc, predReq(0, .lt, " 12 ")));
     try std.testing.expectEqual(@as(u64, 1), try searchTotal(od.doc, predReq(1, .gt, ".5")));
     try std.testing.expectEqual(@as(u64, 1), try searchTotal(od.doc, predReq(0, .lt, "+1e5")));
+}
+
+// ---------------------------------------------------------------------------
+// fc — case mode (the `case_sensitive` request flag). Replaces the retired
+// smart-case rule: false (the default) folds ASCII case for TEXT substring and
+// predicate =/≠; true is byte-exact; bytes >= 0x80 never fold; ordering ops
+// ignore it. The same flag is honored identically by search, nav, filter, and
+// the window match mask (see fc8). (ARCH-search-case-mode §6.B / D1.)
+// ---------------------------------------------------------------------------
+
+test "fc1: B1 insensitive TEXT folds ASCII in BOTH directions (smart-case is gone)" {
+    var od = try openBytes("region\nusa\nUSA\nUsa\nnope\n");
+    defer od.deinit();
+    // A lowercase query folds: usa / USA / Usa all match; "nope" does not.
+    try std.testing.expectEqual(@as(u64, 3), try searchTotal(od.doc, textReq("usa")));
+    try expectFound(try navAndWait(od.doc, 0, .forward), 0, 0, 1);
+    // The KEY departure from smart-case: an UPPERCASE query ALSO folds, so
+    // "USA" matches the SAME three cells (old smart-case made it byte-exact = 1).
+    try std.testing.expectEqual(@as(u64, 3), try searchTotal(od.doc, textReq("USA")));
+    try expectFound(try navAndWait(od.doc, 0, .forward), 0, 0, 1);
+    // A mixed-case query folds too.
+    try std.testing.expectEqual(@as(u64, 3), try searchTotal(od.doc, textReq("uSa")));
+}
+
+test "fc2: B2 sensitive TEXT is byte-exact (each casing matches only itself)" {
+    var od = try openBytes("region\nusa\nUSA\nUsa\nnope\n");
+    defer od.deinit();
+    try std.testing.expectEqual(@as(u64, 1), try searchTotal(od.doc, textReqCase("usa", true)));
+    try expectFound(try navAndWait(od.doc, 0, .forward), 0, 0, 1); // only "usa" (row 0)
+    try std.testing.expectEqual(@as(u64, 1), try searchTotal(od.doc, textReqCase("USA", true)));
+    try expectFound(try navAndWait(od.doc, 0, .forward), 1, 0, 1); // only "USA" (row 1)
+    try std.testing.expectEqual(@as(u64, 1), try searchTotal(od.doc, textReqCase("Usa", true)));
+    try expectFound(try navAndWait(od.doc, 0, .forward), 2, 0, 1); // only "Usa" (row 2)
+}
+
+test "fc3: B3 non-ASCII bytes (>= 0x80) never fold in either case mode" {
+    var od = try openBytes("h\ncafé\nCAFÉ\ncafe\nCAFE\n");
+    defer od.deinit();
+    // Insensitive: ASCII c/a/f fold, but the é bytes (0xC3 0xA9) never do, so a
+    // lowercase "café" matches only "café" (NOT "CAFÉ", whose É is 0xC3 0x89).
+    try std.testing.expectEqual(@as(u64, 1), try searchTotal(od.doc, textReq("café")));
+    try expectFound(try navAndWait(od.doc, 0, .forward), 0, 0, 1);
+    // A plain-ASCII query folds against both ASCII casings.
+    try std.testing.expectEqual(@as(u64, 2), try searchTotal(od.doc, textReq("cafe")));
+    // Insensitive "CAFÉ": ASCII CAF folds to caf, but É stays exact -> only
+    // "CAFÉ" (proving É never folds to é).
+    try std.testing.expectEqual(@as(u64, 1), try searchTotal(od.doc, textReq("CAFÉ")));
+    try expectFound(try navAndWait(od.doc, 0, .forward), 1, 0, 1);
+    // Sensitive: each accented casing matches only itself, byte-for-byte.
+    try std.testing.expectEqual(@as(u64, 1), try searchTotal(od.doc, textReqCase("café", true)));
+    try std.testing.expectEqual(@as(u64, 1), try searchTotal(od.doc, textReqCase("CAFÉ", true)));
+}
+
+test "fc4: B4 insensitive predicate =/≠ folds ASCII case" {
+    var od = try openBytes("name\nisabella\nIsabella\nISABELLA\nbob\n");
+    defer od.deinit();
+    // = folds: all three casings of "isabella" match; "bob" does not.
+    try std.testing.expectEqual(@as(u64, 3), try searchTotal(od.doc, predReq(0, .eq, "isabella")));
+    try expectFound(try navAndWait(od.doc, 0, .forward), 0, 0, 1);
+    // A capitalized query value folds the same way (no smart-case): still 3.
+    try std.testing.expectEqual(@as(u64, 3), try searchTotal(od.doc, predReq(0, .eq, "ISABELLA")));
+    // ≠ is the exact complement: only "bob".
+    try std.testing.expectEqual(@as(u64, 1), try searchTotal(od.doc, predReq(0, .ne, "isabella")));
+    try expectFound(try navAndWait(od.doc, 0, .forward), 3, 0, 1);
+}
+
+test "fc5: B5 sensitive predicate =/≠ is byte-exact" {
+    var od = try openBytes("name\nisabella\nIsabella\nISABELLA\nbob\n");
+    defer od.deinit();
+    try std.testing.expectEqual(@as(u64, 1), try searchTotal(od.doc, predReqCase(0, .eq, "isabella", true)));
+    try expectFound(try navAndWait(od.doc, 0, .forward), 0, 0, 1); // only exact "isabella"
+    try std.testing.expectEqual(@as(u64, 1), try searchTotal(od.doc, predReqCase(0, .eq, "ISABELLA", true)));
+    try expectFound(try navAndWait(od.doc, 0, .forward), 2, 0, 1); // only exact "ISABELLA"
+    // ≠ complement of the single exact "isabella": the other three rows.
+    try std.testing.expectEqual(@as(u64, 3), try searchTotal(od.doc, predReqCase(0, .ne, "isabella", true)));
+}
+
+test "fc6: B6 = '' matches empty and padded cells in both case modes" {
+    var od = try openBytes("a,b\nx,\ny,z\nw\n");
+    defer od.deinit();
+    // Column 1 values: "" (row 0), "z" (row 1), "" padded (row 2, ragged).
+    try std.testing.expectEqual(@as(u64, 2), try searchTotal(od.doc, predReq(1, .eq, "")));
+    try std.testing.expectEqual(@as(u64, 2), try searchTotal(od.doc, predReqCase(1, .eq, "", true)));
+    // Nav lands on the first empty cell.
+    try startSearch(od.doc, predReqCase(1, .eq, "", true));
+    try expectFound(try navAndWait(od.doc, 0, .forward), 0, 1, 1);
+}
+
+test "fc7: B7 ordering ops (< > <= >=) are identical regardless of case_sensitive" {
+    var od = try openBytes("v\n1\n2\n3\nabc\n");
+    defer od.deinit();
+    // Numeric ordering ignores case_sensitive entirely: same count either way.
+    inline for ([_]api.SearchOp{ .lt, .gt, .le, .ge }) |op| {
+        const insensitive = try searchTotal(od.doc, predReqCase(0, op, "2", false));
+        const sensitive = try searchTotal(od.doc, predReqCase(0, op, "2", true));
+        try std.testing.expectEqual(insensitive, sensitive);
+    }
+    // Spot checks: > 2 -> {3} = 1; <= 2 -> {1,2} = 2 ("abc" never matches).
+    try std.testing.expectEqual(@as(u64, 1), try searchTotal(od.doc, predReqCase(0, .gt, "2", true)));
+    try std.testing.expectEqual(@as(u64, 2), try searchTotal(od.doc, predReq(0, .le, "2")));
+}
+
+test "fc8: B8 one insensitive request agrees across scan/count, nav, filter, and the match mask" {
+    var od = try openBytes(fv_fixture);
+    defer od.deinit();
+    winAll(od.doc);
+    const needle_mask = [_]u8{
+        0, 0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1,
+    };
+    // Scan/count surface: an UPPERCASE query, insensitive default -> 6 rows.
+    try std.testing.expectEqual(@as(u64, 6), try searchTotal(od.doc, textReq("NEEDLE")));
+    // Match-mask surface agrees cell-for-cell with the matcher verdict.
+    try std.testing.expectEqualSlices(u8, &needle_mask, matchFlags(od.doc, 0, 3));
+    // Nav surface: forward from row 0 lands on the first matching cell.
+    try expectFound(try navAndWait(od.doc, 0, .forward), 0, 2, 1); // row 0, note column (2)
+    // Filter surface: the same request filters to the same 6 source rows.
+    try setFilter(od.doc, textReq("NEEDLE"));
+    try std.testing.expectEqual(@as(u64, 6), (try waitFilterDone(od.doc)).total);
+    try expectSourceRows(od.doc, &.{ 0, 1, 2, 3, 6, 7 });
 }
 
 // ---------------------------------------------------------------------------
@@ -2551,8 +2653,9 @@ const fv_fixture =
     ",5.,needleneedle\n" ++ //        6: note "needleneedle";     qty 5.
     "plain,abc,end needle\n"; //      7: note "end needle";       qty non-numeric
 
-/// TEXT "needle" (smart-case fold) matches source rows 0,1,2,3,6,7 (m = 6).
-/// WHERE qty(col 1) >= 2 matches source rows 0,1,2,4,6 (m = 5).
+/// TEXT "needle" (case-insensitive default fold) matches source rows
+/// 0,1,2,3,6,7 (m = 6). WHERE qty(col 1) >= 2 matches source rows 0,1,2,4,6
+/// (m = 5).
 fn setFilter(doc: *api.Doc, req: api.SearchRequest) !void {
     try std.testing.expectEqual(true, api.ls_filter_set(doc, &req));
 }
@@ -2635,16 +2738,22 @@ test "fv2: a WHERE filter reports the matching count and serves the matching row
     try expectSourceRows(od.doc, &.{ 0, 1, 2, 4, 6 });
 }
 
-test "fv3: a TEXT filter yields the substring-matching rows with Find's smart-case rule" {
+test "fv3: a TEXT filter yields the substring-matching rows and honors case_sensitive" {
     var od = try openBytes(fv_fixture);
     defer od.deinit();
-    // Lowercase query folds ASCII case: sources 0,1,2,3,6,7.
+    // Insensitive default folds ASCII case: sources 0,1,2,3,6,7.
     try setFilter(od.doc, textReq("needle"));
     var f = try waitFilterDone(od.doc);
     try std.testing.expectEqual(@as(u64, 6), f.total);
     try expectSourceRows(od.doc, &.{ 0, 1, 2, 3, 6, 7 });
-    // One ASCII uppercase byte -> byte-exact: only "NEEDLE" (source 1).
+    // An UPPERCASE query folds identically under the insensitive default (no
+    // smart-case): "NEEDLE" matches the SAME sources as "needle".
     try setFilter(od.doc, textReq("NEEDLE"));
+    f = try waitFilterDone(od.doc);
+    try std.testing.expectEqual(@as(u64, 6), f.total);
+    try expectSourceRows(od.doc, &.{ 0, 1, 2, 3, 6, 7 });
+    // case_sensitive = true makes the filter byte-exact: only "NEEDLE" (source 1).
+    try setFilter(od.doc, textReqCase("NEEDLE", true));
     f = try waitFilterDone(od.doc);
     try std.testing.expectEqual(@as(u64, 1), f.total);
     try expectSourceRows(od.doc, &.{1});
@@ -7980,25 +8089,33 @@ fn genWide(gpa: std.mem.Allocator, cols: u32, rows: u32, hit_col: u32) ![]u8 {
 
 // --- mf1..mf8 — the per-window match-flags companion call --------------------
 
-test "mf1: AC1 TEXT smart-case per-cell verdicts are byte-identical to the matcher" {
+test "mf1: AC1 TEXT per-cell verdicts (case_sensitive) are byte-identical to the matcher" {
     var od = try openBytes(fv_fixture);
     defer od.deinit();
     winAll(od.doc);
 
-    // Lowercase query folds ASCII case (no ASCII uppercase byte).
-    try startSearch(od.doc, textReq("needle"));
-    try std.testing.expectEqualSlices(u8, &.{
+    const needle_mask = [_]u8{
         0, 0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1,
-    }, matchFlags(od.doc, 0, 3));
+    };
+    // Insensitive default folds ASCII case.
+    try startSearch(od.doc, textReq("needle"));
+    try std.testing.expectEqualSlices(u8, &needle_mask, matchFlags(od.doc, 0, 3));
 
-    // One ASCII uppercase byte -> byte-exact: only "Needle point" (row 3, col 2).
+    // An UPPERCASE query folds identically under the insensitive default (no
+    // smart-case): the mask matches "needle" cell-for-cell.
     try startSearch(od.doc, textReq("Needle"));
+    try std.testing.expectEqualSlices(u8, &needle_mask, matchFlags(od.doc, 0, 3));
+
+    // case_sensitive = true makes the mask byte-exact: only "Needle point"
+    // (row 3, col 2).
+    try startSearch(od.doc, textReqCase("Needle", true));
     try std.testing.expectEqualSlices(u8, &.{
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     }, matchFlags(od.doc, 0, 3));
 
-    // Non-ASCII bytes always compare exactly: "café" hits only row 5, col 0
-    // (the col-2 "CAFÉ" folds only its ASCII bytes, so it does NOT match).
+    // Non-ASCII bytes always compare exactly (both modes): "café" hits only
+    // row 5, col 0 (the col-2 "CAFÉ" folds only its ASCII bytes, so it does
+    // NOT match under the insensitive default).
     try startSearch(od.doc, textReq("café"));
     try std.testing.expectEqualSlices(u8, &.{
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0,
