@@ -21,7 +21,9 @@
 #include <gdk/gdkkeysyms.h>
 #include <pango/pangocairo.h>
 
+#include <lsg_column.h>
 #include <lsg_copy.h>
+#include <lsg_dialect.h>
 #include <lsg_document.h>
 #include <lsg_filter.h>
 #include <lsg_find.h>
@@ -166,6 +168,53 @@ typedef struct
   GtkProgressBar *hp_bar;
   GtkButton *hp_cancel;
 
+  /* Settings + dialect override (this slice). */
+  char *doc_path; /* current LOCAL path (OWNED); NULL for a network doc */
+  LsgLocaleGlyphs glyphs; /* process-locale glyphs for the cell formatter */
+  LsgColumnUserSettings *col_settings; /* n_cols; per-column user settings */
+  ls_column_type_kind *col_kind; /* n_cols; cached effective kind (fmt) */
+  ls_column_datetime_semantics
+      *col_sem; /* n_cols; cached datetime semantics */
+
+  AdwToastOverlay *toasts; /* header-change + column-reset toasts (F3 / F7) */
+
+  /* Dialect quick-controls (header bar) — reflect + drive the ONE dialect
+   * state (the effective report), the same state the Preferences "Parsing"
+   * page drives, through the one lsg_dialect_compose funnel. */
+  GtkToggleButton *header_toggle;
+  GtkMenuButton *sep_button;
+  GtkMenuButton *quote_button;
+  gboolean
+      dialect_ui_guard; /* re-entrancy guard for programmatic control sync */
+
+  /* Preferences "Parsing" page rows (live only while the dialog is open;
+   * NULL-reset when it closes). */
+  AdwDialog *prefs;                /* current AdwPreferencesDialog, or NULL */
+  GtkWidget *prefs_header_row;     /* AdwSwitchRow */
+  GtkWidget *prefs_sep_row;        /* AdwComboRow */
+  GtkWidget *prefs_sep_custom;     /* AdwEntryRow (revealed on "Custom…") */
+  GtkWidget *prefs_quote_row;      /* AdwComboRow */
+  GtkWidget *prefs_quote_custom;   /* AdwEntryRow */
+  GtkWidget *prefs_enc_row;        /* AdwComboRow */
+  GtkWidget *prefs_columns_group;  /* the Columns page's per-column group */
+  GtkWidget *prefs_columns_search; /* AdwEntryRow shown in search-only mode */
+  GtkWidget
+      *prefs_columns_status;  /* a status/overflow/no-such-column label row */
+  GtkWidget *prefs_infer_row; /* inference-progress row */
+
+  /* Pending dialect re-open state (captured before the re-open, applied in
+   * open_document AFTER adoption, so the local + network re-open paths share
+   * one post-open re-anchor + column replay/reset). */
+  gboolean reopen_pending;
+  gboolean reopen_header_change; /* the change was a header on/off */
+  gboolean reopen_header_now;    /* the new header state (for the F3 toast) */
+  gint reopen_shift;             /* header re-anchor shift (F5) */
+  guint64 reopen_top_source;     /* source row to re-anchor to */
+  guint32 reopen_old_count;
+  LsgColumnUserSettings *reopen_snapshot; /* OWNED; reopen_old_count entries */
+  LsgColumnLabel *reopen_old_labels;      /* OWNED old identities; or NULL */
+  guint reopen_n_old_labels;
+
   /* Env-gated timing instrumentation (LESSSHEET_GTK_TIMING). Entirely inert —
    * no output, no measurable cost — unless `timing` is set. */
   gboolean timing;
@@ -283,6 +332,14 @@ static void open_jump_with_digit (App *app, char digit);
  * handler (in the find section) calls it. */
 static void open_jump (App *app);
 
+/* Settings + dialect override (this slice). Defined with the settings region
+ * below `ensure_window`; called from `open_document` (which is the single
+ * post-adoption choke point for BOTH the local and network re-open). */
+static void dialect_sync_quick_controls (App *app); /* sync header/sep/quote */
+static void
+settings_reopen_apply (App *app); /* F5 re-anchor + F7 replay/reset */
+static void column_cache_effective (App *app, guint32 col); /* fmt kind/sem */
+
 /* ------------------------------------------------------------------------- */
 /* View teardown */
 /* ------------------------------------------------------------------------- */
@@ -305,6 +362,9 @@ app_reset_document (App *app)
   g_clear_pointer (&app->win, lsg_window_free);
   free_window_headers (app);
   g_clear_pointer (&app->col_widths, g_free);
+  g_clear_pointer (&app->col_settings, g_free);
+  g_clear_pointer (&app->col_kind, g_free);
+  g_clear_pointer (&app->col_sem, g_free);
   g_clear_pointer (&app->doc, lsg_document_close);
   app->n_cols = 0;
   app->row_estimate = 1;
@@ -796,9 +856,27 @@ grid_draw (GtkDrawingArea *area, cairo_t *cr, int width, int height,
               gdk_cairo_set_source_rgba (cr, &fg); /* restore for the text */
             }
 
-          const char *text = lsg_window_cell (app->win, ri, ci);
-          draw_text (cr, layout, text, x + pad, y, colw - 2.0 * pad, row_h,
-                     line_h);
+          const char *raw = lsg_window_cell (app->win, ri, ci);
+          /* Display formatting (F14): AUTO / no-option columns paint the raw
+           * spelling with NO allocation (the common case); a configured column
+           * runs the type+options dispatcher (find/filter/copy still use raw —
+           * the ABI rule). */
+          if (col < app->n_cols && app->col_settings != NULL
+              && !lsg_column_format_options_is_auto (
+                  app->col_settings[col].format))
+            {
+              LsgDisplay disp = lsg_format_cell (
+                  raw, app->col_kind[col], app->col_sem[col],
+                  app->col_settings[col].format, app->glyphs);
+              draw_text (cr, layout, disp.text, x + pad, y, colw - 2.0 * pad,
+                         row_h, line_h);
+              lsg_display_clear (&disp);
+            }
+          else
+            {
+              draw_text (cr, layout, raw, x + pad, y, colw - 2.0 * pad, row_h,
+                         line_h);
+            }
           x += colw;
         }
     }
@@ -980,7 +1058,16 @@ open_document (App *app, LsgDocument *doc, const char *title,
    * O(column_count) window-lane calls + retained strings, breaking the
    * wide-doc viewport-only NFR). They are fetched lazily for the visible
    * column window in grid_materialize, exactly as the cells are. */
-  app->col_widths = g_new0 (double, (app->n_cols > 0) ? app->n_cols : 1);
+  guint32 nc_alloc = (app->n_cols > 0) ? app->n_cols : 1;
+  app->col_widths = g_new0 (double, nc_alloc);
+  /* Per-column user settings + cached effective type for the cell formatter.
+   * All-zero == all-Auto (raw spellings, no inference) — the O(viewport) open
+   * does NO column work (N1). col_kind zero == LS_COLUMN_TYPE_UNKNOWN -> raw.
+   */
+  app->col_settings = g_new0 (LsgColumnUserSettings, nc_alloc);
+  app->col_kind = g_new0 (ls_column_type_kind, nc_alloc);
+  app->col_sem = g_new0 (ls_column_datetime_semantics, nc_alloc);
+  app->glyphs = lsg_locale_glyphs_current ();
 
   LsgRowCount rc = lsg_document_row_count (doc);
   app->row_estimate = (rc.count > 0) ? rc.count : 1;
@@ -1000,7 +1087,17 @@ open_document (App *app, LsgDocument *doc, const char *title,
   gtk_stack_set_visible_child_name (app->stack, "grid");
   grid_materialize (app);
   gtk_widget_queue_draw (GTK_WIDGET (app->area));
-  filter_sync_ui (app); /* the reset cleared any prior filter */
+  filter_sync_ui (app); /* the reset cleared any prior filter (F6) */
+
+  /* Reflect the (possibly re-sniffed) dialect into the header-bar quick
+   * controls + any open Parsing page — the ONE state, three affordances. */
+  dialect_sync_quick_controls (app);
+
+  /* A dialect re-open applies its viewport re-anchor (F5) + column-settings
+   * replay-or-reset (F7) + toasts here — the shared post-adoption step for
+   * both the local re-open and the async network re-open (F8). */
+  if (app->reopen_pending)
+    settings_reopen_apply (app);
 
   if (app->poll_id == 0)
     app->poll_id = g_timeout_add (POLL_INTERVAL_MS, grid_poll_tick, app);
@@ -1043,6 +1140,11 @@ open_file (App *app, GFile *file)
           app->t_open_begin = begin;
           app->first_frame_pending = TRUE;
         }
+      /* Remember the LOCAL path so a dialect change can re-open it (F1). A
+       * fresh user open (not a dialect re-open) clears any pending re-open
+       * state. */
+      g_clear_pointer (&app->doc_path, g_free);
+      app->doc_path = g_strdup (path);
       open_document (app, doc, base, FALSE); /* local file */
     }
 
@@ -1200,6 +1302,7 @@ on_url_response (AdwAlertDialog *dialog, const char *response, gpointer data)
 
   g_clear_pointer (&app->pending_url, g_free);
   app->pending_url = g_strdup (url);
+  g_clear_pointer (&app->doc_path, g_free); /* network doc: no local path */
 
   /* A URL open replaces the current doc, so stop any copy of the OLD doc NOW —
    * before the net open goes in flight and takes over the shared header
@@ -2983,13 +3086,6 @@ on_sel_drag_end (GtkGestureDrag *gesture, double ox, double oy, gpointer data)
   copy_update_affordance (app);
 }
 
-static void
-on_copy_button_clicked (GtkButton *button, gpointer data)
-{
-  (void)button;
-  do_copy ((App *)data);
-}
-
 /* ------------------------------------------------------------------------- */
 /* UI construction */
 /* ------------------------------------------------------------------------- */
@@ -3124,7 +3220,1697 @@ on_window_destroy (GtkWidget *widget, gpointer data)
   app->hp_bar = NULL;
   app->hp_cancel = NULL;
   app->copy_button = NULL;
+  app->header_toggle = NULL;
+  app->sep_button = NULL;
+  app->quote_button = NULL;
+  app->toasts = NULL;
+  app->prefs = NULL; /* the dialog is destroyed with the window */
+  app->prefs_header_row = NULL;
+  app->prefs_sep_row = NULL;
+  app->prefs_quote_row = NULL;
+  app->prefs_enc_row = NULL;
+  app->prefs_columns_group = NULL;
   copy_stop_and_join (app); /* joins the worker; widget calls now no-op */
+}
+
+/* ========================================================================= */
+/* Settings + dialect override (this slice)                                  */
+/*                                                                           */
+/* The three header-bar quick-controls (header toggle, separator ▾, quote ▾),*/
+/* the Preferences "Parsing" page, and this compose/re-open funnel all read +
+ */
+/* drive the ONE dialect state (the effective report from
+ * lsg_document_dialect*/
+/* through the single lsg_dialect_compose funnel. A dialect change is an ABI */
+/* re-open (F1); a network doc re-opens through the NETWORK funnel (F8). */
+/* ========================================================================= */
+
+/* Separator/quote dropdown item tags (object data on each radio + the item's
+ * forced byte). */
+#define DIALECT_KIND_SEP 0
+#define DIALECT_KIND_QUOTE 1
+
+/* Forward declarations for the settings region (callee-before-caller cycles).
+ */
+static void settings_present (App *app);
+static void columns_group_rebuild (App *app);
+static void column_row_sync (App *app, GtkWidget *expander, guint32 col);
+
+/* -------- toast (F3 / F7) ------------------------------------------------ */
+
+static void
+settings_toast (App *app, const char *text)
+{
+  if (app->toasts != NULL)
+    adw_toast_overlay_add_toast (app->toasts, adw_toast_new (text));
+}
+
+/* Set an AdwComboRow's string model (set_model is transfer-none, so drop our
+ * creation ref after the row takes its own). */
+static void
+combo_set_items (GtkWidget *combo, const char *const *items)
+{
+  GtkStringList *m = gtk_string_list_new (items);
+  adw_combo_row_set_model (ADW_COMBO_ROW (combo), G_LIST_MODEL (m));
+  g_object_unref (m);
+}
+
+/* -------- cached effective type for the cell formatter --------------------
+ */
+
+static void
+column_cache_effective (App *app, guint32 col)
+{
+  if (app->doc == NULL || app->col_kind == NULL || col >= app->n_cols)
+    return;
+  ls_column_metadata m;
+  guint64 gen = 0;
+  if (lsg_document_column_metadata_get_many (app->doc, &col, 1, &m, 1, &gen)
+      == LS_COLUMN_OK)
+    {
+      app->col_kind[col] = (ls_column_type_kind)m.effective.kind;
+      app->col_sem[col]
+          = (ls_column_datetime_semantics)m.effective.datetime_semantics;
+    }
+}
+
+/* -------- re-open capture helpers (F7) ----------------------------------- */
+
+static gboolean
+columns_any_authored (App *app)
+{
+  if (app->col_settings == NULL)
+    return FALSE;
+  for (guint32 i = 0; i < app->n_cols; i++)
+    if (!lsg_column_user_settings_is_default (&app->col_settings[i]))
+      return TRUE;
+  return FALSE;
+}
+
+/* Copy every column's header label out (owned), in bounded LS_COLUMN_BATCH_MAX
+ * batches — used only for the F7 re-open identity comparison (never the open
+ * path). Returns a fresh n_cols array, or NULL. */
+static LsgColumnLabel *
+capture_all_labels (App *app, guint *out_n)
+{
+  guint32 total = app->n_cols;
+  *out_n = total;
+  if (total == 0 || app->doc == NULL)
+    {
+      *out_n = 0;
+      return NULL;
+    }
+  LsgColumnLabel *all = g_new0 (LsgColumnLabel, total);
+  guint32 done = 0;
+  while (done < total)
+    {
+      guint32 batch = MIN ((guint32)LS_COLUMN_BATCH_MAX, total - done);
+      guint32 *ids = g_new (guint32, batch);
+      for (guint32 i = 0; i < batch; i++)
+        ids[i] = done + i;
+      ls_column_result r = LS_COLUMN_INVALID_ARGUMENT;
+      LsgColumnLabel *part
+          = lsg_document_column_labels_copy_many (app->doc, ids, batch, &r);
+      g_free (ids);
+      if (part == NULL || r != LS_COLUMN_OK)
+        {
+          if (part != NULL)
+            lsg_column_labels_free (part, batch);
+          break; /* leave the rest zeroed -> a short/mismatch drives RESET */
+        }
+      for (guint32 i = 0; i < batch; i++)
+        {
+          all[done + i] = part[i]; /* steal the owned bytes */
+          part[i].bytes = NULL;
+        }
+      lsg_column_labels_free (part, batch);
+      done += batch;
+    }
+  return all;
+}
+
+/* Build borrowed identity views over an owned label array (freed with it). */
+static LsgColumnHeaderIdentity *
+labels_to_identities (LsgColumnLabel *labels, guint n)
+{
+  if (labels == NULL || n == 0)
+    return NULL;
+  LsgColumnHeaderIdentity *ids = g_new0 (LsgColumnHeaderIdentity, n);
+  for (guint i = 0; i < n; i++)
+    {
+      ids[i].bytes = labels[i].bytes;
+      ids[i].len = labels[i].len;
+      ids[i].truncated = labels[i].truncated;
+    }
+  return ids;
+}
+
+/* -------- the re-open funnel (F1 / F8) ----------------------------------- */
+
+/* Close + re-open the current document with `options`. Local re-opens
+ * synchronously (open_document runs the post-open re-anchor/replay); a NETWORK
+ * doc re-opens through the net funnel — never fed to the local open (F8) — and
+ * the async net poll adopts into the SAME open_document choke point. */
+static void
+dialect_reopen (App *app, ls_open_options options)
+{
+  if (app->is_network)
+    {
+      if (app->pending_url == NULL)
+        return;
+      copy_stop_and_join (app);
+      if (app->net != NULL)
+        {
+          lsg_net_open_cancel (app->net);
+          lsg_net_open_release (app->net);
+          app->net = NULL;
+        }
+      app->net = lsg_net_open_start (app->pending_url, &options);
+      if (app->net == NULL)
+        {
+          show_error (app, "Could not re-open URL",
+                      "The open job could not be started.");
+          return;
+        }
+      header_progress_show (app, "Connecting…");
+      if (app->net_poll_id == 0)
+        app->net_poll_id
+            = g_timeout_add (POLL_INTERVAL_MS, net_poll_tick, app);
+    }
+  else
+    {
+      if (app->doc_path == NULL)
+        return;
+      LsgOpenError err = LSG_OPEN_OK;
+      LsgDocument *doc
+          = lsg_document_open_local (app->doc_path, &options, &err);
+      if (doc == NULL)
+        {
+          show_error (app, "Could not re-open file", open_error_text (err));
+          return;
+        }
+      char *base = g_path_get_basename (app->doc_path);
+      open_document (app, doc, base, FALSE); /* doc_path preserved by reset */
+      g_free (base);
+    }
+}
+
+/* One user selection -> compose -> validate -> capture -> re-open (F1). A
+ * rejected compose is a silent no-op (F2). */
+static void
+dialect_apply_change (App *app, LsgDialectChange change)
+{
+  if (app->doc == NULL)
+    return;
+  LsgDialect report = lsg_document_dialect (app->doc);
+  LsgDialectCompose c = lsg_dialect_compose (report, change);
+  if (!c.accepted)
+    return; /* silent no-op */
+
+  gboolean header_change = (change.kind == LSG_DIALECT_CHANGE_HEADER);
+  gboolean new_header = header_change ? change.header_on : report.header;
+
+  /* Clear any stale pending capture. */
+  g_clear_pointer (&app->reopen_snapshot, g_free);
+  if (app->reopen_old_labels != NULL)
+    {
+      lsg_column_labels_free (app->reopen_old_labels,
+                              app->reopen_n_old_labels);
+      app->reopen_old_labels = NULL;
+      app->reopen_n_old_labels = 0;
+    }
+
+  app->reopen_pending = TRUE;
+  app->reopen_header_change = header_change;
+  app->reopen_header_now = new_header;
+  app->reopen_shift
+      = header_change ? lsg_dialect_header_shift (report.header, new_header)
+                      : 0;
+  app->reopen_top_source = capture_top_source_row (app);
+  app->reopen_old_count = app->n_cols;
+
+  /* Snapshot the user column settings + (for a byte change over a headered
+   * doc) the header identities — only when some settings were authored, so the
+   * common all-Auto case does no O(column_count) label work (N1 / N2). */
+  if (columns_any_authored (app))
+    {
+      guint32 nc = (app->n_cols > 0) ? app->n_cols : 1;
+      app->reopen_snapshot = g_new0 (LsgColumnUserSettings, nc);
+      for (guint32 i = 0; i < app->n_cols; i++)
+        app->reopen_snapshot[i] = app->col_settings[i];
+      if (!header_change && report.header && app->n_cols > 0)
+        app->reopen_old_labels
+            = capture_all_labels (app, &app->reopen_n_old_labels);
+    }
+
+  dialect_reopen (app, c.options);
+}
+
+/* Post-adoption re-anchor (F5) + column replay/reset (F7) + toasts (F3/F7).
+ * Runs at the end of open_document for BOTH the local and network re-open. */
+static void
+settings_reopen_apply (App *app)
+{
+  app->reopen_pending = FALSE;
+
+  /* --- F5: viewport re-anchor --- */
+  if (app->reopen_header_change)
+    {
+      gint64 target = (gint64)app->reopen_top_source + app->reopen_shift;
+      if (target < 0)
+        target = 0;
+      guint64 row = (guint64)target;
+      scroll_to_first_row (app, row);
+      grid_materialize (app);
+      gtk_widget_queue_draw (GTK_WIDGET (app->area));
+      if (app->is_network)
+        net_drive_begin (app, row); /* F8: net funnel drives the landing */
+      settings_toast (app, app->reopen_header_now ? "First row is now a header"
+                                                  : "First row is now data");
+    }
+  /* separator/quote/encoding rest at top-left (open_document already did). */
+
+  /* --- F7: column-settings replay or reset --- */
+  if (app->reopen_snapshot != NULL)
+    {
+      LsgColumnReopenChange kind
+          = app->reopen_header_change
+                ? LSG_COLUMN_REOPEN_HEADER_ONLY
+                : LSG_COLUMN_REOPEN_SEPARATOR_QUOTE_ENCODING;
+
+      LsgColumnHeaderIdentity *old_ids = NULL, *new_ids = NULL;
+      guint n_old = 0, n_new = 0;
+      LsgColumnLabel *new_labels = NULL;
+      if (!app->reopen_header_change && app->reopen_old_labels != NULL
+          && app->n_cols > 0 && lsg_document_has_header (app->doc))
+        {
+          new_labels = capture_all_labels (app, &n_new);
+          if (new_labels != NULL && n_new == app->n_cols)
+            {
+              n_old = app->reopen_n_old_labels;
+              old_ids = labels_to_identities (app->reopen_old_labels, n_old);
+              new_ids = labels_to_identities (new_labels, n_new);
+            }
+        }
+
+      LsgColumnReopenDecision decision
+          = lsg_column_reopen_decide (kind, app->reopen_old_count, app->n_cols,
+                                      old_ids, n_old, new_ids, n_new);
+      g_free (old_ids);
+      g_free (new_ids);
+      if (new_labels != NULL)
+        lsg_column_labels_free (new_labels, n_new);
+
+      if (decision == LSG_COLUMN_REOPEN_REPLAY)
+        {
+          guint32 n = MIN (app->reopen_old_count, app->n_cols);
+          for (guint32 i = 0; i < n; i++)
+            {
+              LsgColumnUserSettings s = app->reopen_snapshot[i];
+              app->col_settings[i] = s; /* format / hidden / width */
+              if (s.has_override)
+                {
+                  ls_column_type t = lsg_column_override_type (
+                      (ls_column_type_kind)s.override.kind,
+                      (ls_column_datetime_semantics)
+                          s.override.datetime_semantics);
+                  lsg_document_column_override_set (app->doc, i, &t);
+                }
+              if (s.has_null_sentinel)
+                lsg_document_column_null_sentinel_set (
+                    app->doc, i, s.null_sentinel_len ? s.null_sentinel : NULL,
+                    s.null_sentinel_len);
+              column_cache_effective (app, i);
+            }
+          grid_materialize (app);
+          gtk_widget_queue_draw (GTK_WIDGET (app->area));
+        }
+      else
+        {
+          /* RESET: the fresh col_settings are already all-Auto; just notify.
+           */
+          settings_toast (app, "Column settings were reset — columns changed");
+        }
+    }
+
+  /* Refresh an open Columns page against the re-parsed document. */
+  if (app->prefs != NULL && app->prefs_columns_group != NULL)
+    columns_group_rebuild (app);
+
+  g_clear_pointer (&app->reopen_snapshot, g_free);
+  if (app->reopen_old_labels != NULL)
+    {
+      lsg_column_labels_free (app->reopen_old_labels,
+                              app->reopen_n_old_labels);
+      app->reopen_old_labels = NULL;
+      app->reopen_n_old_labels = 0;
+    }
+  app->reopen_old_count = 0;
+}
+
+/* -------- quick-control reflection --------------------------------------- */
+
+static const char *
+sep_short_label (guint8 b)
+{
+  switch (b)
+    {
+    case ',':
+      return "Comma ,";
+    case ';':
+      return "Semicolon ;";
+    case '\t':
+      return "Tab ⇥";
+    case '|':
+      return "Pipe |";
+    default:
+      return "Custom";
+    }
+}
+
+static const char *
+quote_short_label (gboolean has_quote, guint8 b)
+{
+  if (!has_quote)
+    return "None";
+  switch (b)
+    {
+    case '"':
+      return "Double \"";
+    case '\'':
+      return "Single '";
+    default:
+      return "Custom";
+    }
+}
+
+/* Reflect the effective dialect into the open Parsing page (guarded so the
+ * programmatic set never re-enters the compose funnel). */
+static void
+parsing_page_sync (App *app, LsgDialect d)
+{
+  if (app->prefs == NULL)
+    return;
+  const guint8 *seps = lsg_dialect_separator_candidates ();
+  const guint8 *quotes = lsg_dialect_quote_candidates ();
+
+  if (app->prefs_header_row != NULL)
+    adw_switch_row_set_active (ADW_SWITCH_ROW (app->prefs_header_row),
+                               d.header);
+
+  if (app->prefs_sep_row != NULL)
+    {
+      guint idx = 4; /* Custom… */
+      for (guint i = 0; i < LSG_DIALECT_SEPARATOR_CANDIDATE_COUNT; i++)
+        if (seps[i] == d.separator)
+          {
+            idx = i;
+            break;
+          }
+      adw_combo_row_set_selected (ADW_COMBO_ROW (app->prefs_sep_row), idx);
+      char *sub = g_strdup_printf ("%s: %s",
+                                   d.separator_forced ? "forced" : "detected",
+                                   sep_short_label (d.separator));
+      adw_action_row_set_subtitle (ADW_ACTION_ROW (app->prefs_sep_row), sub);
+      g_free (sub);
+    }
+
+  if (app->prefs_quote_row != NULL)
+    {
+      guint idx = 3; /* Custom… */
+      if (!d.has_quote)
+        idx = 2; /* None */
+      else
+        for (guint i = 0; i < LSG_DIALECT_QUOTE_CANDIDATE_COUNT; i++)
+          if (quotes[i] == d.quote)
+            {
+              idx = i;
+              break;
+            }
+      adw_combo_row_set_selected (ADW_COMBO_ROW (app->prefs_quote_row), idx);
+      char *sub
+          = g_strdup_printf ("%s: %s", d.quote_forced ? "forced" : "detected",
+                             quote_short_label (d.has_quote, d.quote));
+      adw_action_row_set_subtitle (ADW_ACTION_ROW (app->prefs_quote_row), sub);
+      g_free (sub);
+    }
+
+  if (app->prefs_enc_row != NULL)
+    {
+      LsgEncoding sel = lsg_encoding_picker_selection (d);
+      LsgEncoding det = lsg_encoding_picker_detected (d);
+      static const char *names[LSG_ENCODING_PICKER_OPTION_COUNT]
+          = { "Automatic", "UTF-8",      "UTF-16 LE",
+              "UTF-16 BE", "ISO-8859-1", "Windows-1252" };
+      /* Selection maps AUTO->0, else the concrete value + 1 (fixed order). */
+      guint sidx = (sel == LSG_ENCODING_AUTO) ? 0 : (guint)(sel + 1);
+      adw_combo_row_set_selected (ADW_COMBO_ROW (app->prefs_enc_row), sidx);
+      guint didx = (guint)(det + 1);
+      if (didx < LSG_ENCODING_PICKER_OPTION_COUNT)
+        {
+          char *sub = g_strdup_printf ("detected: %s", names[didx]);
+          adw_action_row_set_subtitle (ADW_ACTION_ROW (app->prefs_enc_row),
+                                       sub);
+          g_free (sub);
+        }
+    }
+}
+
+static void
+dialect_sync_quick_controls (App *app)
+{
+  if (app->doc == NULL)
+    return;
+  LsgDialect d = lsg_document_dialect (app->doc);
+  app->dialect_ui_guard = TRUE;
+  if (app->header_toggle != NULL)
+    gtk_toggle_button_set_active (app->header_toggle, d.header);
+  if (app->sep_button != NULL)
+    gtk_menu_button_set_label (app->sep_button, sep_short_label (d.separator));
+  if (app->quote_button != NULL)
+    gtk_menu_button_set_label (app->quote_button,
+                               quote_short_label (d.has_quote, d.quote));
+  parsing_page_sync (app, d);
+  app->dialect_ui_guard = FALSE;
+}
+
+/* -------- header-bar quick controls (F3 / F3b) --------------------------- */
+
+static void
+on_header_toggle_toggled (GtkToggleButton *btn, gpointer data)
+{
+  App *app = data;
+  if (app->dialect_ui_guard)
+    return;
+  dialect_apply_change (
+      app, lsg_dialect_change_header (gtk_toggle_button_get_active (btn)));
+}
+
+/* A separator/quote radio was chosen in a header-bar dropdown. */
+static void
+on_dialect_radio_toggled (GtkCheckButton *check, gpointer data)
+{
+  App *app = data;
+  if (app->dialect_ui_guard || !gtk_check_button_get_active (check))
+    return;
+
+  GtkWidget *pop
+      = gtk_widget_get_ancestor (GTK_WIDGET (check), GTK_TYPE_POPOVER);
+  int kind
+      = GPOINTER_TO_INT (g_object_get_data (G_OBJECT (check), "lsg-kind"));
+  gboolean is_custom
+      = g_object_get_data (G_OBJECT (check), "lsg-custom") != NULL;
+  gboolean is_none = g_object_get_data (G_OBJECT (check), "lsg-none") != NULL;
+
+  if (is_custom)
+    {
+      /* Reveal the in-popover custom entry; the byte is applied on Enter. */
+      GtkWidget *entry = g_object_get_data (G_OBJECT (check), "lsg-entry");
+      if (entry != NULL)
+        {
+          gtk_widget_set_visible (entry, TRUE);
+          gtk_widget_grab_focus (entry);
+        }
+      return;
+    }
+
+  if (kind == DIALECT_KIND_SEP)
+    {
+      guint8 b = (guint8)GPOINTER_TO_INT (
+          g_object_get_data (G_OBJECT (check), "lsg-byte"));
+      dialect_apply_change (app, lsg_dialect_change_separator (b));
+    }
+  else if (is_none)
+    dialect_apply_change (app, lsg_dialect_change_quote_none ());
+  else
+    {
+      guint8 b = (guint8)GPOINTER_TO_INT (
+          g_object_get_data (G_OBJECT (check), "lsg-byte"));
+      dialect_apply_change (app, lsg_dialect_change_quote (b));
+    }
+  if (pop != NULL)
+    gtk_popover_popdown (GTK_POPOVER (pop));
+}
+
+static void
+on_dialect_custom_activate (GtkWidget *entry, gpointer data)
+{
+  App *app = data;
+  int kind
+      = GPOINTER_TO_INT (g_object_get_data (G_OBJECT (entry), "lsg-kind"));
+  guint8 b = 0;
+  if (lsg_dialect_parse_custom_byte (
+          gtk_editable_get_text (GTK_EDITABLE (entry)), &b))
+    {
+      if (kind == DIALECT_KIND_SEP)
+        dialect_apply_change (app, lsg_dialect_change_separator (b));
+      else
+        dialect_apply_change (app, lsg_dialect_change_quote (b));
+      GtkWidget *pop = gtk_widget_get_ancestor (entry, GTK_TYPE_POPOVER);
+      if (pop != NULL)
+        gtk_popover_popdown (GTK_POPOVER (pop));
+    }
+  /* An invalid byte is a silent no-op (F3b) — leave the entry for a retry. */
+}
+
+/* Add one radio row to a dropdown box; returns the check button. */
+static GtkCheckButton *
+add_dialect_radio (GtkWidget *box, GtkCheckButton *group, const char *label,
+                   int kind, int byte, gboolean is_none, gboolean is_custom,
+                   GtkWidget *entry, App *app)
+{
+  GtkWidget *c = gtk_check_button_new_with_label (label);
+  if (group != NULL)
+    gtk_check_button_set_group (GTK_CHECK_BUTTON (c), group);
+  g_object_set_data (G_OBJECT (c), "lsg-kind", GINT_TO_POINTER (kind));
+  g_object_set_data (G_OBJECT (c), "lsg-byte", GINT_TO_POINTER (byte));
+  if (is_none)
+    g_object_set_data (G_OBJECT (c), "lsg-none", GINT_TO_POINTER (1));
+  if (is_custom)
+    {
+      g_object_set_data (G_OBJECT (c), "lsg-custom", GINT_TO_POINTER (1));
+      g_object_set_data (G_OBJECT (c), "lsg-entry", entry);
+    }
+  g_signal_connect (c, "toggled", G_CALLBACK (on_dialect_radio_toggled), app);
+  gtk_box_append (GTK_BOX (box), c);
+  return GTK_CHECK_BUTTON (c);
+}
+
+static GtkWidget *
+build_dialect_dropdown_popover (App *app, int kind)
+{
+  GtkWidget *pop = gtk_popover_new ();
+  GtkWidget *box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 4);
+  gtk_widget_set_margin_top (box, 6);
+  gtk_widget_set_margin_bottom (box, 6);
+  gtk_widget_set_margin_start (box, 6);
+  gtk_widget_set_margin_end (box, 6);
+
+  GtkWidget *entry = gtk_entry_new ();
+  gtk_entry_set_max_length (GTK_ENTRY (entry), 1);
+  gtk_entry_set_placeholder_text (GTK_ENTRY (entry), "One character");
+  gtk_widget_set_visible (entry, FALSE);
+  g_object_set_data (G_OBJECT (entry), "lsg-kind", GINT_TO_POINTER (kind));
+  g_signal_connect (entry, "activate", G_CALLBACK (on_dialect_custom_activate),
+                    app);
+
+  GtkCheckButton *group = NULL;
+  if (kind == DIALECT_KIND_SEP)
+    {
+      const guint8 *s = lsg_dialect_separator_candidates ();
+      group = add_dialect_radio (box, NULL, "Comma  ,", kind, s[0], FALSE,
+                                 FALSE, NULL, app);
+      add_dialect_radio (box, group, "Semicolon  ;", kind, s[1], FALSE, FALSE,
+                         NULL, app);
+      add_dialect_radio (box, group, "Tab  ⇥", kind, s[2], FALSE, FALSE, NULL,
+                         app);
+      add_dialect_radio (box, group, "Pipe  |", kind, s[3], FALSE, FALSE, NULL,
+                         app);
+      add_dialect_radio (box, group, "Custom…", kind, 0, FALSE, TRUE, entry,
+                         app);
+    }
+  else
+    {
+      const guint8 *q = lsg_dialect_quote_candidates ();
+      group = add_dialect_radio (box, NULL, "Double  \"", kind, q[0], FALSE,
+                                 FALSE, NULL, app);
+      add_dialect_radio (box, group, "Single  '", kind, q[1], FALSE, FALSE,
+                         NULL, app);
+      add_dialect_radio (box, group, "None", kind, 0, TRUE, FALSE, NULL, app);
+      add_dialect_radio (box, group, "Custom…", kind, 0, FALSE, TRUE, entry,
+                         app);
+    }
+
+  gtk_box_append (GTK_BOX (box), entry);
+  gtk_popover_set_child (GTK_POPOVER (pop), box);
+  return pop;
+}
+
+/* -------- primary menu: Preferences / Keyboard Shortcuts / About --------- */
+
+static void
+add_shortcut_row (GtkWidget *group, const char *action, const char *accel)
+{
+  GtkWidget *row = adw_action_row_new ();
+  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (row), action);
+  GtkWidget *lbl = gtk_label_new (accel);
+  gtk_widget_add_css_class (lbl, "dim-label");
+  adw_action_row_add_suffix (ADW_ACTION_ROW (row), lbl);
+  adw_preferences_group_add (ADW_PREFERENCES_GROUP (group), row);
+}
+
+static void
+action_shortcuts (GSimpleAction *a, GVariant *p, gpointer data)
+{
+  (void)a;
+  (void)p;
+  App *app = data;
+  if (app->window == NULL)
+    return;
+  AdwDialog *dlg = ADW_DIALOG (adw_preferences_dialog_new ());
+  GtkWidget *page = adw_preferences_page_new ();
+  adw_preferences_page_set_title (ADW_PREFERENCES_PAGE (page),
+                                  "Keyboard Shortcuts");
+  adw_preferences_page_set_icon_name (ADW_PREFERENCES_PAGE (page),
+                                      "preferences-desktop-keyboard-symbolic");
+  GtkWidget *grp = adw_preferences_group_new ();
+  add_shortcut_row (grp, "Open file", "Ctrl+O");
+  add_shortcut_row (grp, "Open URL", "Ctrl+Shift+O");
+  add_shortcut_row (grp, "Find", "Ctrl+F");
+  add_shortcut_row (grp, "Jump to row", "Ctrl+G");
+  add_shortcut_row (grp, "Copy selection", "Ctrl+C");
+  add_shortcut_row (grp, "Preferences", "Ctrl+comma");
+  adw_preferences_page_add (ADW_PREFERENCES_PAGE (page),
+                            ADW_PREFERENCES_GROUP (grp));
+  adw_preferences_dialog_add (ADW_PREFERENCES_DIALOG (dlg),
+                              ADW_PREFERENCES_PAGE (page));
+  adw_dialog_present (dlg, GTK_WIDGET (app->window));
+}
+
+static void
+action_about (GSimpleAction *a, GVariant *p, gpointer data)
+{
+  (void)a;
+  (void)p;
+  App *app = data;
+  if (app->window == NULL)
+    return;
+  AdwDialog *about = ADW_DIALOG (adw_about_dialog_new ());
+  adw_about_dialog_set_application_name (ADW_ABOUT_DIALOG (about),
+                                         "less-sheet");
+  adw_about_dialog_set_application_icon (ADW_ABOUT_DIALOG (about),
+                                         "dev.lesssheet.Gtk");
+  adw_about_dialog_set_developer_name (ADW_ABOUT_DIALOG (about), "less-sheet");
+  adw_about_dialog_set_version (ADW_ABOUT_DIALOG (about), "0.0.0");
+  adw_about_dialog_set_comments (ADW_ABOUT_DIALOG (about),
+                                 "A fast viewer for large delimited files.");
+  adw_about_dialog_set_license_type (ADW_ABOUT_DIALOG (about),
+                                     GTK_LICENSE_MIT_X11);
+  adw_dialog_present (about, GTK_WIDGET (app->window));
+}
+
+static void
+action_preferences (GSimpleAction *a, GVariant *p, gpointer data)
+{
+  (void)a;
+  (void)p;
+  settings_present ((App *)data);
+}
+
+static GMenuModel *
+build_primary_menu (App *app)
+{
+  GSimpleActionGroup *grp = g_simple_action_group_new ();
+  const GActionEntry entries[] = {
+    { "preferences", action_preferences, NULL, NULL, NULL, { 0, 0, 0 } },
+    { "shortcuts", action_shortcuts, NULL, NULL, NULL, { 0, 0, 0 } },
+    { "about", action_about, NULL, NULL, NULL, { 0, 0, 0 } },
+  };
+  g_action_map_add_action_entries (G_ACTION_MAP (grp), entries,
+                                   G_N_ELEMENTS (entries), app);
+  gtk_widget_insert_action_group (GTK_WIDGET (app->window), "win",
+                                  G_ACTION_GROUP (grp));
+  g_object_unref (grp);
+
+  GMenu *menu = g_menu_new ();
+  g_menu_append (menu, "Preferences", "win.preferences");
+  g_menu_append (menu, "Keyboard Shortcuts", "win.shortcuts");
+  g_menu_append (menu, "About less-sheet", "win.about");
+  return G_MENU_MODEL (menu);
+}
+
+/* ========================================================================= */
+/* Preferences dialog: "Parsing" + "Columns" pages                           */
+/* ========================================================================= */
+
+static void
+on_prefs_closed (AdwDialog *dialog, gpointer data)
+{
+  (void)dialog;
+  App *app = data;
+  app->prefs = NULL;
+  app->prefs_header_row = NULL;
+  app->prefs_sep_row = NULL;
+  app->prefs_sep_custom = NULL;
+  app->prefs_quote_row = NULL;
+  app->prefs_quote_custom = NULL;
+  app->prefs_enc_row = NULL;
+  app->prefs_columns_group = NULL;
+  app->prefs_columns_search = NULL;
+  app->prefs_columns_status = NULL;
+  app->prefs_infer_row = NULL;
+}
+
+/* -------- Parsing page --------------------------------------------------- */
+
+static void
+on_parsing_header_active (GObject *row, GParamSpec *pspec, gpointer data)
+{
+  (void)pspec;
+  App *app = data;
+  if (app->dialect_ui_guard)
+    return;
+  dialect_apply_change (app,
+                        lsg_dialect_change_header (
+                            adw_switch_row_get_active (ADW_SWITCH_ROW (row))));
+}
+
+static void
+on_parsing_sep_selected (GObject *row, GParamSpec *pspec, gpointer data)
+{
+  (void)pspec;
+  App *app = data;
+  if (app->dialect_ui_guard)
+    return;
+  guint idx = adw_combo_row_get_selected (ADW_COMBO_ROW (row));
+  if (idx == 4) /* Custom… */
+    {
+      if (app->prefs_sep_custom != NULL)
+        {
+          gtk_widget_set_visible (app->prefs_sep_custom, TRUE);
+          gtk_widget_grab_focus (app->prefs_sep_custom);
+        }
+      return;
+    }
+  const guint8 *s = lsg_dialect_separator_candidates ();
+  if (idx < LSG_DIALECT_SEPARATOR_CANDIDATE_COUNT)
+    dialect_apply_change (app, lsg_dialect_change_separator (s[idx]));
+}
+
+static void
+on_parsing_quote_selected (GObject *row, GParamSpec *pspec, gpointer data)
+{
+  (void)pspec;
+  App *app = data;
+  if (app->dialect_ui_guard)
+    return;
+  guint idx = adw_combo_row_get_selected (ADW_COMBO_ROW (row));
+  const guint8 *q = lsg_dialect_quote_candidates ();
+  if (idx == 2) /* None */
+    dialect_apply_change (app, lsg_dialect_change_quote_none ());
+  else if (idx == 3) /* Custom… */
+    {
+      if (app->prefs_quote_custom != NULL)
+        {
+          gtk_widget_set_visible (app->prefs_quote_custom, TRUE);
+          gtk_widget_grab_focus (app->prefs_quote_custom);
+        }
+    }
+  else if (idx < LSG_DIALECT_QUOTE_CANDIDATE_COUNT)
+    dialect_apply_change (app, lsg_dialect_change_quote (q[idx]));
+}
+
+static void
+on_parsing_enc_selected (GObject *row, GParamSpec *pspec, gpointer data)
+{
+  (void)pspec;
+  App *app = data;
+  if (app->dialect_ui_guard)
+    return;
+  guint idx = adw_combo_row_get_selected (ADW_COMBO_ROW (row));
+  const LsgEncoding *opts = lsg_encoding_picker_options ();
+  if (idx < LSG_ENCODING_PICKER_OPTION_COUNT)
+    dialect_apply_change (app, lsg_dialect_change_encoding (opts[idx]));
+}
+
+static void
+on_parsing_sep_custom_apply (GtkWidget *entry, gpointer data)
+{
+  App *app = data;
+  guint8 b = 0;
+  if (lsg_dialect_parse_custom_byte (
+          gtk_editable_get_text (GTK_EDITABLE (entry)), &b))
+    dialect_apply_change (app, lsg_dialect_change_separator (b));
+}
+
+static void
+on_parsing_quote_custom_apply (GtkWidget *entry, gpointer data)
+{
+  App *app = data;
+  guint8 b = 0;
+  if (lsg_dialect_parse_custom_byte (
+          gtk_editable_get_text (GTK_EDITABLE (entry)), &b))
+    dialect_apply_change (app, lsg_dialect_change_quote (b));
+}
+
+static GtkWidget *
+build_parsing_page (App *app)
+{
+  GtkWidget *page = adw_preferences_page_new ();
+  adw_preferences_page_set_title (ADW_PREFERENCES_PAGE (page), "Parsing");
+  adw_preferences_page_set_icon_name (ADW_PREFERENCES_PAGE (page),
+                                      "document-properties-symbolic");
+
+  GtkWidget *grp = adw_preferences_group_new ();
+  adw_preferences_group_set_title (ADW_PREFERENCES_GROUP (grp),
+                                   "File parsing");
+
+  /* Header switch. */
+  GtkWidget *hdr = adw_switch_row_new ();
+  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (hdr),
+                                 "First row is a header");
+  app->prefs_header_row = hdr;
+  g_signal_connect (hdr, "notify::active",
+                    G_CALLBACK (on_parsing_header_active), app);
+  adw_preferences_group_add (ADW_PREFERENCES_GROUP (grp), hdr);
+
+  /* Separator combo + custom entry. */
+  GtkWidget *sep = adw_combo_row_new ();
+  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (sep), "Field separator");
+  const char *sep_items[]
+      = { "Comma", "Semicolon", "Tab", "Pipe", "Custom…", NULL };
+  combo_set_items (sep, sep_items);
+  app->prefs_sep_row = sep;
+  g_signal_connect (sep, "notify::selected",
+                    G_CALLBACK (on_parsing_sep_selected), app);
+  adw_preferences_group_add (ADW_PREFERENCES_GROUP (grp), sep);
+
+  GtkWidget *sepc = adw_entry_row_new ();
+  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (sepc),
+                                 "Custom separator (one character)");
+  gtk_widget_set_visible (sepc, FALSE);
+  app->prefs_sep_custom = sepc;
+  g_signal_connect (sepc, "apply", G_CALLBACK (on_parsing_sep_custom_apply),
+                    app);
+  adw_preferences_group_add (ADW_PREFERENCES_GROUP (grp), sepc);
+
+  /* Quote combo + custom entry. */
+  GtkWidget *quote = adw_combo_row_new ();
+  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (quote),
+                                 "Quote character");
+  const char *q_items[]
+      = { "Double quote", "Single quote", "None", "Custom…", NULL };
+  combo_set_items (quote, q_items);
+  app->prefs_quote_row = quote;
+  g_signal_connect (quote, "notify::selected",
+                    G_CALLBACK (on_parsing_quote_selected), app);
+  adw_preferences_group_add (ADW_PREFERENCES_GROUP (grp), quote);
+
+  GtkWidget *quotec = adw_entry_row_new ();
+  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (quotec),
+                                 "Custom quote (one character)");
+  gtk_widget_set_visible (quotec, FALSE);
+  app->prefs_quote_custom = quotec;
+  g_signal_connect (quotec, "apply",
+                    G_CALLBACK (on_parsing_quote_custom_apply), app);
+  adw_preferences_group_add (ADW_PREFERENCES_GROUP (grp), quotec);
+
+  /* Encoding combo. */
+  GtkWidget *enc = adw_combo_row_new ();
+  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (enc), "Text encoding");
+  const char *enc_items[]
+      = { "Automatic",  "UTF-8",        "UTF-16 LE", "UTF-16 BE",
+          "ISO-8859-1", "Windows-1252", NULL };
+  combo_set_items (enc, enc_items);
+  app->prefs_enc_row = enc;
+  g_signal_connect (enc, "notify::selected",
+                    G_CALLBACK (on_parsing_enc_selected), app);
+  adw_preferences_group_add (ADW_PREFERENCES_GROUP (grp), enc);
+
+  adw_preferences_page_add (ADW_PREFERENCES_PAGE (page),
+                            ADW_PREFERENCES_GROUP (grp));
+
+  if (app->doc != NULL)
+    {
+      LsgDialect d = lsg_document_dialect (app->doc);
+      app->dialect_ui_guard = TRUE;
+      parsing_page_sync (app, d);
+      app->dialect_ui_guard = FALSE;
+    }
+  return page;
+}
+
+/* -------- Columns page --------------------------------------------------- */
+
+/* Repaint the grid after a column mutation (F13 — the GTK REPAINT-FAMILY
+ * analog: a synchronous poke, never wait for scroll). */
+static void
+column_repaint (App *app)
+{
+  grid_materialize (app);
+  gtk_widget_queue_draw (GTK_WIDGET (app->area));
+}
+
+/* Map a type combo index to a kind (0 == Auto). */
+static ls_column_type_kind
+type_index_to_kind (guint idx)
+{
+  switch (idx)
+    {
+    case 1:
+      return LS_COLUMN_TYPE_TEXT;
+    case 2:
+      return LS_COLUMN_TYPE_BOOLEAN;
+    case 3:
+      return LS_COLUMN_TYPE_INTEGER;
+    case 4:
+      return LS_COLUMN_TYPE_DECIMAL;
+    case 5:
+      return LS_COLUMN_TYPE_DATE;
+    case 6:
+      return LS_COLUMN_TYPE_DATETIME;
+    default:
+      return LS_COLUMN_TYPE_UNKNOWN; /* Auto */
+    }
+}
+
+static guint
+kind_to_type_index (ls_column_type_kind kind)
+{
+  switch (kind)
+    {
+    case LS_COLUMN_TYPE_TEXT:
+      return 1;
+    case LS_COLUMN_TYPE_BOOLEAN:
+      return 2;
+    case LS_COLUMN_TYPE_INTEGER:
+      return 3;
+    case LS_COLUMN_TYPE_DECIMAL:
+      return 4;
+    case LS_COLUMN_TYPE_DATE:
+      return 5;
+    case LS_COLUMN_TYPE_DATETIME:
+      return 6;
+    default:
+      return 0;
+    }
+}
+
+static guint32
+col_of (GtkWidget *w)
+{
+  return (guint32)GPOINTER_TO_UINT (
+      g_object_get_data (G_OBJECT (w), "lsg-col"));
+}
+
+/* Re-apply the column's type override (or clear it) from its user settings. */
+static void
+column_apply_type (App *app, guint32 col)
+{
+  LsgColumnUserSettings *s = &app->col_settings[col];
+  if (s->has_override)
+    {
+      ls_column_type t = lsg_column_override_type (
+          (ls_column_type_kind)s->override.kind,
+          (ls_column_datetime_semantics)s->override.datetime_semantics);
+      lsg_document_column_override_set (app->doc, col, &t);
+    }
+  else
+    lsg_document_column_override_clear (app->doc, col);
+  column_cache_effective (app, col);
+}
+
+static void
+on_col_visibility (GtkCheckButton *check, gpointer data)
+{
+  App *app = data;
+  if (app->dialect_ui_guard)
+    return;
+  guint32 col = col_of (GTK_WIDGET (check));
+  if (col < app->n_cols)
+    {
+      app->col_settings[col].hidden = !gtk_check_button_get_active (check);
+      column_repaint (app);
+    }
+}
+
+static void
+on_col_type (GObject *row, GParamSpec *pspec, gpointer data)
+{
+  (void)pspec;
+  App *app = data;
+  if (app->dialect_ui_guard)
+    return;
+  guint32 col = col_of (GTK_WIDGET (row));
+  if (col >= app->n_cols)
+    return;
+  guint idx = adw_combo_row_get_selected (ADW_COMBO_ROW (row));
+  ls_column_type_kind kind = type_index_to_kind (idx);
+  LsgColumnUserSettings *s = &app->col_settings[col];
+  if (kind == LS_COLUMN_TYPE_UNKNOWN)
+    {
+      s->has_override = FALSE;
+    }
+  else
+    {
+      s->has_override = TRUE;
+      s->override = lsg_column_override_type (
+          kind, (kind == LS_COLUMN_TYPE_DATETIME) ? LS_COLUMN_DATETIME_NAIVE
+                                                  : LS_COLUMN_DATETIME_NONE);
+    }
+  column_apply_type (app, col);
+  /* Reveal/hide the datetime-semantics + format rows for the new kind. */
+  GtkWidget *expander
+      = gtk_widget_get_ancestor (GTK_WIDGET (row), ADW_TYPE_EXPANDER_ROW);
+  if (expander != NULL)
+    column_row_sync (app, expander, col);
+  column_repaint (app);
+}
+
+static void
+on_col_datetime_sem (GObject *row, GParamSpec *pspec, gpointer data)
+{
+  (void)pspec;
+  App *app = data;
+  if (app->dialect_ui_guard)
+    return;
+  guint32 col = col_of (GTK_WIDGET (row));
+  if (col >= app->n_cols)
+    return;
+  LsgColumnUserSettings *s = &app->col_settings[col];
+  if (!s->has_override || s->override.kind != LS_COLUMN_TYPE_DATETIME)
+    return;
+  guint idx = adw_combo_row_get_selected (ADW_COMBO_ROW (row));
+  ls_column_datetime_semantics sem
+      = (idx == 1) ? LS_COLUMN_DATETIME_ZONED : LS_COLUMN_DATETIME_NAIVE;
+  s->override = lsg_column_override_type (LS_COLUMN_TYPE_DATETIME, sem);
+  column_apply_type (app, col);
+  column_repaint (app);
+}
+
+static void
+on_col_grouping (GObject *row, GParamSpec *pspec, gpointer data)
+{
+  (void)pspec;
+  App *app = data;
+  if (app->dialect_ui_guard)
+    return;
+  guint32 col = col_of (GTK_WIDGET (row));
+  if (col < app->n_cols)
+    {
+      app->col_settings[col].format.grouping
+          = adw_switch_row_get_active (ADW_SWITCH_ROW (row));
+      column_repaint (app);
+    }
+}
+
+static void
+on_col_has_fraction (GObject *row, GParamSpec *pspec, gpointer data)
+{
+  (void)pspec;
+  App *app = data;
+  if (app->dialect_ui_guard)
+    return;
+  guint32 col = col_of (GTK_WIDGET (row));
+  if (col < app->n_cols)
+    {
+      app->col_settings[col].format.has_fraction_digits
+          = adw_switch_row_get_active (ADW_SWITCH_ROW (row));
+      column_repaint (app);
+    }
+}
+
+static void
+on_col_fraction_value (GtkAdjustment *adj, gpointer data)
+{
+  App *app = g_object_get_data (G_OBJECT (adj), "lsg-app");
+  (void)data;
+  if (app == NULL || app->dialect_ui_guard)
+    return;
+  guint32 col = (guint32)GPOINTER_TO_UINT (
+      g_object_get_data (G_OBJECT (adj), "lsg-col"));
+  if (col < app->n_cols)
+    {
+      app->col_settings[col].format.fraction_digits
+          = (gint)gtk_adjustment_get_value (adj);
+      column_repaint (app);
+    }
+}
+
+static void
+on_col_date_preset (GObject *row, GParamSpec *pspec, gpointer data)
+{
+  (void)pspec;
+  App *app = data;
+  if (app->dialect_ui_guard)
+    return;
+  guint32 col = col_of (GTK_WIDGET (row));
+  if (col < app->n_cols)
+    {
+      app->col_settings[col].format.date_preset
+          = (LsgDatePreset)adw_combo_row_get_selected (ADW_COMBO_ROW (row));
+      column_repaint (app);
+    }
+}
+
+static void
+on_col_null_enabled (GObject *row, GParamSpec *pspec, gpointer data)
+{
+  (void)pspec;
+  App *app = data;
+  if (app->dialect_ui_guard)
+    return;
+  guint32 col = col_of (GTK_WIDGET (row));
+  if (col >= app->n_cols)
+    return;
+  LsgColumnUserSettings *s = &app->col_settings[col];
+  if (adw_switch_row_get_active (ADW_SWITCH_ROW (row)))
+    {
+      s->has_null_sentinel = TRUE;
+      lsg_document_column_null_sentinel_set (
+          app->doc, col, s->null_sentinel_len ? s->null_sentinel : NULL,
+          s->null_sentinel_len);
+    }
+  else
+    {
+      s->has_null_sentinel = FALSE;
+      lsg_document_column_null_sentinel_clear (app->doc, col);
+    }
+  column_cache_effective (app, col);
+  column_repaint (app);
+}
+
+static void
+on_col_null_value_apply (GtkWidget *entry, gpointer data)
+{
+  App *app = data;
+  guint32 col = col_of (entry);
+  if (col >= app->n_cols)
+    return;
+  LsgColumnUserSettings *s = &app->col_settings[col];
+  const char *text = gtk_editable_get_text (GTK_EDITABLE (entry));
+  gsize len = (text != NULL) ? strlen (text) : 0;
+  if (len > LS_COLUMN_SENTINEL_MAX_BYTES)
+    len = LS_COLUMN_SENTINEL_MAX_BYTES;
+  memcpy (s->null_sentinel, (text != NULL) ? text : "", len);
+  s->null_sentinel_len = len;
+  s->has_null_sentinel = TRUE;
+  lsg_document_column_null_sentinel_set (app->doc, col,
+                                         len ? s->null_sentinel : NULL, len);
+  column_cache_effective (app, col);
+  column_repaint (app);
+}
+
+static void
+on_col_width_value (GtkAdjustment *adj, gpointer data)
+{
+  App *app = g_object_get_data (G_OBJECT (adj), "lsg-app");
+  (void)data;
+  if (app == NULL || app->dialect_ui_guard)
+    return;
+  guint32 col = (guint32)GPOINTER_TO_UINT (
+      g_object_get_data (G_OBJECT (adj), "lsg-col"));
+  if (col < app->n_cols)
+    {
+      app->col_settings[col].has_manual_width = TRUE;
+      app->col_settings[col].manual_width = gtk_adjustment_get_value (adj);
+      app->col_widths[col] = gtk_adjustment_get_value (adj);
+      grid_update_hadjustment (app);
+      column_repaint (app);
+    }
+}
+
+static void
+on_col_reset (GtkButton *btn, gpointer data)
+{
+  App *app = data;
+  guint32 col = col_of (GTK_WIDGET (btn));
+  if (col >= app->n_cols)
+    return;
+  app->col_settings[col] = lsg_column_user_settings_default ();
+  lsg_document_column_override_clear (app->doc, col);
+  lsg_document_column_null_sentinel_clear (app->doc, col);
+  column_cache_effective (app, col);
+  column_repaint (app);
+  columns_group_rebuild (app); /* re-reflect every control from the reset */
+}
+
+static void
+on_col_expanded (GObject *expander, GParamSpec *pspec, gpointer data)
+{
+  (void)pspec;
+  App *app = data;
+  if (app->dialect_ui_guard)
+    return;
+  if (!adw_expander_row_get_expanded (ADW_EXPANDER_ROW (expander)))
+    return;
+  /* Auto-collapse the previously-open row (F11: at most one usefully open). */
+  GtkWidget *grp = app->prefs_columns_group;
+  if (grp == NULL)
+    return;
+  app->dialect_ui_guard = TRUE;
+  /* Iterate the group's rows and collapse the others. AdwPreferencesGroup has
+   * no child iterator; walk via the shared expander list stored on the group.
+   */
+  GPtrArray *rows = g_object_get_data (G_OBJECT (grp), "lsg-rows");
+  if (rows != NULL)
+    for (guint i = 0; i < rows->len; i++)
+      {
+        GtkWidget *e = g_ptr_array_index (rows, i);
+        if (e != (GtkWidget *)expander)
+          adw_expander_row_set_expanded (ADW_EXPANDER_ROW (e), FALSE);
+      }
+  app->dialect_ui_guard = FALSE;
+}
+
+/* Reflect the datetime-semantics + format rows' visibility for the current
+ * effective/override kind of `col`. */
+static void
+column_row_sync (App *app, GtkWidget *expander, guint32 col)
+{
+  ls_column_type_kind kind
+      = app->col_settings[col].has_override
+            ? (ls_column_type_kind)app->col_settings[col].override.kind
+            : app->col_kind[col];
+  gboolean is_num
+      = (kind == LS_COLUMN_TYPE_INTEGER || kind == LS_COLUMN_TYPE_DECIMAL);
+  gboolean is_dec = (kind == LS_COLUMN_TYPE_DECIMAL);
+  gboolean is_date
+      = (kind == LS_COLUMN_TYPE_DATE || kind == LS_COLUMN_TYPE_DATETIME);
+  gboolean is_dt = (kind == LS_COLUMN_TYPE_DATETIME);
+
+  GtkWidget *w;
+  if ((w = g_object_get_data (G_OBJECT (expander), "row-datetime")) != NULL)
+    gtk_widget_set_visible (w, is_dt);
+  if ((w = g_object_get_data (G_OBJECT (expander), "row-grouping")) != NULL)
+    gtk_widget_set_visible (w, is_num);
+  if ((w = g_object_get_data (G_OBJECT (expander), "row-hasfrac")) != NULL)
+    gtk_widget_set_visible (w, is_dec);
+  if ((w = g_object_get_data (G_OBJECT (expander), "row-frac")) != NULL)
+    gtk_widget_set_visible (w, is_dec);
+  if ((w = g_object_get_data (G_OBJECT (expander), "row-datepreset")) != NULL)
+    gtk_widget_set_visible (w, is_date);
+}
+
+/* Build one column's inline expander-row inspector (F11). */
+static GtkWidget *
+build_column_row (App *app, guint32 col)
+{
+  column_cache_effective (app, col);
+  LsgColumnUserSettings *s = &app->col_settings[col];
+
+  char *label = lsg_document_header_cell_dup (app->doc, col);
+  char *title;
+  if (label != NULL && label[0] != '\0')
+    title = g_strdup (label);
+  else
+    {
+      char *gn = lsg_column_generic_name (col);
+      title = g_strdup_printf ("%s (#%u)", gn, col + 1);
+      g_free (gn);
+    }
+  g_free (label);
+
+  GtkWidget *exp = adw_expander_row_new ();
+  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (exp), title);
+  g_free (title);
+  g_object_set_data (G_OBJECT (exp), "lsg-col", GUINT_TO_POINTER (col));
+
+  /* Visibility check as the row prefix. */
+  GtkWidget *vis = gtk_check_button_new ();
+  gtk_check_button_set_active (GTK_CHECK_BUTTON (vis), !s->hidden);
+  gtk_widget_set_valign (vis, GTK_ALIGN_CENTER);
+  gtk_widget_set_tooltip_text (vis, "Visible");
+  g_object_set_data (G_OBJECT (vis), "lsg-col", GUINT_TO_POINTER (col));
+  g_signal_connect (vis, "toggled", G_CALLBACK (on_col_visibility), app);
+  adw_expander_row_add_prefix (ADW_EXPANDER_ROW (exp), vis);
+
+  /* Type. */
+  GtkWidget *type = adw_combo_row_new ();
+  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (type), "Type");
+  const char *type_items[] = { "Auto",    "Text", "Boolean",     "Integer",
+                               "Decimal", "Date", "Date & time", NULL };
+  combo_set_items (type, type_items);
+  adw_combo_row_set_selected (
+      ADW_COMBO_ROW (type),
+      s->has_override
+          ? kind_to_type_index ((ls_column_type_kind)s->override.kind)
+          : 0);
+  g_object_set_data (G_OBJECT (type), "lsg-col", GUINT_TO_POINTER (col));
+  g_signal_connect (type, "notify::selected", G_CALLBACK (on_col_type), app);
+  adw_expander_row_add_row (ADW_EXPANDER_ROW (exp), type);
+
+  /* Guessed-type read-out. */
+  GtkWidget *guessed = adw_action_row_new ();
+  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (guessed),
+                                 "Detected type");
+  {
+    static const char *kn[]
+        = { "Unknown", "Unsupported", "Text", "Boolean",
+            "Integer", "Decimal",     "Date", "Date & time" };
+    guint ki = (guint)app->col_kind[col];
+    adw_action_row_set_subtitle (ADW_ACTION_ROW (guessed),
+                                 (ki < G_N_ELEMENTS (kn)) ? kn[ki]
+                                                          : "Unknown");
+  }
+  adw_expander_row_add_row (ADW_EXPANDER_ROW (exp), guessed);
+
+  /* Datetime semantics. */
+  GtkWidget *dtsem = adw_combo_row_new ();
+  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (dtsem),
+                                 "Date-time zone");
+  const char *dt_items[] = { "Naive (no zone)", "With time zone", NULL };
+  combo_set_items (dtsem, dt_items);
+  adw_combo_row_set_selected (
+      ADW_COMBO_ROW (dtsem),
+      (s->has_override
+       && s->override.datetime_semantics == LS_COLUMN_DATETIME_ZONED)
+          ? 1
+          : 0);
+  g_object_set_data (G_OBJECT (dtsem), "lsg-col", GUINT_TO_POINTER (col));
+  g_signal_connect (dtsem, "notify::selected",
+                    G_CALLBACK (on_col_datetime_sem), app);
+  g_object_set_data (G_OBJECT (exp), "row-datetime", dtsem);
+  adw_expander_row_add_row (ADW_EXPANDER_ROW (exp), dtsem);
+
+  /* Number grouping. */
+  GtkWidget *grouping = adw_switch_row_new ();
+  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (grouping),
+                                 "Thousands grouping");
+  adw_switch_row_set_active (ADW_SWITCH_ROW (grouping), s->format.grouping);
+  g_object_set_data (G_OBJECT (grouping), "lsg-col", GUINT_TO_POINTER (col));
+  g_signal_connect (grouping, "notify::active", G_CALLBACK (on_col_grouping),
+                    app);
+  g_object_set_data (G_OBJECT (exp), "row-grouping", grouping);
+  adw_expander_row_add_row (ADW_EXPANDER_ROW (exp), grouping);
+
+  /* Fixed fraction digits (decimal only). */
+  GtkWidget *hasfrac = adw_switch_row_new ();
+  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (hasfrac),
+                                 "Fixed fraction digits");
+  adw_switch_row_set_active (ADW_SWITCH_ROW (hasfrac),
+                             s->format.has_fraction_digits);
+  g_object_set_data (G_OBJECT (hasfrac), "lsg-col", GUINT_TO_POINTER (col));
+  g_signal_connect (hasfrac, "notify::active",
+                    G_CALLBACK (on_col_has_fraction), app);
+  g_object_set_data (G_OBJECT (exp), "row-hasfrac", hasfrac);
+  adw_expander_row_add_row (ADW_EXPANDER_ROW (exp), hasfrac);
+
+  GtkWidget *frac = adw_spin_row_new_with_range (
+      0.0, (double)LSG_COLUMN_FRACTION_DIGITS_MAX, 1.0);
+  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (frac),
+                                 "Fraction digits");
+  adw_spin_row_set_value (
+      ADW_SPIN_ROW (frac),
+      s->format.has_fraction_digits ? (double)s->format.fraction_digits : 2.0);
+  {
+    GtkAdjustment *adj = adw_spin_row_get_adjustment (ADW_SPIN_ROW (frac));
+    g_object_set_data (G_OBJECT (adj), "lsg-app", app);
+    g_object_set_data (G_OBJECT (adj), "lsg-col", GUINT_TO_POINTER (col));
+    g_signal_connect (adj, "value-changed", G_CALLBACK (on_col_fraction_value),
+                      NULL);
+  }
+  g_object_set_data (G_OBJECT (exp), "row-frac", frac);
+  adw_expander_row_add_row (ADW_EXPANDER_ROW (exp), frac);
+
+  /* Date preset (date / datetime only). */
+  GtkWidget *dpreset = adw_combo_row_new ();
+  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (dpreset), "Date format");
+  const char *dp_items[] = { "Original", "Short", "Medium", "Long", NULL };
+  combo_set_items (dpreset, dp_items);
+  adw_combo_row_set_selected (ADW_COMBO_ROW (dpreset),
+                              (guint)s->format.date_preset);
+  g_object_set_data (G_OBJECT (dpreset), "lsg-col", GUINT_TO_POINTER (col));
+  g_signal_connect (dpreset, "notify::selected",
+                    G_CALLBACK (on_col_date_preset), app);
+  g_object_set_data (G_OBJECT (exp), "row-datepreset", dpreset);
+  adw_expander_row_add_row (ADW_EXPANDER_ROW (exp), dpreset);
+
+  /* Null sentinel. */
+  GtkWidget *nullen = adw_switch_row_new ();
+  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (nullen),
+                                 "Treat a value as null");
+  adw_switch_row_set_active (ADW_SWITCH_ROW (nullen), s->has_null_sentinel);
+  g_object_set_data (G_OBJECT (nullen), "lsg-col", GUINT_TO_POINTER (col));
+  g_signal_connect (nullen, "notify::active", G_CALLBACK (on_col_null_enabled),
+                    app);
+  adw_expander_row_add_row (ADW_EXPANDER_ROW (exp), nullen);
+
+  GtkWidget *nullval = adw_entry_row_new ();
+  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (nullval),
+                                 "Null value (exact text)");
+  if (s->has_null_sentinel && s->null_sentinel_len > 0)
+    {
+      char *v = lsg_utf8_sanitize_dup (s->null_sentinel, s->null_sentinel_len);
+      gtk_editable_set_text (GTK_EDITABLE (nullval), v);
+      g_free (v);
+    }
+  g_object_set_data (G_OBJECT (nullval), "lsg-col", GUINT_TO_POINTER (col));
+  g_signal_connect (nullval, "apply", G_CALLBACK (on_col_null_value_apply),
+                    app);
+  adw_expander_row_add_row (ADW_EXPANDER_ROW (exp), nullval);
+
+  /* Width + auto-fit + reset. */
+  double cur_w = (col < app->n_cols && app->col_widths[col] > 0.0)
+                     ? app->col_widths[col]
+                     : 100.0;
+  GtkWidget *width = adw_spin_row_new_with_range (30.0, 800.0, 5.0);
+  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (width), "Column width");
+  adw_spin_row_set_value (ADW_SPIN_ROW (width), cur_w);
+  {
+    GtkAdjustment *adj = adw_spin_row_get_adjustment (ADW_SPIN_ROW (width));
+    g_object_set_data (G_OBJECT (adj), "lsg-app", app);
+    g_object_set_data (G_OBJECT (adj), "lsg-col", GUINT_TO_POINTER (col));
+    g_signal_connect (adj, "value-changed", G_CALLBACK (on_col_width_value),
+                      NULL);
+  }
+  adw_expander_row_add_row (ADW_EXPANDER_ROW (exp), width);
+
+  GtkWidget *reset = gtk_button_new_with_label ("Reset to Auto");
+  gtk_widget_add_css_class (reset, "flat");
+  gtk_widget_set_margin_top (reset, 6);
+  gtk_widget_set_margin_bottom (reset, 6);
+  gtk_widget_set_margin_start (reset, 6);
+  gtk_widget_set_margin_end (reset, 6);
+  g_object_set_data (G_OBJECT (reset), "lsg-col", GUINT_TO_POINTER (col));
+  g_signal_connect (reset, "clicked", G_CALLBACK (on_col_reset), app);
+  adw_expander_row_add_row (ADW_EXPANDER_ROW (exp), reset);
+
+  g_signal_connect (exp, "notify::expanded", G_CALLBACK (on_col_expanded),
+                    app);
+
+  column_row_sync (app, exp, col); /* hide the rows irrelevant to the kind */
+  return exp;
+}
+
+static void
+on_columns_search_changed (GtkEditable *entry, gpointer data)
+{
+  (void)entry;
+  App *app = data;
+  columns_group_rebuild (app);
+}
+
+/* (Re)populate the Columns page's per-column group from the discovery mode +
+ * current search (O(<=10) rows — N2). */
+static void
+columns_group_rebuild (App *app)
+{
+  GtkWidget *grp = app->prefs_columns_group;
+  if (grp == NULL || app->doc == NULL)
+    return;
+
+  /* Drop the previous rows. */
+  GPtrArray *rows = g_object_get_data (G_OBJECT (grp), "lsg-rows");
+  if (rows != NULL)
+    {
+      for (guint i = 0; i < rows->len; i++)
+        adw_preferences_group_remove (ADW_PREFERENCES_GROUP (grp),
+                                      g_ptr_array_index (rows, i));
+      g_ptr_array_set_size (rows, 0);
+    }
+  else
+    {
+      rows = g_ptr_array_new ();
+      g_object_set_data_full (G_OBJECT (grp), "lsg-rows", rows,
+                              (GDestroyNotify)g_ptr_array_unref);
+    }
+
+  LsgColumnDiscoveryMode mode = lsg_column_discovery_mode (app->n_cols);
+  const char *status = NULL;
+
+  if (mode == LSG_COLUMN_DISCOVERY_SEARCH_ONLY)
+    gtk_widget_set_visible (app->prefs_columns_search, TRUE);
+  else
+    gtk_widget_set_visible (app->prefs_columns_search, FALSE);
+
+  if (mode == LSG_COLUMN_DISCOVERY_EMPTY)
+    {
+      status = "This document has no columns.";
+    }
+  else if (mode == LSG_COLUMN_DISCOVERY_FULL_LIST)
+    {
+      for (guint32 c = 0; c < app->n_cols; c++)
+        {
+          GtkWidget *row = build_column_row (app, c);
+          adw_preferences_group_add (ADW_PREFERENCES_GROUP (grp), row);
+          g_ptr_array_add (rows, row);
+        }
+    }
+  else /* SEARCH_ONLY */
+    {
+      const char *q = (app->prefs_columns_search != NULL)
+                          ? gtk_editable_get_text (
+                                GTK_EDITABLE (app->prefs_columns_search))
+                          : "";
+      LsgColumnDirectAddress a
+          = lsg_column_resolve_direct_address (q, app->n_cols);
+      if (a.kind == LSG_COLUMN_ADDRESS_RESOLVED)
+        {
+          GtkWidget *row = build_column_row (app, a.column);
+          adw_preferences_group_add (ADW_PREFERENCES_GROUP (grp), row);
+          g_ptr_array_add (rows, row);
+        }
+      else if (a.kind == LSG_COLUMN_ADDRESS_NO_SUCH_COLUMN)
+        {
+          status = "No such column.";
+        }
+      else if (q == NULL || q[0] == '\0')
+        {
+          status = "Search by name, or type #N for a column number.";
+        }
+      else
+        {
+          /* Label substring search, in bounded batches, retaining <=10. */
+          LsgColumnMatchAccumulation acc = lsg_column_match_initial ();
+          guint32 done = 0;
+          while (done < app->n_cols && !lsg_column_match_stop (acc))
+            {
+              guint32 batch = MIN ((guint32)LSG_COLUMN_LABEL_BATCH_MAX,
+                                   app->n_cols - done);
+              guint32 *ids = g_new (guint32, batch);
+              for (guint32 i = 0; i < batch; i++)
+                ids[i] = done + i;
+              ls_column_result r = LS_COLUMN_INVALID_ARGUMENT;
+              LsgColumnLabel *labels = lsg_document_column_labels_copy_many (
+                  app->doc, ids, batch, &r);
+              if (labels == NULL || r != LS_COLUMN_OK)
+                {
+                  g_free (ids);
+                  if (labels != NULL)
+                    lsg_column_labels_free (labels, batch);
+                  break;
+                }
+              LsgColumnLabelCandidate *cands
+                  = g_new0 (LsgColumnLabelCandidate, batch);
+              char **strs = g_new0 (char *, batch);
+              for (guint32 i = 0; i < batch; i++)
+                {
+                  cands[i].column = ids[i];
+                  if (labels[i].present && labels[i].len > 0)
+                    {
+                      strs[i] = lsg_utf8_sanitize_dup (labels[i].bytes,
+                                                       labels[i].len);
+                      cands[i].label = strs[i];
+                    }
+                  else
+                    cands[i].label = NULL; /* generic-name fallback */
+                }
+              acc = lsg_column_match_accumulate (acc, q, cands, batch);
+              for (guint32 i = 0; i < batch; i++)
+                g_free (strs[i]);
+              g_free (strs);
+              g_free (cands);
+              g_free (ids);
+              lsg_column_labels_free (labels, batch);
+              done += batch;
+            }
+
+          for (guint i = 0; i < acc.n_retained; i++)
+            {
+              GtkWidget *row = build_column_row (app, acc.retained[i]);
+              adw_preferences_group_add (ADW_PREFERENCES_GROUP (grp), row);
+              g_ptr_array_add (rows, row);
+            }
+          if (acc.n_retained == 0)
+            status = "No matching columns.";
+          else if (acc.overflow)
+            status = "More matches — refine your search.";
+        }
+    }
+
+  if (app->prefs_columns_status != NULL)
+    {
+      if (status != NULL)
+        {
+          adw_preferences_row_set_title (
+              ADW_PREFERENCES_ROW (app->prefs_columns_status), status);
+          gtk_widget_set_visible (app->prefs_columns_status, TRUE);
+        }
+      else
+        gtk_widget_set_visible (app->prefs_columns_status, FALSE);
+    }
+}
+
+static void
+on_show_all_columns (GtkButton *btn, gpointer data)
+{
+  (void)btn;
+  App *app = data;
+  for (guint32 c = 0; c < app->n_cols; c++)
+    app->col_settings[c].hidden = FALSE;
+  column_repaint (app);
+  columns_group_rebuild (app);
+}
+
+static GtkWidget *
+build_columns_page (App *app)
+{
+  GtkWidget *page = adw_preferences_page_new ();
+  adw_preferences_page_set_title (ADW_PREFERENCES_PAGE (page), "Columns");
+  adw_preferences_page_set_icon_name (ADW_PREFERENCES_PAGE (page),
+                                      "view-column-symbolic");
+
+  /* Discovery search (shown only in search-only mode). */
+  GtkWidget *search_grp = adw_preferences_group_new ();
+  GtkWidget *search = adw_entry_row_new ();
+  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (search),
+                                 "Search columns (name or #N)");
+  app->prefs_columns_search = search;
+  g_signal_connect (search, "changed", G_CALLBACK (on_columns_search_changed),
+                    app);
+  adw_preferences_group_add (ADW_PREFERENCES_GROUP (search_grp), search);
+
+  GtkWidget *status = adw_action_row_new ();
+  gtk_widget_set_visible (status, FALSE);
+  app->prefs_columns_status = status;
+  adw_preferences_group_add (ADW_PREFERENCES_GROUP (search_grp), status);
+  adw_preferences_page_add (ADW_PREFERENCES_PAGE (page),
+                            ADW_PREFERENCES_GROUP (search_grp));
+
+  /* The per-column rows group. */
+  GtkWidget *grp = adw_preferences_group_new ();
+  adw_preferences_group_set_title (ADW_PREFERENCES_GROUP (grp), "Columns");
+  app->prefs_columns_group = grp;
+  adw_preferences_page_add (ADW_PREFERENCES_PAGE (page),
+                            ADW_PREFERENCES_GROUP (grp));
+
+  /* Show All + inference progress. */
+  GtkWidget *tools = adw_preferences_group_new ();
+  GtkWidget *show_all = adw_action_row_new ();
+  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (show_all),
+                                 "Show all columns");
+  GtkWidget *sa_btn = gtk_button_new_with_label ("Show All");
+  gtk_widget_set_valign (sa_btn, GTK_ALIGN_CENTER);
+  g_signal_connect (sa_btn, "clicked", G_CALLBACK (on_show_all_columns), app);
+  adw_action_row_add_suffix (ADW_ACTION_ROW (show_all), sa_btn);
+  adw_preferences_group_add (ADW_PREFERENCES_GROUP (tools), show_all);
+
+  GtkWidget *infer = adw_action_row_new ();
+  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (infer),
+                                 "Type detection runs for shown columns");
+  app->prefs_infer_row = infer;
+  adw_preferences_group_add (ADW_PREFERENCES_GROUP (tools), infer);
+  adw_preferences_page_add (ADW_PREFERENCES_PAGE (page),
+                            ADW_PREFERENCES_GROUP (tools));
+
+  columns_group_rebuild (app);
+  return page;
+}
+
+static void
+settings_present (App *app)
+{
+  if (app->doc == NULL || app->window == NULL)
+    return;
+  AdwDialog *dlg = ADW_DIALOG (adw_preferences_dialog_new ());
+  app->prefs = dlg;
+  adw_preferences_dialog_add (ADW_PREFERENCES_DIALOG (dlg),
+                              ADW_PREFERENCES_PAGE (build_parsing_page (app)));
+  adw_preferences_dialog_add (ADW_PREFERENCES_DIALOG (dlg),
+                              ADW_PREFERENCES_PAGE (build_columns_page (app)));
+  g_signal_connect (dlg, "closed", G_CALLBACK (on_prefs_closed), app);
+  adw_dialog_present (dlg, GTK_WIDGET (app->window));
 }
 
 /* Build the single window once (idempotent). Shared by "activate" (no file)
@@ -3188,7 +4974,7 @@ ensure_window (App *app, GtkApplication *gtk_app)
   build_find_popover (app);
   gtk_menu_button_set_popover (GTK_MENU_BUTTON (find_btn),
                                GTK_WIDGET (app->find_popover));
-  adw_header_bar_pack_end (ADW_HEADER_BAR (header), find_btn);
+  /* Packed at the end in the signed order (see below). */
 
   /* Jump-to-row: a menu button whose popover is the jump UI (Ctrl+G / Ctrl+L,
    * or type a digit on the grid). Its icon is the custom macOS-style jump
@@ -3212,25 +4998,63 @@ ensure_window (App *app, GtkApplication *gtk_app)
   build_jump_popover (app);
   gtk_menu_button_set_popover (GTK_MENU_BUTTON (jump_btn),
                                GTK_WIDGET (app->jump_popover));
-  adw_header_bar_pack_end (ADW_HEADER_BAR (header), jump_btn);
+  /* Packed at the end in the signed order (see below). */
 
-  /* Copy affordance: a header-bar Copy button (Ctrl+C on the grid also works),
-   * sensitive only when there is a selection. */
-  GtkWidget *copy_btn = gtk_button_new_from_icon_name ("edit-copy-symbolic");
-  gtk_widget_set_tooltip_text (copy_btn, "Copy selection (Ctrl+C)");
-  gtk_widget_set_sensitive (copy_btn, FALSE);
-  app->copy_button = GTK_BUTTON (copy_btn);
-  g_signal_connect (copy_btn, "clicked", G_CALLBACK (on_copy_button_clicked),
-                    app);
-  adw_header_bar_pack_start (ADW_HEADER_BAR (header), copy_btn);
+  /* Copy button is DROPPED (F15): Ctrl+C on the grid still copies the
+   * selection (on_key_pressed -> do_copy); only the bar button is removed.
+   * app->copy_button stays NULL (copy_update_affordance is NULL-guarded). */
+
+  /* Dialect quick-controls (F3): a header toggle + separator ▾ + quote ▾, all
+   * driving the ONE lsg_dialect_compose funnel and reflecting the effective
+   * report (kept in sync by dialect_sync_quick_controls after every open). */
+  GtkWidget *hdr_toggle = gtk_toggle_button_new ();
+  gtk_button_set_icon_name (GTK_BUTTON (hdr_toggle), "view-list-symbolic");
+  gtk_widget_set_tooltip_text (hdr_toggle, "First row is a header");
+  app->header_toggle = GTK_TOGGLE_BUTTON (hdr_toggle);
+  g_signal_connect (hdr_toggle, "toggled",
+                    G_CALLBACK (on_header_toggle_toggled), app);
+
+  GtkWidget *sep_btn = gtk_menu_button_new ();
+  gtk_menu_button_set_label (GTK_MENU_BUTTON (sep_btn), "Separator");
+  gtk_widget_set_tooltip_text (sep_btn, "Field separator");
+  app->sep_button = GTK_MENU_BUTTON (sep_btn);
+  gtk_menu_button_set_popover (
+      GTK_MENU_BUTTON (sep_btn),
+      GTK_WIDGET (build_dialect_dropdown_popover (app, DIALECT_KIND_SEP)));
+
+  GtkWidget *quote_btn = gtk_menu_button_new ();
+  gtk_menu_button_set_label (GTK_MENU_BUTTON (quote_btn), "Quote");
+  gtk_widget_set_tooltip_text (quote_btn, "Quote character");
+  app->quote_button = GTK_MENU_BUTTON (quote_btn);
+  gtk_menu_button_set_popover (
+      GTK_MENU_BUTTON (quote_btn),
+      GTK_WIDGET (build_dialect_dropdown_popover (app, DIALECT_KIND_QUOTE)));
+
+  /* Settings gear: the primary menu (Preferences + Keyboard Shortcuts +
+   * About). */
+  GtkWidget *settings_btn = gtk_menu_button_new ();
+  gtk_menu_button_set_icon_name (GTK_MENU_BUTTON (settings_btn),
+                                 "open-menu-symbolic");
+  gtk_widget_set_tooltip_text (settings_btn, "Main menu");
+  GMenuModel *primary = build_primary_menu (app);
+  gtk_menu_button_set_menu_model (GTK_MENU_BUTTON (settings_btn), primary);
+  g_object_unref (primary); /* the button holds its own ref */
 
   /* Reusable header-bar progress (determinate bar + inline cancel) for long
-   * ops; hidden until a copy (or a future scan/network op) drives it. */
+   * ops; hidden until a copy / network op drives it. */
   build_header_progress (app);
-  adw_header_bar_pack_end (ADW_HEADER_BAR (header), app->hp_box);
 
-  /* Network-open progress now uses the unified header-bar progress above (no
-   * separate net banner). */
+  /* Signed right-side layout (E). pack_end is right-anchored (first packed =
+   * rightmost), so pack in reverse of the L-to-R order
+   * [Find][Jump][Header][Separator ▾][Quote ▾][Settings]; the progress box
+   * sits leftmost of the group, next to the title. */
+  adw_header_bar_pack_end (ADW_HEADER_BAR (header), settings_btn);
+  adw_header_bar_pack_end (ADW_HEADER_BAR (header), quote_btn);
+  adw_header_bar_pack_end (ADW_HEADER_BAR (header), sep_btn);
+  adw_header_bar_pack_end (ADW_HEADER_BAR (header), hdr_toggle);
+  adw_header_bar_pack_end (ADW_HEADER_BAR (header), jump_btn);
+  adw_header_bar_pack_end (ADW_HEADER_BAR (header), find_btn);
+  adw_header_bar_pack_end (ADW_HEADER_BAR (header), app->hp_box);
 
   app->stack = GTK_STACK (gtk_stack_new ());
   gtk_widget_set_vexpand (GTK_WIDGET (app->stack), TRUE);
@@ -3255,10 +5079,15 @@ ensure_window (App *app, GtkApplication *gtk_app)
   gtk_box_append (GTK_BOX (content), GTK_WIDGET (app->filter_banner));
   gtk_box_append (GTK_BOX (content), GTK_WIDGET (app->stack));
 
+  /* Toast overlay for the header-change + column-reset notices (F3 / F7). */
+  GtkWidget *toasts = adw_toast_overlay_new ();
+  app->toasts = ADW_TOAST_OVERLAY (toasts);
+  adw_toast_overlay_set_child (ADW_TOAST_OVERLAY (toasts), content);
+
   GtkWidget *toolbar = adw_toolbar_view_new ();
   app->toolbar = ADW_TOOLBAR_VIEW (toolbar);
   adw_toolbar_view_add_top_bar (ADW_TOOLBAR_VIEW (toolbar), header);
-  adw_toolbar_view_set_content (ADW_TOOLBAR_VIEW (toolbar), content);
+  adw_toolbar_view_set_content (ADW_TOOLBAR_VIEW (toolbar), toasts);
 
   adw_application_window_set_content (ADW_APPLICATION_WINDOW (win), toolbar);
 }
@@ -3327,6 +5156,10 @@ main (int argc, char *argv[])
     g_source_remove (app.jump_reject_id);
   find_clear_mask (&app);
   g_clear_pointer (&app.pending_url, g_free);
+  g_clear_pointer (&app.doc_path, g_free);
+  g_clear_pointer (&app.reopen_snapshot, g_free);
+  if (app.reopen_old_labels != NULL)
+    lsg_column_labels_free (app.reopen_old_labels, app.reopen_n_old_labels);
   g_clear_pointer (&app.vadj, g_object_unref);
   g_clear_pointer (&app.hadj, g_object_unref);
   pango_font_description_free (app.font_desc);

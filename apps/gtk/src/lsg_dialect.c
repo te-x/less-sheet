@@ -62,37 +62,110 @@ lsg_dialect_change_encoding (LsgEncoding encoding)
 }
 
 /* ------------------------------------------------------------------------- */
-/* Compose + validate (SEED: always reject — no re-open)                     */
+/* Compose + validate (F1 carry-forward + F2 validation)                     */
 /* ------------------------------------------------------------------------- */
+
+/* A forced separator/quote byte must be ASCII 0x01..0x7F and neither CR nor
+ * LF (0x0D / 0x0A both fall inside the ASCII range, so they are excluded
+ * explicitly). Catches an out-of-domain "Custom…" byte. */
+static gboolean
+valid_dialect_byte (guint8 byte)
+{
+  return byte >= 0x01 && byte <= 0x7F && byte != 0x0D && byte != 0x0A;
+}
 
 LsgDialectCompose
 lsg_dialect_compose (LsgDialect report, LsgDialectChange change)
 {
-  (void)report;
-  (void)change;
   LsgDialectCompose out = { 0 };
-  out.accepted = FALSE; /* SEED: reject every change */
+  out.accepted = FALSE;
+
+  /* CARRY-FORWARD: each parameter starts from its effective FORCED value, or
+   * LS_SNIFF / LS_ENCODING_AUTO to be re-sniffed / re-detected on the re-open.
+   * A forced-disabled quote carries LS_QUOTE_NONE. */
+  ls_open_options o;
+  o.separator = report.separator_forced ? (int32_t)report.separator : LS_SNIFF;
+  if (report.quote_forced)
+    o.quote = report.has_quote ? (int32_t)report.quote : LS_QUOTE_NONE;
+  else
+    o.quote = LS_SNIFF;
+  o.header = report.header_forced
+                 ? (report.header ? LS_HEADER_ON : LS_HEADER_OFF)
+                 : LS_SNIFF;
+  o.index_mode = LS_INDEX_AUTO;
+  o.encoding
+      = report.encoding_forced ? (int32_t)report.encoding : LS_ENCODING_AUTO;
+
+  /* Apply the change as the forced value of ITS parameter, validating (F2). A
+   * separator/quote collision is checked against the CARRIED FORCED byte of
+   * the other; equalling a merely SNIFFED byte is accepted (the re-open
+   * re-sniffs the other and excludes the conflict). */
+  switch (change.kind)
+    {
+    case LSG_DIALECT_CHANGE_SEPARATOR:
+      if (!valid_dialect_byte (change.separator))
+        return out;
+      if (report.quote_forced && report.has_quote
+          && (guint8)report.quote == change.separator)
+        return out; /* collides with the carried forced quote */
+      o.separator = (int32_t)change.separator;
+      break;
+
+    case LSG_DIALECT_CHANGE_QUOTE:
+      if (change.quote_none)
+        {
+          o.quote = LS_QUOTE_NONE; /* disabling quoting is always valid */
+          break;
+        }
+      if (!valid_dialect_byte (change.quote))
+        return out;
+      if (report.separator_forced && (guint8)report.separator == change.quote)
+        return out; /* collides with the carried forced separator */
+      o.quote = (int32_t)change.quote;
+      break;
+
+    case LSG_DIALECT_CHANGE_HEADER:
+      o.header = change.header_on ? LS_HEADER_ON : LS_HEADER_OFF;
+      break;
+
+    case LSG_DIALECT_CHANGE_ENCODING:
+      /* Encoding never touches the dialect bytes; always accepted. */
+      o.encoding = (int32_t)change.encoding;
+      break;
+
+    default:
+      return out;
+    }
+
+  out.accepted = TRUE;
+  out.options = o;
   return out;
 }
 
 gboolean
 lsg_dialect_parse_custom_byte (const char *text, guint8 *out_byte)
 {
-  (void)text;
-  (void)out_byte;
-  return FALSE; /* SEED: never accept a custom byte */
+  if (text == NULL || text[0] == '\0')
+    return FALSE; /* NULL / empty */
+  if (text[1] != '\0')
+    return FALSE; /* > 1 byte (incl. a multi-byte UTF-8 codepoint) */
+  guint8 b = (guint8)text[0];
+  if (!valid_dialect_byte (b))
+    return FALSE; /* out of 0x01..0x7F, or CR / LF */
+  *out_byte = b;
+  return TRUE;
 }
 
 /* ------------------------------------------------------------------------- */
-/* Header re-anchor shift (SEED: never shift)                                */
+/* Header re-anchor shift (F5)                                               */
 /* ------------------------------------------------------------------------- */
 
 gint
 lsg_dialect_header_shift (gboolean old_header, gboolean new_header)
 {
-  (void)old_header;
-  (void)new_header;
-  return 0; /* SEED: always 0 */
+  if (old_header == new_header)
+    return 0;
+  return new_header ? -1 : +1; /* header ON => -1, header OFF => +1 */
 }
 
 /* ------------------------------------------------------------------------- */
@@ -128,13 +201,15 @@ lsg_encoding_picker_options (void)
 LsgEncoding
 lsg_encoding_picker_selection (LsgDialect report)
 {
-  (void)report;
-  return LSG_ENCODING_AUTO; /* SEED: always Automatic */
+  /* The forced encoding when forced, else Automatic (detection chose the
+   * resolved value). */
+  return report.encoding_forced ? (LsgEncoding)report.encoding
+                                : LSG_ENCODING_AUTO;
 }
 
 LsgEncoding
 lsg_encoding_picker_detected (LsgDialect report)
 {
-  (void)report;
-  return LSG_ENCODING_AUTO; /* SEED: never reports the resolved encoding */
+  /* Always the report's concrete resolved encoding (never AUTO). */
+  return (LsgEncoding)report.encoding;
 }

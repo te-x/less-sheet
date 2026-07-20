@@ -708,22 +708,188 @@ lsg_column_format_options_auto (void)
 gboolean
 lsg_column_format_options_is_auto (LsgColumnFormatOptions options)
 {
-  (void)options;
-  return FALSE; /* SEED: never reports Auto */
+  /* Auto == the source spelling for every kind: no grouping, no fixed
+   * fraction, Original date preset (the fraction-digit VALUE is irrelevant
+   * when has_fraction_digits is FALSE). */
+  return !options.grouping && !options.has_fraction_digits
+         && options.date_preset == LSG_DATE_PRESET_ORIGINAL;
 }
+
+static LsgDisplay
+original (const char *raw)
+{
+  return make_display (LSG_DISPLAY_ORIGINAL,
+                       g_strdup (raw != NULL ? raw : ""));
+}
+
+/* ------------------------------------------------------------------------- */
+/* Date / datetime preset formatting via GDateTime (F14)                     */
+/* ------------------------------------------------------------------------- */
+
+/* Two ASCII digits at s[0..1] -> value (the caller has kind-gated the span).
+ */
+static int
+two_digits (const char *s)
+{
+  return (s[0] - '0') * 10 + (s[1] - '0');
+}
+
+/* Build the GDateTime for a datetime `raw` already gated to the wanted
+ * semantics. NAIVE holds its wall clock in UTC (no offset shown); ZONED is
+ * held in its SOURCE offset (never converted to the system zone). Returns NULL
+ * on an unexpected parse failure. */
+static GDateTime *
+build_datetime (const char *raw, gboolean zoned)
+{
+  int y = (raw[0] - '0') * 1000 + (raw[1] - '0') * 100 + (raw[2] - '0') * 10
+          + (raw[3] - '0');
+  int mo = two_digits (raw + 5);
+  int dy = two_digits (raw + 8);
+  int hh = two_digits (raw + 11);
+  int mm = two_digits (raw + 14);
+  int ss = two_digits (raw + 17);
+
+  /* Skip an optional fractional-seconds run; the localized presets render at
+   * whole-second resolution (parity with the macOS presets). */
+  gsize i = 19;
+  gsize len = strlen (raw);
+  if (i < len && raw[i] == '.')
+    {
+      i++;
+      while (i < len && is_digit (raw[i]))
+        i++;
+    }
+
+  GTimeZone *tz = NULL;
+  if (zoned && i < len)
+    {
+      if (raw[i] == 'Z')
+        tz = g_time_zone_new_utc ();
+      else /* an explicit "+HH:MM" / "-HH:MM" offset identifier */
+        tz = g_time_zone_new_identifier (raw + i);
+    }
+  if (tz == NULL)
+    tz = g_time_zone_new_utc (); /* NAIVE wall clock, or a defensive fallback
+                                  */
+
+  GDateTime *dt = g_date_time_new (tz, y, mo, dy, hh, mm, (gdouble)ss);
+  g_time_zone_unref (tz);
+  return dt;
+}
+
+static char *
+format_date_preset (GDateTime *dt, LsgDatePreset preset)
+{
+  switch (preset)
+    {
+    case LSG_DATE_PRESET_LOCALIZED_SHORT:
+      return g_date_time_format (dt, "%x");
+    case LSG_DATE_PRESET_LOCALIZED_MEDIUM:
+      return g_date_time_format (dt, "%b %e, %Y");
+    case LSG_DATE_PRESET_LOCALIZED_LONG:
+      return g_date_time_format (dt, "%A, %B %e, %Y");
+    default:
+      return NULL; /* ORIGINAL handled by the caller */
+    }
+}
+
+static char *
+format_datetime_preset (GDateTime *dt, gboolean zoned, LsgDatePreset preset)
+{
+  switch (preset)
+    {
+    case LSG_DATE_PRESET_LOCALIZED_SHORT:
+      return g_date_time_format (dt, zoned ? "%x %H:%M %:z" : "%x %H:%M");
+    case LSG_DATE_PRESET_LOCALIZED_MEDIUM:
+      return g_date_time_format (dt, zoned ? "%b %e, %Y, %H:%M:%S %:z"
+                                           : "%b %e, %Y, %H:%M:%S");
+    case LSG_DATE_PRESET_LOCALIZED_LONG:
+      return g_date_time_format (dt, zoned ? "%A, %B %e, %Y, %H:%M:%S %:z"
+                                           : "%A, %B %e, %Y, %H:%M:%S");
+    default:
+      return NULL;
+    }
+}
+
+/* ------------------------------------------------------------------------- */
+/* The type+options dispatcher (F14)                                         */
+/* ------------------------------------------------------------------------- */
 
 LsgDisplay
 lsg_format_cell (const char *raw, ls_column_type_kind kind,
                  ls_column_datetime_semantics semantics,
                  LsgColumnFormatOptions options, LsgLocaleGlyphs glyphs)
 {
-  (void)kind;
-  (void)semantics;
-  (void)options;
-  (void)glyphs;
-  /* SEED: never formats — always the raw spelling. The real dispatcher gates
-   * on lsg_scalar_kind + the effective type + the options and delegates to the
-   * lossless number formatters / GDateTime presets. */
-  return make_display (LSG_DISPLAY_ORIGINAL,
-                       g_strdup (raw != NULL ? raw : ""));
+  /* Empty cell OR Auto options -> the source spelling for EVERY kind. */
+  if (raw == NULL || raw[0] == '\0'
+      || lsg_column_format_options_is_auto (options))
+    return original (raw);
+
+  switch (kind)
+    {
+    case LS_COLUMN_TYPE_INTEGER:
+      /* Only a grouping request on an integer-kind value formats; a decimal-
+       * spelled value under an integer column is a kind mismatch -> raw. */
+      if (options.grouping && lsg_scalar_kind (raw) == LSG_KIND_INTEGER)
+        return lsg_format_integer (raw, TRUE, glyphs);
+      return original (raw);
+
+    case LS_COLUMN_TYPE_DECIMAL:
+      {
+        if (lsg_scalar_kind (raw) != LSG_KIND_DECIMAL)
+          return original (raw); /* integer-spelled / non-numeric -> raw */
+        if (options.has_fraction_digits
+            && (options.fraction_digits < 0
+                || options.fraction_digits > LSG_COLUMN_FRACTION_DIGITS_MAX))
+          return unavailable (raw); /* out-of-range request, never a lie */
+        if (options.grouping || options.has_fraction_digits)
+          return lsg_format_decimal (
+              raw, options.grouping,
+              options.has_fraction_digits ? options.fraction_digits : -1,
+              glyphs);
+        return original (raw); /* no control set */
+      }
+
+    case LS_COLUMN_TYPE_DATE:
+      {
+        if (options.date_preset == LSG_DATE_PRESET_ORIGINAL
+            || lsg_scalar_kind (raw) != LSG_KIND_DATE)
+          return original (raw);
+        int y = (raw[0] - '0') * 1000 + (raw[1] - '0') * 100
+                + (raw[2] - '0') * 10 + (raw[3] - '0');
+        int mo = two_digits (raw + 5);
+        int dy = two_digits (raw + 8);
+        GDateTime *dt = g_date_time_new_utc (y, mo, dy, 0, 0, 0);
+        if (dt == NULL)
+          return original (raw);
+        char *text = format_date_preset (dt, options.date_preset);
+        g_date_time_unref (dt);
+        if (text == NULL)
+          return original (raw);
+        return make_display (LSG_DISPLAY_FORMATTED, text);
+      }
+
+    case LS_COLUMN_TYPE_DATETIME:
+      {
+        LsgScalarKind want = (semantics == LS_COLUMN_DATETIME_ZONED)
+                                 ? LSG_KIND_DATETIME_ZONED
+                                 : LSG_KIND_DATETIME_NAIVE;
+        if (options.date_preset == LSG_DATE_PRESET_ORIGINAL
+            || lsg_scalar_kind (raw) != want)
+          return original (raw);
+        gboolean zoned = (semantics == LS_COLUMN_DATETIME_ZONED);
+        GDateTime *dt = build_datetime (raw, zoned);
+        if (dt == NULL)
+          return original (raw);
+        char *text = format_datetime_preset (dt, zoned, options.date_preset);
+        g_date_time_unref (dt);
+        if (text == NULL)
+          return original (raw);
+        return make_display (LSG_DISPLAY_FORMATTED, text);
+      }
+
+    default:
+      /* TEXT / BOOLEAN / UNKNOWN / UNSUPPORTED — no v1 format controls. */
+      return original (raw);
+    }
 }
