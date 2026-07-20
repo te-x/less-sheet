@@ -2313,6 +2313,14 @@ build_find_popover (App *app)
   GtkWidget *stack = gtk_stack_new ();
   gtk_stack_set_transition_type (GTK_STACK (stack),
                                  GTK_STACK_TRANSITION_TYPE_NONE);
+  /* Each page sizes to ITS OWN content: a homogeneous stack would stretch
+   * the small Text search entry to the width AND height of the larger Where
+   * builder page. With homogeneity off the Text page stays a compact entry
+   * and the popover grows only when switched to Where; interpolate-size
+   * makes that grow smooth. */
+  gtk_stack_set_hhomogeneous (GTK_STACK (stack), FALSE);
+  gtk_stack_set_vhomogeneous (GTK_STACK (stack), FALSE);
+  gtk_stack_set_interpolate_size (GTK_STACK (stack), TRUE);
   app->find_stack = GTK_STACK (stack);
   GtkWidget *switcher = gtk_stack_switcher_new ();
   gtk_stack_switcher_set_stack (GTK_STACK_SWITCHER (switcher),
@@ -3187,14 +3195,19 @@ filter_poll_fold (App *app)
   gboolean has = lsg_document_filter_poll (app->doc, &snap);
   app->filter = lsg_filter_resolved (app->filter, has, snap);
   update_title_subtitle (app);
-  /* The filtered row count m grows as the scan advances (row_estimate is
-   * already refreshed at the top of the poll tick); re-materialize so the
-   * widening view paints. */
-  if (app->filter.snapshot.phase == LSG_FILTER_PHASE_SCANNING)
-    {
-      grid_materialize (app);
-      gtk_widget_queue_draw (GTK_WIDGET (app->area));
-    }
+  /* The filtered row count m grows as the scan advances AND jumps to its
+   * final value on the SCANNING->DONE transition; the poll STOPS right after
+   * total_exact latches (grid_poll_tick keeps ticking only while
+   * !total_exact), so the DONE fold is the LAST chance to paint the completed
+   * set. A phase==SCANNING guard here dropped that final repaint: a fast
+   * local scan finishing before the first ~100 ms tick left the grid frozen
+   * on the near-empty apply-time window until a manual click forced a redraw.
+   * Re-materialize on EVERY fold (O(viewport), matcher-independent) so both
+   * the widening view and the final batch paint with no click — the GTK
+   * analog of the macOS REPAINT-FAMILY rule (a mutation with no scroll defers
+   * its draw -> drive a synchronous repaint). */
+  grid_materialize (app);
+  gtk_widget_queue_draw (GTK_WIDGET (app->area));
 }
 
 static void
