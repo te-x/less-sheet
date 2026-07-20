@@ -8,7 +8,8 @@
  * materialize/keep-polling decision), lsg_net_open (the network-open drive),
  * lsg_formatter (the lossless cell formatter). main.c owns only the
  * AdwApplicationWindow + AdwHeaderBar chrome, the launch / error
- * AdwStatusPages, the AdwBanner for network progress, and the custom grid: a
+ * AdwStatusPages, the header-bar progress widget for long-op / network status,
+ * and the custom grid: a
  * GtkDrawingArea painted with Cairo + Pango, driven by a hand-managed
  * GtkAdjustment + GtkScrollbar, materializing ONLY the visible window (+
  * scroll buffer) via lsg_document_set_window — never O(file).
@@ -137,10 +138,11 @@ typedef struct
                                  * an incidental autohide (FALSE) keeps a
                                  * live deep/net scan alive so it lands. */
 
-  /* Filter-to-matches (slice 4): the pure state + the toggle + the banner. */
+  /* Filter-to-matches (slice 4): the pure state + the toggle. The passive
+   * "Filtered — N of M rows" status is shown in the header-bar subtitle
+   * (update_title_subtitle), not a full-width banner. */
   LsgFilterState filter;
   GtkToggleButton *filter_toggle;
-  AdwBanner *filter_banner;
   gboolean filter_ui_guard; /* re-entrancy guard for programmatic toggle */
 
   /* Network doc (http_range): the core is DEMAND-DRIVEN — a bare ls_window_set
@@ -302,7 +304,7 @@ static void find_poll_fold (App *app);
  * jump helpers below; the poll loop calls it while a jump is scanning. */
 static void jump_poll_fold (App *app);
 
-/* Poll the core filter slot, fold it, and refresh the banner + grid. Defined
+/* Poll the core filter slot, fold it, and refresh the subtitle + grid. Defined
  * with the filter helpers below; the poll loop calls it while filtered. */
 static void filter_poll_fold (App *app);
 
@@ -334,7 +336,7 @@ static void header_progress_hide (App *app);
 static void on_filter_toggled (GtkToggleButton *toggle, gpointer data);
 static void filter_update_toggle_sensitivity (App *app);
 
-/* Sync the filter toggle + banner to state; called after opening a document
+/* Sync the filter toggle + subtitle to state; called after opening a document
  * (the reset cleared any prior filter). Defined with the filter helpers. */
 static void filter_sync_ui (App *app);
 
@@ -656,18 +658,48 @@ grid_materialize (App *app)
   app->window_short = (lsg_window_row_count (nw) < span.row_count);
 }
 
+/* The header-bar subtitle is the ONE passive-status line (single source of
+ * truth): the "Filtered — N of M rows" status when a filter owns the view,
+ * otherwise the document's row count. Everything is re-derived from `app`
+ * state, so every caller (open, poll tick, filter apply/clear/poll) funnels
+ * through here. Replaces the old full-width filter AdwBanner. */
 static void
-grid_update_title_counts (App *app, LsgRowCount rc, LsgScanProgress prog)
+update_title_subtitle (App *app)
 {
+  if (app->title == NULL || app->doc == NULL)
+    return;
+
   char *sub;
-  if (rc.exact)
-    sub = g_strdup_printf ("%" G_GUINT64_FORMAT " rows", rc.count);
+  LsgFilterBanner b;
+  if (app->filter.active && lsg_filter_banner (app->filter, &b))
+    {
+      const char *tilde = b.document_rows_estimated ? "~" : "";
+      if (b.is_empty_result)
+        sub = g_strdup ("Filtered — no matching rows");
+      else if (b.has_progress)
+        sub = g_strdup_printf ("Filtered — %" G_GUINT64_FORMAT
+                               " of %s%" G_GUINT64_FORMAT " rows · %d%%",
+                               b.matching, tilde, b.document_rows,
+                               (int)(b.progress * 100.0));
+      else
+        sub = g_strdup_printf ("Filtered — %" G_GUINT64_FORMAT
+                               " of %s%" G_GUINT64_FORMAT " rows",
+                               b.matching, tilde, b.document_rows);
+    }
   else
     {
-      double frac = lsg_scan_progress_fraction (prog);
-      sub = g_strdup_printf ("~%" G_GUINT64_FORMAT " rows · indexing %d%%",
-                             rc.count, (int)(frac * 100.0));
+      LsgRowCount rc = lsg_document_row_count (app->doc);
+      if (rc.exact)
+        sub = g_strdup_printf ("%" G_GUINT64_FORMAT " rows", rc.count);
+      else
+        {
+          LsgScanProgress prog = lsg_document_index_progress (app->doc);
+          double frac = lsg_scan_progress_fraction (prog);
+          sub = g_strdup_printf ("~%" G_GUINT64_FORMAT " rows · indexing %d%%",
+                                 rc.count, (int)(frac * 100.0));
+        }
     }
+
   adw_window_title_set_subtitle (app->title, sub);
   g_free (sub);
 }
@@ -701,7 +733,7 @@ grid_poll_tick (gpointer data)
       gtk_widget_queue_draw (GTK_WIDGET (app->area));
     }
 
-  grid_update_title_counts (app, rc, prog);
+  update_title_subtitle (app);
 
   /* Keep polling (and folding search snapshots) while a find is active, so its
    * live count grows, its landing scrolls into view, and the highlight mask
@@ -722,7 +754,7 @@ grid_poll_tick (gpointer data)
         keep = TRUE;
     }
 
-  /* Keep ticking while a filter-scan is not yet final (the "N of M" banner
+  /* Keep ticking while a filter-scan is not yet final (the "N of M" subtitle
    * grows and the grid materializes the widening filtered view). Under
    * LS_INDEX_AUTO a CANCELLED scan (a jump/find took the slot) auto-resumes to
    * DONE without caller input, so `!total_exact` is more robust than `phase ==
@@ -1149,7 +1181,7 @@ open_document (App *app, LsgDocument *doc, const char *title,
 
   adw_window_title_set_title (app->title,
                               (title != NULL) ? title : "less-sheet");
-  grid_update_title_counts (app, rc, lsg_document_index_progress (doc));
+  update_title_subtitle (app);
 
   gtk_stack_set_visible_child_name (app->stack, "grid");
   grid_materialize (app);
@@ -2548,7 +2580,7 @@ build_dialect_button_child (const char *category, GtkLabel **out_glyph)
 }
 
 /* ------------------------------------------------------------------------- */
-/* Filter-to-matches (slice 4): the toggle + banner over lsg_filter */
+/* Filter-to-matches (slice 4): the toggle + subtitle status over lsg_filter */
 /* ------------------------------------------------------------------------- */
 
 /* The toggle may turn ON only when the current find draft is filterable
@@ -2568,40 +2600,6 @@ filter_update_toggle_sensitivity (App *app)
                             app->doc != NULL && can);
 }
 
-/* Render the "Filtered — N of M rows" AdwBanner from the pure banner model, or
- * hide it in the identity view. */
-static void
-filter_update_banner (App *app)
-{
-  if (app->filter_banner == NULL)
-    return;
-  LsgFilterBanner b;
-  if (!lsg_filter_banner (app->filter, &b))
-    {
-      adw_banner_set_revealed (app->filter_banner, FALSE);
-      return;
-    }
-
-  const char *tilde = b.document_rows_estimated ? "~" : "";
-  char *text;
-  if (b.is_empty_result)
-    text = g_strdup ("Filtered — no matching rows");
-  else if (b.has_progress)
-    text = g_strdup_printf ("Filtered — %" G_GUINT64_FORMAT
-                            " of %s%" G_GUINT64_FORMAT " rows · %d%%",
-                            b.matching, tilde, b.document_rows,
-                            (int)(b.progress * 100.0));
-  else
-    text = g_strdup_printf ("Filtered — %" G_GUINT64_FORMAT
-                            " of %s%" G_GUINT64_FORMAT " rows",
-                            b.matching, tilde, b.document_rows);
-
-  adw_banner_set_title (app->filter_banner, text);
-  adw_banner_set_button_label (app->filter_banner, "Clear");
-  adw_banner_set_revealed (app->filter_banner, TRUE);
-  g_free (text);
-}
-
 static void
 filter_set_toggle (App *app, gboolean active)
 {
@@ -2612,14 +2610,14 @@ filter_set_toggle (App *app, gboolean active)
   app->filter_ui_guard = FALSE;
 }
 
-/* Sync the whole filter UI (toggle position + sensitivity + banner) to state.
- */
+/* Sync the whole filter UI (toggle position + sensitivity + subtitle) to
+ * state. */
 static void
 filter_sync_ui (App *app)
 {
   filter_set_toggle (app, app->filter.active);
   filter_update_toggle_sensitivity (app);
-  filter_update_banner (app);
+  update_title_subtitle (app);
 }
 
 /* Capture the ORIGINAL row number of the top visible (filtered) row, so the
@@ -2686,7 +2684,7 @@ do_apply_filter (App *app)
       return;
     }
 
-  /* The guaranteed non-idle post-set poll makes the banner correct
+  /* The guaranteed non-idle post-set poll makes the subtitle correct
    * immediately. */
   LsgFilterSnapshot snap = { LSG_FILTER_PHASE_SCANNING, 0.0, 0, FALSE };
   lsg_document_filter_poll (app->doc, &snap);
@@ -2707,7 +2705,7 @@ do_apply_filter (App *app)
    * view is not empty (a bare ls_window_set fetched nothing). No-op on a local
    * doc. */
   net_drive_begin (app, 0);
-  filter_update_banner (app);
+  update_title_subtitle (app);
   filter_update_toggle_sensitivity (app);
   ensure_poll (app);
 }
@@ -2720,7 +2718,7 @@ do_clear_filter (App *app)
   if (app->doc == NULL || !app->filter.active)
     {
       app->filter = lsg_filter_cleared (app->filter); /* no-op */
-      filter_update_banner (app);
+      update_title_subtitle (app);
       return;
     }
 
@@ -2738,11 +2736,11 @@ do_clear_filter (App *app)
   app->jump = lsg_jump_initial ();
 
   filter_rebuild_grid (app, restore); /* identity view, re-anchored */
-  filter_update_banner (app);
+  update_title_subtitle (app);
   filter_update_toggle_sensitivity (app);
 }
 
-/* Forward-declared above; fold one filter poll into the banner + grid. */
+/* Forward-declared above; fold one filter poll into the subtitle + grid. */
 static void
 filter_poll_fold (App *app)
 {
@@ -2751,7 +2749,7 @@ filter_poll_fold (App *app)
   LsgFilterSnapshot snap;
   gboolean has = lsg_document_filter_poll (app->doc, &snap);
   app->filter = lsg_filter_resolved (app->filter, has, snap);
-  filter_update_banner (app);
+  update_title_subtitle (app);
   /* The filtered row count m grows as the scan advances (row_estimate is
    * already refreshed at the top of the poll tick); re-materialize so the
    * widening view paints. */
@@ -2772,16 +2770,6 @@ on_filter_toggled (GtkToggleButton *toggle, gpointer data)
     do_apply_filter (app);
   else
     do_clear_filter (app);
-}
-
-static void
-on_filter_banner_clear (AdwBanner *banner, gpointer data)
-{
-  (void)banner;
-  App *app = data;
-  /* Route through the toggle (fires on_filter_toggled -> do_clear_filter). */
-  if (app->filter_toggle != NULL)
-    gtk_toggle_button_set_active (app->filter_toggle, FALSE);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -5564,20 +5552,13 @@ ensure_window (App *app, GtkApplication *gtk_app)
 
   gtk_stack_set_visible_child_name (app->stack, "launch");
 
-  /* Filter banner ("Filtered — N of M rows", with a Clear affordance). */
-  app->filter_banner = ADW_BANNER (adw_banner_new (""));
-  adw_banner_set_revealed (app->filter_banner, FALSE);
-  g_signal_connect (app->filter_banner, "button-clicked",
-                    G_CALLBACK (on_filter_banner_clear), app);
-
-  GtkWidget *content = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
-  gtk_box_append (GTK_BOX (content), GTK_WIDGET (app->filter_banner));
-  gtk_box_append (GTK_BOX (content), GTK_WIDGET (app->stack));
-
-  /* Toast overlay for the header-change + column-reset notices (F3 / F7). */
+  /* Toast overlay for the header-change + column-reset notices (F3 / F7). The
+   * passive filter status lives in the header-bar subtitle, so the stack is
+   * the overlay's sole child (no full-width status banner above it). */
   GtkWidget *toasts = adw_toast_overlay_new ();
   app->toasts = ADW_TOAST_OVERLAY (toasts);
-  adw_toast_overlay_set_child (ADW_TOAST_OVERLAY (toasts), content);
+  adw_toast_overlay_set_child (ADW_TOAST_OVERLAY (toasts),
+                               GTK_WIDGET (app->stack));
 
   GtkWidget *toolbar = adw_toolbar_view_new ();
   app->toolbar = ADW_TOOLBAR_VIEW (toolbar);
