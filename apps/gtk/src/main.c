@@ -3684,6 +3684,55 @@ quote_short_label (gboolean has_quote, guint8 b)
     }
 }
 
+/* Header-bar quick-control button labels: the GLYPH ONLY (compact). A custom
+ * byte (validated ASCII 0x01..0x7F by the compose funnel) renders as its
+ * literal character; a disabled quote renders as the ∅ "none" marker. The
+ * returned pointer is either a string literal or a module-static one-char
+ * buffer — read immediately (main thread), never stored. */
+static const char *
+sep_glyph (guint8 b)
+{
+  switch (b)
+    {
+    case ',':
+      return ",";
+    case ';':
+      return ";";
+    case '\t':
+      return "⇥";
+    case '|':
+      return "|";
+    default:
+      {
+        static char buf[2];
+        buf[0] = (char)b;
+        buf[1] = '\0';
+        return buf;
+      }
+    }
+}
+
+static const char *
+quote_glyph (gboolean has_quote, guint8 b)
+{
+  if (!has_quote)
+    return "∅";
+  switch (b)
+    {
+    case '"':
+      return "\"";
+    case '\'':
+      return "'";
+    default:
+      {
+        static char buf[2];
+        buf[0] = (char)b;
+        buf[1] = '\0';
+        return buf;
+      }
+    }
+}
+
 /* Reflect the effective dialect into the open Parsing page (guarded so the
  * programmatic set never re-enters the compose funnel). */
 static void
@@ -3766,10 +3815,10 @@ dialect_sync_quick_controls (App *app)
   if (app->header_toggle != NULL)
     gtk_toggle_button_set_active (app->header_toggle, d.header);
   if (app->sep_button != NULL)
-    gtk_menu_button_set_label (app->sep_button, sep_short_label (d.separator));
+    gtk_menu_button_set_label (app->sep_button, sep_glyph (d.separator));
   if (app->quote_button != NULL)
     gtk_menu_button_set_label (app->quote_button,
-                               quote_short_label (d.has_quote, d.quote));
+                               quote_glyph (d.has_quote, d.quote));
   parsing_page_sync (app, d);
   app->dialect_ui_guard = FALSE;
 }
@@ -3853,13 +3902,18 @@ on_dialect_custom_activate (GtkWidget *entry, gpointer data)
   /* An invalid byte is a silent no-op (F3b) — leave the entry for a retry. */
 }
 
-/* Add one radio row to a dropdown box; returns the check button. */
+/* Add one radio row to a dropdown box; returns the check button. `markup` is
+ * Pango markup so the glyph reads primary and the (Name) is dimmed. */
 static GtkCheckButton *
-add_dialect_radio (GtkWidget *box, GtkCheckButton *group, const char *label,
+add_dialect_radio (GtkWidget *box, GtkCheckButton *group, const char *markup,
                    int kind, int byte, gboolean is_none, gboolean is_custom,
                    GtkWidget *entry, App *app)
 {
-  GtkWidget *c = gtk_check_button_new_with_label (label);
+  GtkWidget *c = gtk_check_button_new ();
+  GtkWidget *lbl = gtk_label_new (NULL);
+  gtk_label_set_markup (GTK_LABEL (lbl), markup);
+  gtk_label_set_xalign (GTK_LABEL (lbl), 0.0);
+  gtk_check_button_set_child (GTK_CHECK_BUTTON (c), lbl);
   if (group != NULL)
     gtk_check_button_set_group (GTK_CHECK_BUTTON (c), group);
   g_object_set_data (G_OBJECT (c), "lsg-kind", GINT_TO_POINTER (kind));
@@ -3898,25 +3952,28 @@ build_dialect_dropdown_popover (App *app, int kind)
   if (kind == DIALECT_KIND_SEP)
     {
       const guint8 *s = lsg_dialect_separator_candidates ();
-      group = add_dialect_radio (box, NULL, "Comma  ,", kind, s[0], FALSE,
-                                 FALSE, NULL, app);
-      add_dialect_radio (box, group, "Semicolon  ;", kind, s[1], FALSE, FALSE,
-                         NULL, app);
-      add_dialect_radio (box, group, "Tab  ⇥", kind, s[2], FALSE, FALSE, NULL,
-                         app);
-      add_dialect_radio (box, group, "Pipe  |", kind, s[3], FALSE, FALSE, NULL,
-                         app);
+      group
+          = add_dialect_radio (box, NULL, ", <span alpha='55%'>(Comma)</span>",
+                               kind, s[0], FALSE, FALSE, NULL, app);
+      add_dialect_radio (box, group, "; <span alpha='55%'>(Semicolon)</span>",
+                         kind, s[1], FALSE, FALSE, NULL, app);
+      add_dialect_radio (box, group, "⇥ <span alpha='55%'>(Tab)</span>", kind,
+                         s[2], FALSE, FALSE, NULL, app);
+      add_dialect_radio (box, group, "| <span alpha='55%'>(Pipe)</span>", kind,
+                         s[3], FALSE, FALSE, NULL, app);
       add_dialect_radio (box, group, "Custom…", kind, 0, FALSE, TRUE, entry,
                          app);
     }
   else
     {
       const guint8 *q = lsg_dialect_quote_candidates ();
-      group = add_dialect_radio (box, NULL, "Double  \"", kind, q[0], FALSE,
-                                 FALSE, NULL, app);
-      add_dialect_radio (box, group, "Single  '", kind, q[1], FALSE, FALSE,
-                         NULL, app);
-      add_dialect_radio (box, group, "None", kind, 0, TRUE, FALSE, NULL, app);
+      group = add_dialect_radio (box, NULL,
+                                 "\" <span alpha='55%'>(Double)</span>", kind,
+                                 q[0], FALSE, FALSE, NULL, app);
+      add_dialect_radio (box, group, "' <span alpha='55%'>(Single)</span>",
+                         kind, q[1], FALSE, FALSE, NULL, app);
+      add_dialect_radio (box, group, "∅ <span alpha='55%'>(None)</span>", kind,
+                         0, TRUE, FALSE, NULL, app);
       add_dialect_radio (box, group, "Custom…", kind, 0, FALSE, TRUE, entry,
                          app);
     }
@@ -4933,7 +4990,7 @@ build_columns_page (App *app)
   GtkWidget *page = adw_preferences_page_new ();
   adw_preferences_page_set_title (ADW_PREFERENCES_PAGE (page), "Columns");
   adw_preferences_page_set_icon_name (ADW_PREFERENCES_PAGE (page),
-                                      "view-column-symbolic");
+                                      "view-grid-symbolic");
 
   /* Discovery search (shown only in search-only mode). */
   GtkWidget *search_grp = adw_preferences_group_new ();
