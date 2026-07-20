@@ -25,27 +25,32 @@ import SwiftUI
 struct HeaderButton: View {
     @Bindable var model: DocumentModel
 
-    private var on: Bool { model.dialect.hasHeader }
+    private var isOn: Bool { model.dialect.hasHeader }
     private var tooltip: String {
-        on ? "First row is a header — click to treat it as data"
-           : "First row is data — click to treat it as a header"
+        isOn ? "First row is a header — click to treat it as data"
+             : "First row is data — click to treat it as a header"
     }
 
     var body: some View {
         Button {
-            model.applyDialectChange(.header(!on))
+            model.applyDialectChange(.header(!isOn))
             model.revealOverlay()
         } label: {
-            HeaderGlyph(on: on)
+            HeaderGlyph(isOn: isOn)
                 .frame(width: OverlayMetrics.controlSize, height: OverlayMetrics.controlSize)
                 .contentShape(Circle())
         }
         .buttonStyle(.plain)
-        .glassChrome(model.dialect.headerForced ? .regular.tint(.accentColor).interactive() : .regular.interactive(), in: Circle())
+        .glassChrome(
+            model.dialect.headerForced
+                ? .regular.tint(.accentColor).interactive()
+                : .regular.interactive(),
+            in: Circle()
+        )
         .overlay { if model.dialect.headerForced { Circle().strokeBorder(Color.accentColor, lineWidth: 2) } }
         .help(tooltip)
         .accessibilityLabel(DialectGlyph.pillLabel(.header))
-        .accessibilityValue(on ? "on" : "off")
+        .accessibilityValue(isOn ? "on" : "off")
         .accessibilityHint(tooltip)
     }
 }
@@ -55,16 +60,16 @@ struct HeaderButton: View {
 /// "H negated" — the slash, not the H, carries the meaning. Semantic colors, so
 /// the slash is full white in dark mode / full black in light mode either way.
 struct HeaderGlyph: View {
-    let on: Bool
+    let isOn: Bool
 
     var body: some View {
         Text("H")
             .font(.callout.weight(.semibold))
             // Header ON: solid label color. Header OFF: faint (~0.3 of label
             // color) so the crossing slash dominates.
-            .foregroundStyle(on ? AnyShapeStyle(.primary) : AnyShapeStyle(.primary.opacity(0.3)))
+            .foregroundStyle(isOn ? AnyShapeStyle(.primary) : AnyShapeStyle(.primary.opacity(0.3)))
             .overlay {
-                if !on {
+                if !isOn {
                     // Full-strength (labelColor) and thicker than the H's stroke,
                     // so the negation is unmistakable in both appearances.
                     Capsule()

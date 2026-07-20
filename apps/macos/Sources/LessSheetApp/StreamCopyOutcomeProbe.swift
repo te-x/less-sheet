@@ -32,12 +32,12 @@ enum StreamCopyOutcomeProbe {
     private static let env = ProcessInfo.processInfo.environment
     static let active = env["LESSSHEET_STREAM_COPY_OUTCOME"] != nil
     private static var started = false
-    private static var t0 = DispatchTime.now()
+    private static var startTime = DispatchTime.now()
 
     static func run() {
         guard active, !started else { return }
         started = true
-        t0 = DispatchTime.now()
+        startTime = DispatchTime.now()
         Task { await runCases(); finish() }
     }
 
@@ -103,11 +103,12 @@ enum StreamCopyOutcomeProbe {
     }
 
     private static func elapsedMs() -> Int {
-        Int((DispatchTime.now().uptimeNanoseconds &- t0.uptimeNanoseconds) / 1_000_000)
+        Int((DispatchTime.now().uptimeNanoseconds &- startTime.uptimeNanoseconds) / 1_000_000)
     }
 
     private static func emit(_ name: String, _ outcome: CopyOutcome, _ extra: String, _ pass: Bool) {
-        log("lesssheet.streamcopyoutcome.case name=\(name) outcome=\(outcome) \(extra) pass=\(pass) at_ms=\(elapsedMs())")
+        log("lesssheet.streamcopyoutcome.case name=\(name) outcome=\(outcome) " +
+            "\(extra) pass=\(pass) at_ms=\(elapsedMs())")
     }
 
     private static func finish() {

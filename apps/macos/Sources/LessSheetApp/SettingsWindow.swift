@@ -117,9 +117,9 @@ struct SettingsView: View {
             get: { showSeparatorCustom ? .custom : .byte(model.dialect.separator) },
             set: { choice in
                 switch choice {
-                case .byte(let b):
+                case .byte(let byte):
                     showSeparatorCustom = false
-                    model.applyDialectChange(.separator(b))
+                    model.applyDialectChange(.separator(byte))
                 case .custom:
                     showSeparatorCustom = true
                     customFocus = .separator
@@ -132,14 +132,14 @@ struct SettingsView: View {
         Binding(
             get: {
                 if showQuoteCustom { return .custom }
-                guard let q = model.dialect.quote else { return .none }
-                return .byte(q)
+                guard let quote = model.dialect.quote else { return .none }
+                return .byte(quote)
             },
             set: { choice in
                 switch choice {
-                case .byte(let b):
+                case .byte(let byte):
                     showQuoteCustom = false
-                    model.applyDialectChange(.quote(b))
+                    model.applyDialectChange(.quote(byte))
                 case .none:
                     showQuoteCustom = false
                     model.applyDialectChange(.quote(nil))
@@ -208,8 +208,8 @@ struct SettingsView: View {
     }
 
     private var customQuote: UInt8? {
-        guard let q = model.dialect.quote, !DialectCandidates.quotes.contains(q) else { return nil }
-        return q
+        guard let quote = model.dialect.quote, !DialectCandidates.quotes.contains(quote) else { return nil }
+        return quote
     }
 
 }

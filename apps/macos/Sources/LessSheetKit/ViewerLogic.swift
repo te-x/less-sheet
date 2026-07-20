@@ -102,47 +102,64 @@ public struct DialectComposer: DialectComposing {
     public init() {}
 
     public func compose(from current: DialectReport, changing change: DialectChange) -> DialectOverride? {
-        let carriedSeparator: SeparatorOverride =
-            current.separatorForced ? .forced(current.separator) : .sniff
-        let carriedQuote: QuoteOverride = {
-            guard current.quoteForced else { return .sniff }
-            if let q = current.quote { return .forced(q) }
-            return .none
-        }()
-        let carriedHeader: HeaderOverride =
-            current.headerForced ? (current.hasHeader ? .on : .off) : .sniff
-        // Encoding carries the same way as the other parameters: forced ->
-        // pinned as the forced value; otherwise `.automatic` (re-detected on
-        // the re-open).
-        let carriedEncoding: EncodingOverride =
-            current.encodingForced ? EncodingOverride(current.encoding) : .automatic
+        let carried = carriedOverrides(from: current)
 
         switch change {
         case let .separator(byte):
             guard Self.isValidDialectByte(byte) else { return nil }
             // Collision only against a byte the caller is CARRYING as forced.
-            if case let .forced(q) = carriedQuote, q == byte { return nil }
-            return DialectOverride(separator: .forced(byte), quote: carriedQuote, header: carriedHeader, encoding: carriedEncoding)
+            if case let .forced(quoteByte) = carried.quote, quoteByte == byte { return nil }
+            return DialectOverride(separator: .forced(byte), quote: carried.quote,
+                                   header: carried.header, encoding: carried.encoding)
 
         case let .quote(maybeByte):
             guard let byte = maybeByte else {
                 // NONE disables quoting; it can never collide with a separator.
-                return DialectOverride(separator: carriedSeparator, quote: .none, header: carriedHeader, encoding: carriedEncoding)
+                return DialectOverride(separator: carried.separator, quote: .none,
+                                       header: carried.header, encoding: carried.encoding)
             }
             guard Self.isValidDialectByte(byte) else { return nil }
-            if case let .forced(s) = carriedSeparator, s == byte { return nil }
-            return DialectOverride(separator: carriedSeparator, quote: .forced(byte), header: carriedHeader, encoding: carriedEncoding)
+            if case let .forced(separatorByte) = carried.separator, separatorByte == byte { return nil }
+            return DialectOverride(separator: carried.separator, quote: .forced(byte),
+                                   header: carried.header, encoding: carried.encoding)
 
         case let .header(isOn):
             // Header changes are always valid.
-            return DialectOverride(separator: carriedSeparator, quote: carriedQuote, header: isOn ? .on : .off, encoding: carriedEncoding)
+            return DialectOverride(separator: carried.separator, quote: carried.quote,
+                                   header: isOn ? .forcedOn : .forcedOff, encoding: carried.encoding)
 
         case let .encoding(chosen):
             // An encoding change never fails and never touches the dialect
             // bytes — it only sets `encoding` to the chosen override
             // (`.automatic` included, which re-detects on the re-open).
-            return DialectOverride(separator: carriedSeparator, quote: carriedQuote, header: carriedHeader, encoding: chosen)
+            return DialectOverride(separator: carried.separator, quote: carried.quote,
+                                   header: carried.header, encoding: chosen)
         }
+    }
+
+    /// The four dialect parameters carried forward into the next open: each
+    /// already-forced parameter stays pinned as its forced value, each sniffed
+    /// parameter re-sniffs (encoding uses `.automatic` for the re-detect).
+    private struct CarriedOverrides {
+        let separator: SeparatorOverride
+        let quote: QuoteOverride
+        let header: HeaderOverride
+        let encoding: EncodingOverride
+    }
+
+    private func carriedOverrides(from current: DialectReport) -> CarriedOverrides {
+        let separator: SeparatorOverride =
+            current.separatorForced ? .forced(current.separator) : .sniff
+        let quote: QuoteOverride = {
+            guard current.quoteForced else { return .sniff }
+            if let quoteByte = current.quote { return .forced(quoteByte) }
+            return .none
+        }()
+        let header: HeaderOverride =
+            current.headerForced ? (current.hasHeader ? .forcedOn : .forcedOff) : .sniff
+        let encoding: EncodingOverride =
+            current.encodingForced ? EncodingOverride(current.encoding) : .automatic
+        return CarriedOverrides(separator: separator, quote: quote, header: header, encoding: encoding)
     }
 
     /// A separator/quote byte is a single ASCII byte in 0x01...0x7F that is

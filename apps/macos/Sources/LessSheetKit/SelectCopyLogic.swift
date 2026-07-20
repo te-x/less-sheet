@@ -43,19 +43,22 @@ public struct SelectionModel: Selecting {
 
     public func wholeRow(_ row: UInt64, in extent: GridExtent) -> Selection? {
         guard !extent.isEmpty else { return nil }
-        let r = min(row, extent.lastRow)
-        return Selection(anchor: GridCell(row: r, column: 0), active: GridCell(row: r, column: extent.lastColumn))
+        let clampedRow = min(row, extent.lastRow)
+        return Selection(anchor: GridCell(row: clampedRow, column: 0),
+                         active: GridCell(row: clampedRow, column: extent.lastColumn))
     }
 
     public func wholeColumn(_ column: Int, in extent: GridExtent) -> Selection? {
         guard !extent.isEmpty else { return nil }
-        let c = min(max(column, 0), extent.lastColumn)
-        return Selection(anchor: GridCell(row: 0, column: c), active: GridCell(row: extent.lastRow, column: c))
+        let clampedColumn = min(max(column, 0), extent.lastColumn)
+        return Selection(anchor: GridCell(row: 0, column: clampedColumn),
+                         active: GridCell(row: extent.lastRow, column: clampedColumn))
     }
 
     public func selectAll(in extent: GridExtent) -> Selection? {
         guard !extent.isEmpty else { return nil }
-        return Selection(anchor: GridCell(row: 0, column: 0), active: GridCell(row: extent.lastRow, column: extent.lastColumn))
+        return Selection(anchor: GridCell(row: 0, column: 0),
+                         active: GridCell(row: extent.lastRow, column: extent.lastColumn))
     }
 
     /// `cell` moved one step in `direction`, saturating at 0 (up/left) or the
@@ -63,14 +66,15 @@ public struct SelectionModel: Selecting {
     /// the edge (never under/overflows the UInt64 row / Int column).
     private static func stepped(_ cell: GridCell, _ direction: SelectionDirection, in extent: GridExtent) -> GridCell {
         switch direction {
-        case .up:
+        case .upward:
             return GridCell(row: cell.row == 0 ? 0 : cell.row - 1, column: cell.column)
         case .down:
             return GridCell(row: cell.row >= extent.lastRow ? extent.lastRow : cell.row + 1, column: cell.column)
         case .left:
             return GridCell(row: cell.row, column: cell.column <= 0 ? 0 : cell.column - 1)
         case .right:
-            return GridCell(row: cell.row, column: cell.column >= extent.lastColumn ? extent.lastColumn : cell.column + 1)
+            return GridCell(row: cell.row,
+                            column: cell.column >= extent.lastColumn ? extent.lastColumn : cell.column + 1)
         }
     }
 }

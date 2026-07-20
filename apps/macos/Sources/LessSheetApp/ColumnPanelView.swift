@@ -8,7 +8,10 @@ private enum PanelRowSource: Equatable {
     case matches([UInt32])
 
     var count: Int {
-        switch self { case .all(let count): count; case .matches(let ids): ids.count }
+        switch self {
+        case .all(let count): count
+        case .matches(let ids): ids.count
+        }
     }
 
     func column(at row: Int) -> Int? {
@@ -42,9 +45,14 @@ struct ColumnSettingsSection: View {
     }
 
     var body: some View {
+        // Touch the observable revisions so the body re-renders on any panel
+        // change. The SwiftUI result builder rejects a bare `_ = value` (it
+        // feeds `()` to `buildExpression`), so the discarding `let _` must stay.
+        // swiftlint:disable redundant_discardable_let
         let _ = model.columnPresentationRevision
         let _ = model.columnConfigurationRevision
         let _ = model.columnPanelRevision
+        // swiftlint:enable redundant_discardable_let
         VStack(spacing: 0) {
             HStack {
                 Text("Columns").font(.headline)
@@ -126,20 +134,7 @@ struct ColumnSettingsSection: View {
             return
         }
 
-        switch ColumnDiscovery().resolveDirectAddress(query, columnCount: model.columnCount) {
-        case .some(.column(let column)):
-            matches = [UInt32(column)]
-            model.setSettingsDiscoveryRows([column])
-            model.selectSettingsColumn(column)
-            searching = false
-            return
-        case .some(.noSuchColumn):
-            noSuchColumn = true
-            searching = false
-            return
-        case .none:
-            break
-        }
+        if applyDirectAddress() { return }
 
         guard let core = model.columnPanelCore() else { searching = false; return }
         searching = true
@@ -159,7 +154,7 @@ struct ColumnSettingsSection: View {
                 let values = core.columnLabels(ids)
                 let candidates = zip(ids, values).map { id, value in
                     ColumnLabelCandidate(column: id,
-                                         label: value.map { String(decoding: $0.bytes, as: UTF8.self) })
+                                         label: value.map { String(bytes: $0.bytes, encoding: .utf8) ?? "" })
                 }
                 return searcher.matches(query: needle, in: candidates, locale: locale)
             }.value
@@ -173,6 +168,25 @@ struct ColumnSettingsSection: View {
             await Task.yield()
         }
         if model.settingsLifecycle.query == needle { searching = false }
+    }
+
+    /// Direct `#N` / exact-name address resolution. Returns true when it fully
+    /// handled the query (nothing more for `search()` to do).
+    private func applyDirectAddress() -> Bool {
+        switch ColumnDiscovery().resolveDirectAddress(query, columnCount: model.columnCount) {
+        case .some(.column(let column)):
+            matches = [UInt32(column)]
+            model.setSettingsDiscoveryRows([column])
+            model.selectSettingsColumn(column)
+            searching = false
+            return true
+        case .some(.noSuchColumn):
+            noSuchColumn = true
+            searching = false
+            return true
+        case .none:
+            return false
+        }
     }
 }
 
@@ -313,7 +327,9 @@ private struct ColumnPanelTable: NSViewRepresentable {
             if label.truncated { states.append("Label truncated") }
             if metadata?.conflictState != ColumnConflictState.none { states.append("Type conflict") }
             if model.panelColumnHasFormatUnavailable(column) { states.append("Format unavailable") }
-            view.status.image = states.isEmpty ? nil : NSImage(systemSymbolName: "exclamationmark.triangle", accessibilityDescription: states.joined(separator: ", "))
+            view.status.image = states.isEmpty ? nil : NSImage(
+                systemSymbolName: "exclamationmark.triangle",
+                accessibilityDescription: states.joined(separator: ", "))
             view.setAccessibilityLabel("Column \(column + 1), \(label.text), \(view.subtitle.stringValue)"
                 + (states.isEmpty ? "" : ", \(states.joined(separator: ", "))"))
         }
@@ -357,209 +373,17 @@ private final class ColumnPanelCellView: NSTableCellView {
     }
 }
 
-private struct ColumnInspector: View {
-    @Bindable var model: DocumentModel
-    let column: Int
-    @State private var nullEnabled = false
-    @State private var nullText = ""
-
-    private var metadata: ColumnMetadata? { model.metadata(for: column) }
-
-    var body: some View {
-        Form {
-            Section("Column") {
-                Toggle("Visible", isOn: Binding(
-                    get: { !model.visibility.isHidden(column) },
-                    set: { _ in model.toggleColumn(column) }
-                ))
-                .disabled(!model.visibility.isHidden(column) && !model.canHide(column))
-            }
-
-            Section("Type") {
-                Picker("Type", selection: typeSelection) {
-                    Text("Auto").tag(0)
-                    ForEach([ColumnKind.text, .boolean, .integer, .decimal, .date, .datetime], id: \.rawValue) {
-                        Text($0.panelName).tag($0.rawValue + 1)
-                    }
-                }
-                if effectiveKind == .datetime {
-                    Picker("Datetime values", selection: datetimeSemantics) {
-                        Text("Naive wall time").tag(ColumnDatetimeSemantics.naive.rawValue)
-                        Text("Offset required").tag(ColumnDatetimeSemantics.zoned.rawValue)
-                    }
-                }
-                if model.userSettings(for: column).overrideType != nil {
-                    Button("Reset to Auto") { model.setColumnOverride(nil, column: column) }
-                }
-                if let metadata, metadata.effectiveSource == .inferred {
-                    LabeledContent("Guessed", value: metadata.effective.kind.panelName)
-                }
-            }
-
-            if metadata?.conflictState != ColumnConflictState.none
-                || model.panelColumnHasFormatUnavailable(column) {
-                Section("Status") {
-                    if metadata?.conflictState != ColumnConflictState.none {
-                        Label("Some values conflict with this type", systemImage: "exclamationmark.triangle")
-                            .accessibilityLabel("Type conflict in this column")
-                    }
-                    if model.panelColumnHasFormatUnavailable(column) {
-                        Label("Some exact values are shown raw because formatting is unavailable",
-                              systemImage: "number.circle")
-                            .accessibilityLabel("Format unavailable; affected exact values are shown raw")
-                    }
-                }
-            }
-
-            formatControls
-
-            Section("Advanced") {
-                DisclosureGroup("Null values", isExpanded: nullDisclosureBinding) {
-                    Toggle("Use sentinel", isOn: Binding(
-                        get: { nullEnabled },
-                        set: { enabled in
-                            nullEnabled = enabled
-                            model.setColumnNullSentinel(enabled ? nullText : nil, column: column)
-                        }
-                    ))
-                    if nullEnabled {
-                        TextField("Exact value", text: $nullText)
-                            .onSubmit { model.setColumnNullSentinel(nullText, column: column) }
-                    }
-                }
-
-                DisclosureGroup("Width and Auto-fit", isExpanded: widthDisclosureBinding) {
-                    Slider(value: widthBinding, in: Double(GridMetrics.minColumnWidth)...Double(GridMetrics.maxColumnWidth)) {
-                        Text("Column width")
-                    }
-                    LabeledContent("Width", value: "\(Int(model.columnWidth(column))) pt")
-                    Button("Auto-fit Width") { model.autoFitPanelColumn(column) }
-                }
-            }
-        }
-        .formStyle(.grouped)
-        .task(id: "\(column):\(model.openGeneration)") {
-            let setting = model.userSettings(for: column)
-            nullEnabled = setting.nullSentinel != nil
-            nullText = setting.nullSentinel.map { String(decoding: $0, as: UTF8.self) } ?? ""
-            model.setPanelSelection(column)
-        }
-    }
-
-    private var effectiveKind: ColumnKind {
-        model.userSettings(for: column).overrideType?.kind ?? metadata?.effective.kind ?? .unknown
-    }
-
-    @ViewBuilder
-    private var formatControls: some View {
-        let settings = model.userSettings(for: column)
-        if effectiveKind == .integer || effectiveKind == .decimal {
-            Section("Number format") {
-                Toggle("Thousands grouping", isOn: formatBinding(\.grouping))
-                if effectiveKind == .decimal {
-                    Toggle("Fixed fraction digits", isOn: Binding(
-                        get: { model.userSettings(for: column).format.fractionDigits != nil },
-                        set: { enabled in
-                            var value = model.userSettings(for: column).format
-                            value.fractionDigits = enabled ? (value.fractionDigits ?? 2) : nil
-                            model.setColumnFormat(value, column: column)
-                        }
-                    ))
-                    if settings.format.fractionDigits != nil {
-                        Stepper("Fraction digits: \(settings.format.fractionDigits ?? 0)", value: fractionBinding, in: 0...38)
-                    }
-                }
-            }
-        } else if effectiveKind == .date || effectiveKind == .datetime {
-            Section("Date format") {
-                Picker("Preset", selection: datePresetBinding) {
-                    Text("Original").tag(0)
-                    Text("Localized Short").tag(1)
-                    Text("Localized Medium").tag(2)
-                    Text("Localized Long").tag(3)
-                }
-            }
-        }
-    }
-
-    private var typeSelection: Binding<Int> {
-        Binding(
-            get: { model.userSettings(for: column).overrideType.map { $0.kind.rawValue + 1 } ?? 0 },
-            set: { value in
-                if value == 0 { model.setColumnOverride(nil, column: column); return }
-                guard let kind = ColumnKind(rawValue: value - 1) else { return }
-                let existing = model.userSettings(for: column).overrideType?.datetimeSemantics
-                model.setColumnOverride(ColumnType(kind: kind,
-                    datetimeSemantics: kind == .datetime ? (existing == .zoned ? .zoned : .naive) : .none), column: column)
-            }
-        )
-    }
-
-    private var datetimeSemantics: Binding<Int> {
-        Binding(
-            get: { model.userSettings(for: column).overrideType?.datetimeSemantics.rawValue
-                ?? metadata?.effective.datetimeSemantics.rawValue ?? ColumnDatetimeSemantics.naive.rawValue },
-            set: { raw in
-                let semantics = ColumnDatetimeSemantics(rawValue: raw) ?? .naive
-                model.setColumnOverride(ColumnType(kind: .datetime, datetimeSemantics: semantics), column: column)
-            }
-        )
-    }
-
-    private var widthBinding: Binding<Double> {
-        Binding(get: { model.columnWidth(column) },
-                set: { model.setPanelColumnWidth($0, column: column) })
-    }
-
-    private var nullDisclosureBinding: Binding<Bool> {
-        Binding(
-            get: { model.settingsLifecycle.nullValuesExpanded },
-            set: { model.setSettingsDisclosure(.nullValues, expanded: $0) }
-        )
-    }
-
-    private var widthDisclosureBinding: Binding<Bool> {
-        Binding(
-            get: { model.settingsLifecycle.widthAutoFitExpanded },
-            set: { model.setSettingsDisclosure(.widthAutoFit, expanded: $0) }
-        )
-    }
-
-    private func formatBinding(_ keyPath: WritableKeyPath<ColumnFormatOptions, Bool>) -> Binding<Bool> {
-        Binding(get: { model.userSettings(for: column).format[keyPath: keyPath] }, set: { newValue in
-            var format = model.userSettings(for: column).format
-            format[keyPath: keyPath] = newValue
-            model.setColumnFormat(format, column: column)
-        })
-    }
-
-    private var fractionBinding: Binding<Int> {
-        Binding(get: { model.userSettings(for: column).format.fractionDigits ?? 0 }, set: { value in
-            var format = model.userSettings(for: column).format
-            format.fractionDigits = value
-            model.setColumnFormat(format, column: column)
-        })
-    }
-
-    private var datePresetBinding: Binding<Int> {
-        Binding(get: {
-            switch model.userSettings(for: column).format.datePreset {
-            case .original: 0; case .localizedShort: 1; case .localizedMedium: 2; case .localizedLong: 3
-            }
-        }, set: { value in
-            var format = model.userSettings(for: column).format
-            format.datePreset = [.original, .localizedShort, .localizedMedium, .localizedLong][min(max(value, 0), 3)]
-            model.setColumnFormat(format, column: column)
-        })
-    }
-}
-
 extension ColumnKind {
     var panelName: String {
         switch self {
-        case .unknown: "Unknown"; case .unsupported: "Unsupported"; case .text: "Text"
-        case .boolean: "Boolean"; case .integer: "Integer"; case .decimal: "Decimal"
-        case .date: "Date"; case .datetime: "Date & Time"
+        case .unknown: "Unknown"
+        case .unsupported: "Unsupported"
+        case .text: "Text"
+        case .boolean: "Boolean"
+        case .integer: "Integer"
+        case .decimal: "Decimal"
+        case .date: "Date"
+        case .datetime: "Date & Time"
         }
     }
 }

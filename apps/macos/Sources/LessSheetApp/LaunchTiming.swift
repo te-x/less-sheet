@@ -17,7 +17,7 @@ enum LaunchTiming {
     /// Emits the marker for the first frame that shows document data.
     static func markFirstRowsVisible() {
         let elapsed = DispatchTime.now().uptimeNanoseconds &- startNanos
-        let ms = Int(elapsed / 1_000_000)
-        FileHandle.standardError.write(Data((TimingMarker.line(milliseconds: ms) + "\n").utf8))
+        let milliseconds = Int(elapsed / 1_000_000)
+        FileHandle.standardError.write(Data((TimingMarker.line(milliseconds: milliseconds) + "\n").utf8))
     }
 }

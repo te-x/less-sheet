@@ -30,33 +30,33 @@ public struct ColumnLayout: ColumnLayouting {
         let count = widths.count
         guard count > 0 else { return ColumnWindow(first: 0, count: 0, firstX: 0) }
 
-        let lo = max(0, viewportX)
-        let hi = viewportX + max(viewportWidth, 0)
-        guard hi > lo else { return ColumnWindow(first: 0, count: 0, firstX: 0) }
+        let lowerBound = max(0, viewportX)
+        let upperBound = viewportX + max(viewportWidth, 0)
+        guard upperBound > lowerBound else { return ColumnWindow(first: 0, count: 0, firstX: 0) }
 
-        var offset = 0.0     // running Σ widths[0..<i], i.e. column i's start x
-        var firstHit = -1    // first column whose END exceeds `lo`
+        var offset = 0.0     // running Σ widths[0..<index], i.e. column index's start x
+        var firstHit = -1    // first column whose END exceeds `lowerBound`
         var firstHitX = 0.0  // that column's start x (Σ widths[0..<firstHit])
-        var lastHit = -1     // last column whose START is still before `hi`
-        for i in 0..<count {
+        var lastHit = -1     // last column whose START is still before `upperBound`
+        for index in 0..<count {
             let start = offset
-            offset += widths[i] > 0 ? widths[i] : 0
+            offset += widths[index] > 0 ? widths[index] : 0
             if firstHit < 0 {
-                guard offset > lo else { continue }
-                // The first column reaching past `lo`: since it is the FIRST
+                guard offset > lowerBound else { continue }
+                // The first column reaching past `lowerBound`: since it is the FIRST
                 // such column, the PREVIOUS one's end (== this one's start)
-                // is <= lo < hi, so this column always also qualifies for
-                // `lastHit` below — the window is never empty once found.
-                firstHit = i
+                // is <= lowerBound < upperBound, so this column always also qualifies
+                // for `lastHit` below — the window is never empty once found.
+                firstHit = index
                 firstHitX = start
             }
-            if start < hi {
-                lastHit = i
+            if start < upperBound {
+                lastHit = index
             } else {
                 break   // every later column starts even later — done
             }
         }
-        // No column's end ever passed `lo`: the viewport starts at/past the
+        // No column's end ever passed `lowerBound`: the viewport starts at/past the
         // end of all content (contract: "a viewport intersecting no column
         // yields an empty window at firstX 0").
         guard firstHit >= 0 else { return ColumnWindow(first: 0, count: 0, firstX: 0) }

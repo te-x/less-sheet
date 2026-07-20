@@ -65,9 +65,9 @@ struct FilterBannerView: View {
 enum FilterCopy {
     static func summary(_ banner: FilterBanner) -> String {
         if banner.isEmptyResult { return "Filtered — no matching rows" }
-        let n = RowCountText.abbreviated(banner.matching)
-        let m = (banner.documentRowsEstimated ? "~" : "") + RowCountText.abbreviated(banner.documentRows)
-        let base = "Filtered — \(n) of \(m) rows"
+        let matchingText = RowCountText.abbreviated(banner.matching)
+        let totalText = (banner.documentRowsEstimated ? "~" : "") + RowCountText.abbreviated(banner.documentRows)
+        let base = "Filtered — \(matchingText) of \(totalText) rows"
         return banner.matchingIsFinal ? base : base + "…"
     }
 }

@@ -31,7 +31,7 @@ enum JumpProbe {
 
     private static var index = 0
     private static var model: DocumentModel?
-    private static var t0 = DispatchTime.now()
+    private static var startTime = DispatchTime.now()
     private static var lastTick = DispatchTime.now()
     private static var heartbeat: Task<Void, Never>?
     private static var scanningLogged = false
@@ -39,7 +39,7 @@ enum JumpProbe {
     private static var maxGapMs = 0
 
     private static func elapsedMs() -> Int {
-        Int((DispatchTime.now().uptimeNanoseconds &- t0.uptimeNanoseconds) / 1_000_000)
+        Int((DispatchTime.now().uptimeNanoseconds &- startTime.uptimeNanoseconds) / 1_000_000)
     }
 
     /// Called from the first data-bearing frame's task (after the cold-start
@@ -47,8 +47,8 @@ enum JumpProbe {
     static func run(model: DocumentModel) {
         guard active else { return }
         self.model = model
-        t0 = DispatchTime.now()
-        lastTick = t0
+        startTime = DispatchTime.now()
+        lastTick = startTime
         index = 0
         maxGapMs = 0
         startHeartbeat()
@@ -165,17 +165,17 @@ enum ScrollProbe {
     private static var last: CGPoint?
     private static let start = DispatchTime.now()
 
-    static func noteFrame(_ label: String, _ r: CGRect) {
+    static func noteFrame(_ label: String, _ rect: CGRect) {
         guard layoutEnabled else { return }
-        let ms = Int((DispatchTime.now().uptimeNanoseconds &- start.uptimeNanoseconds) / 1_000_000)
+        let milliseconds = Int((DispatchTime.now().uptimeNanoseconds &- start.uptimeNanoseconds) / 1_000_000)
         FileHandle.standardError.write(Data(String(
             format: "lesssheet.layout.\(label) minY=%.1f maxY=%.1f minX=%.1f height=%.1f at_ms=%d\n",
-            r.minY, r.maxY, r.minX, r.height, ms).utf8))
+            rect.minY, rect.maxY, rect.minX, rect.height, milliseconds).utf8))
     }
 
     static func note(_ offset: CGPoint) {
         guard enabled else { return }
-        if let l = last, abs(l.x - offset.x) < 0.5, abs(l.y - offset.y) < 0.5 { return }
+        if let previous = last, abs(previous.x - offset.x) < 0.5, abs(previous.y - offset.y) < 0.5 { return }
         last = offset
         FileHandle.standardError.write(
             Data(String(format: "lesssheet.scroll.offset x=%.1f y=%.1f\n", offset.x, offset.y).utf8)
@@ -235,15 +235,26 @@ enum ViewportLandingProbe {
 enum ColWidthProbe {
     static let enabled = ProcessInfo.processInfo.environment["LESSSHEET_LOG_COLWIDTH"] != nil
 
-    static func log(
-        site: String, total: CGFloat, viewport: CGFloat, scrollFrame: CGFloat,
-        documentWidth: CGFloat, columnWidth: CGFloat, filler: Int, hScrollerHidden: Bool
-    ) {
+    /// One column-width layout sample, bundled so `log` stays within the
+    /// parameter-count budget (the fields are unchanged).
+    struct Sample {
+        let site: String
+        let total: CGFloat
+        let viewport: CGFloat
+        let scrollFrame: CGFloat
+        let documentWidth: CGFloat
+        let columnWidth: CGFloat
+        let filler: Int
+        let hScrollerHidden: Bool
+    }
+
+    static func log(_ sample: Sample) {
         guard enabled else { return }
         FileHandle.standardError.write(Data(String(
-            format: "lesssheet.colwidth site=\(site) total=%.1f viewport=%.1f scrollframe=%.1f"
-                + " docwidth=%.1f colwidth=%.1f filler=%d hscroller_hidden=\(hScrollerHidden)\n",
-            total, viewport, scrollFrame, documentWidth, columnWidth, filler
+            format: "lesssheet.colwidth site=\(sample.site) total=%.1f viewport=%.1f scrollframe=%.1f"
+                + " docwidth=%.1f colwidth=%.1f filler=%d hscroller_hidden=\(sample.hScrollerHidden)\n",
+            sample.total, sample.viewport, sample.scrollFrame,
+            sample.documentWidth, sample.columnWidth, sample.filler
         ).utf8))
     }
 }
@@ -322,9 +333,12 @@ enum HeaderToggleProbe {
         let oldHasHeader = shift == 0 ? newHasHeader : (shift > 0)  // +1 = turned OFF; −1 = turned ON
         let recordBefore = oldTop + (oldHasHeader ? 1 : 0)
         let recordAfter = newTop + (newHasHeader ? 1 : 0)
-        log("lesssheet.header_toggle.before top_data_0based=\(oldTop) file_record=\(recordBefore) has_header=\(oldHasHeader)")
-        log("lesssheet.header_toggle.after top_data_0based=\(newTop) file_record=\(recordAfter) has_header=\(newHasHeader)"
-            + " same_record=\(recordAfter == recordBefore) data_index_delta=\(newTop - oldTop) landed_at_zero=\(newTop == 0)")
+        log("lesssheet.header_toggle.before top_data_0based=\(oldTop) "
+            + "file_record=\(recordBefore) has_header=\(oldHasHeader)")
+        log("lesssheet.header_toggle.after top_data_0based=\(newTop) "
+            + "file_record=\(recordAfter) has_header=\(newHasHeader) "
+            + "same_record=\(recordAfter == recordBefore) "
+            + "data_index_delta=\(newTop - oldTop) landed_at_zero=\(newTop == 0)")
         if env["LESSSHEET_DUMP_EXIT"] != nil {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { NSApp.terminate(nil) }
         }

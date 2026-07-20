@@ -26,13 +26,13 @@ enum SelectCopyProbe {
     static let active = env["LESSSHEET_SELECT_COPY"] != nil
 
     private static var model: DocumentModel?
-    private static var t0 = DispatchTime.now()
+    private static var startTime = DispatchTime.now()
     private static var lastTick = DispatchTime.now()
     private static var heartbeat: Task<Void, Never>?
     private static var maxGapMs = 0
 
     private static func elapsedMs() -> Int {
-        Int((DispatchTime.now().uptimeNanoseconds &- t0.uptimeNanoseconds) / 1_000_000)
+        Int((DispatchTime.now().uptimeNanoseconds &- startTime.uptimeNanoseconds) / 1_000_000)
     }
 
     private static func describe(_ rect: SelectionRect?) -> String {
@@ -47,7 +47,7 @@ enum SelectCopyProbe {
     static func run(model: DocumentModel) {
         guard active else { return }
         self.model = model
-        t0 = DispatchTime.now()
+        startTime = DispatchTime.now()
         log("lesssheet.selectcopy.start columns=\(model.columnCount) rows=\(model.rowCountInfo.count)"
             + " exact=\(model.rowCountInfo.isExact)")
         guard model.columnCount > 0 else {
@@ -119,27 +119,27 @@ enum SelectCopyProbe {
     }
 
     private static func selectionInteractionRegressions() {
-        guard let model, let c = NativeGridController.live else { return }
+        guard let model, let controller = NativeGridController.live else { return }
         let cell = GridCell(row: 0, column: 0)
 
         model.clearSelection()
-        c.cellMouseDown(cell, shift: false); c.cellMouseUp(at: cell)
-        c.cellMouseDown(cell, shift: false); c.cellMouseUp(at: cell)
+        controller.cellMouseDown(cell, shift: false); controller.cellMouseUp(at: cell)
+        controller.cellMouseDown(cell, shift: false); controller.cellMouseUp(at: cell)
         log("lesssheet.selectcopy.toggle_cell deselected=\(model.selection == nil)")
 
-        c.gutterMouseDown(atY: c.table.rect(ofRow: 0).midY, shift: false)
-        c.gutterMouseDown(atY: c.table.rect(ofRow: 0).midY, shift: false)
+        controller.gutterMouseDown(atY: controller.table.rect(ofRow: 0).midY, shift: false)
+        controller.gutterMouseDown(atY: controller.table.rect(ofRow: 0).midY, shift: false)
         log("lesssheet.selectcopy.toggle_row deselected=\(model.selection == nil)")
 
-        guard !c.widths.isEmpty else { return }
-        let headerX = c.columnFirstX + c.widths[0] / 2
-        c.headerMouseDown(atX: headerX, shift: false)
-        c.headerMouseDown(atX: headerX, shift: false)
+        guard !controller.widths.isEmpty else { return }
+        let headerX = controller.columnFirstX + controller.widths[0] / 2
+        controller.headerMouseDown(atX: headerX, shift: false)
+        controller.headerMouseDown(atX: headerX, shift: false)
         log("lesssheet.selectcopy.toggle_column deselected=\(model.selection == nil)")
 
         var loadedRow: (row: Int, view: SheetRowView)?
-        c.table.enumerateAvailableRowViews { rowView, row in
-            guard loadedRow == nil, row < c.dataRowCount,
+        controller.table.enumerateAvailableRowViews { rowView, row in
+            guard loadedRow == nil, row < controller.dataRowCount,
                   let view = rowView as? SheetRowView, !view.pending, !view.cells.isEmpty
             else { return }
             loadedRow = (row, view)
@@ -150,10 +150,11 @@ enum SelectCopyProbe {
         }
         let cellsBefore = loadedRow.view.cells
         let pendingBefore = loadedRow.view.pending
-        let start = GridCell(row: UInt64(loadedRow.row), column: c.absoluteColumns.first ?? 0)
-        c.cellMouseDown(start, shift: false)
-        c.cellMouseDragged(to: GridCell(row: start.row, column: min(start.column + 1, model.columnCount - 1)))
-        c.cellMouseUp(at: start)
+        let start = GridCell(row: UInt64(loadedRow.row), column: controller.absoluteColumns.first ?? 0)
+        controller.cellMouseDown(start, shift: false)
+        controller.cellMouseDragged(
+            to: GridCell(row: start.row, column: min(start.column + 1, model.columnCount - 1)))
+        controller.cellMouseUp(at: start)
         let pass = loadedRow.view.cells == cellsBefore && loadedRow.view.pending == pendingBefore
         log("lesssheet.selectcopy.selection_repaint content_preserved=\(pass)"
             + " pending_before=\(pendingBefore) pending_after=\(loadedRow.view.pending)")
@@ -182,40 +183,40 @@ enum SelectCopyProbe {
     /// position afterward so nothing downstream (the small-copy dump) sees
     /// the grid scrolled away from its expected columns.
     private static func headerScrolledSelectRegression() {
-        guard let model, let c = NativeGridController.live else { return }
-        let clip = c.scroll.contentView
-        let maxX = max(0, c.table.frame.width - clip.bounds.width)
+        guard let model, let controller = NativeGridController.live else { return }
+        let clip = controller.scroll.contentView
+        let maxX = max(0, controller.table.frame.width - clip.bounds.width)
         guard maxX > 1 else {
             log("lesssheet.selectcopy.header_scrolled_select skip=not_wide_enough")
             return
         }
         let restoreX = clip.bounds.origin.x
         clip.scroll(to: NSPoint(x: maxX, y: clip.bounds.origin.y))
-        c.scroll.reflectScrolledClipView(clip)
+        controller.scroll.reflectScrolledClipView(clip)
         defer {
             clip.scroll(to: NSPoint(x: restoreX, y: clip.bounds.origin.y))
-            c.scroll.reflectScrolledClipView(clip)
+            controller.scroll.reflectScrolledClipView(clip)
         }
 
-        guard c.widths.count > 1, c.header.contentOffsetX > 0 else {
+        guard controller.widths.count > 1, controller.header.contentOffsetX > 0 else {
             log("lesssheet.selectcopy.header_scrolled_select skip=window_too_narrow"
-                + " widths=\(c.widths.count) offset=\(c.header.contentOffsetX)")
+                + " widths=\(controller.widths.count) offset=\(controller.header.contentOffsetX)")
             return
         }
 
         // The window's LAST column — as far from index 0 as this scroll
         // gets, so the bug (always resolving to index 0) is unmistakable.
-        let targetIndex = c.widths.count - 1
-        let columnStartX = c.columnFirstX + c.widths[0..<targetIndex].reduce(CGFloat(0), +)
-        let midAbsoluteX = columnStartX + c.widths[targetIndex] / 2
-        let localX = midAbsoluteX - c.header.contentOffsetX
-        let expectedColumn = c.absoluteColumns[targetIndex]
+        let targetIndex = controller.widths.count - 1
+        let columnStartX = controller.columnFirstX + controller.widths[0..<targetIndex].reduce(CGFloat(0), +)
+        let midAbsoluteX = columnStartX + controller.widths[targetIndex] / 2
+        let localX = midAbsoluteX - controller.header.contentOffsetX
+        let expectedColumn = controller.absoluteColumns[targetIndex]
 
         model.selectCell(row: 0, column: 0)   // known baseline before the click
-        c.header.handleClick(atLocalX: localX, doubleClick: false, shift: false)
+        controller.header.handleClick(atLocalX: localX, doubleClick: false, shift: false)
         let selectedColumn = model.selection?.rect.left
         let pass = selectedColumn == expectedColumn
-        log("lesssheet.selectcopy.header_scrolled_select offset=\(c.header.contentOffsetX)"
+        log("lesssheet.selectcopy.header_scrolled_select offset=\(controller.header.contentOffsetX)"
             + " local_x=\(localX) expected_column=\(expectedColumn)"
             + " selected_column=\(selectedColumn.map(String.init) ?? "nil") pass=\(pass)")
 
@@ -226,9 +227,9 @@ enum SelectCopyProbe {
         // click above. Extends from the anchor set above (the window's LAST
         // column) back to the window's FIRST column, and checks the rect
         // spans exactly those two absolute columns.
-        let extendColumn = c.absoluteColumns[0]
-        let extendLocalX = c.columnFirstX + c.widths[0] / 2 - c.header.contentOffsetX
-        c.header.handleClick(atLocalX: extendLocalX, doubleClick: false, shift: true)
+        let extendColumn = controller.absoluteColumns[0]
+        let extendLocalX = controller.columnFirstX + controller.widths[0] / 2 - controller.header.contentOffsetX
+        controller.header.handleClick(atLocalX: extendLocalX, doubleClick: false, shift: true)
         let extendedRect = model.selection?.rect
         let expectedLeft = min(expectedColumn, extendColumn)
         let expectedRight = max(expectedColumn, extendColumn)
@@ -280,7 +281,9 @@ enum SelectCopyProbe {
 
     private static var loggedInProgress = false
 
-    private static func pollForCompletion(label: String, rect: SelectionRect?, triesLeft: Int, then next: @escaping () -> Void) {
+    private static func pollForCompletion(
+        label: String, rect: SelectionRect?, triesLeft: Int, then next: @escaping () -> Void
+    ) {
         guard let model else { next(); return }
         if model.copyInFlight, model.copyNotice == "Copying…", !loggedInProgress {
             loggedInProgress = true
@@ -329,8 +332,8 @@ enum SelectCopyProbe {
 
     /// Escapes newlines/tabs/quotes so one payload prints on one log line,
     /// unambiguously (the whole point is a human/diff can read it exactly).
-    private static func escaped(_ s: String) -> String {
-        s.replacingOccurrences(of: "\\", with: "\\\\")
+    private static func escaped(_ text: String) -> String {
+        text.replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "\\\"")
             .replacingOccurrences(of: "\n", with: "\\n")
             .replacingOccurrences(of: "\t", with: "\\t")

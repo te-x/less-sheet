@@ -54,10 +54,10 @@ enum FilterRepaintProbe {
     }
 
     private static var started = false
-    private static var t0 = DispatchTime.now()
+    private static var startTime = DispatchTime.now()
 
     private static func elapsedMs() -> Int {
-        Int((DispatchTime.now().uptimeNanoseconds &- t0.uptimeNanoseconds) / 1_000_000)
+        Int((DispatchTime.now().uptimeNanoseconds &- startTime.uptimeNanoseconds) / 1_000_000)
     }
 
     /// Whether the live grid controller is attached to a window — the state in
@@ -70,7 +70,7 @@ enum FilterRepaintProbe {
     static func run(model: DocumentModel) {
         guard active, !started else { return }
         started = true
-        t0 = DispatchTime.now()
+        startTime = DispatchTime.now()
 
         guard model.columnCount > 0 else {
             log("lesssheet.filterrepaint.skip reason=empty_document")

@@ -50,20 +50,29 @@ enum EstimateReloadProbe {
         // subtraction expression) risks initializing `start` to a time AFTER
         // the already-evaluated "now" on the very first call — an `&-`
         // underflow (a huge bogus elapsed value) rather than a small one.
-        let t0 = start
-        return Int((DispatchTime.now().uptimeNanoseconds &- t0.uptimeNanoseconds) / 1_000_000)
+        let startedAt = start
+        return Int((DispatchTime.now().uptimeNanoseconds &- startedAt.uptimeNanoseconds) / 1_000_000)
+    }
+
+    /// One row-count-estimate reload decision, bundled so `noteDecision` stays
+    /// within the parameter-count budget (the fields are unchanged).
+    struct ReloadDecision {
+        let applied: Bool
+        let rows: Int
+        let lastRows: Int
+        let origin: CGPoint
+        let overscrollX: Bool
+        let overscrollY: Bool
     }
 
     /// Logs one reload decision (called from `NativeGridController.syncRowCountEstimate`).
-    static func noteDecision(
-        applied: Bool, rows: Int, lastRows: Int, origin: CGPoint, overscrollX: Bool, overscrollY: Bool
-    ) {
+    static func noteDecision(_ decision: ReloadDecision) {
         guard logEnabled else { return }
         FileHandle.standardError.write(Data(String(
-            format: "lesssheet.estimate.reload applied=\(applied) rows=%d last=%d"
-                + " overscroll_x=\(overscrollX) overscroll_y=\(overscrollY)"
+            format: "lesssheet.estimate.reload applied=\(decision.applied) rows=%d last=%d"
+                + " overscroll_x=\(decision.overscrollX) overscroll_y=\(decision.overscrollY)"
                 + " origin_x=%.1f origin_y=%.1f at_ms=%d\n",
-            rows, lastRows, origin.x, origin.y, elapsedMs()
+            decision.rows, decision.lastRows, decision.origin.x, decision.origin.y, elapsedMs()
         ).utf8))
     }
 
@@ -118,7 +127,9 @@ enum EstimateReloadProbe {
     /// `apply()` calls this probe exists to observe). Releases back to the
     /// resting top-left at the deadline, logs the release, and quits shortly
     /// after (self-contained — see the type doc).
-    private static func hold(clip: NSClipView, scroll: NSScrollView, at point: NSPoint, restY: CGFloat, until deadline: Date) {
+    private static func hold(
+        clip: NSClipView, scroll: NSScrollView, at point: NSPoint, restY: CGFloat, until deadline: Date
+    ) {
         clip.scroll(to: point)
         scroll.reflectScrolledClipView(clip)
         if Date() < deadline {
@@ -169,8 +180,8 @@ enum EstimateCollapseProbe {
     private static let start = DispatchTime.now()
 
     private static func elapsedMs() -> Int {
-        let t0 = start   // see EstimateReloadProbe.elapsedMs for the ordering note
-        return Int((DispatchTime.now().uptimeNanoseconds &- t0.uptimeNanoseconds) / 1_000_000)
+        let startedAt = start   // see EstimateReloadProbe.elapsedMs for the ordering note
+        return Int((DispatchTime.now().uptimeNanoseconds &- startedAt.uptimeNanoseconds) / 1_000_000)
     }
 
     /// Called once the live grid is built (mirrors `EstimateReloadProbe.

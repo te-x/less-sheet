@@ -35,10 +35,10 @@ enum MatchFlagsFetchProbe {
     private static let repaintN = 5      // "N repaints" for the cadence case
     private static var started = false
     private static var seeded = false
-    private static var t0 = DispatchTime.now()
+    private static var startTime = DispatchTime.now()
 
     private static func elapsedMs() -> Int {
-        Int((DispatchTime.now().uptimeNanoseconds &- t0.uptimeNanoseconds) / 1_000_000)
+        Int((DispatchTime.now().uptimeNanoseconds &- startTime.uptimeNanoseconds) / 1_000_000)
     }
 
     private static var gridWindowReady: Bool {
@@ -50,15 +50,15 @@ enum MatchFlagsFetchProbe {
     /// fetches at most once across all rows.
     private static func repaint(_ model: DocumentModel) {
         let first = Int(model.window.firstRow)
-        let n = model.window.rows.count
-        guard n > 0 else { return }
-        for r in first..<(first + n) { _ = model.cellHighlights(forRow: r) }
+        let rowCount = model.window.rows.count
+        guard rowCount > 0 else { return }
+        for row in first..<(first + rowCount) { _ = model.cellHighlights(forRow: row) }
     }
 
     static func run(model: DocumentModel) {
         guard active, !started else { return }
         started = true
-        t0 = DispatchTime.now()
+        startTime = DispatchTime.now()
         guard model.columnCount > 0 else {
             log("lesssheet.matchflagsfetch.skip reason=empty_document"); finish(); return
         }

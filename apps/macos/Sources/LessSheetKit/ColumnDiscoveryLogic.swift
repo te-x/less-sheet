@@ -27,7 +27,8 @@ public struct ColumnDiscovery: ColumnDiscoveryRouting {
         return .column(value - 1)
     }
 
-    public func accumulate(_ accumulation: ColumnMatchAccumulation, matches batch: [UInt32]) -> ColumnMatchAccumulation {
+    public func accumulate(_ accumulation: ColumnMatchAccumulation,
+                           matches batch: [UInt32]) -> ColumnMatchAccumulation {
         guard !accumulation.overflow else { return accumulation }
         let remaining = max(0, columnDiscoveryResultMax - accumulation.retained.count)
         var retained = accumulation.retained
@@ -53,7 +54,8 @@ public struct SettingsLifecycleReducer: SettingsLifecycleReducing {
                                widthAutoFitExpanded: state.widthAutoFitExpanded)
     }
 
-    public func disclosureSet(_ state: SettingsLifecycleState, _ disclosure: SettingsDisclosure, expanded: Bool) -> SettingsLifecycleState {
+    public func disclosureSet(_ state: SettingsLifecycleState, _ disclosure: SettingsDisclosure,
+                              expanded: Bool) -> SettingsLifecycleState {
         var next = state
         switch disclosure {
         case .nullValues: next.nullValuesExpanded = expanded
@@ -62,7 +64,8 @@ public struct SettingsLifecycleReducer: SettingsLifecycleReducing {
         return next
     }
 
-    public func headerAction(_ state: SettingsLifecycleState, target: Int, columnCount: Int, targetInCurrentRows: Bool) -> SettingsLifecycleState {
+    public func headerAction(_ state: SettingsLifecycleState, target: Int, columnCount: Int,
+                             targetInCurrentRows: Bool) -> SettingsLifecycleState {
         guard valid(target, columnCount: columnCount) != nil else { return state }
         var next = state
         next.selection = target
@@ -70,7 +73,8 @@ public struct SettingsLifecycleReducer: SettingsLifecycleReducing {
         return next
     }
 
-    public func parsingReopened(_ state: SettingsLifecycleState, decision: ColumnReopenDecision, columnCount: Int) -> SettingsLifecycleState {
+    public func parsingReopened(_ state: SettingsLifecycleState, decision: ColumnReopenDecision,
+                                columnCount: Int) -> SettingsLifecycleState {
         var next = state
         next.query = ""
         switch decision {

@@ -49,8 +49,8 @@ public struct FindControl: FindControlling {
             guard (0..<columnCount).contains(draft.column) else { return .rejected }
             // Ordering operators need a numeric value; the empty value fails too.
             // = / ≠ accept ANY value (the empty one matches empty cells).
-            if draft.op.isOrdering, !NumericGrammar.isNumeric(draft.value) { return .rejected }
-            return .run(.predicate(column: draft.column, op: draft.op, value: draft.value))
+            if draft.comparison.isOrdering, !NumericGrammar.isNumeric(draft.value) { return .rejected }
+            return .run(.predicate(column: draft.column, comparison: draft.comparison, value: draft.value))
         }
     }
 
@@ -172,15 +172,15 @@ public struct FindControl: FindControlling {
         // The scan-cancel affordance: keep everything known so far, end the
         // progress UI, and state "Stopped". No-op when nothing is active.
         guard session.display.request != nil else { return session }
-        let d = session.display
+        let display = session.display
         return FindSession(
             draft: session.draft,
             display: FindDisplay(
-                request: d.request,
-                current: d.current,
-                position: d.position,
-                total: d.total,
-                totalIsFinal: d.totalIsFinal,
+                request: display.request,
+                current: display.current,
+                position: display.position,
+                total: display.total,
+                totalIsFinal: display.totalIsFinal,
                 progress: nil,
                 notice: .stopped
             )
