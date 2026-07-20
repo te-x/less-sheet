@@ -2387,7 +2387,13 @@ install_jump_css (void)
            "  80%  { transform: translateX(-2px); }"
            "  100% { transform: translateX(0px); }"
            "}"
-           ".lsg-shake { animation: lsg-shake 300ms ease; }");
+           ".lsg-shake { animation: lsg-shake 300ms ease; }"
+           /* The dialect dropdown's GtkListBox: drop the `list` node's own
+            * `@view_bg_color` fill (darker than the popover on dark themes)
+            * so the standard popover background shows through — matching the
+            * Find/Jump popovers. Row hover-highlight is unaffected (it comes
+            * from the activatable rows, not this background). */
+           ".lsg-flat-list { background: none; }");
   GdkDisplay *display = gdk_display_get_default ();
   if (display != NULL)
     gtk_style_context_add_provider_for_display (
@@ -4009,23 +4015,28 @@ on_dialect_custom_activate (GtkWidget *entry, gpointer data)
   /* An invalid byte is a silent no-op (F3b) — leave the entry for a retry. */
 }
 
-/* Append one clickable preset ROW to the dropdown list (no radios). `markup`
- * is Pango markup so the glyph reads primary and the (Name) is dimmed; the row
- * is activatable, so Adwaita highlights it on hover to signal it is clickable.
- */
+/* Append one clickable preset ROW to the dropdown list (no radios): the
+ * CHARACTER glyph far-LEFT and the DIMMED name far-RIGHT (space-between), no
+ * parentheses. The row is activatable, so Adwaita highlights it on hover. */
 static void
-add_dialect_row (GtkWidget *list, const char *markup, int kind, int byte,
-                 gboolean is_none)
+add_dialect_row (GtkWidget *list, const char *glyph, const char *name,
+                 int kind, int byte, gboolean is_none)
 {
   GtkWidget *row = gtk_list_box_row_new ();
-  GtkWidget *lbl = gtk_label_new (NULL);
-  gtk_label_set_markup (GTK_LABEL (lbl), markup);
-  gtk_label_set_xalign (GTK_LABEL (lbl), 0.0);
-  gtk_widget_set_margin_start (lbl, 10);
-  gtk_widget_set_margin_end (lbl, 10);
-  gtk_widget_set_margin_top (lbl, 6);
-  gtk_widget_set_margin_bottom (lbl, 6);
-  gtk_list_box_row_set_child (GTK_LIST_BOX_ROW (row), lbl);
+  GtkWidget *rb = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 12);
+  gtk_widget_set_margin_start (rb, 10);
+  gtk_widget_set_margin_end (rb, 10);
+  gtk_widget_set_margin_top (rb, 6);
+  gtk_widget_set_margin_bottom (rb, 6);
+  GtkWidget *gl = gtk_label_new (glyph); /* character, at the start */
+  gtk_widget_set_halign (gl, GTK_ALIGN_START);
+  GtkWidget *nl = gtk_label_new (name); /* dimmed name, pushed to the end */
+  gtk_widget_add_css_class (nl, "dim-label");
+  gtk_widget_set_hexpand (nl, TRUE);
+  gtk_widget_set_halign (nl, GTK_ALIGN_END);
+  gtk_box_append (GTK_BOX (rb), gl);
+  gtk_box_append (GTK_BOX (rb), nl);
+  gtk_list_box_row_set_child (GTK_LIST_BOX_ROW (row), rb);
   g_object_set_data (G_OBJECT (row), "lsg-kind", GINT_TO_POINTER (kind));
   g_object_set_data (G_OBJECT (row), "lsg-byte", GINT_TO_POINTER (byte));
   if (is_none)
@@ -4044,35 +4055,30 @@ build_dialect_dropdown_popover (App *app, int kind)
   gtk_widget_set_margin_end (box, 6);
 
   /* A plain clickable presets list (hover-highlighted rows), NOT radios and
-   * NOT a menu-model, and NO custom CSS class — Adwaita's default popover/list
-   * styling shows through. A preset applies + popdowns via
-   * on_dialect_row_activated. */
+   * NOT a menu-model. The `.lsg-flat-list` class drops the GtkListBox's own
+   * `@view_bg_color` fill so the standard popover background shows through
+   * (matching Find/Jump) on both light and dark themes. A preset applies +
+   * popdowns via on_dialect_row_activated. */
   GtkWidget *list = gtk_list_box_new ();
   gtk_list_box_set_selection_mode (GTK_LIST_BOX (list), GTK_SELECTION_NONE);
+  gtk_widget_add_css_class (list, "lsg-flat-list");
   g_signal_connect (list, "row-activated",
                     G_CALLBACK (on_dialect_row_activated), app);
 
   if (kind == DIALECT_KIND_SEP)
     {
       const guint8 *s = lsg_dialect_separator_candidates ();
-      add_dialect_row (list, ", <span alpha='55%'>(Comma)</span>", kind, s[0],
-                       FALSE);
-      add_dialect_row (list, "; <span alpha='55%'>(Semicolon)</span>", kind,
-                       s[1], FALSE);
-      add_dialect_row (list, "⇥ <span alpha='55%'>(Tab)</span>", kind, s[2],
-                       FALSE);
-      add_dialect_row (list, "| <span alpha='55%'>(Pipe)</span>", kind, s[3],
-                       FALSE);
+      add_dialect_row (list, ",", "Comma", kind, s[0], FALSE);
+      add_dialect_row (list, ";", "Semicolon", kind, s[1], FALSE);
+      add_dialect_row (list, "⇥", "Tab", kind, s[2], FALSE);
+      add_dialect_row (list, "|", "Pipe", kind, s[3], FALSE);
     }
   else
     {
       const guint8 *q = lsg_dialect_quote_candidates ();
-      add_dialect_row (list, "\" <span alpha='55%'>(Double)</span>", kind,
-                       q[0], FALSE);
-      add_dialect_row (list, "' <span alpha='55%'>(Single)</span>", kind, q[1],
-                       FALSE);
-      add_dialect_row (list, "∅ <span alpha='55%'>(None)</span>", kind, 0,
-                       TRUE);
+      add_dialect_row (list, "\"", "Double", kind, q[0], FALSE);
+      add_dialect_row (list, "'", "Single", kind, q[1], FALSE);
+      add_dialect_row (list, "∅", "None", kind, 0, TRUE);
     }
 
   /* An ALWAYS-visible one-char custom entry below the presets: placeholder
