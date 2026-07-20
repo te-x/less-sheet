@@ -60,7 +60,17 @@ typedef struct
 {
   AdwApplication *app;
   GtkWindow *window;
-  AdwWindowTitle *title;
+  /* Header-bar title: a custom widget (an AdwWindowTitle cannot hold a button)
+   * — the document-name label over a subtitle ROW that carries the passive
+   * status text PLUS a filtered-only (x) clear-filter button. Mirrors
+   * AdwWindowTitle's centering + `.title`/`.subtitle` styling; the (x) is the
+   * compact successor to the old full-width filter banner's Clear. */
+  GtkWidget *title_box;   /* the title widget packed into the header bar */
+  GtkLabel *title_name;   /* document name (.title) */
+  GtkLabel *title_status; /* passive status line (.subtitle) */
+  GtkButton
+      *filter_clear_btn; /* (x) after the status; shown only when filtered
+                          */
   AdwToolbarView *toolbar;
   GtkStack *stack; /* "launch" / "grid" / "error" */
   AdwStatusPage *error_page;
@@ -123,6 +133,20 @@ typedef struct
   LsgFindNotice
       find_sticky_notice; /* a briefly-lingering wrap notice for the label */
   guint find_notice_id;   /* timeout clearing the sticky notice */
+
+  /* Find "Where" predicate builder: a `Text | Where` mode of the SAME find
+   * popover (macOS parity) over the already-frozen predicate engine. The mode
+   * lives in `find_stack`; the Where body holds the column picker, the
+   * operator glyph dropdown, and the value field. All compose into
+   * `find.draft` and go through the frozen `lsg_find_submit`. */
+  GtkStack *find_stack;      /* "text" | "where" bodies */
+  GtkDropDown *where_column; /* column picker (model built lazily per doc) */
+  GtkDropDown *where_op;     /* operator glyph picker (= != < > <= >=) */
+  GtkEditable *where_value;  /* the predicate value field */
+  guint where_reject_id;     /* timeout clearing the value reject blink */
+  gboolean
+      where_columns_dirty; /* the column model needs a rebuild (new doc) */
+  gboolean where_ui_guard; /* suppress re-run on programmatic model swaps */
 
   /* Jump-to-row (slice 3): the pure flow + the popover widgets. */
   LsgJumpFlow jump;
@@ -340,6 +364,19 @@ static void filter_update_toggle_sensitivity (App *app);
  * (the reset cleared any prior filter). Defined with the filter helpers. */
 static void filter_sync_ui (App *app);
 
+/* (Re)build the Where column picker's model lazily on first entry into Where
+ * mode (never at open — keeps open O(viewport)). Defined with the find
+ * helpers; capture_all_labels fetches every column's label (defined far below
+ * with the re-open funnel). */
+static void where_ensure_columns (App *app);
+static LsgColumnLabel *capture_all_labels (App *app, guint *out_n);
+
+/* Input-rejection blink (Adwaita .error red + reduce-motion-aware shake) and
+ * its cancel, shared by the jump box + the Where value field. Defined with the
+ * jump helpers; used by the find/filter reject paths + app_reset_document. */
+static void entry_reject_feedback (GtkWidget *entry, guint *id_slot);
+static void entry_clear_feedback (GtkWidget *entry, guint *id_slot);
+
 /* Open the jump popover pre-filled with a digit typed on the grid (macOS
  * parity). Defined with the jump helpers; the grid key handler calls it. */
 static void open_jump_with_digit (App *app, char digit);
@@ -399,6 +436,9 @@ app_reset_document (App *app)
   app->find_sticky_notice = LSG_FIND_NOTICE_NONE;
   app->find_wrap_issued = FALSE;
   find_clear_mask (app);
+  /* Drop any lingering Where value reject blink; the column model is rebuilt
+   * for the new document (dirty is re-armed in open_document). */
+  entry_clear_feedback (GTK_WIDGET (app->where_value), &app->where_reject_id);
 
   /* The old document's jump slot died with its core handle: reset the flow. */
   if (app->jump_reject_id != 0)
@@ -419,13 +459,29 @@ app_reset_document (App *app)
 /* Error / launch pages */
 /* ------------------------------------------------------------------------- */
 
+/* Set the header-bar subtitle text on the custom title widget, mirroring
+ * AdwWindowTitle: an empty subtitle is HIDDEN so the name centers. The
+ * filtered-only (x) button's visibility is a separate rule owned by
+ * update_title_subtitle (it tracks filter.active, not this text). */
+static void
+title_set_status (App *app, const char *text)
+{
+  if (app->title_status == NULL)
+    return;
+  gtk_label_set_text (app->title_status, (text != NULL) ? text : "");
+  gtk_widget_set_visible (GTK_WIDGET (app->title_status),
+                          text != NULL && text[0] != '\0');
+}
+
 static void
 show_error (App *app, const char *title, const char *description)
 {
   adw_status_page_set_title (app->error_page, title);
   adw_status_page_set_description (app->error_page, description);
   gtk_stack_set_visible_child_name (app->stack, "error");
-  adw_window_title_set_subtitle (app->title, "");
+  title_set_status (app, "");
+  if (app->filter_clear_btn != NULL)
+    gtk_widget_set_visible (GTK_WIDGET (app->filter_clear_btn), FALSE);
 }
 
 static const char *
@@ -666,7 +722,7 @@ grid_materialize (App *app)
 static void
 update_title_subtitle (App *app)
 {
-  if (app->title == NULL || app->doc == NULL)
+  if (app->title_status == NULL || app->doc == NULL)
     return;
 
   char *sub;
@@ -700,8 +756,13 @@ update_title_subtitle (App *app)
         }
     }
 
-  adw_window_title_set_subtitle (app->title, sub);
+  title_set_status (app, sub);
   g_free (sub);
+  /* The (x) clear-filter button lives right after the subtitle and shows ONLY
+   * while a filter owns the view (no (x) on the plain row-count). */
+  if (app->filter_clear_btn != NULL)
+    gtk_widget_set_visible (GTK_WIDGET (app->filter_clear_btn),
+                            app->filter.active);
 }
 
 static gboolean
@@ -1153,6 +1214,8 @@ open_document (App *app, LsgDocument *doc, const char *title,
 
   app->n_cols = lsg_document_column_count (doc);
   app->has_header = lsg_document_has_header (doc);
+  app->where_columns_dirty
+      = TRUE; /* the Where column picker needs a rebuild */
   /* Header labels are NOT prefetched for every column (that would be
    * O(column_count) window-lane calls + retained strings, breaking the
    * wide-doc viewport-only NFR). They are fetched lazily for the visible
@@ -1179,8 +1242,9 @@ open_document (App *app, LsgDocument *doc, const char *title,
   gtk_adjustment_set_value (app->vadj, 0.0);
   gtk_adjustment_set_value (app->hadj, 0.0);
 
-  adw_window_title_set_title (app->title,
-                              (title != NULL) ? title : "less-sheet");
+  if (app->title_name != NULL)
+    gtk_label_set_text (app->title_name,
+                        (title != NULL) ? title : "less-sheet");
   update_title_subtitle (app);
 
   gtk_stack_set_visible_child_name (app->stack, "grid");
@@ -1704,7 +1768,62 @@ find_set_sticky_notice (App *app, LsgFindNotice notice)
   app->find_notice_id = g_timeout_add (2500, find_notice_clear, app);
 }
 
-/* (Re)run the current entry text as a live TEXT search, or clear when empty.
+/* Read the whole find draft out of the popover widgets: the mode from the
+ * Text|Where stack, the TEXT query, and the WHERE column / operator / value.
+ * `text` and `value` borrow the entries' buffers (valid while they live), so
+ * the draft is consumed immediately (submit). The one canonical widgets->draft
+ * funnel — find_run_query, do_apply_filter, and the toggle-sensitivity gate
+ * all call it, so predicate-find and predicate-filter always see the same
+ * draft. */
+static void
+find_read_draft (App *app)
+{
+  gboolean where
+      = (app->find_stack != NULL)
+        && g_strcmp0 (gtk_stack_get_visible_child_name (app->find_stack),
+                      "where")
+               == 0;
+  app->find.draft.mode = where ? LSG_FIND_PREDICATE : LSG_FIND_TEXT;
+  app->find.draft.text = (app->find_entry != NULL)
+                             ? gtk_editable_get_text (app->find_entry)
+                             : "";
+  if (app->where_column != NULL)
+    {
+      guint sel = gtk_drop_down_get_selected (app->where_column);
+      app->find.draft.column
+          = (sel == GTK_INVALID_LIST_POSITION) ? 0 : (guint32)sel;
+    }
+  if (app->where_op != NULL)
+    {
+      guint sel = gtk_drop_down_get_selected (app->where_op);
+      app->find.draft.op = (sel == GTK_INVALID_LIST_POSITION)
+                               ? LSG_SEARCH_OP_EQ
+                               : (LsgSearchOp)sel;
+    }
+  app->find.draft.value = (app->where_value != NULL)
+                              ? gtk_editable_get_text (app->where_value)
+                              : "";
+}
+
+/* Reject feedback for a rejected predicate submit: keep the popover open,
+ * focus
+ * + select-all the value field, blink it (red + shake, reduce-motion aware),
+ * and make NO core call. Shared by find_run_query + do_apply_filter. */
+static void
+where_reject_value (App *app)
+{
+  GtkWidget *v = GTK_WIDGET (app->where_value);
+  if (v != NULL)
+    {
+      gtk_widget_grab_focus (v);
+      gtk_editable_select_region (app->where_value, 0, -1);
+    }
+  entry_reject_feedback (v, &app->where_reject_id);
+}
+
+/* (Re)run the current draft as a live search: a TEXT substring query, or a
+ * WHERE predicate; clear on an empty text query; blink on a rejected
+ * predicate.
  */
 static void
 find_run_query (App *app)
@@ -1719,14 +1838,24 @@ find_run_query (App *app)
   if (app->copy_op != NULL)
     return;
 
-  app->find.draft.mode = LSG_FIND_TEXT;
-  app->find.draft.text
-      = gtk_editable_get_text (app->find_entry); /* borrowed */
+  find_read_draft (app);
 
-  /* Slice-2 UI is text find over ALL columns (no column hiding yet): the whole
-   * column set is visible, so the composed scope is NULL. */
+  /* Find is over ALL columns (predicate targets a single column and ignores
+   * the scope; a hidden column is a legal predicate target): the whole column
+   * set is visible, so the composed TEXT scope is NULL. */
   LsgFindSubmit sub
       = lsg_find_submit (app->find, NULL, app->n_cols, app->n_cols);
+
+  if (sub.outcome == LSG_FIND_REJECTED)
+    {
+      /* Invalid predicate (out-of-range column, or an ordering op < > <= >=
+       * with a non-numeric/empty value): NO core call — the active search and
+       * its highlights are left exactly as they were; just blink the value. */
+      where_reject_value (app);
+      filter_update_toggle_sensitivity (app);
+      return;
+    }
+
   if (sub.outcome == LSG_FIND_RUN
       && lsg_document_search_start (app->doc, sub.request))
     {
@@ -1745,7 +1874,7 @@ find_run_query (App *app)
     }
   else
     {
-      /* Empty query (IGNORED) or a rejected/failed start: clear the search. */
+      /* Empty text query (IGNORED) or a failed start: clear the search. */
       lsg_document_search_cancel (app->doc);
       app->find = lsg_find_closed (app->find);
     }
@@ -1894,17 +2023,32 @@ on_find_popover_closed (GtkPopover *popover, gpointer data)
     }
 }
 
-/* Opening (re)focuses the entry and re-runs any retained query to
- * re-highlight. */
+/* Opening (re)focuses the mode's field and re-runs any retained query to
+ * re-highlight. In Where mode the column model is built lazily here. */
 static void
 on_find_popover_show (GtkWidget *popover, gpointer data)
 {
   (void)popover;
   App *app = data;
-  gtk_widget_grab_focus (GTK_WIDGET (app->find_entry));
-  const char *text = gtk_editable_get_text (app->find_entry);
-  if (text != NULL && text[0] != '\0')
-    find_run_query (app);
+  gboolean where
+      = (app->find_stack != NULL)
+        && g_strcmp0 (gtk_stack_get_visible_child_name (app->find_stack),
+                      "where")
+               == 0;
+  if (where)
+    {
+      where_ensure_columns (app);
+      if (app->where_value != NULL)
+        gtk_widget_grab_focus (GTK_WIDGET (app->where_value));
+      find_run_query (app); /* re-run the retained predicate */
+    }
+  else
+    {
+      gtk_widget_grab_focus (GTK_WIDGET (app->find_entry));
+      const char *text = gtk_editable_get_text (app->find_entry);
+      if (text != NULL && text[0] != '\0')
+        find_run_query (app);
+    }
 }
 
 static void
@@ -1953,26 +2097,252 @@ on_window_key (GtkEventControllerKey *ctrl, guint keyval, guint keycode,
   return GDK_EVENT_PROPAGATE;
 }
 
+/* The WHERE operator dropdown: glyphs shown, names in per-item tooltips +
+ * accessible labels. Index i maps 1:1 to LsgSearchOp i (EQ..GE). */
+static const char *const WHERE_OP_GLYPHS[] = { "=", "≠", "<", ">", "≤", "≥" };
+static const char *const WHERE_OP_NAMES[]
+    = { "Equals",       "Not equal",          "Less than",
+        "Greater than", "Less than or equal", "Greater than or equal" };
+
+static void
+where_op_setup (GtkSignalListItemFactory *f, GtkListItem *item, gpointer d)
+{
+  (void)f;
+  (void)d;
+  GtkWidget *lbl = gtk_label_new (NULL);
+  gtk_widget_set_halign (lbl, GTK_ALIGN_CENTER);
+  gtk_list_item_set_child (item, lbl);
+}
+
+static void
+where_op_bind (GtkSignalListItemFactory *f, GtkListItem *item, gpointer d)
+{
+  (void)f;
+  (void)d;
+  guint pos = gtk_list_item_get_position (item);
+  GtkWidget *lbl = gtk_list_item_get_child (item);
+  if (lbl == NULL || pos >= G_N_ELEMENTS (WHERE_OP_GLYPHS))
+    return;
+  gtk_label_set_text (GTK_LABEL (lbl), WHERE_OP_GLYPHS[pos]);
+  gtk_widget_set_tooltip_text (lbl, WHERE_OP_NAMES[pos]);
+  gtk_accessible_update_property (GTK_ACCESSIBLE (lbl),
+                                  GTK_ACCESSIBLE_PROPERTY_LABEL,
+                                  WHERE_OP_NAMES[pos], -1);
+}
+
+/* A mode / column / operator change re-runs the query, mirroring macOS
+ * `.onChange` (the value field is submit-validated instead — on Enter — so a
+ * half-typed number does not blink on every keystroke). */
+static void
+on_where_changed (GObject *obj, GParamSpec *pspec, gpointer data)
+{
+  (void)obj;
+  (void)pspec;
+  App *app = data;
+  if (app->where_ui_guard)
+    return; /* programmatic model/selection swap: not a user change */
+  find_run_query (app);
+}
+
+/* The Text|Where stack switched: build the Where column model on first entry,
+ * focus the mode's field, and re-run (a mode change re-runs, macOS parity). */
+static void
+on_find_mode_changed (GObject *stack, GParamSpec *pspec, gpointer data)
+{
+  (void)stack;
+  (void)pspec;
+  App *app = data;
+  gboolean where
+      = g_strcmp0 (gtk_stack_get_visible_child_name (app->find_stack), "where")
+        == 0;
+  if (where)
+    {
+      where_ensure_columns (app);
+      if (app->where_value != NULL)
+        gtk_widget_grab_focus (GTK_WIDGET (app->where_value));
+    }
+  else if (app->find_entry != NULL)
+    gtk_widget_grab_focus (GTK_WIDGET (app->find_entry));
+  find_run_query (app);
+}
+
+/* Enter submits the predicate (validated by lsg_find_submit; a reject blinks);
+ * Esc closes the popover. Capture phase so we see Return before the entry's
+ * internal activate. */
+static gboolean
+on_where_value_key (GtkEventControllerKey *ctrl, guint keyval, guint keycode,
+                    GdkModifierType state, gpointer data)
+{
+  (void)ctrl;
+  (void)keycode;
+  (void)state;
+  App *app = data;
+  switch (keyval)
+    {
+    case GDK_KEY_Escape:
+      gtk_popover_popdown (app->find_popover);
+      return GDK_EVENT_STOP;
+    case GDK_KEY_Return:
+    case GDK_KEY_KP_Enter:
+      find_run_query (app);
+      return GDK_EVENT_STOP;
+    default:
+      return GDK_EVENT_PROPAGATE;
+    }
+}
+
+/* Forward-declared above: (re)build the column picker's model from every
+ * column's label. Lazy (first Where entry / popover show), never at open. */
+static void
+where_ensure_columns (App *app)
+{
+  if (app->where_column == NULL || !app->where_columns_dirty
+      || app->doc == NULL)
+    return;
+  app->where_columns_dirty = FALSE;
+
+  GtkStringList *list = gtk_string_list_new (NULL);
+  guint n = 0;
+  LsgColumnLabel *labels = capture_all_labels (app, &n);
+  for (guint32 i = 0; i < app->n_cols; i++)
+    {
+      char *base;
+      if (labels != NULL && i < n && labels[i].present)
+        base = lsg_utf8_sanitize_dup (labels[i].bytes, labels[i].len);
+      else
+        base = lsg_column_generic_name (i); /* A, B, C … (no source header) */
+      gboolean hidden
+          = (app->col_settings != NULL && app->col_settings[i].hidden);
+      if (hidden)
+        {
+          /* Hidden columns are LEGAL predicate targets — mark, don't drop. */
+          char *tagged = g_strdup_printf ("%s  (hidden)", base);
+          gtk_string_list_append (list, tagged);
+          g_free (tagged);
+        }
+      else
+        gtk_string_list_append (list, base);
+      g_free (base);
+    }
+  if (labels != NULL)
+    lsg_column_labels_free (labels, n);
+
+  /* Swapping the model resets the selection (emits notify::selected): guard so
+   * it does not spuriously re-run mid-rebuild. */
+  app->where_ui_guard = TRUE;
+  gtk_drop_down_set_model (app->where_column, G_LIST_MODEL (list));
+  guint sel = gtk_drop_down_get_selected (app->where_column);
+  if (app->n_cols > 0
+      && (sel == GTK_INVALID_LIST_POSITION || sel >= app->n_cols))
+    gtk_drop_down_set_selected (app->where_column, 0);
+  app->where_ui_guard = FALSE;
+  g_object_unref (list);
+}
+
+/* The Where builder body: a column picker (searchable, over the column
+ * labels), an operator glyph dropdown, and a value field. */
+static GtkWidget *
+build_where_body (App *app)
+{
+  GtkWidget *body = gtk_box_new (GTK_ORIENTATION_VERTICAL, 6);
+  gtk_widget_set_size_request (body, 240, -1);
+
+  /* Column picker: a searchable GtkDropDown over the label strings. The model
+   * is set lazily (where_ensure_columns) so open stays O(viewport). */
+  GtkExpression *expr
+      = gtk_property_expression_new (GTK_TYPE_STRING_OBJECT, NULL, "string");
+  GtkWidget *col = gtk_drop_down_new (NULL, expr); /* takes the expression */
+  gtk_drop_down_set_enable_search (GTK_DROP_DOWN (col), TRUE);
+  gtk_widget_set_hexpand (col, TRUE);
+  gtk_accessible_update_property (GTK_ACCESSIBLE (col),
+                                  GTK_ACCESSIBLE_PROPERTY_LABEL,
+                                  "Filter column", -1);
+  app->where_column = GTK_DROP_DOWN (col);
+
+  /* Operator glyph dropdown (= != < > <= >=), names in tooltips. */
+  const char *const op_items[] = { "=", "!=", "<", ">", "<=", ">=", NULL };
+  GtkStringList *op_model = gtk_string_list_new (op_items);
+  GtkListItemFactory *op_factory = gtk_signal_list_item_factory_new ();
+  g_signal_connect (op_factory, "setup", G_CALLBACK (where_op_setup), NULL);
+  g_signal_connect (op_factory, "bind", G_CALLBACK (where_op_bind), NULL);
+  GtkWidget *op = gtk_drop_down_new (G_LIST_MODEL (op_model),
+                                     NULL); /* takes the model */
+  gtk_drop_down_set_factory (GTK_DROP_DOWN (op), op_factory);
+  g_object_unref (op_factory);
+  gtk_accessible_update_property (GTK_ACCESSIBLE (op),
+                                  GTK_ACCESSIBLE_PROPERTY_LABEL,
+                                  "Comparison operator", -1);
+  app->where_op = GTK_DROP_DOWN (op);
+
+  GtkWidget *value = gtk_entry_new ();
+  gtk_entry_set_placeholder_text (GTK_ENTRY (value), "Value");
+  gtk_widget_set_hexpand (value, TRUE);
+  gtk_accessible_update_property (GTK_ACCESSIBLE (value),
+                                  GTK_ACCESSIBLE_PROPERTY_LABEL,
+                                  "Filter value", -1);
+  app->where_value = GTK_EDITABLE (value);
+
+  GtkWidget *opval = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 6);
+  gtk_box_append (GTK_BOX (opval), op);
+  gtk_box_append (GTK_BOX (opval), value);
+
+  gtk_box_append (GTK_BOX (body), col);
+  gtk_box_append (GTK_BOX (body), opval);
+
+  g_signal_connect (col, "notify::selected", G_CALLBACK (on_where_changed),
+                    app);
+  g_signal_connect (op, "notify::selected", G_CALLBACK (on_where_changed),
+                    app);
+
+  GtkEventController *vkeys = gtk_event_controller_key_new ();
+  gtk_event_controller_set_propagation_phase (vkeys, GTK_PHASE_CAPTURE);
+  g_signal_connect (vkeys, "key-pressed", G_CALLBACK (on_where_value_key),
+                    app);
+  gtk_widget_add_controller (value, vkeys);
+  return body;
+}
+
 static void
 build_find_popover (App *app)
 {
   GtkWidget *pop = gtk_popover_new ();
   GtkWidget *box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 6);
 
-  GtkWidget *row = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 6);
+  /* A `Text | Where` segmented switch at the TOP (a GtkStackSwitcher over the
+   * two-page body stack) — macOS parity. */
+  GtkWidget *stack = gtk_stack_new ();
+  gtk_stack_set_transition_type (GTK_STACK (stack),
+                                 GTK_STACK_TRANSITION_TYPE_NONE);
+  app->find_stack = GTK_STACK (stack);
+  GtkWidget *switcher = gtk_stack_switcher_new ();
+  gtk_stack_switcher_set_stack (GTK_STACK_SWITCHER (switcher),
+                                GTK_STACK (stack));
+  gtk_widget_set_halign (switcher, GTK_ALIGN_CENTER);
+
+  /* TEXT body: the substring search entry (page "text"). */
   GtkWidget *entry = gtk_search_entry_new ();
   gtk_widget_set_hexpand (entry, TRUE);
   gtk_widget_set_size_request (entry, 220, -1);
   app->find_entry = GTK_EDITABLE (entry);
+  gtk_stack_add_titled (GTK_STACK (stack), entry, "text", "Text");
 
+  /* WHERE body: the predicate builder (page "where"). */
+  GtkWidget *where_body = build_where_body (app);
+  gtk_stack_add_titled (GTK_STACK (stack), where_body, "where", "Where");
+
+  /* Shared find navigation (both modes): prev / next beside the mode body. */
   GtkWidget *prev = gtk_button_new_from_icon_name ("go-up-symbolic");
   gtk_widget_set_tooltip_text (prev, "Previous match (Shift+Enter)");
   gtk_widget_add_css_class (prev, "flat");
+  gtk_widget_set_valign (prev, GTK_ALIGN_CENTER);
   GtkWidget *next = gtk_button_new_from_icon_name ("go-down-symbolic");
   gtk_widget_set_tooltip_text (next, "Next match (Enter)");
   gtk_widget_add_css_class (next, "flat");
+  gtk_widget_set_valign (next, GTK_ALIGN_CENTER);
 
-  gtk_box_append (GTK_BOX (row), entry);
+  GtkWidget *row = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 6);
+  gtk_widget_set_hexpand (stack, TRUE);
+  gtk_box_append (GTK_BOX (row), stack);
   gtk_box_append (GTK_BOX (row), prev);
   gtk_box_append (GTK_BOX (row), next);
 
@@ -1981,12 +2351,14 @@ build_find_popover (App *app)
   gtk_widget_add_css_class (status, "dim-label");
   app->find_status = GTK_LABEL (status);
 
-  /* "Filter to matches" — applies the current find query as a filter. */
+  /* "Filter to matches" — applies the current find query (text OR predicate)
+   * as a filter (shared across both modes). */
   GtkWidget *toggle = gtk_toggle_button_new_with_label ("Filter to matches");
   gtk_widget_set_sensitive (toggle, FALSE);
   app->filter_toggle = GTK_TOGGLE_BUTTON (toggle);
   g_signal_connect (toggle, "toggled", G_CALLBACK (on_filter_toggled), app);
 
+  gtk_box_append (GTK_BOX (box), switcher);
   gtk_box_append (GTK_BOX (box), row);
   gtk_box_append (GTK_BOX (box), status);
   gtk_box_append (GTK_BOX (box), toggle);
@@ -1997,6 +2369,8 @@ build_find_popover (App *app)
                     G_CALLBACK (on_find_search_changed), app);
   g_signal_connect (prev, "clicked", G_CALLBACK (on_find_prev_clicked), app);
   g_signal_connect (next, "clicked", G_CALLBACK (on_find_next_clicked), app);
+  g_signal_connect (stack, "notify::visible-child-name",
+                    G_CALLBACK (on_find_mode_changed), app);
   g_signal_connect (pop, "closed", G_CALLBACK (on_find_popover_closed), app);
   g_signal_connect (pop, "show", G_CALLBACK (on_find_popover_show), app);
 
@@ -2031,58 +2405,98 @@ jump_update_ui (App *app)
     gtk_widget_set_visible (GTK_WIDGET (app->jump_cancel), scanning);
 }
 
-static gboolean
-jump_reject_clear (gpointer data)
+/* Duration of the input-rejection blink (Adwaita .error red + shake), the ONE
+ * knob shared by the jump box and the Where value field. */
+#define LSG_REJECT_BLINK_MS 700
+
+/* Per-shake context for the auto-clear timeout: which entry to un-style and
+ * which App id-slot to zero. Freed by the source's destroy notify. */
+typedef struct
 {
-  App *app = data;
-  if (app->jump_entry != NULL)
+  GtkWidget *entry;
+  guint *id_slot;
+} LsgRejectClear;
+
+static gboolean
+reject_shake_add (gpointer entry)
+{
+  gtk_widget_add_css_class (GTK_WIDGET (entry), "lsg-shake");
+  return G_SOURCE_REMOVE;
+}
+
+static gboolean
+reject_clear_timeout (gpointer data)
+{
+  LsgRejectClear *c = data;
+  gtk_widget_remove_css_class (c->entry, "error");
+  gtk_widget_remove_css_class (c->entry, "lsg-shake");
+  *c->id_slot = 0; /* the ctx itself is freed by the source destroy notify */
+  return G_SOURCE_REMOVE;
+}
+
+/* Whether the desktop wants animations — the reduce-motion switch
+ * (gtk-enable-animations). A FALSE means honor reduce-motion: skip the shake.
+ */
+static gboolean
+animations_enabled (GtkWidget *w)
+{
+  gboolean anim = TRUE;
+  GtkSettings *s = gtk_widget_get_settings (w);
+  if (s != NULL)
+    g_object_get (s, "gtk-enable-animations", &anim, NULL);
+  return anim;
+}
+
+/* Rejection feedback shared by the jump box and the Where value field: the
+ * Adwaita error state (red) plus a short shake, auto-cleared after
+ * LSG_REJECT_BLINK_MS. The shake class is removed then re-added on an idle so
+ * the animation restarts on a repeated reject; it is SKIPPED entirely under
+ * reduce-motion (the red state still shows). The pending clear-timeout id
+ * lives in *id_slot so the reset/teardown paths can cancel it. */
+static void
+entry_reject_feedback (GtkWidget *entry, guint *id_slot)
+{
+  if (entry == NULL)
+    return;
+  gtk_widget_add_css_class (entry, "error");
+  gtk_widget_remove_css_class (entry, "lsg-shake");
+  if (animations_enabled (entry))
+    g_idle_add (reject_shake_add, entry);
+  if (*id_slot != 0)
+    g_source_remove (*id_slot);
+  LsgRejectClear *c = g_new (LsgRejectClear, 1);
+  c->entry = entry;
+  c->id_slot = id_slot;
+  *id_slot = g_timeout_add_full (G_PRIORITY_DEFAULT, LSG_REJECT_BLINK_MS,
+                                 reject_clear_timeout, c, g_free);
+}
+
+/* Cancel a pending reject blink and drop the styling now. */
+static void
+entry_clear_feedback (GtkWidget *entry, guint *id_slot)
+{
+  if (*id_slot != 0)
     {
-      gtk_widget_remove_css_class (GTK_WIDGET (app->jump_entry), "error");
-      gtk_widget_remove_css_class (GTK_WIDGET (app->jump_entry), "lsg-shake");
+      g_source_remove (*id_slot); /* frees the ctx via the destroy notify */
+      *id_slot = 0;
     }
-  app->jump_reject_id = 0;
-  return G_SOURCE_REMOVE;
+  if (entry != NULL)
+    {
+      gtk_widget_remove_css_class (entry, "error");
+      gtk_widget_remove_css_class (entry, "lsg-shake");
+    }
 }
 
-static gboolean
-jump_shake_add (gpointer data)
-{
-  App *app = data;
-  if (app->jump_entry != NULL)
-    gtk_widget_add_css_class (GTK_WIDGET (app->jump_entry), "lsg-shake");
-  return G_SOURCE_REMOVE;
-}
-
-/* Rejection feedback: the Adwaita error state (red) plus a short shake — the
- * shake class is removed then re-added on an idle so the animation restarts on
- * a repeated reject. */
 static void
 jump_reject_feedback (App *app)
 {
-  if (app->jump_entry == NULL)
-    return;
-  GtkWidget *e = GTK_WIDGET (app->jump_entry);
-  gtk_widget_add_css_class (e, "error");
-  gtk_widget_remove_css_class (e, "lsg-shake");
-  g_idle_add (jump_shake_add, app);
-  if (app->jump_reject_id != 0)
-    g_source_remove (app->jump_reject_id);
-  app->jump_reject_id = g_timeout_add (700, jump_reject_clear, app);
+  entry_reject_feedback (GTK_WIDGET (app->jump_entry), &app->jump_reject_id);
 }
 
 static void
 jump_clear_feedback (App *app)
 {
-  if (app->jump_reject_id != 0)
-    {
-      g_source_remove (app->jump_reject_id);
-      app->jump_reject_id = 0;
-    }
-  if (app->jump_entry != NULL)
-    {
-      gtk_widget_remove_css_class (GTK_WIDGET (app->jump_entry), "error");
-      gtk_widget_remove_css_class (GTK_WIDGET (app->jump_entry), "lsg-shake");
-    }
+  entry_clear_feedback (GTK_WIDGET (app->jump_entry), &app->jump_reject_id);
 }
 
 /* Forward-declared above; fold one core jump poll and act on the outcome. */
@@ -2584,17 +2998,22 @@ build_dialect_button_child (const char *category, GtkLabel **out_glyph)
 /* ------------------------------------------------------------------------- */
 
 /* The toggle may turn ON only when the current find draft is filterable
- * (canApplyFilter = the compose is not IGNORED), or stay live to turn OFF. */
+ * (canApplyFilter = the compose is not IGNORED — an empty TEXT query), or stay
+ * live to turn OFF. Reads the whole draft (text OR predicate) through the one
+ * find_read_draft funnel so predicate drafts enable it too: a REJECTED
+ * predicate still counts as filterable (the reject blinks at apply time). */
 static void
 filter_update_toggle_sensitivity (App *app)
 {
   if (app->filter_toggle == NULL)
     return;
   gboolean can = app->filter.active;
-  if (!can && app->find_entry != NULL)
+  if (!can && app->doc != NULL)
     {
-      const char *t = gtk_editable_get_text (app->find_entry);
-      can = (t != NULL && t[0] != '\0');
+      find_read_draft (app);
+      LsgFindSubmit sub
+          = lsg_find_submit (app->find, NULL, app->n_cols, app->n_cols);
+      can = (sub.outcome != LSG_FIND_IGNORED);
     }
   gtk_widget_set_sensitive (GTK_WIDGET (app->filter_toggle),
                             app->doc != NULL && can);
@@ -2659,12 +3078,17 @@ do_apply_filter (App *app)
   if (app->doc == NULL)
     return;
 
-  app->find.draft.mode = LSG_FIND_TEXT;
-  app->find.draft.text = gtk_editable_get_text (app->find_entry);
+  find_read_draft (app); /* text OR predicate — the same draft Find runs */
   LsgFindSubmit sub
       = lsg_find_submit (app->find, NULL, app->n_cols, app->n_cols);
   if (sub.outcome != LSG_FIND_RUN)
     {
+      /* A rejected PREDICATE (out-of-range column / non-numeric ordering
+       * value) blinks the value field, exactly like a rejected predicate find;
+       * an empty TEXT query is a silent no-op. Either way, no filter is set.
+       */
+      if (sub.outcome == LSG_FIND_REJECTED)
+        where_reject_value (app);
       filter_set_toggle (app, FALSE); /* not filterable (empty / rejected) */
       return;
     }
@@ -2711,13 +3135,16 @@ do_apply_filter (App *app)
 }
 
 /* Clear the active filter, restoring the identity view re-anchored near the
- * row that was on screen. */
+ * row that was on screen. Reachable from the popover toggle AND the header-bar
+ * (x) button, so it always syncs the toggle back OFF (guarded — no re-entry).
+ */
 static void
 do_clear_filter (App *app)
 {
   if (app->doc == NULL || !app->filter.active)
     {
       app->filter = lsg_filter_cleared (app->filter); /* no-op */
+      filter_set_toggle (app, FALSE);
       update_title_subtitle (app);
       return;
     }
@@ -2735,9 +3162,19 @@ do_clear_filter (App *app)
   find_clear_mask (app);
   app->jump = lsg_jump_initial ();
 
+  filter_set_toggle (app, FALSE); /* the (x) path also un-presses the toggle */
   filter_rebuild_grid (app, restore); /* identity view, re-anchored */
   update_title_subtitle (app);
   filter_update_toggle_sensitivity (app);
+}
+
+/* The header-bar (x) after the "Filtered — N of M rows" subtitle: the compact
+ * successor to the old banner's Clear button. Shown only while filtered. */
+static void
+on_filter_clear_clicked (GtkButton *button, gpointer data)
+{
+  (void)button;
+  do_clear_filter ((App *)data);
 }
 
 /* Forward-declared above; fold one filter poll into the subtitle + grid. */
@@ -3103,11 +3540,11 @@ copy_tick (gpointer data)
       guint8 nul = 0;
       g_byte_array_append (op->blob, &nul, 1);
       gdk_clipboard_set_text (clip, (const char *)op->blob->data);
-      if (app->title != NULL)
+      if (app->title_status != NULL)
         {
           char *note = g_strdup_printf ("Copied %" G_GUINT64_FORMAT " rows",
                                         op->rows_done);
-          adw_window_title_set_subtitle (app->title, note);
+          title_set_status (app, note);
           g_free (note);
         }
     }
@@ -3364,13 +3801,25 @@ on_window_destroy (GtkWidget *widget, gpointer data)
       g_source_remove (app->jump_reject_id);
       app->jump_reject_id = 0;
     }
+  if (app->where_reject_id != 0)
+    {
+      g_source_remove (app->where_reject_id);
+      app->where_reject_id = 0;
+    }
   if (app->prefs_infer_poll_id != 0)
     {
       g_source_remove (app->prefs_infer_poll_id);
       app->prefs_infer_poll_id = 0;
     }
   app->window = NULL;
-  app->title = NULL;
+  app->title_box = NULL;
+  app->title_name = NULL;
+  app->title_status = NULL;
+  app->filter_clear_btn = NULL;
+  app->find_stack = NULL;
+  app->where_column = NULL;
+  app->where_op = NULL;
+  app->where_value = NULL;
   app->area = NULL;
   app->hp_box = NULL;
   app->hp_bar = NULL;
@@ -5418,11 +5867,47 @@ ensure_window (App *app, GtkApplication *gtk_app)
                                       "/dev/lesssheet/Gtk/icons");
   gtk_window_set_icon_name (app->window, "dev.lesssheet.Gtk");
 
-  /* Header bar: Open + Open URL on the left, filename title in the center. */
+  /* Header bar: Open + Open URL on the left, filename title in the center.
+   * The title is a CUSTOM widget (not an AdwWindowTitle) so the filtered
+   * subtitle can carry a (x) clear-filter button: a centered document-name
+   * label over a subtitle ROW (the status label + the filtered-only (x)).
+   * `.title`/`.subtitle` + ellipsize + centering match AdwWindowTitle, so the
+   * unfiltered look is unchanged (the (x) is hidden, taking no space). */
   GtkWidget *header = adw_header_bar_new ();
-  app->title = ADW_WINDOW_TITLE (adw_window_title_new ("less-sheet", ""));
-  adw_header_bar_set_title_widget (ADW_HEADER_BAR (header),
-                                   GTK_WIDGET (app->title));
+  GtkWidget *title_box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
+  gtk_widget_set_valign (title_box, GTK_ALIGN_CENTER);
+
+  GtkWidget *title_name = gtk_label_new ("less-sheet");
+  gtk_widget_add_css_class (title_name, "title");
+  gtk_label_set_single_line_mode (GTK_LABEL (title_name), TRUE);
+  gtk_label_set_ellipsize (GTK_LABEL (title_name), PANGO_ELLIPSIZE_END);
+  gtk_widget_set_halign (title_name, GTK_ALIGN_CENTER);
+
+  GtkWidget *subrow = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 4);
+  gtk_widget_set_halign (subrow, GTK_ALIGN_CENTER);
+  GtkWidget *title_status = gtk_label_new ("");
+  gtk_widget_add_css_class (title_status, "subtitle");
+  gtk_label_set_single_line_mode (GTK_LABEL (title_status), TRUE);
+  gtk_label_set_ellipsize (GTK_LABEL (title_status), PANGO_ELLIPSIZE_END);
+  gtk_widget_set_visible (title_status, FALSE); /* empty => hidden, like Adw */
+
+  GtkWidget *fx = gtk_button_new_from_icon_name ("window-close-symbolic");
+  gtk_widget_add_css_class (fx, "flat");
+  gtk_widget_add_css_class (fx, "circular");
+  gtk_widget_set_tooltip_text (fx, "Clear filter");
+  gtk_widget_set_valign (fx, GTK_ALIGN_CENTER);
+  gtk_widget_set_visible (fx, FALSE); /* filtered-only; no space when hidden */
+  g_signal_connect (fx, "clicked", G_CALLBACK (on_filter_clear_clicked), app);
+
+  gtk_box_append (GTK_BOX (subrow), title_status);
+  gtk_box_append (GTK_BOX (subrow), fx);
+  gtk_box_append (GTK_BOX (title_box), title_name);
+  gtk_box_append (GTK_BOX (title_box), subrow);
+  adw_header_bar_set_title_widget (ADW_HEADER_BAR (header), title_box);
+  app->title_box = title_box;
+  app->title_name = GTK_LABEL (title_name);
+  app->title_status = GTK_LABEL (title_status);
+  app->filter_clear_btn = GTK_BUTTON (fx);
 
   GtkWidget *open_btn
       = gtk_button_new_from_icon_name ("document-open-symbolic");
@@ -5630,6 +6115,8 @@ main (int argc, char *argv[])
     g_source_remove (app.find_notice_id);
   if (app.jump_reject_id != 0)
     g_source_remove (app.jump_reject_id);
+  if (app.where_reject_id != 0)
+    g_source_remove (app.where_reject_id);
   find_clear_mask (&app);
   g_clear_pointer (&app.pending_url, g_free);
   g_clear_pointer (&app.doc_path, g_free);
