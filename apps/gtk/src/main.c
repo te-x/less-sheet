@@ -339,6 +339,7 @@ static void dialect_sync_quick_controls (App *app); /* sync header/sep/quote */
 static void
 settings_reopen_apply (App *app); /* F5 re-anchor + F7 replay/reset */
 static void column_cache_effective (App *app, guint32 col); /* fmt kind/sem */
+static void reopen_state_clear (App *app); /* drop a pending dialect re-open */
 
 /* ------------------------------------------------------------------------- */
 /* View teardown */
@@ -521,8 +522,15 @@ grid_autofit_widths (App *app, LsgColumnWindow colwin, LsgWindow *win)
   const char **buf = g_new (const char *, (gr > 0) ? gr : 1);
   double max_w = app->char_advance * 60.0 + 12.0;
 
+  guint nfit = 0; /* only the non-manual columns are auto-fit candidates */
   for (guint32 ci = 0; ci < gc; ci++)
     {
+      guint32 abscol = colwin.first + ci;
+      /* A user-set manual width is authoritative — never let the monotone
+       * auto-fit grow re-widen it (Finding 3). */
+      if (app->col_settings != NULL && abscol < app->n_cols
+          && app->col_settings[abscol].has_manual_width)
+        continue;
       guint cnt = 0;
       for (guint32 r = 0; r < gr; r++)
         buf[cnt++] = lsg_window_cell (win, r, ci);
@@ -533,12 +541,13 @@ grid_autofit_widths (App *app, LsgColumnWindow colwin, LsgWindow *win)
           buf, cnt, hdr, app->char_advance, app->char_advance * 2.0 + 12.0);
       if (wpx > max_w)
         wpx = max_w;
-      cand[ci] = wpx;
-      cols[ci] = colwin.first + ci;
+      cand[nfit] = wpx;
+      cols[nfit] = abscol;
+      nfit++;
     }
 
   gdouble *out = g_new (gdouble, app->n_cols);
-  lsg_grid_grow_widths (app->col_widths, app->n_cols, cols, cand, gc, out);
+  lsg_grid_grow_widths (app->col_widths, app->n_cols, cols, cand, nfit, out);
   gboolean changed
       = memcmp (out, app->col_widths, (gsize)app->n_cols * sizeof (gdouble))
         != 0;
@@ -1036,6 +1045,42 @@ sample_column_widths (App *app)
   lsg_window_free (sw);
 }
 
+/* Re-sample ONE column's auto width from the head window (the "Reset to Auto"
+ * path — a manual width must be able to SHRINK back, so we recompute rather
+ * than leave the widened value). O(head rows) for the single column. */
+static void
+sample_one_column_width (App *app, guint32 col)
+{
+  if (app->doc == NULL || app->col_widths == NULL || col >= app->n_cols)
+    return;
+  double wpx = app->char_advance * 12.0 + 12.0; /* default */
+  double min_w = app->char_advance * 3.0 + 12.0;
+  double max_w = app->char_advance * 60.0 + 12.0;
+
+  LsgWindow *sw
+      = lsg_document_set_window (app->doc, 0, WIDTH_SAMPLE_ROWS, col, 1);
+  guint32 got = lsg_window_row_count (sw);
+  if (lsg_window_col_count (sw) > 0)
+    {
+      const char *cells[WIDTH_SAMPLE_ROWS];
+      guint cnt = 0;
+      for (guint32 r = 0; r < got && cnt < WIDTH_SAMPLE_ROWS; r++)
+        cells[cnt++] = lsg_window_cell (sw, r, 0);
+      char *hdr = app->has_header
+                      ? lsg_document_header_cell_dup (app->doc, col)
+                      : NULL;
+      wpx = lsg_grid_column_width_estimate (cells, cnt, hdr, app->char_advance,
+                                            app->char_advance * 2.0 + 12.0);
+      g_free (hdr);
+      if (wpx < min_w)
+        wpx = min_w;
+      if (wpx > max_w)
+        wpx = max_w;
+    }
+  lsg_window_free (sw);
+  app->col_widths[col] = wpx;
+}
+
 static void
 open_document (App *app, LsgDocument *doc, const char *title,
                gboolean is_network)
@@ -1113,6 +1158,10 @@ open_document (App *app, LsgDocument *doc, const char *title,
 static void
 open_file (App *app, GFile *file)
 {
+  /* A fresh user open is never a dialect re-open — drop any pending capture so
+   * a prior failed re-open can't fire a stale settings_reopen_apply here. */
+  reopen_state_clear (app);
+
   char *path = g_file_get_path (file);
   char *base = g_file_get_basename (file);
 
@@ -1266,11 +1315,19 @@ net_poll_tick (gpointer data)
                        (app->pending_url != NULL) ? app->pending_url : "URL",
                        TRUE);
       else
-        show_error (app, "Could not open URL",
-                    "The network document could not be adopted.");
+        {
+          /* Adopt failed: a pending dialect re-open must not fire stale. */
+          reopen_state_clear (app);
+          show_error (app, "Could not open URL",
+                      "The network document could not be adopted.");
+        }
     }
   else
     {
+      /* FAILED / CANCELLED: no adoption, so drop any pending dialect re-open
+       * capture (else the next fresh open runs a stale settings_reopen_apply).
+       */
+      reopen_state_clear (app);
       char http[64];
       const char *msg = net_error_text (p.error);
       if (p.error == LSG_NET_ERROR_HTTP_STATUS)
@@ -1299,6 +1356,10 @@ on_url_response (AdwAlertDialog *dialog, const char *response, gpointer data)
   const char *url = (entry != NULL) ? gtk_editable_get_text (entry) : NULL;
   if (url == NULL || url[0] == '\0')
     return;
+
+  /* A fresh URL open is never a dialect re-open — clear any pending capture.
+   */
+  reopen_state_clear (app);
 
   g_clear_pointer (&app->pending_url, g_free);
   app->pending_url = g_strdup (url);
@@ -3367,17 +3428,41 @@ labels_to_identities (LsgColumnLabel *labels, guint n)
 
 /* -------- the re-open funnel (F1 / F8) ----------------------------------- */
 
+/* Drop the pending dialect re-open capture. Called on the end of a successful
+ * apply, on EVERY re-open failure / cancel path, and defensively at a fresh
+ * user open — so a failed re-open never leaves a STALE settings_reopen_apply
+ * to fire against the next document (spurious replay/reset + wrong viewport).
+ */
+static void
+reopen_state_clear (App *app)
+{
+  app->reopen_pending = FALSE;
+  g_clear_pointer (&app->reopen_snapshot, g_free);
+  if (app->reopen_old_labels != NULL)
+    {
+      lsg_column_labels_free (app->reopen_old_labels,
+                              app->reopen_n_old_labels);
+      app->reopen_old_labels = NULL;
+      app->reopen_n_old_labels = 0;
+    }
+  app->reopen_old_count = 0;
+}
+
 /* Close + re-open the current document with `options`. Local re-opens
  * synchronously (open_document runs the post-open re-anchor/replay); a NETWORK
  * doc re-opens through the net funnel — never fed to the local open (F8) — and
- * the async net poll adopts into the SAME open_document choke point. */
+ * the async net poll adopts into the SAME open_document choke point. Every
+ * failure path clears the pending capture so it can never fire stale. */
 static void
 dialect_reopen (App *app, ls_open_options options)
 {
   if (app->is_network)
     {
       if (app->pending_url == NULL)
-        return;
+        {
+          reopen_state_clear (app);
+          return;
+        }
       copy_stop_and_join (app);
       if (app->net != NULL)
         {
@@ -3388,6 +3473,7 @@ dialect_reopen (App *app, ls_open_options options)
       app->net = lsg_net_open_start (app->pending_url, &options);
       if (app->net == NULL)
         {
+          reopen_state_clear (app);
           show_error (app, "Could not re-open URL",
                       "The open job could not be started.");
           return;
@@ -3400,12 +3486,16 @@ dialect_reopen (App *app, ls_open_options options)
   else
     {
       if (app->doc_path == NULL)
-        return;
+        {
+          reopen_state_clear (app);
+          return;
+        }
       LsgOpenError err = LSG_OPEN_OK;
       LsgDocument *doc
           = lsg_document_open_local (app->doc_path, &options, &err);
       if (doc == NULL)
         {
+          reopen_state_clear (app);
           show_error (app, "Could not re-open file", open_error_text (err));
           return;
         }
@@ -3430,15 +3520,7 @@ dialect_apply_change (App *app, LsgDialectChange change)
   gboolean header_change = (change.kind == LSG_DIALECT_CHANGE_HEADER);
   gboolean new_header = header_change ? change.header_on : report.header;
 
-  /* Clear any stale pending capture. */
-  g_clear_pointer (&app->reopen_snapshot, g_free);
-  if (app->reopen_old_labels != NULL)
-    {
-      lsg_column_labels_free (app->reopen_old_labels,
-                              app->reopen_n_old_labels);
-      app->reopen_old_labels = NULL;
-      app->reopen_n_old_labels = 0;
-    }
+  reopen_state_clear (app); /* drop any stale capture before the new one */
 
   app->reopen_pending = TRUE;
   app->reopen_header_change = header_change;
@@ -3540,7 +3622,13 @@ settings_reopen_apply (App *app)
                 lsg_document_column_null_sentinel_set (
                     app->doc, i, s.null_sentinel_len ? s.null_sentinel : NULL,
                     s.null_sentinel_len);
-              column_cache_effective (app, i);
+              /* Cache the effective type ONLY for columns that feed the
+               * formatter — never O(column_count) metadata reads on a wide
+               * doc (N2: O(visible) column work). A pure-default column needs
+               * no cache (it paints raw). */
+              if (s.has_override
+                  || !lsg_column_format_options_is_auto (s.format))
+                column_cache_effective (app, i);
             }
           grid_materialize (app);
           gtk_widget_queue_draw (GTK_WIDGET (app->area));
@@ -3557,15 +3645,7 @@ settings_reopen_apply (App *app)
   if (app->prefs != NULL && app->prefs_columns_group != NULL)
     columns_group_rebuild (app);
 
-  g_clear_pointer (&app->reopen_snapshot, g_free);
-  if (app->reopen_old_labels != NULL)
-    {
-      lsg_column_labels_free (app->reopen_old_labels,
-                              app->reopen_n_old_labels);
-      app->reopen_old_labels = NULL;
-      app->reopen_n_old_labels = 0;
-    }
-  app->reopen_old_count = 0;
+  reopen_state_clear (app);
 }
 
 /* -------- quick-control reflection --------------------------------------- */
@@ -4431,6 +4511,10 @@ on_col_reset (GtkButton *btn, gpointer data)
   lsg_document_column_override_clear (app->doc, col);
   lsg_document_column_null_sentinel_clear (app->doc, col);
   column_cache_effective (app, col);
+  /* Reset cleared has_manual_width — re-sample the auto width so a previously
+   * widened column shrinks back (Finding 3). */
+  sample_one_column_width (app, col);
+  grid_update_hadjustment (app);
   column_repaint (app);
   columns_group_rebuild (app); /* re-reflect every control from the reset */
 }

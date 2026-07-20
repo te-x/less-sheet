@@ -206,6 +206,13 @@ match_datetime (const char *s, gsize len)
           if (!is_digit (s[i + 1]) || !is_digit (s[i + 2]) || s[i + 3] != ':'
               || !is_digit (s[i + 4]) || !is_digit (s[i + 5]))
             return LSG_KIND_NONE;
+          /* Range-check the offset so an out-of-range value (e.g. "+05:99")
+           * is NOT classified ZONED -> the dispatcher keeps ORIGINAL(raw)
+           * instead of silently rendering it in UTC. */
+          int oh = (s[i + 1] - '0') * 10 + (s[i + 2] - '0');
+          int om = (s[i + 4] - '0') * 10 + (s[i + 5] - '0');
+          if (oh > 23 || om > 59)
+            return LSG_KIND_NONE;
           i += 6;
           zoned = TRUE;
         }
