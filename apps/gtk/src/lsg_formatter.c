@@ -686,3 +686,44 @@ lsg_format_integer (const char *raw, gboolean grouping, LsgLocaleGlyphs glyphs)
   g_string_free (v.digits, TRUE);
   return make_display (LSG_DISPLAY_FORMATTED, text);
 }
+
+/* ------------------------------------------------------------------------- */
+/* Column-config format options + the type+options dispatcher (SEED)         */
+/*                                                                           */
+/* The slice-1 primitives above (kind gate, lossless decimal/integer, locale */
+/* glyphs) stay implemented (green). This growth adds the settings-driven    */
+/* dispatcher + date presets; the seed below always returns the raw spelling */
+/* so the new G9 tests are RED until the dispatcher is implemented.          */
+/* ------------------------------------------------------------------------- */
+
+LsgColumnFormatOptions
+lsg_column_format_options_auto (void)
+{
+  /* real: the Auto default — a zeroed options value (no grouping, source
+   * fraction length, Original preset). */
+  LsgColumnFormatOptions o = { FALSE, FALSE, 0, LSG_DATE_PRESET_ORIGINAL };
+  return o;
+}
+
+gboolean
+lsg_column_format_options_is_auto (LsgColumnFormatOptions options)
+{
+  (void)options;
+  return FALSE; /* SEED: never reports Auto */
+}
+
+LsgDisplay
+lsg_format_cell (const char *raw, ls_column_type_kind kind,
+                 ls_column_datetime_semantics semantics,
+                 LsgColumnFormatOptions options, LsgLocaleGlyphs glyphs)
+{
+  (void)kind;
+  (void)semantics;
+  (void)options;
+  (void)glyphs;
+  /* SEED: never formats — always the raw spelling. The real dispatcher gates
+   * on lsg_scalar_kind + the effective type + the options and delegates to the
+   * lossless number formatters / GDateTime presets. */
+  return make_display (LSG_DISPLAY_ORIGINAL,
+                       g_strdup (raw != NULL ? raw : ""));
+}

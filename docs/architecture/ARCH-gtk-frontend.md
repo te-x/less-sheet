@@ -160,8 +160,9 @@ non-GUI logic is unit-testable headlessly and only rendering needs a display.
 - **Chrome / app shell (`src/app.*`, `src/window.*`, `src/settings.*`).** `AdwApplication` +
   `AdwApplicationWindow` + `AdwToolbarView` + `AdwHeaderBar`; find/jump as `GtkPopover`; filter and
   network-open state as `AdwBanner`; copy/dialect notices as `AdwToast`; launch/empty/error states as
-  `AdwStatusPage`; Settings as an `AdwPreferencesWindow` (parsing group + column list + per-column
-  inspector via `AdwComboRow`/`AdwSwitchRow`/`AdwSpinRow`). Actions via `GAction` + `GtkShortcutController`.
+  `AdwStatusPage`; Settings as an `AdwPreferencesDialog` (decision 3, amended 2026-07-20; a "Parsing" page +
+  a "Columns" page of per-column inspectors via `AdwExpanderRow`/`AdwComboRow`/`AdwSwitchRow`/`AdwSpinRow`).
+  Actions via `GAction` + `GtkShortcutController`.
 
 **Data flow (unchanged from macOS):** UI gesture → session wrapper → `ls_*` (control lane) → worker poll
 folds the resulting snapshot on the main loop → view-model decides repaint/materialize → grid reads the
@@ -215,10 +216,15 @@ them when he signs off this ARCH (no separate question round).
    cell draw. The GSK-vfunc-subclass alternative was considered and deferred; the perf verdict is the **H4
    human GUI pass** — if scroll janks on real GNOME hardware, revisit.
 3. **Window chrome = native Adwaita** (`AdwHeaderBar` + `GtkPopover` find/jump + `AdwBanner` + `AdwToast` +
-   `AdwStatusPage` + `AdwPreferencesWindow`). Satisfies "look native in GNOME / as default as possible";
+   `AdwStatusPage` + `AdwPreferencesDialog`). Satisfies "look native in GNOME / as default as possible";
    interaction parity (not pixel parity) is the bar. *Alternative rejected:* replicating the macOS
    chromeless Liquid-Glass floating overlay (non-native; no GTK equivalent; custom-drawn approximation).
-   *(the author, option A.)*
+   *(the author, option A.)* **AMENDED 2026-07-20 (the author-confirmed, relayed): Settings container =
+   `AdwPreferencesDialog`, NOT `AdwPreferencesWindow`.** `AdwPreferencesWindow` was deprecated at our
+   libadwaita 1.6 floor in favor of `AdwPreferencesDialog` (presented sheet-like, attached to the main
+   window); per "prefer native and latest" we adopt the current idiom, accepting the small delta from
+   macOS's separate Settings window. See `ARCH-gtk-settings-dialect.md` decision B (the "Settings + dialect
+   override" slice) for the two-page ("Parsing" + "Columns") structure.
 4. **v1 scope = full macOS feature parity**, with **accessibility the single deferred item** (later pass).
    *(the author.)*
 5. **Build = Meson** (GNOME default; matches the `c-gtk` profile: frozen `include/` + `tests/`, impl under

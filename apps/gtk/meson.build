@@ -31,7 +31,8 @@ core_inc = include_directories('include')
 # Compiling this under -Werror is the CONFORMANCE gate: the module sources must
 # match the frozen headers exactly or the build fails. The surface grows per
 # slice (slice 1: open/display/scroll; slice 2: find; slice 3: jump; slice 4:
-# filter; slice 5: streaming copy).
+# filter; slice 5: streaming copy; settings + dialect: dialect compose + column
+# config + the formatter's type+options dispatcher).
 # ---------------------------------------------------------------------------
 lsg_sources = files(
   'src/lsg_document.c',
@@ -43,6 +44,8 @@ lsg_sources = files(
   'src/lsg_jump.c',
   'src/lsg_filter.c',
   'src/lsg_copy.c',
+  'src/lsg_dialect.c',
+  'src/lsg_column.c',
 )
 lsgkit = static_library('lsgkit',
   lsg_sources,
@@ -112,7 +115,8 @@ test_net_open = executable('test-net-open',
 )
 test('net-open', test_net_open)
 
-# Cell formatter engine (pure; kind gate + lossless decimal + locale glyphs).
+# Cell formatter engine (pure; slice-1 kind gate + lossless decimal + locale
+# glyphs, PLUS the settings-slice type+options dispatcher + GDateTime presets).
 test_formatter = executable('test-formatter',
   'tests/test_formatter.c',
   dependencies : test_deps,
@@ -202,3 +206,33 @@ test_copy = executable('test-copy',
   install : false,
 )
 test('copy', test_copy)
+
+# Dialect override (settings slice): PURE compose/validate view-model — F1
+# carry-forward, F2 validation (byte domain + custom byte + collision), the
+# header re-anchor shift, the encoding picker + candidate lists, and the
+# compose->ls_open_options field mapping. No core, no fixture.
+test_dialect = executable('test-dialect',
+  'tests/test_dialect.c',
+  dependencies : test_deps,
+  link_with : lsgkit,
+  include_directories : core_inc,
+  install : false,
+)
+test('dialect', test_dialect)
+
+# Column configuration (settings slice): pure view-model (discovery mode, `#N`
+# direct address, generic names, label match + accumulation, session default +
+# the replay-vs-reset re-open decision, the override-type builder) + the column
+# core bridge over the real core (override / null sentinel / inference / labels /
+# conflict round-trips) + the O(<=10) probe (a synthetic 100k-column read stays
+# O(batch)). Needs the columns.csv fixture path baked in.
+columns_fixture = meson.current_source_dir() / 'tests' / 'fixtures' / 'columns.csv'
+test_column = executable('test-column',
+  'tests/test_column.c',
+  dependencies : test_deps,
+  link_with : lsgkit,
+  include_directories : core_inc,
+  c_args : ['-DCOLUMNS_FIXTURE_PATH="' + columns_fixture + '"'],
+  install : false,
+)
+test('column', test_column)

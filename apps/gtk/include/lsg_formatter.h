@@ -1,31 +1,42 @@
 /*
- * lsg_formatter.h — the GTK frontend's display-free CELL FORMATTER engine
- * (slice 1). The C analog of the macOS `ColumnDisplayFormatting`, reproduced
- * per ARCH decision 8 with GLib + the C-library locale + `GDateTime`, NOT ICU
- * (the single-digit-MB budget forbids ICU). The exact-decimal losslessness
- * macOS gets from Foundation `Decimal.FormatStyle` is reproduced here in
- * base-10 ARITHMETIC (never binary floating point).
+ * lsg_formatter.h — the GTK frontend's display-free CELL FORMATTER engine. The
+ * C analog of the macOS `ColumnDisplayFormatting`, reproduced per ARCH
+ * decision 8 with GLib + the C-library locale + `GDateTime`, NOT ICU (the
+ * single-digit-MB budget forbids ICU). The exact-decimal losslessness macOS
+ * gets from Foundation `Decimal.FormatStyle` is reproduced here in base-10
+ * ARITHMETIC (never binary floating point).
  *
- * SCOPE (slice 1): the DISPLAY-FREE, deterministic core — (1) the strict
- * lexical KIND gate; (2) the LOSSLESS exact-decimal / integer formatters; (3)
- * the platform LOCALE GLYPHS. The slice-1 grid renders raw cell spelling
- * (AUTO), so these engines are frozen + unit-pinned now (decision 8 is a
- * confirmed slice-1 technology choice and the biggest cross-frontend
- * correctness risk), but the SETTINGS UI that drives non-AUTO options
- * (grouping / fraction digits / type override) and localized DATE-PRESET
- * formatting are LATER slices (column-config); this header intentionally does
- * NOT freeze a `type + options`-driven dispatcher or date-preset formatting
- * yet.
+ * SLICE 1 (frozen already): the DISPLAY-FREE, deterministic primitives — (1)
+ * the strict lexical KIND gate; (2) the LOSSLESS exact-decimal / integer
+ * formatters; (3) the platform LOCALE GLYPHS. The slice-1 grid renders raw
+ * cell spelling (AUTO).
+ *
+ * SETTINGS + DIALECT SLICE (this growth): the type+options DISPATCHER that the
+ * column-config UI drives — given a raw cell, the column's EFFECTIVE type (an
+ * ABI `ls_column_type_kind` + datetime semantics), and the session format
+ * options (grouping / fixed fraction digits / date preset), it produces the
+ * on-screen string over the slice-1 primitives; plus localized DATE / DATETIME
+ * preset formatting via `GDateTime` (naive vs zoned honored). The header
+ * anticipated this ("the SETTINGS UI that drives non-AUTO options … and
+ * localized DATE-PRESET formatting are LATER slices").
  *
  * The core serves RAW cells; nothing here mutates the source, and it is never
  * used by find / filter / copy (those keep the raw value — the ABI's rule).
  * Pure and display-free: no widgets, no display server — all functions run
- * headlessly under `g_test`.
+ * headlessly under `g_test` (locale glyphs are injected explicitly, and the
+ * localized-date determinism comes from the process locale/timezone the test
+ * pins).
+ *
+ * Contract role (frozen; the prototypes/structs ARE the signatures — compiled
+ * with -Werror so any drift against a stub/caller fails compilation). Symbols
+ * are namespaced `lsg_` / `Lsg` / `LSG_` so they never collide with the core's
+ * frozen `ls_` / `LS_` ABI in <lesssheet.h>, which this header builds ON.
  */
 #ifndef LSG_FORMATTER_H
 #define LSG_FORMATTER_H
 
 #include <glib.h>
+#include <lesssheet.h> /* ls_column_type_kind + ls_column_datetime_semantics */
 
 G_BEGIN_DECLS
 
@@ -89,6 +100,15 @@ LsgLocaleGlyphs lsg_locale_glyphs_current (void);
  */
 #define LSG_DECIMAL_MAX_SIG_DIGITS (38)
 
+/*
+ * The maximum fixed FRACTION DIGITS the decimal format control offers (F11:
+ * the inspector's spinner range is 0..38) — the single named knob for that
+ * ceiling (N5). Distinct from LSG_DECIMAL_MAX_SIG_DIGITS (a representability
+ * bound): this bounds the UI's fixed-fraction request. A request outside
+ * 0..this makes the dispatcher report UNAVAILABLE (never a rounded lie).
+ */
+#define LSG_COLUMN_FRACTION_DIGITS_MAX (38)
+
 /* The display outcome for one cell (mirrors `ColumnDisplay`). */
 typedef enum
 {
@@ -140,6 +160,93 @@ LsgDisplay lsg_format_decimal (const char *raw, gboolean grouping,
  */
 LsgDisplay lsg_format_integer (const char *raw, gboolean grouping,
                                LsgLocaleGlyphs glyphs);
+
+/* ------------------------------------------------------------------------- */
+/* Column-config format options + the type+options dispatcher (F14)          */
+/* ------------------------------------------------------------------------- */
+
+/*
+ * Date/datetime display preset (the C analog of `DatePreset`). ORIGINAL keeps
+ * the source spelling exactly (incl. 1..9 fraction digits); the three
+ * localized presets render via `GDateTime`/`g_date_time_format` under the
+ * process locale (the exact CLDR-ish glyphs are the reviewer/host check — the
+ * gate pins Original == raw and that a localized preset yields a non-original
+ * FORMATTED string, honoring naive vs zoned).
+ */
+typedef enum
+{
+  LSG_DATE_PRESET_ORIGINAL = 0,
+  LSG_DATE_PRESET_LOCALIZED_SHORT = 1,
+  LSG_DATE_PRESET_LOCALIZED_MEDIUM = 2,
+  LSG_DATE_PRESET_LOCALIZED_LONG = 3,
+} LsgDatePreset;
+
+/*
+ * The session-only display format controls for one column (the C analog of
+ * `ColumnFormatOptions`). A PLAIN VALUE. `lsg_column_format_options_auto`
+ * (all fields default) means "preserve the source spelling exactly". Grouping
+ * applies to integer & decimal; fixed fraction digits apply to decimal only
+ * (`has_fraction_digits` FALSE preserves the source fractional length); the
+ * date preset applies to date/datetime only.
+ */
+typedef struct
+{
+  gboolean grouping;
+  gboolean
+      has_fraction_digits; /* FALSE == preserve the source fractional length */
+  gint fraction_digits; /* valid iff has_fraction_digits; the inspector offers
+                           0..LSG_COLUMN_FRACTION_DIGITS_MAX */
+  LsgDatePreset date_preset;
+} LsgColumnFormatOptions;
+
+/* The Auto default: no grouping, source fraction length, Original date preset
+ * (preserve the source spelling for every kind). */
+LsgColumnFormatOptions lsg_column_format_options_auto (void);
+
+/* TRUE iff `options` equals the Auto default (the dispatcher's AUTO short
+ * circuit: every kind renders ORIGINAL). */
+gboolean lsg_column_format_options_is_auto (LsgColumnFormatOptions options);
+
+/*
+ * The type+options DISPATCHER (the C analog of
+ * `ColumnDisplayFormatting.display(raw:type:options:locale:)`) — the single
+ * entry the grid's cell paint calls once a column carries options. Produces
+ * the display string for `raw` (NUL-terminated) under the column's EFFECTIVE
+ * type
+ * (`kind` + `semantics` from the core's `ls_column_metadata.effective`) and
+ * `options`, over the slice-1 primitives + `GDateTime`. Owned result (free
+ * with `lsg_display_clear`). Pinned semantics (the RED seed returns
+ * ORIGINAL(raw) for everything):
+ *   - `raw` empty OR `options` is Auto -> ORIGINAL(raw) for EVERY kind (source
+ *     preserved byte-for-byte).
+ *   - TEXT / BOOLEAN / UNKNOWN / UNSUPPORTED -> always ORIGINAL(raw) (no v1
+ *     format controls).
+ *   - INTEGER: only when `lsg_scalar_kind(raw) == LSG_KIND_INTEGER` AND
+ *     `options.grouping` -> the grouped integer (else ORIGINAL(raw); a
+ * decimal- spelled value under an integer column is ORIGINAL — kind mismatch).
+ *   - DECIMAL: only when `lsg_scalar_kind(raw) == LSG_KIND_DECIMAL` AND
+ *     (`options.grouping` OR `options.has_fraction_digits`) -> the lossless
+ *     grouped/fixed-fraction decimal (FORMATTED, or UNAVAILABLE when not
+ * exactly representable, per `lsg_format_decimal`); a `has_fraction_digits`
+ * outside 0..LSG_COLUMN_FRACTION_DIGITS_MAX -> UNAVAILABLE(raw); otherwise
+ *     ORIGINAL(raw) (an integer-spelled value, or no control set).
+ *   - DATE: only when `lsg_scalar_kind(raw) == LSG_KIND_DATE` AND the preset
+ * is not ORIGINAL -> the localized date string (FORMATTED via GDateTime); else
+ *     ORIGINAL(raw).
+ *   - DATETIME: only when `lsg_scalar_kind(raw)` matches the column's
+ * semantics
+ *     (`LSG_KIND_DATETIME_ZONED` iff `semantics == LS_COLUMN_DATETIME_ZONED`,
+ *     else `LSG_KIND_DATETIME_NAIVE`) AND the preset is not ORIGINAL -> the
+ *     localized datetime string, NAIVE keeping its wall time and ZONED kept in
+ *     the value's SOURCE offset (never converted to the system zone); else
+ *     ORIGINAL(raw).
+ * FIND / FILTER / COPY keep the RAW value (the ABI rule) — this is
+ * display-only.
+ */
+LsgDisplay lsg_format_cell (const char *raw, ls_column_type_kind kind,
+                            ls_column_datetime_semantics semantics,
+                            LsgColumnFormatOptions options,
+                            LsgLocaleGlyphs glyphs);
 
 G_END_DECLS
 
