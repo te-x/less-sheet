@@ -56,17 +56,6 @@ lsg_search_nav_from_end (void)
 /* Pure helpers */
 /* ------------------------------------------------------------------------- */
 
-gboolean
-lsg_find_query_case_sensitive (const char *query)
-{
-  if (query == NULL)
-    return FALSE;
-  for (const char *p = query; *p != '\0'; p++)
-    if (*p >= 'A' && *p <= 'Z') /* any ASCII uppercase byte -> byte-exact */
-      return TRUE;
-  return FALSE;
-}
-
 /* The pinned numeric grammar (verbatim the ABI HEADER RULE / macOS
  * NumericGrammar): sign? ( digits ('.' digits?)? | '.' digits ) (e sign?
  * digits)? over ASCII, after trimming ASCII whitespace (0x09..0x0D, 0x20). */
@@ -157,6 +146,10 @@ lsg_find_submit (LsgFindSession session, const guint32 *visible_columns,
       out.outcome = LSG_FIND_RUN;
       out.request.kind = LSG_FIND_TEXT;
       out.request.value = draft.text;
+      /* The "Match case" checkbox marshals 1:1 into the request: one
+       * session bool shared by both modes, NEVER derived from the query
+       * (smart case is retired). */
+      out.request.case_sensitive = draft.case_sensitive;
       /* scope NULL iff every column is visible; else the visible set is fixed
        * into the request (borrowed; the core treats it as a set). */
       if (n_visible == column_count)
@@ -192,6 +185,9 @@ lsg_find_submit (LsgFindSession session, const guint32 *visible_columns,
   out.request.column = draft.column;
   out.request.op = draft.op;
   out.request.value = (draft.value != NULL) ? draft.value : "";
+  /* Same session bool as TEXT — governs EQ/NE folding; ordering ops ignore it.
+   */
+  out.request.case_sensitive = draft.case_sensitive;
   return out;
 }
 

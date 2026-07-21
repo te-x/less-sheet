@@ -148,6 +148,12 @@ typedef struct
       where_columns_dirty; /* the column model needs a rebuild (new doc) */
   gboolean where_ui_guard; /* suppress re-run on programmatic model swaps */
 
+  /* "Match case" checkbox: the ONE session-scoped case flag SHARED by both the
+   * Text and Where modes (default OFF = ASCII case-insensitive). Read into
+   * `find.draft.case_sensitive` by find_read_draft, so every find / filter
+   * submit inherits it; toggling it live re-issues the active query. */
+  GtkCheckButton *match_case;
+
   /* Jump-to-row (slice 3): the pure flow + the popover widgets. */
   LsgJumpFlow jump;
   GtkMenuButton *jump_button;
@@ -358,6 +364,7 @@ static void header_progress_hide (App *app);
 /* Filter helpers referenced from the earlier find section (the toggle lives in
  * the find popover); defined with the filter helpers below. */
 static void on_filter_toggled (GtkToggleButton *toggle, gpointer data);
+static void on_match_case_toggled (GtkCheckButton *button, gpointer data);
 static void filter_update_toggle_sensitivity (App *app);
 
 /* Sync the filter toggle + subtitle to state; called after opening a document
@@ -1803,6 +1810,11 @@ find_read_draft (App *app)
   app->find.draft.value = (app->where_value != NULL)
                               ? gtk_editable_get_text (app->where_value)
                               : "";
+  /* One session flag shared by both modes; the checkbox is the ONLY thing that
+   * decides folding (smart case is retired). */
+  app->find.draft.case_sensitive
+      = (app->match_case != NULL)
+        && gtk_check_button_get_active (app->match_case);
 }
 
 /* Reject feedback for a rejected predicate submit: keep the popover open,
@@ -2366,10 +2378,25 @@ build_find_popover (App *app)
   app->filter_toggle = GTK_TOGGLE_BUTTON (toggle);
   g_signal_connect (toggle, "toggled", G_CALLBACK (on_filter_toggled), app);
 
+  /* "Match case" — the one session case flag SHARED by Text and Where; default
+   * OFF (unchecked = ASCII case-insensitive). Toggling it re-issues the active
+   * query. Sits beside "Filter to matches". */
+  GtkWidget *match_case = gtk_check_button_new_with_label ("Match case");
+  app->match_case = GTK_CHECK_BUTTON (match_case);
+  g_signal_connect (match_case, "toggled", G_CALLBACK (on_match_case_toggled),
+                    app);
+
+  GtkWidget *actions = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 12);
+  gtk_widget_set_hexpand (toggle, TRUE);
+  gtk_widget_set_halign (toggle, GTK_ALIGN_START);
+  gtk_widget_set_valign (match_case, GTK_ALIGN_CENTER);
+  gtk_box_append (GTK_BOX (actions), toggle);
+  gtk_box_append (GTK_BOX (actions), match_case);
+
   gtk_box_append (GTK_BOX (box), switcher);
   gtk_box_append (GTK_BOX (box), row);
   gtk_box_append (GTK_BOX (box), status);
-  gtk_box_append (GTK_BOX (box), toggle);
+  gtk_box_append (GTK_BOX (box), actions);
   gtk_popover_set_child (GTK_POPOVER (pop), box);
   app->find_popover = GTK_POPOVER (pop);
 
@@ -3220,6 +3247,26 @@ on_filter_toggled (GtkToggleButton *toggle, gpointer data)
     do_apply_filter (app);
   else
     do_clear_filter (app);
+}
+
+/* Toggling "Match case" re-issues whatever the flag governs so the new
+ * folding takes effect at once (find_read_draft reads the checkbox fresh):
+ * a live find re-runs, and an active filter re-applies. Order matters:
+ * re-applying the filter re-folds the visible SET (and invalidates the
+ * find), so capture the find's live state first and re-run it afterwards,
+ * restoring highlights within the freshly re-folded view. */
+static void
+on_match_case_toggled (GtkCheckButton *button, gpointer data)
+{
+  App *app = data;
+  (void)button;
+  if (app->doc == NULL)
+    return;
+  gboolean find_was_active = app->find.display.active;
+  if (app->filter.active)
+    do_apply_filter (app);
+  if (find_was_active)
+    find_run_query (app);
 }
 
 /* ------------------------------------------------------------------------- */

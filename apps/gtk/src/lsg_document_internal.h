@@ -62,6 +62,9 @@ lsg_build_abi_request (LsgSearchRequest request)
   ls_search_request req;
   req.value_ptr = (const uint8_t *) request.value;
   req.value_len = (request.value != NULL) ? strlen (request.value) : 0;
+  /* The "Match case" flag is marshaled 1:1 at this single choke point, so find,
+   * filter, navigation, and the highlight mask all inherit it identically. */
+  req.case_sensitive = request.case_sensitive;
 
   if (request.kind == LSG_FIND_TEXT)
     {
