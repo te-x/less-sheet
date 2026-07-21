@@ -16,10 +16,10 @@ public enum FindMode: Equatable, Sendable {
 }
 
 /// Predicate operators. Raw values are pinned to the ABI (LS_SEARCH_OP_*).
-/// `equals`/`notEquals` compare cell bytes to the value BYTE-EXACTLY (no case
-/// folding, no trimming). The ordering four are NUMERIC: both cell and value
-/// must satisfy `NumericGrammar`, and comparison is by exact mathematical
-/// value (never rounded through binary floating point).
+/// `equals`/`notEquals` compare cell bytes with ASCII case folding per the
+/// request's `caseSensitive` (insensitive by default), no trimming. The
+/// ordering four are NUMERIC (both cell and value must satisfy
+/// `NumericGrammar`, compared by exact mathematical value) and ignore case.
 public enum SearchOperator: Int32, CaseIterable, Equatable, Sendable {
     case equals = 0
     case notEquals = 1
@@ -37,20 +37,21 @@ public enum SearchOperator: Int32, CaseIterable, Equatable, Sendable {
     }
 }
 
-/// A composed search request — what the bridge sends to the core
-/// (mirrors `ls_search_request`).
+/// A composed search request — what the bridge sends to the core (mirrors
+/// `ls_search_request`). `caseSensitive` (the shared "Match case" control) is
+/// the ONLY thing deciding ASCII case folding for the TEXT substring and
+/// predicate `=`/`≠` (ordering ops ignore it): `false` (default) = ASCII
+/// case-INSENSITIVE (bytes >= 0x80 always exact); `true` = byte-exact.
+/// Smart-case is retired; the flag is part of the value's identity, so
+/// flipping it re-issues (restarts) the active search.
 public enum SearchRequest: Equatable, Sendable {
-    /// Substring text search with SMART CASE (pinned in api/lesssheet.h): a
-    /// query containing at least one ASCII uppercase byte matches
-    /// byte-exactly; otherwise ASCII letters fold case-insensitively and
-    /// every non-ASCII byte still compares exactly. `scope` is the set of
-    /// 0-based columns to evaluate — nil means ALL columns. The scope is
-    /// FIXED for the search's lifetime (visibility changes re-scope from the
-    /// next run).
-    case text(query: String, scope: [Int]?)
-    /// Single-column typed predicate. Any column may be targeted (hidden
-    /// ones included — hiding is presentation state).
-    case predicate(column: Int, comparison: SearchOperator, value: String)
+    /// Substring text search. `scope` is the 0-based columns to evaluate — nil
+    /// means ALL columns; it is FIXED for the search's lifetime (visibility
+    /// changes re-scope from the next run).
+    case text(query: String, scope: [Int]?, caseSensitive: Bool)
+    /// Single-column typed predicate. Any column may be targeted (hidden ones
+    /// included — hiding is presentation state).
+    case predicate(column: Int, comparison: SearchOperator, value: String, caseSensitive: Bool)
 }
 
 // MARK: - Navigation
@@ -236,19 +237,24 @@ public struct FindDraft: Equatable, Sendable {
     public var column: Int
     public var comparison: SearchOperator
     public var value: String
+    /// "Match case": false (default) = ASCII case-INSENSITIVE, true = byte-exact.
+    /// SHARED across Text/Where; session-scoped; `submit` maps it 1:1 to `.caseSensitive`.
+    public var caseSensitive: Bool
 
     public init(
         mode: FindMode = .text,
         text: String = "",
         column: Int = 0,
         comparison: SearchOperator = .equals,
-        value: String = ""
+        value: String = "",
+        caseSensitive: Bool = false
     ) {
         self.mode = mode
         self.text = text
         self.column = column
         self.comparison = comparison
         self.value = value
+        self.caseSensitive = caseSensitive
     }
 
     public static let empty = FindDraft()
@@ -331,14 +337,13 @@ public struct FindSession: Equatable, Sendable {
 ///   position nil, total 0, not final, progress nil, notice nil).
 ///
 /// - `submit(_:visibleColumns:columnCount:)` — Enter. Text mode: the empty
-///   query -> `.ignored`; otherwise `.run(.text(query:scope:))` with scope =
-///   nil when every column is visible (visibleColumns.count == columnCount),
-///   else the ASCENDING visible set (hidden-column changes thereby re-scope
-///   from the next run). Where mode: a column outside 0..<columnCount ->
-///   `.rejected`; an ordering operator whose value fails `NumericGrammar`
-///   (including the empty value) -> `.rejected`; otherwise
-///   `.run(.predicate(...))` (equals/notEquals accept ANY value, empty
-///   included — it matches empty cells).
+///   query -> `.ignored`; else `.run(.text(...))` (scope = nil when every
+///   column is visible, else the ASCENDING visible set — hidden-column
+///   changes re-scope next run). Where mode: a column outside 0..<columnCount
+///   or an ordering operator whose value fails `NumericGrammar` (empty
+///   included) -> `.rejected`; else `.run(.predicate(...))` (=/≠ accept ANY
+///   value, empty matching empty cells). BOTH modes carry the draft's
+///   `caseSensitive` verbatim (the shared "Match case" control).
 ///
 /// - `began(_:running:)` — a submitted request started in the core: draft
 ///   unchanged; display = (request, current nil, position nil, total 0, not

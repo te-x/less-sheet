@@ -103,7 +103,8 @@
 //
 // Fixture: generated once into the user temp dir and cached by exact byte size
 // (34_888_925 bytes) — header "id,tag,val" + 3_000_000 data rows "<i>,r,<i%10>",
-// with tag "ZQZmark" (the stall probe's default query; smart-case = byte-exact) on
+// with tag "ZQZmark" (the stall probe's default query; matched case-insensitively by
+// default, and the cell text equals the query so it matches either way) on
 // 0-based data rows 200000 / 1400000 / 2000000 / 2800000. Generation ~2 s, one-time.
 // Gate cost: 6 headless app launches (one per probe test on the happy path; some
 // relaunch once on a malformed run), ~20-30 s green (red adds nothing: fail-fast).

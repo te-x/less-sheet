@@ -7,6 +7,10 @@
 // Sources/Contracts/FilterControl.swift + DocumentSession.swift and
 // api/lesssheet.h FILTERED VIEWS.
 //
+// ARCH-search-case-mode A3/C4 (filter half): a filter inherits the request's
+// `caseSensitive` exactly like find (bridgeTextFilterHonorsMatchCase), so a
+// live "Match case" toggle re-applies with the new folding.
+//
 // Determinism: find.csv is far below the core's head budget, so filter/match
 // scans complete in milliseconds; polls are bounded (10 s) and every bridge
 // test asserts `setFilter == true` via #require BEFORE any poll loop, so an
@@ -31,8 +35,8 @@ private func findCSVPath() throws -> String {
 //   0 Widget,2,alpha needle      1 NEEDLE,10,beta       2 needle,2.0,gamma
 //   3 gadget,-3,Needle point      4 Gizmo,1e2,delta      5 café,0.5,CAFÉ
 //   6 ,5.,needleneedle            7 plain,abc,end needle
-// TEXT "needle" (smart-case) -> sources 0,1,2,3,6,7 (m = 6).
-// WHERE qty(col 1) >= 2       -> sources 0,1,2,4,6   (m = 5).
+// TEXT "needle" (case-insensitive by default) -> sources 0,1,2,3,6,7 (m = 6).
+// WHERE qty(col 1) >= 2                        -> sources 0,1,2,4,6   (m = 5).
 
 private func openFiltered(forcing override: DialectOverride = .sniffAll) async throws -> any DocumentSession {
     try await CoreSessionOpener().open(path: findCSVPath(), forcing: override)
@@ -146,7 +150,7 @@ private func waitJump(_ session: any DocumentSession) async throws -> UInt64 {
     let session = try await openFiltered()
     defer { session.close() }
     // qty (col 1) >= 2 -> source rows 0,1,2,4,6 (m = 5).
-    try #require(session.setFilter(.predicate(column: 1, comparison: .greaterOrEqual, value: "2")), "core rejected the filter")
+    try #require(session.setFilter(.predicate(column: 1, comparison: .greaterOrEqual, value: "2", caseSensitive: false)), "core rejected the filter")
     let done = try await waitFilter(session) { $0.totalIsFinal }
     #expect(done.total == 5)
     #expect(session.rowCount() == RowCountInfo(count: 5, isExact: true))
@@ -163,14 +167,34 @@ private func waitJump(_ session: any DocumentSession) async throws -> UInt64 {
     #expect(session.headerCells == ["name", "qty", "note"])
 }
 
-@Test func bridgeAppliesATextFilterWithSmartCase() async throws {
+@Test func bridgeAppliesATextFilterCaseInsensitiveByDefault() async throws {
     let session = try await openFiltered()
     defer { session.close() }
-    try #require(session.setFilter(.text(query: "needle", scope: nil)), "core rejected the filter")
+    try #require(session.setFilter(.text(query: "needle", scope: nil, caseSensitive: false)), "core rejected the filter")
     let done = try await waitFilter(session) { $0.totalIsFinal }
     #expect(done.total == 6) // sources 0,1,2,3,6,7
     _ = session.setWindow(firstRow: 0, rowCount: 6)
     #expect((0..<6).map { session.sourceRow(UInt64($0)) } == [0, 1, 2, 3, 6, 7])
+}
+
+@Test func bridgeTextFilterHonorsMatchCase() async throws {
+    // ARCH-search-case-mode A3 + C4 (filter half): the filter inherits
+    // `caseSensitive` exactly like find. Default (insensitive) "Needle" folds
+    // to the 6 needle rows; Match case ON is byte-exact — only source row 3
+    // ("Needle point"). (The ON assertions are RED until the bridge marshals
+    // the flag; re-issuing on toggle is the implementer's UI glue.)
+    let session = try await openFiltered()
+    defer { session.close() }
+    // Insensitive (default): an uppercase query folds -> 6 rows.
+    try #require(session.setFilter(.text(query: "Needle", scope: nil, caseSensitive: false)), "core rejected the filter")
+    #expect(try await waitFilter(session) { $0.totalIsFinal }.total == 6)
+    // Match case ON: byte-exact -> only "Needle point".
+    try #require(session.setFilter(.text(query: "Needle", scope: nil, caseSensitive: true)), "core rejected the filter")
+    let done = try await waitFilter(session) { $0.totalIsFinal }
+    #expect(done.total == 1)
+    #expect(session.rowCount() == RowCountInfo(count: 1, isExact: true))
+    _ = session.setWindow(firstRow: 0, rowCount: 1)
+    #expect(session.sourceRow(0) == 3) // source row 3 = "Needle point"
 }
 
 @Test func bridgeApplyAsFilterReusesTheFindSubmitRequest() async throws {
@@ -197,7 +221,7 @@ private func waitJump(_ session: any DocumentSession) async throws -> UInt64 {
 @Test func bridgeClearRestoresIdentityAndReanchorsOnTheTopSourceRow() async throws {
     let session = try await openFiltered()
     defer { session.close() }
-    try #require(session.setFilter(.text(query: "needle", scope: nil)), "core rejected the filter")
+    try #require(session.setFilter(.text(query: "needle", scope: nil, caseSensitive: false)), "core rejected the filter")
     _ = try await waitFilter(session) { $0.totalIsFinal }
     // Viewport top at filtered row 4 (source row 6): capture the re-anchor row.
     _ = session.setWindow(firstRow: 4, rowCount: 2)
@@ -218,7 +242,7 @@ private func waitJump(_ session: any DocumentSession) async throws -> UInt64 {
     let session = try await openFiltered()
     defer { session.close() }
     // needle -> filtered 0..5 == sources 0,1,2,3,6,7.
-    try #require(session.setFilter(.text(query: "needle", scope: nil)), "core rejected the filter")
+    try #require(session.setFilter(.text(query: "needle", scope: nil, caseSensitive: false)), "core rejected the filter")
     _ = try await waitFilter(session) { $0.totalIsFinal }
     // "go to" original row 4 -> nearest match >= 4 is source 6 = filtered index 4.
     session.startJump(to: 4)
@@ -238,11 +262,11 @@ private func waitJump(_ session: any DocumentSession) async throws -> UInt64 {
     let session = try await openFiltered()
     defer { session.close() }
     // Filter qty >= 2 -> source 0,1,2,4,6 (filtered 0..4).
-    try #require(session.setFilter(.predicate(column: 1, comparison: .greaterOrEqual, value: "2")), "core rejected the filter")
+    try #require(session.setFilter(.predicate(column: 1, comparison: .greaterOrEqual, value: "2", caseSensitive: false)), "core rejected the filter")
     _ = try await waitFilter(session) { $0.totalIsFinal }
     // Find "needle" within the filter: filtered rows 0,1,2,4 match (filtered 3 =
     // source 4 "Gizmo" does not) -> total within the filter = 4.
-    try #require(session.startSearch(.text(query: "needle", scope: nil)), "core rejected the search")
+    try #require(session.startSearch(.text(query: "needle", scope: nil, caseSensitive: false)), "core rejected the search")
     let sdone = try await waitSearch(session) { $0.totalIsFinal }
     #expect(sdone.total == 4)
     // found_row is a FILTERED index; navigation stays within the filtered view;
@@ -263,7 +287,7 @@ private func waitJump(_ session: any DocumentSession) async throws -> UInt64 {
 @Test func bridgeEmptyFilterShowsNoMatchingRows() async throws {
     let session = try await openFiltered()
     defer { session.close() }
-    try #require(session.setFilter(.text(query: "zzz-no-such-substring", scope: nil)), "core rejected the filter")
+    try #require(session.setFilter(.text(query: "zzz-no-such-substring", scope: nil, caseSensitive: false)), "core rejected the filter")
     let done = try await waitFilter(session) { $0.totalIsFinal }
     #expect(done.total == 0)
     #expect(session.rowCount() == RowCountInfo(count: 0, isExact: true))
@@ -274,7 +298,7 @@ private func waitJump(_ session: any DocumentSession) async throws -> UInt64 {
 @Test func bridgeSourceRowIsNilOutsideTheMaterializedWindow() async throws {
     let session = try await openFiltered()
     defer { session.close() }
-    try #require(session.setFilter(.text(query: "needle", scope: nil)), "core rejected the filter")
+    try #require(session.setFilter(.text(query: "needle", scope: nil, caseSensitive: false)), "core rejected the filter")
     _ = try await waitFilter(session) { $0.totalIsFinal }
     _ = session.setWindow(firstRow: 2, rowCount: 2) // filtered rows 2,3 -> sources 2,3
     #expect(session.sourceRow(2) == 2)
@@ -287,20 +311,20 @@ private func waitJump(_ session: any DocumentSession) async throws -> UInt64 {
     let session = try await openFiltered()
     defer { session.close() }
     // A running find in the identity view...
-    try #require(session.startSearch(.text(query: "needle", scope: nil)), "core rejected the search")
+    try #require(session.startSearch(.text(query: "needle", scope: nil, caseSensitive: false)), "core rejected the search")
     _ = try await waitSearch(session) { $0.totalIsFinal }
     #expect(session.searchStatus() != nil)
     // ...is RESET when a filter is set (the coordinate space changed).
-    try #require(session.setFilter(.predicate(column: 1, comparison: .greaterOrEqual, value: "2")), "core rejected the filter")
+    try #require(session.setFilter(.predicate(column: 1, comparison: .greaterOrEqual, value: "2", caseSensitive: false)), "core rejected the filter")
     #expect(session.searchStatus() == nil)
     // A find within the filter, then CLEARING the filter, resets it again.
-    try #require(session.startSearch(.text(query: "needle", scope: nil)), "core rejected the search")
+    try #require(session.startSearch(.text(query: "needle", scope: nil, caseSensitive: false)), "core rejected the search")
     _ = try await waitSearch(session) { $0.totalIsFinal }
     session.clearFilter()
     #expect(session.searchStatus() == nil)
     // A dialect RE-OPEN is a fresh session (new document identity): no filter,
     // no search — the state died with the old handle.
-    try #require(session.setFilter(.predicate(column: 1, comparison: .greaterOrEqual, value: "2")), "core rejected the filter")
+    try #require(session.setFilter(.predicate(column: 1, comparison: .greaterOrEqual, value: "2", caseSensitive: false)), "core rejected the filter")
     _ = try await waitFilter(session) { $0.totalIsFinal }
     let reopened = try await openFiltered(forcing: DialectOverride(header: .forcedOff))
     defer { reopened.close() }

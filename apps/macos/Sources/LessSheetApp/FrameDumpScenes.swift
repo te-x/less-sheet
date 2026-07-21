@@ -238,7 +238,7 @@ enum FindScenes {
     static let countsState = FindSession(
         draft: draft(mode: .text, text: "needle"),
         display: FindDisplay(
-            request: .text(query: "needle", scope: nil),
+            request: .text(query: "needle", scope: nil, caseSensitive: false),
             current: SearchMatch(row: 2, column: 0),
             position: 3, total: 47, totalIsFinal: false, progress: 0.34, notice: nil
         )
@@ -248,7 +248,7 @@ enum FindScenes {
     static let noMatchesState = FindSession(
         draft: draft(mode: .text, text: "zzz"),
         display: FindDisplay(
-            request: .text(query: "zzz", scope: nil),
+            request: .text(query: "zzz", scope: nil, caseSensitive: false),
             current: nil, position: nil, total: 0, totalIsFinal: true, progress: nil, notice: .noMatches
         )
     )
@@ -257,7 +257,7 @@ enum FindScenes {
     static let wrappedState = FindSession(
         draft: draft(mode: .text, text: "needle"),
         display: FindDisplay(
-            request: .text(query: "needle", scope: nil),
+            request: .text(query: "needle", scope: nil, caseSensitive: false),
             current: SearchMatch(row: 0, column: 2),
             position: 1, total: 6, totalIsFinal: true, progress: nil, notice: .wrappedToStart
         )
@@ -268,7 +268,7 @@ enum FindScenes {
     static let highlightsState = FindSession(
         draft: draft(mode: .text, text: "needle"),
         display: FindDisplay(
-            request: .text(query: "needle", scope: nil),
+            request: .text(query: "needle", scope: nil, caseSensitive: false),
             current: SearchMatch(row: 0, column: 2),
             position: 1, total: 6, totalIsFinal: true, progress: nil, notice: nil
         )

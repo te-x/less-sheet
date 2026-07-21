@@ -5,6 +5,14 @@
 // frontend-vs-core matcher-verdict identity matrix. Semantics are normative
 // in Sources/Contracts/FindControl.swift and api/lesssheet.h.
 //
+// ARCH-search-case-mode (§6.C, macOS): the "Match case" control is one shared
+// session bool (default OFF = ASCII case-INSENSITIVE) marshaled 1:1 to the
+// request's `caseSensitive` — smart-case is retired. The composer + bridge
+// tests below pin: default insensitive folding (an uppercase query matches
+// lowercase cells), byte-exact when ON, predicate EQ/NE folding, ordering
+// unaffected, non-ASCII never folded, and the flag being part of the request
+// identity (so a live toggle re-issues).
+//
 // Determinism: the fixture is far below the core's head budget, so match
 // scans complete in milliseconds; polls are bounded (10 s) and every bridge
 // test asserts `startSearch == true` via #require BEFORE any poll loop, so
@@ -62,7 +70,7 @@ private func matchedRows(_ session: any DocumentSession, _ request: SearchReques
     return rows
 }
 
-private let sampleRequest = SearchRequest.text(query: "x", scope: nil)
+private let sampleRequest = SearchRequest.text(query: "x", scope: nil, caseSensitive: false)
 
 // MARK: - Contract conformance pins (signature drift fails this build)
 
@@ -106,6 +114,31 @@ private let sampleRequest = SearchRequest.text(query: "x", scope: nil)
     #expect(SearchOperator.greaterOrEqual.isOrdering)
 }
 
+@Test func searchRequestABICarriesCaseSensitive() {
+    // ARCH-search-case-mode A1: `ls_search_request` grew one `bool
+    // case_sensitive` — the field the frontend marshals the "Match case"
+    // control to. It round-trips through the C-imported memberwise init (and
+    // there is no case enum / SMART value anywhere in the ABI).
+    var req = ls_search_request(
+        kind: LS_SEARCH_TEXT, op: LS_SEARCH_OP_EQ, column: 0,
+        value_ptr: nil, value_len: 0, scope_ptr: nil, scope_len: 0,
+        case_sensitive: true
+    )
+    #expect(req.case_sensitive == true)
+    req.case_sensitive = false
+    #expect(req.case_sensitive == false)
+}
+
+@Test func caseSensitiveIsPartOfTheRequestIdentity() {
+    // ARCH-search-case-mode C4 (mechanism): flipping "Match case" makes an
+    // otherwise-equal request UNEQUAL, so a live toggle re-issues (restarts)
+    // rather than advances the active search.
+    #expect(SearchRequest.text(query: "a", scope: nil, caseSensitive: false)
+        != .text(query: "a", scope: nil, caseSensitive: true))
+    #expect(SearchRequest.predicate(column: 0, comparison: .equals, value: "a", caseSensitive: false)
+        != .predicate(column: 0, comparison: .equals, value: "a", caseSensitive: true))
+}
+
 // MARK: - The pinned numeric grammar (same fixtures as the core's frozen tests)
 
 @Test func numericGrammarMatchesTheCorePins() {
@@ -132,15 +165,40 @@ private let sampleRequest = SearchRequest.text(query: "x", scope: nil)
     var s = c.initial()
     s.draft.mode = .text
     s.draft.text = "needle"
-    // Nothing hidden: scope nil (all columns).
+    // Nothing hidden: scope nil (all columns). Match case defaults OFF.
     #expect(c.submit(s, visibleColumns: [0, 1, 2], columnCount: 3)
-        == .run(.text(query: "needle", scope: nil)))
+        == .run(.text(query: "needle", scope: nil, caseSensitive: false)))
     // Hidden columns: the ASCENDING visible set is fixed into the request.
     #expect(c.submit(s, visibleColumns: [2, 0], columnCount: 3)
-        == .run(.text(query: "needle", scope: [0, 2])))
+        == .run(.text(query: "needle", scope: [0, 2], caseSensitive: false)))
     // The empty query means "no search" — ignored, not an error.
     s.draft.text = ""
     #expect(c.submit(s, visibleColumns: [0, 1, 2], columnCount: 3) == .ignored)
+}
+
+@Test func submitMarshalsTheMatchCaseControlIntoTheRequest() {
+    // ARCH-search-case-mode C2 (composer half): the ONE "Match case" draft bool
+    // threads 1:1 into the composed request's `caseSensitive`, shared by Text
+    // and Where. (RED until the composer reads draft.caseSensitive.)
+    let c = FindControl()
+    var s = c.initial()
+    s.draft.caseSensitive = true
+    // Text mode carries it.
+    s.draft.mode = .text
+    s.draft.text = "needle"
+    #expect(c.submit(s, visibleColumns: [0, 1, 2], columnCount: 3)
+        == .run(.text(query: "needle", scope: nil, caseSensitive: true)))
+    // The SAME control governs the Where predicate request.
+    s.draft.mode = .predicate
+    s.draft.column = 1
+    s.draft.comparison = .equals
+    s.draft.value = "x"
+    #expect(c.submit(s, visibleColumns: [0, 1, 2], columnCount: 3)
+        == .run(.predicate(column: 1, comparison: .equals, value: "x", caseSensitive: true)))
+    // Toggling it OFF marshals false (the default).
+    s.draft.caseSensitive = false
+    #expect(c.submit(s, visibleColumns: [0, 1, 2], columnCount: 3)
+        == .run(.predicate(column: 1, comparison: .equals, value: "x", caseSensitive: false)))
 }
 
 @Test func submitValidatesOrderingPredicateValues() {
@@ -151,7 +209,7 @@ private let sampleRequest = SearchRequest.text(query: "x", scope: nil)
     s.draft.comparison = .lessOrEqual
     s.draft.value = "2.5"
     #expect(c.submit(s, visibleColumns: [0, 1], columnCount: 2)
-        == .run(.predicate(column: 1, comparison: .lessOrEqual, value: "2.5")))
+        == .run(.predicate(column: 1, comparison: .lessOrEqual, value: "2.5", caseSensitive: false)))
     // Ordering + non-numeric value -> the rejection state (blink + shake),
     // BEFORE any core call.
     s.draft.value = "abc"
@@ -164,10 +222,10 @@ private let sampleRequest = SearchRequest.text(query: "x", scope: nil)
     s.draft.comparison = .equals
     s.draft.value = ""
     #expect(c.submit(s, visibleColumns: [0, 1], columnCount: 2)
-        == .run(.predicate(column: 1, comparison: .equals, value: "")))
+        == .run(.predicate(column: 1, comparison: .equals, value: "", caseSensitive: false)))
     // A hidden column is a legal predicate target (the picker marks it)...
     #expect(c.submit(s, visibleColumns: [0], columnCount: 2)
-        == .run(.predicate(column: 1, comparison: .equals, value: "")))
+        == .run(.predicate(column: 1, comparison: .equals, value: "", caseSensitive: false)))
     // ...but a column outside the document is not.
     s.draft.column = 5
     #expect(c.submit(s, visibleColumns: [0, 1], columnCount: 2) == .rejected)
@@ -178,6 +236,7 @@ private let sampleRequest = SearchRequest.text(query: "x", scope: nil)
 @Test func initialFindSessionIsEmpty() {
     let s = FindControl().initial()
     #expect(s.draft == .empty)
+    #expect(s.draft.caseSensitive == false) // C1: Match case defaults OFF (insensitive)
     #expect(s.display == FindDisplay(
         request: nil, current: nil, position: nil,
         total: 0, totalIsFinal: false, progress: nil, notice: nil
@@ -282,7 +341,7 @@ private let sampleRequest = SearchRequest.text(query: "x", scope: nil)
     #expect(c.step(s, .backward, viewportRow: 42) == SearchNav(anchor: 42, direction: .backward))
     // With a current match: next = at-or-after row + 1; previous = strictly
     // before the current row (the core's backward rule — no decrement, and
-    // previous-from-row-0 exhausts core-side into the wrap).
+    // previous-from-row-0 exhausts core-side).
     s = c.resolved(s, with: SearchSnapshot(
         phase: .done,
         nav: .found(SearchMatch(row: 10, column: 2), position: 2),
@@ -393,8 +452,8 @@ private let sampleRequest = SearchRequest.text(query: "x", scope: nil)
 @Test func bridgeRunsATextSearchWithLandingsCountsAndNavigation() async throws {
     let session = try await openFindFixture()
     defer { session.close() }
-    // Smart case: "needle" folds ASCII -> rows 0,1,2,3,6,7 (m = 6).
-    try #require(session.startSearch(.text(query: "needle", scope: nil)))
+    // Insensitive (default): "needle" folds ASCII -> rows 0,1,2,3,6,7 (m = 6).
+    try #require(session.startSearch(.text(query: "needle", scope: nil, caseSensitive: false)))
     session.navigateSearch(.fromTop)
     let first = try await waitSearch(session) {
         if case .found = $0.nav { return true } else { return false }
@@ -422,8 +481,14 @@ private let sampleRequest = SearchRequest.text(query: "x", scope: nil)
     // Cancel after completion: DONE persists (mirrors ls_search_cancel).
     session.cancelSearch()
     #expect(session.searchStatus()?.phase == .done)
-    // An uppercase byte flips to exact bytes: only "Needle point" matches.
-    try #require(session.startSearch(.text(query: "Needle", scope: nil)))
+    // Match case OFF: an UPPERCASE query still folds — "Needle" matches the
+    // SAME rows as "needle" (D1: the retired smart-case "uppercase => exact"
+    // auto-rule is gone; the flag is the only thing that decides folding).
+    try #require(session.startSearch(.text(query: "Needle", scope: nil, caseSensitive: false)))
+    let folded = try await waitSearch(session) { $0.totalIsFinal }
+    #expect(folded.total == 6)
+    // Match case ON: byte-exact — only "Needle point" (row 3, col 2) matches.
+    try #require(session.startSearch(.text(query: "Needle", scope: nil, caseSensitive: true)))
     let exact = try await waitSearch(session) { $0.totalIsFinal }
     #expect(exact.total == 1)
     session.navigateSearch(.fromTop)
@@ -434,7 +499,7 @@ private let sampleRequest = SearchRequest.text(query: "x", scope: nil)
     let session = try await openFindFixture()
     defer { session.close() }
     // qty <= 2 numerically: rows 0 (2), 2 (2.0), 3 (-3), 5 (0.5) — m = 4.
-    try #require(session.startSearch(.predicate(column: 1, comparison: .lessOrEqual, value: "2")))
+    try #require(session.startSearch(.predicate(column: 1, comparison: .lessOrEqual, value: "2", caseSensitive: false)))
     session.navigateSearch(.fromTop)
     let first = try await waitSearch(session) {
         if case .found = $0.nav { return true } else { return false }
@@ -448,37 +513,79 @@ private let sampleRequest = SearchRequest.text(query: "x", scope: nil)
     #expect(done.total == 4)
     session.navigateSearch(.fromEnd)
     #expect(session.searchStatus()?.nav == .found(SearchMatch(row: 5, column: 1), position: 4))
-    // Byte-exact equality distinguishes representations ("2.0" vs "2").
-    #expect(try await matchedRows(session, .predicate(column: 1, comparison: .equals, value: "2.0")) == [2])
-    #expect(try await matchedRows(session, .predicate(column: 1, comparison: .equals, value: "2")) == [0])
-    // The empty value matches the empty cell (ragged/pad rule).
-    #expect(try await matchedRows(session, .predicate(column: 0, comparison: .equals, value: "")) == [6])
+    // Exact-decimal equality distinguishes representations ("2.0" vs "2");
+    // digits are unaffected by ASCII case folding, so this holds by default.
+    #expect(try await matchedRows(session, .predicate(column: 1, comparison: .equals, value: "2.0", caseSensitive: false)) == [2])
+    #expect(try await matchedRows(session, .predicate(column: 1, comparison: .equals, value: "2", caseSensitive: false)) == [0])
+    // The empty value matches the empty cell (ragged/pad rule), independent of case.
+    #expect(try await matchedRows(session, .predicate(column: 0, comparison: .equals, value: "", caseSensitive: false)) == [6])
     // Core-side enforcement mirrors the composer: rejected starts change
     // nothing (the previous search stays polled).
-    try #require(session.startSearch(.predicate(column: 1, comparison: .lessOrEqual, value: "2")))
+    try #require(session.startSearch(.predicate(column: 1, comparison: .lessOrEqual, value: "2", caseSensitive: false)))
     _ = try await waitSearch(session) { $0.totalIsFinal }
-    #expect(session.startSearch(.predicate(column: 1, comparison: .lessThan, value: "abc")) == false)
-    #expect(session.startSearch(.text(query: "", scope: nil)) == false)
-    #expect(session.startSearch(.predicate(column: 9, comparison: .equals, value: "x")) == false)
+    #expect(session.startSearch(.predicate(column: 1, comparison: .lessThan, value: "abc", caseSensitive: false)) == false)
+    #expect(session.startSearch(.text(query: "", scope: nil, caseSensitive: false)) == false)
+    #expect(session.startSearch(.predicate(column: 9, comparison: .equals, value: "x", caseSensitive: false)) == false)
     #expect(session.searchStatus()?.total == 4)
     #expect(session.searchStatus()?.totalIsFinal == true)
+}
+
+@Test func bridgePredicateEqualityHonorsMatchCase() async throws {
+    // ARCH-search-case-mode B4/B5 + C3 (predicate half): col 0 holds both
+    // "NEEDLE" (row 1) and "needle" (row 2). `= needle` folds ASCII by default
+    // (matches BOTH), and is byte-exact when Match case is ON (only "needle").
+    let session = try await openFindFixture()
+    defer { session.close() }
+    // Insensitive (default): EQ matches "NEEDLE" and "needle".
+    #expect(try await matchedRows(session,
+        .predicate(column: 0, comparison: .equals, value: "needle", caseSensitive: false)) == [1, 2])
+    // NE is the exact complement.
+    #expect(try await matchedRows(session,
+        .predicate(column: 0, comparison: .notEquals, value: "needle", caseSensitive: false)) == [0, 3, 4, 5, 6, 7])
+    // Match case ON: EQ is byte-exact — only the exact "needle" (row 2).
+    #expect(try await matchedRows(session,
+        .predicate(column: 0, comparison: .equals, value: "needle", caseSensitive: true)) == [2])
+}
+
+@Test func bridgeOrderingPredicatesIgnoreMatchCase() async throws {
+    // ARCH-search-case-mode B7: the numeric ordering operators produce the SAME
+    // verdict regardless of Match case. qty (col 1) <= 2 -> rows 0,2,3,5 in
+    // both modes.
+    let session = try await openFindFixture()
+    defer { session.close() }
+    let insensitive = try await matchedRows(session,
+        .predicate(column: 1, comparison: .lessOrEqual, value: "2", caseSensitive: false))
+    let sensitive = try await matchedRows(session,
+        .predicate(column: 1, comparison: .lessOrEqual, value: "2", caseSensitive: true))
+    #expect(insensitive == [0, 2, 3, 5])
+    #expect(sensitive == [0, 2, 3, 5])
+}
+
+@Test func bridgeInsensitiveTextNeverFoldsNonASCII() async throws {
+    // ARCH-search-case-mode B3: ASCII folds, but bytes >= 0x80 always compare
+    // exactly, even insensitively. "CAFÉ" (uppercase, non-ASCII É) matches only
+    // the exact "CAFÉ" cell (row 5, col 2) — NOT the "café" cell (col 0), whose
+    // é differs from É in the non-ASCII bytes.
+    let session = try await openFindFixture()
+    defer { session.close() }
+    #expect(try await matchedRows(session, .text(query: "CAFÉ", scope: nil, caseSensitive: false)) == [5])
 }
 
 @Test func bridgeScopesTextSearchesExactly() async throws {
     let session = try await openFindFixture()
     defer { session.close() }
     // "needle" per column: col 0 -> rows 1,2; col 2 -> rows 0,3,6,7.
-    #expect(try await matchedRows(session, .text(query: "needle", scope: [0])) == [1, 2])
-    #expect(try await matchedRows(session, .text(query: "needle", scope: [2])) == [0, 3, 6, 7])
-    #expect(try await matchedRows(session, .text(query: "needle", scope: [1])) == [])
-    #expect(try await matchedRows(session, .text(query: "needle", scope: [0, 2])) == [0, 1, 2, 3, 6, 7])
+    #expect(try await matchedRows(session, .text(query: "needle", scope: [0], caseSensitive: false)) == [1, 2])
+    #expect(try await matchedRows(session, .text(query: "needle", scope: [2], caseSensitive: false)) == [0, 3, 6, 7])
+    #expect(try await matchedRows(session, .text(query: "needle", scope: [1], caseSensitive: false)) == [])
+    #expect(try await matchedRows(session, .text(query: "needle", scope: [0, 2], caseSensitive: false)) == [0, 1, 2, 3, 6, 7])
 }
 
 @Test func aFreshOrReopenedSessionHasZeroSearchState() async throws {
     // Header ON: "name" lives in the header record — never matched.
     let first = try await openFindFixture()
     #expect(first.searchStatus() == nil) // fresh session: no search state
-    try #require(first.startSearch(.text(query: "name", scope: nil)))
+    try #require(first.startSearch(.text(query: "name", scope: nil, caseSensitive: false)))
     let headerOn = try await waitSearch(first) { $0.totalIsFinal }
     #expect(headerOn.total == 0)
     first.close()
@@ -487,7 +594,7 @@ private let sampleRequest = SearchRequest.text(query: "x", scope: nil)
     let second = try await openFindFixture(forcing: DialectOverride(header: .forcedOff))
     defer { second.close() }
     #expect(second.searchStatus() == nil)
-    try #require(second.startSearch(.text(query: "name", scope: nil)))
+    try #require(second.startSearch(.text(query: "name", scope: nil, caseSensitive: false)))
     let headerOff = try await waitSearch(second) { $0.totalIsFinal }
     #expect(headerOff.total == 1)
     second.navigateSearch(.fromTop)

@@ -256,7 +256,7 @@ private func matchedRows(_ session: any DocumentSession, _ request: SearchReques
     let session = try await openBytes(fixture)
     defer { session.close() }
     // The match is found even though it lives past the served display bytes.
-    #expect(try await matchedRows(session, .text(query: "NEEDLE", scope: nil)) == [0])
+    #expect(try await matchedRows(session, .text(query: "NEEDLE", scope: nil, caseSensitive: false)) == [0])
     // ...and that served cell is capped + flagged (display-only).
     let window = session.setWindow(firstRow: 0, rowCount: 10)
     #expect(window.rows[0][0].utf8.count <= Int(LS_CELL_MAX_BYTES))

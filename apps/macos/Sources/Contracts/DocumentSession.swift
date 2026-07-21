@@ -266,11 +266,12 @@ public protocol DocumentSession: AnyObject, Sendable {
     /// `[firstColumn, firstColumn + columnCount)` (stride `columnCount`,
     /// `count == windowRowCount * columnCount`), COPIED out of the core's
     /// borrow immediately (the UTF-8-copy-out discipline). The verdict is the
-    /// SAME one the core's matcher computes for `startSearch`, byte-identical to
-    /// the frontend's former `CellMatcher`: TEXT smart-case over IN-SCOPE
-    /// columns, PREDICATE eq/ne byte-exact + exact-decimal ordering on the
-    /// target column; a FILTER changes only which rows the window holds, not
-    /// the verdict. Returns `[]` when no search is active, no window is
+    /// SAME one the core's matcher computes for `startSearch`: TEXT substring
+    /// and PREDICATE eq/ne fold ASCII case per the active request's
+    /// `caseSensitive` (insensitive by default, byte-exact when set) over
+    /// IN-SCOPE columns, plus exact-decimal ordering on the target column;
+    /// a FILTER changes only which rows the window holds, not the verdict.
+    /// Returns `[]` when no search is active, no window is
     /// materialized, or the column range is empty / out of range. ADDITIVE:
     /// the RED default below returns `[]` (no highlights) so existing
     /// conformers compile; the real conformer OVERRIDES it to call

@@ -42,7 +42,10 @@ public struct FindControl: FindControlling {
             // set is fixed into the request (hidden-column changes re-scope from
             // the next run).
             let scope: [Int]? = (visibleColumns.count == columnCount) ? nil : visibleColumns.sorted()
-            return .run(.text(query: draft.text, scope: scope))
+            // SEED (planner): the implementer marshals the shared "Match case" here
+            // (`caseSensitive: draft.caseSensitive`, for BOTH branches). Hard-false until
+            // then, so the caseSensitive-ON composer/behavior tests are RED.
+            return .run(.text(query: draft.text, scope: scope, caseSensitive: false))
         case .predicate:
             // A column outside the document rejects (blink + shake), before any
             // core call. Hidden columns are legal targets (the picker marks them).
@@ -50,7 +53,10 @@ public struct FindControl: FindControlling {
             // Ordering operators need a numeric value; the empty value fails too.
             // = / ≠ accept ANY value (the empty one matches empty cells).
             if draft.comparison.isOrdering, !NumericGrammar.isNumeric(draft.value) { return .rejected }
-            return .run(.predicate(column: draft.column, comparison: draft.comparison, value: draft.value))
+            return .run(.predicate(
+                column: draft.column, comparison: draft.comparison,
+                value: draft.value, caseSensitive: false
+            ))
         }
     }
 
