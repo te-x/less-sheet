@@ -18,6 +18,24 @@ extension DocumentModel {
         if isFiltered { applyFindAsFilter() } else { submitFind() }
     }
 
+    /// Flip the shared "Match case" control (ARCH-search-case-mode C4). Records
+    /// the one session-scoped draft flag (shared by Text/Where) and LIVE-re-issues
+    /// whatever is active: because `caseSensitive` is part of `SearchRequest`
+    /// identity, the composed request is now UNEQUAL to the running one, so
+    /// `submitFind` takes its restart branch (never the same-request "advance to
+    /// next"), and `applyFindAsFilter` re-applies the filter with the new folding.
+    /// With nothing active only the draft changes — a never-submitted query is not
+    /// spontaneously searched.
+    func setCaseSensitive(_ enabled: Bool) {
+        guard findSession.draft.caseSensitive != enabled else { return }
+        findSession.draft.caseSensitive = enabled
+        if isFiltered {
+            applyFindAsFilter()
+        } else if findSession.display.request != nil {
+            submitFind()
+        }
+    }
+
     /// Submit the current draft (Enter): compose + start the search, then
     /// navigate to the first match in the FILE. A rejected compose (ordering
     /// predicate with a non-numeric value, or an out-of-range column) blinks +

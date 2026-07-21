@@ -81,7 +81,7 @@ struct FindControlView: View {
     /// (an overestimate only widens the gap; it never overlaps).
     private var popupHeight: CGFloat {
         let base: CGFloat = model.findSession.draft.mode == .text ? 116 : 156
-        return base + (searching ? 34 : 0) + 28   // + the apply-as-filter row
+        return base + (searching ? 34 : 0) + 28 + 24   // + apply-as-filter + match-case rows
     }
 
     // MARK: - Popup
@@ -99,6 +99,7 @@ struct FindControlView: View {
             case .predicate: whereFields
             }
 
+            matchCaseRow
             filterRow
             statusRow
             if let progress = display.progress { scanningRow(progress) }
@@ -137,7 +138,31 @@ struct FindControlView: View {
                 set: { enabled in enabled ? model.applyFindAsFilter() : model.clearFilter() })
     }
 
-    // Text mode: one query field with smart case (ARCH req. 7).
+    // "Match case" (ARCH-search-case-mode §6.C): the ONE shared control for both
+    // Text and Where (smart-case is retired). Default OFF = ASCII case-insensitive
+    // fold; ON = byte-exact. Flipping it live-re-issues the active find and
+    // re-applies an active filter (`setCaseSensitive`), since `caseSensitive` is
+    // part of the request's identity. Native macOS checkbox.
+    private var matchCaseRow: some View {
+        HStack(spacing: 8) {
+            Toggle("Match case", isOn: matchCaseBinding)
+                .toggleStyle(.checkbox)
+                .controlSize(.small)
+            Spacer(minLength: 8)
+        }
+        .font(.caption)
+        .accessibilityLabel("Match case")
+        .accessibilityHint("Off folds letter case; on matches exactly.")
+    }
+
+    /// Reflects + drives the shared draft flag; the setter routes through the
+    /// model so the toggle re-issues (never merely records the flag).
+    private var matchCaseBinding: Binding<Bool> {
+        Binding(get: { model.findSession.draft.caseSensitive },
+                set: { model.setCaseSensitive($0) })
+    }
+
+    // Text mode: one query field; case folding is the shared "Match case" control.
     private var textFields: some View {
         HStack(spacing: 8) {
             Image(systemName: "magnifyingglass").foregroundStyle(.secondary)

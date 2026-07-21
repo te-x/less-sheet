@@ -69,7 +69,7 @@ extension CoreDocumentSession {
     /// core rejects genuinely out-of-range indices itself.
     private func withSearchRequest(_ request: SearchRequest, _ body: (inout ls_search_request) -> Bool) -> Bool {
         switch request {
-        case let .text(query, scope, _):
+        case let .text(query, scope, caseSensitive):
             let value = Array(query.utf8)
             return value.withUnsafeBufferPointer { valueBuffer in
                 func run(scopePtr: UnsafePointer<UInt32>?, scopeLen: Int) -> Bool {
@@ -81,10 +81,10 @@ extension CoreDocumentSession {
                         value_len: valueBuffer.count,
                         scope_ptr: scopePtr,
                         scope_len: scopeLen,
-                        // SEED (planner): bind the destructured caseSensitive and pass it
-                        // here (`case_sensitive: caseSensitive`) to marshal "Match case"
-                        // 1:1. Hard-false until then -> the caseSensitive-ON tests are RED.
-                        case_sensitive: false
+                        // "Match case" marshaled 1:1 (false = ASCII-insensitive fold,
+                        // true = byte-exact) — the single ABI choke point for Find,
+                        // filter, and the match-flags verdict alike.
+                        case_sensitive: caseSensitive
                     )
                     return body(&req)
                 }
@@ -101,7 +101,7 @@ extension CoreDocumentSession {
                 }
                 return run(scopePtr: nil, scopeLen: 0)
             }
-        case let .predicate(column, comparison, value, _):
+        case let .predicate(column, comparison, value, caseSensitive):
             guard let abiColumn = UInt32(exactly: column) else { return false }
             let value = Array(value.utf8)
             return value.withUnsafeBufferPointer { valueBuffer in
@@ -113,7 +113,7 @@ extension CoreDocumentSession {
                     value_len: valueBuffer.count,
                     scope_ptr: nil,                   // ignored for PREDICATE
                     scope_len: 0,
-                    case_sensitive: false             // SEED (planner): see the TEXT branch
+                    case_sensitive: caseSensitive     // "Match case" (see the TEXT branch)
                 )
                 return body(&req)
             }

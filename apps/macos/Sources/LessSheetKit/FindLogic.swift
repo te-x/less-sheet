@@ -42,10 +42,9 @@ public struct FindControl: FindControlling {
             // set is fixed into the request (hidden-column changes re-scope from
             // the next run).
             let scope: [Int]? = (visibleColumns.count == columnCount) ? nil : visibleColumns.sorted()
-            // SEED (planner): the implementer marshals the shared "Match case" here
-            // (`caseSensitive: draft.caseSensitive`, for BOTH branches). Hard-false until
-            // then, so the caseSensitive-ON composer/behavior tests are RED.
-            return .run(.text(query: draft.text, scope: scope, caseSensitive: false))
+            // The ONE shared "Match case" draft bool threads 1:1 into the composed
+            // request's `caseSensitive` (shared by Text and Where; see FindDraft).
+            return .run(.text(query: draft.text, scope: scope, caseSensitive: draft.caseSensitive))
         case .predicate:
             // A column outside the document rejects (blink + shake), before any
             // core call. Hidden columns are legal targets (the picker marks them).
@@ -55,7 +54,7 @@ public struct FindControl: FindControlling {
             if draft.comparison.isOrdering, !NumericGrammar.isNumeric(draft.value) { return .rejected }
             return .run(.predicate(
                 column: draft.column, comparison: draft.comparison,
-                value: draft.value, caseSensitive: false
+                value: draft.value, caseSensitive: draft.caseSensitive
             ))
         }
     }

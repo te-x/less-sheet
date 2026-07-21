@@ -86,8 +86,15 @@ struct AmendmentContractGuardTests {
         // MATCH-FLAGS EXTENSION) BYTE-IDENTICAL (verified by the root planner: the
         // only change is the appended block). Updated through the change-authority
         // process, exactly as this guard provides for an approved header amendment.
+        // Baseline re-bumped for the ARCH-search-case-mode amendment (authorized:
+        // signed ARCH + root freeze 95bce88): ls_search_request GREW one trailing
+        // `bool case_sensitive` and its case-folding prose was rewritten (smart-case
+        // deleted). A v1 frozen-surface change under lock-step rebuild (no external
+        // ABI consumer), NOT a byte-identical layout change — every OTHER symbol's
+        // layout is unchanged. Updated through the change-authority process, exactly
+        // as this guard provides for an approved header amendment.
         expectEmptyDiff("api/lesssheet.h",
-                        baseline: "e4854551fc91c8d46254a7ef956633d01b706b3dee76760da6b1d08d666c4ab2")
+                        baseline: "df0436b6ea29211fd0634c40c857b626b6d85466db2a802c190d4a77c85cdd42")
     }
 
     // AC23 — the public Swift search/layout contracts are byte-identical:
