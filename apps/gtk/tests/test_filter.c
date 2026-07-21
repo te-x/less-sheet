@@ -17,9 +17,10 @@
  *   rows, row count = m, the gutter shows ORIGINAL numbers via the frozen
  *   slice-1 lsg_window_source_row), clear (identity restored), invalid-request
  *   rejection leaving the view unchanged, the zero-match empty view, the
- *   fresh/re-opened IDLE state, and the two compositions END-TO-END over the core
- *   — a filtered jump lands on the nearest match's filtered index, and a find
- *   within a filter counts only the filtered rows.
+ *   fresh/re-opened IDLE state, the Match-case flag (the filter inherits
+ *   case_sensitive from the same request), and the two compositions END-TO-END
+ *   over the core — a filtered jump lands on the nearest match's filtered index,
+ *   and a find within a filter counts only the filtered rows.
  *
  * These are RED against the seeded src/lsg_filter.c (identity-only view-model +
  * no-op bridge) and turn GREEN as the module is implemented. Determinism: the
@@ -35,8 +36,8 @@
  *   2: needle | 2.0 | gamma             6:       | 5.  | needleneedle
  *   3: gadget | -3  | Needle point      7: plain | abc | end needle
  *
- *   TEXT "needle" (smart-case, all columns) -> rows 0,1,2,3,6,7  (m = 6)
- *   WHERE qty <= 2 (numeric)             -> rows 0,2,3,5        (m = 4)
+ *   TEXT "needle" (case-insensitive default, all columns) -> rows 0,1,2,3,6,7 (m = 6)
+ *   WHERE qty <= 2 (numeric)                               -> rows 0,2,3,5     (m = 4)
  */
 #include <glib.h>
 #include <lesssheet.h>
@@ -508,14 +509,15 @@ test_bridge_set_where_filter (void)
   lsg_document_close (doc);
 }
 
-/* --- set a TEXT filter: smart-case substring over all columns --- */
+/* --- set a TEXT filter: case-insensitive substring (Match case OFF default)
+ *     over all columns --- */
 
 static void
 test_bridge_set_text_filter (void)
 {
   LsgDocument *doc = open_find_fixture ();
 
-  /* "needle" folds ASCII -> original rows 0,1,2,3,6,7 (m = 6). */
+  /* "needle" folds ASCII (Match case OFF) -> original rows 0,1,2,3,6,7 (m = 6). */
   g_assert_true (lsg_document_filter_set (doc,
       (LsgSearchRequest){ .kind = LSG_FIND_TEXT, .value = "needle" }));
   LsgFilterSnapshot fs;
@@ -527,6 +529,40 @@ test_bridge_set_text_filter (void)
 
   GArray *src = filtered_source_rows (doc, 6);
   assert_rows (src, (const guint64[]){ 0, 1, 2, 3, 6, 7 }, 6);
+  g_array_free (src, TRUE);
+
+  lsg_document_close (doc);
+}
+
+/* --- the filter honors the request's Match-case flag identically to Find (§6
+ *     A3 cross-surface; C8 re-apply): Match case OFF folds an uppercase query,
+ *     ON is byte-exact. The filter bridge marshals case_sensitive at the SAME
+ *     choke point as Find, so this is RED until that marshaling lands. --- */
+
+static void
+test_bridge_filter_case_mode (void)
+{
+  LsgDocument *doc = open_find_fixture ();
+
+  /* Match case OFF (default): an uppercase "NEEDLE" filter folds -> the 6 needle
+   * rows (the SAME set as the lowercase "needle" filter). */
+  g_assert_true (lsg_document_filter_set (doc,
+      (LsgSearchRequest){ .kind = LSG_FIND_TEXT, .value = "NEEDLE" }));
+  LsgFilterSnapshot fs;
+  g_assert_true (wait_filter_final (doc, &fs));
+  g_assert_cmpuint (fs.total, ==, 6);
+  GArray *src = filtered_source_rows (doc, 6);
+  assert_rows (src, (const guint64[]){ 0, 1, 2, 3, 6, 7 }, 6);
+  g_array_free (src, TRUE);
+
+  /* Match case ON: the byte-exact "Needle" filter keeps only "Needle point"
+   * (original row 3) -> the filtered view inherits case_sensitive. */
+  g_assert_true (lsg_document_filter_set (doc,
+      (LsgSearchRequest){ .kind = LSG_FIND_TEXT, .value = "Needle", .case_sensitive = TRUE }));
+  g_assert_true (wait_filter_final (doc, &fs));
+  g_assert_cmpuint (fs.total, ==, 1);
+  src = filtered_source_rows (doc, 1);
+  assert_rows (src, (const guint64[]){ 3 }, 1);
   g_array_free (src, TRUE);
 
   lsg_document_close (doc);
@@ -714,6 +750,7 @@ main (int argc, char *argv[])
   g_test_add_func ("/filter/bridge-fresh-idle", test_bridge_fresh_idle);
   g_test_add_func ("/filter/bridge-set-where-filter", test_bridge_set_where_filter);
   g_test_add_func ("/filter/bridge-set-text-filter", test_bridge_set_text_filter);
+  g_test_add_func ("/filter/bridge-filter-case-mode", test_bridge_filter_case_mode);
   g_test_add_func ("/filter/bridge-clear-restores-identity", test_bridge_clear_restores_identity);
   g_test_add_func ("/filter/bridge-reject-unchanged", test_bridge_reject_unchanged);
   g_test_add_func ("/filter/bridge-empty-result", test_bridge_empty_result);

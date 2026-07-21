@@ -4,16 +4,17 @@
  * FindSeekTests:
  *
  *   PURE VIEW-MODEL — the C port of FindControl: the ABI enum/op pins, the
- *   pinned numeric grammar, the smart-case decision, request composition +
- *   validation, the growing→final count state machine, landings, wrap /
- *   no-matches / stopped notices, and the next/prev navigation anchors. No core.
+ *   pinned numeric grammar, the "Match case" flag marshaling (draft ->
+ *   request), request composition + validation, the growing→final count state
+ *   machine, landings, wrap / no-matches / stopped notices, and the next/prev
+ *   navigation anchors. No core.
  *
  *   SEARCH BRIDGE — the real Zig core through lsg_document_search_* /
- *   lsg_document_window_match_flags over the find.csv fixture: smart-case text
- *   search with live counts + navigation, typed predicates + validation, exact
- *   column scoping, the fresh/reopened IDLE state, and the per-visible-cell
- *   highlight MASK (the drawing of it is the author's GUI pass; the mask VALUES are
- *   gate-pinned here).
+ *   lsg_document_window_match_flags over the find.csv fixture: case-folded text
+ *   search (Match case OFF folds ASCII, ON is byte-exact) with live counts +
+ *   navigation, typed predicates + validation, exact column scoping, the
+ *   fresh/reopened IDLE state, and the per-visible-cell highlight MASK (the
+ *   drawing of it is the author's GUI pass; the mask VALUES are gate-pinned here).
  *
  * These are RED against the seeded src/lsg_find.c (empty view-model + no-op
  * bridge) and turn GREEN as the module is implemented. Determinism: the fixture
@@ -97,24 +98,52 @@ test_numeric_grammar (void)
   g_assert_false (lsg_numeric_is_numeric (NULL)); /* NULL treated as empty */
 }
 
-/* --- smart case: any ASCII uppercase byte -> case-sensitive --- */
+/* --- Match case: the draft's case_sensitive marshals 1:1 into the composed
+ *     request, ONE session bool shared by TEXT and WHERE, default OFF; the flag
+ *     is NEVER derived from the query — smart case is retired (§6 C6, D1). --- */
 
 static void
-test_smart_case (void)
+test_case_mode (void)
 {
-  g_assert_false (lsg_find_query_case_sensitive ("needle"));
-  g_assert_false (lsg_find_query_case_sensitive (""));
-  g_assert_false (lsg_find_query_case_sensitive ("123-._"));
-  g_assert_false (lsg_find_query_case_sensitive ("caf\xc3\xa9")); /* café: non-ASCII, no ASCII uppercase */
-  g_assert_false (lsg_find_query_case_sensitive (NULL));          /* NULL treated as empty */
+  guint32 all3[] = { 0, 1, 2 };
 
-  g_assert_true (lsg_find_query_case_sensitive ("Needle"));
-  g_assert_true (lsg_find_query_case_sensitive ("NEEDLE"));
-  g_assert_true (lsg_find_query_case_sensitive ("aBc"));
-  g_assert_true (lsg_find_query_case_sensitive ("Caf\xc3\xa9")); /* Café: C is ASCII uppercase */
+  /* Default OFF: a fresh session is case-INSENSITIVE. */
+  LsgFindSession s = lsg_find_initial ();
+  g_assert_false (s.draft.case_sensitive);
+
+  /* TEXT, OFF -> request.case_sensitive FALSE, even for an uppercase query
+   * (the old "uppercase => exact" smart-case auto-rule is GONE: OFF stays
+   * insensitive regardless of the query bytes). */
+  s.draft.mode = LSG_FIND_TEXT;
+  s.draft.text = "USA";
+  LsgFindSubmit textOff = lsg_find_submit (s, all3, 3, 3);
+  g_assert_cmpint (textOff.outcome, ==, LSG_FIND_RUN);
+  g_assert_false (textOff.request.case_sensitive);
+
+  /* TEXT, ON -> request.case_sensitive TRUE (RED on the seed: the composer does
+   * not thread the flag yet). */
+  s.draft.case_sensitive = TRUE;
+  LsgFindSubmit textOn = lsg_find_submit (s, all3, 3, 3);
+  g_assert_cmpint (textOn.outcome, ==, LSG_FIND_RUN);
+  g_assert_true (textOn.request.case_sensitive);
+
+  /* The SAME session bool is shared by WHERE (predicate) mode — no per-mode
+   * case control. ON -> TRUE, OFF -> FALSE, unchanged by the operator/value. */
+  s.draft.mode = LSG_FIND_PREDICATE;
+  s.draft.column = 0;
+  s.draft.op = LSG_SEARCH_OP_EQ;
+  s.draft.value = "isabella";
+  LsgFindSubmit whereOn = lsg_find_submit (s, all3, 3, 3);
+  g_assert_cmpint (whereOn.outcome, ==, LSG_FIND_RUN);
+  g_assert_true (whereOn.request.case_sensitive);
+
+  s.draft.case_sensitive = FALSE;
+  LsgFindSubmit whereOff = lsg_find_submit (s, all3, 3, 3);
+  g_assert_cmpint (whereOff.outcome, ==, LSG_FIND_RUN);
+  g_assert_false (whereOff.request.case_sensitive);
 }
 
-/* --- initial session is empty --- */
+/* --- initial session is empty (Match case OFF) --- */
 
 static void
 test_initial_empty (void)
@@ -125,6 +154,7 @@ test_initial_empty (void)
   g_assert_cmpstr (s.draft.value, ==, "");
   g_assert_cmpuint (s.draft.column, ==, 0);
   g_assert_cmpint (s.draft.op, ==, LSG_SEARCH_OP_EQ);
+  g_assert_false (s.draft.case_sensitive); /* default OFF = insensitive */
 
   g_assert_false (s.display.active);
   g_assert_false (s.display.has_current);
@@ -380,7 +410,8 @@ test_step_anchors (void)
   g_assert_false (lsg_find_step (lsg_find_initial (), LSG_SEARCH_FORWARD, 5, &nav));
 }
 
-/* --- stop keeps partials; Esc / reopen clear the display but keep the draft --- */
+/* --- stop keeps partials; Esc / reopen clear the display but keep the draft
+ *     (incl. the "Match case" flag — it is session-scoped) --- */
 
 static void
 test_stop_close_reopen (void)
@@ -388,6 +419,7 @@ test_stop_close_reopen (void)
   LsgFindSession s = lsg_find_initial ();
   s.draft.mode = LSG_FIND_TEXT;
   s.draft.text = "needle";
+  s.draft.case_sensitive = TRUE; /* the toggle is part of the retained draft */
   s = lsg_find_began (s);
   LsgSearchSnapshot partial = {
     .phase = LSG_SEARCH_PHASE_SCANNING, .progress = 0.3,
@@ -422,18 +454,21 @@ test_stop_close_reopen (void)
   g_assert_false (viaPoll.display.has_progress);
   g_assert_cmpuint (viaPoll.display.total, ==, 2);
 
-  /* Esc: active search + highlights clear; the DRAFT is retained. */
+  /* Esc: active search + highlights clear; the DRAFT is retained (text AND the
+   * Match case flag ride along — the session keeps them). */
   LsgFindSession closed = lsg_find_closed (s);
   g_assert_false (closed.display.active);
   g_assert_false (closed.display.has_current);
   g_assert_cmpuint (closed.display.total, ==, 0);
   g_assert_cmpint (closed.display.notice, ==, LSG_FIND_NOTICE_NONE);
   g_assert_cmpstr (closed.draft.text, ==, "needle");
+  g_assert_true (closed.draft.case_sensitive);
 
   /* Dialect re-open (new document identity): same clearing, same retention. */
   LsgFindSession reopened = lsg_find_invalidated (s);
   g_assert_false (reopened.display.active);
   g_assert_cmpstr (reopened.draft.text, ==, "needle");
+  g_assert_true (reopened.draft.case_sensitive);
 }
 
 /* --- REGRESSION: a network net-park poll (CANCELLED that CARRIES a landing)
@@ -624,14 +659,15 @@ assert_rows (GArray *got, const guint64 *want, guint n)
     g_assert_cmpuint (g_array_index (got, guint64, i), ==, want[i]);
 }
 
-/* --- text search: smart case, live counts, next/prev/ends/wrap-exhaust --- */
+/* --- text search: Match case OFF default (folds), live counts,
+ *     next/prev/ends/wrap-exhaust, then Match case ON (byte-exact) --- */
 
 static void
 test_bridge_text_search (void)
 {
   LsgDocument *doc = open_find_fixture ();
 
-  /* Smart case: "needle" folds ASCII -> rows 0,1,2,3,6,7 (m = 6). */
+  /* Match case OFF (default): "needle" folds ASCII -> rows 0,1,2,3,6,7 (m = 6). */
   LsgSearchRequest req = { .kind = LSG_FIND_TEXT, .value = "needle" };
   g_assert_true (lsg_document_search_start (doc, req));
   lsg_document_search_nav (doc, lsg_search_nav_from_top ());
@@ -660,13 +696,74 @@ test_bridge_text_search (void)
   g_assert_true (lsg_document_search_poll (doc, &afterCancel));
   g_assert_cmpint (afterCancel.phase, ==, LSG_SEARCH_PHASE_DONE);
 
-  /* An uppercase byte flips to exact bytes: only "Needle point" matches. */
-  LsgSearchRequest exact = { .kind = LSG_FIND_TEXT, .value = "Needle" };
+  /* Match case ON is byte-exact: the uppercase "Needle" query matches ONLY the
+   * exact bytes "Needle point" (row 3), NOT the folded needle cells. Under the
+   * new default this behavior requires case_sensitive = TRUE — the old
+   * smart-case "uppercase => exact" auto-rule is gone. */
+  LsgSearchRequest exact = { .kind = LSG_FIND_TEXT, .value = "Needle", .case_sensitive = TRUE };
   g_assert_true (lsg_document_search_start (doc, exact));
   LsgSearchSnapshot exactDone;
   g_assert_true (wait_final (doc, &exactDone));
   g_assert_cmpuint (exactDone.total, ==, 1);
   nav_found (doc, lsg_search_nav_from_top (), 3, 2, 1);
+
+  lsg_document_close (doc);
+}
+
+/* --- Match case end-to-end through the frontend's BUILT request (§6 C7): a
+ *     draft composed by lsg_find_submit drives the core; OFF folds an uppercase
+ *     query, ON is byte-exact — for both TEXT and predicate EQ. This exercises
+ *     the WHOLE frontend path (draft -> compose -> marshal -> core); it turns
+ *     GREEN once the composer threads the flag AND the bridge marshals it. --- */
+
+static void
+test_bridge_case_mode (void)
+{
+  LsgDocument *doc = open_find_fixture ();
+  guint32 all3[] = { 0, 1, 2 };
+  GArray *m;
+
+  /* TEXT, Match case OFF (default): an uppercase "NEEDLE" folds -> all 6 needle
+   * rows (the key departure from smart-case). */
+  LsgFindSession s = lsg_find_initial ();
+  s.draft.mode = LSG_FIND_TEXT;
+  s.draft.text = "NEEDLE";
+  s.draft.case_sensitive = FALSE;
+  LsgFindSubmit textOff = lsg_find_submit (s, all3, 3, 3);
+  g_assert_cmpint (textOff.outcome, ==, LSG_FIND_RUN);
+  m = matched_rows (doc, textOff.request);
+  assert_rows (m, (const guint64[]){ 0, 1, 2, 3, 6, 7 }, 6);
+  g_array_free (m, TRUE);
+
+  /* TEXT, Match case ON: byte-exact "NEEDLE" -> only row 1 ("NEEDLE"). */
+  s.draft.case_sensitive = TRUE;
+  LsgFindSubmit textOn = lsg_find_submit (s, all3, 3, 3);
+  g_assert_cmpint (textOn.outcome, ==, LSG_FIND_RUN);
+  m = matched_rows (doc, textOn.request);
+  assert_rows (m, (const guint64[]){ 1 }, 1);
+  g_array_free (m, TRUE);
+
+  /* PREDICATE EQ, Match case OFF: "widget" matches the "Widget" cell (row 0) —
+   * the ARCH's "= isabella matches Isabella" default, over this fixture. */
+  s.draft.mode = LSG_FIND_PREDICATE;
+  s.draft.column = 0;
+  s.draft.op = LSG_SEARCH_OP_EQ;
+  s.draft.value = "widget";
+  s.draft.case_sensitive = FALSE;
+  LsgFindSubmit eqOff = lsg_find_submit (s, all3, 3, 3);
+  g_assert_cmpint (eqOff.outcome, ==, LSG_FIND_RUN);
+  m = matched_rows (doc, eqOff.request);
+  assert_rows (m, (const guint64[]){ 0 }, 1);
+  g_array_free (m, TRUE);
+
+  /* PREDICATE EQ, Match case ON: "widget" is byte-exact -> no longer equals
+   * "Widget" -> zero matches. */
+  s.draft.case_sensitive = TRUE;
+  LsgFindSubmit eqOn = lsg_find_submit (s, all3, 3, 3);
+  g_assert_cmpint (eqOn.outcome, ==, LSG_FIND_RUN);
+  m = matched_rows (doc, eqOn.request);
+  assert_rows (m, NULL, 0);
+  g_array_free (m, TRUE);
 
   lsg_document_close (doc);
 }
@@ -788,7 +885,8 @@ test_bridge_match_flags (void)
   g_assert_cmpuint (idle.cols, ==, 0);
   lsg_window_free (w);
 
-  /* Text "needle" over all columns: the mask marks exactly the matching cells. */
+  /* Match case OFF (default): text "needle" over all columns marks exactly the
+   * matching cells (folding includes "NEEDLE" and "Needle point"). */
   g_assert_true (lsg_document_search_start (doc, (LsgSearchRequest){ .kind = LSG_FIND_TEXT, .value = "needle" }));
   LsgSearchSnapshot done;
   g_assert_true (wait_final (doc, &done));
@@ -812,8 +910,9 @@ test_bridge_match_flags (void)
   g_free (m.flags);
   lsg_window_free (w);
 
-  /* An uppercase query is byte-exact: only "Needle point" at (3,2). */
-  g_assert_true (lsg_document_search_start (doc, (LsgSearchRequest){ .kind = LSG_FIND_TEXT, .value = "Needle" }));
+  /* Match case ON is byte-exact (the mask inherits case_sensitive too): the
+   * uppercase "Needle" query lights only "Needle point" at (3,2). */
+  g_assert_true (lsg_document_search_start (doc, (LsgSearchRequest){ .kind = LSG_FIND_TEXT, .value = "Needle", .case_sensitive = TRUE }));
   g_assert_true (wait_final (doc, &done));
   w = lsg_document_set_window (doc, 0, 8, 0, 3);
   LsgMatchFlags mx = lsg_document_window_match_flags (doc, 0, 3);
@@ -841,7 +940,7 @@ main (int argc, char *argv[])
   g_test_add_func ("/find/abi-enum-pins", test_abi_enum_pins);
   g_test_add_func ("/find/op-ordering", test_op_ordering);
   g_test_add_func ("/find/numeric-grammar", test_numeric_grammar);
-  g_test_add_func ("/find/smart-case", test_smart_case);
+  g_test_add_func ("/find/case-mode", test_case_mode);
   g_test_add_func ("/find/initial-empty", test_initial_empty);
   g_test_add_func ("/find/submit-text-scope", test_submit_text_scope);
   g_test_add_func ("/find/submit-predicate", test_submit_predicate);
@@ -855,6 +954,7 @@ main (int argc, char *argv[])
 
   /* Search bridge over the real core. */
   g_test_add_func ("/find/bridge-text-search", test_bridge_text_search);
+  g_test_add_func ("/find/bridge-case-mode", test_bridge_case_mode);
   g_test_add_func ("/find/bridge-predicate", test_bridge_predicate);
   g_test_add_func ("/find/bridge-scope", test_bridge_scope);
   g_test_add_func ("/find/bridge-fresh-idle", test_bridge_fresh_idle);

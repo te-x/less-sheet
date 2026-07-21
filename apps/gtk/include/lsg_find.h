@@ -19,20 +19,21 @@
  * slice) and so take an `LsgDocument *`.
  *
  * The frontend owns NO matcher: every per-cell find/predicate verdict —
- * smart-case substring, exact-decimal ordering — comes from the core
- * (`ls_search_*` counts + navigation, `ls_window_match_flags` for highlights).
- * This module only composes requests, folds the async count/nav snapshots into
- * a display, and copies the borrowed highlight mask out.
+ * substring matching (ASCII case folding per the request's "Match case" flag),
+ * exact-decimal ordering — comes from the core (`ls_search_*` counts +
+ * navigation, `ls_window_match_flags` for highlights). This module only
+ * composes requests, folds the async count/nav snapshots into a display, and
+ * copies the borrowed highlight mask out.
  *
- * SLICE 2 SCOPE (find): text + predicate search, smart case, the live
- * match-count state machine, find-next / find-prev navigation, wrap notices,
- * and the visible- window match-flag highlight mask. OUT (later slices, NOT
- * frozen here): jump-to- row, filter-to-matches (`ls_filter_*`), streaming
- * copy, Settings/column-config, dialect override. The find POPOVER widget and
- * the grid's highlight DRAWING are display-dependent (the author's GUI pass) — but
- * every signature the implementer wires into main.c is frozen here, and every
- * non-drawing decision (compose, count, nav, wrap, the highlight MASK values)
- * is unit-pinned under `g_test`.
+ * SLICE 2 SCOPE (find): text + predicate search, the "Match case" flag, the
+ * live match-count state machine, find-next / find-prev navigation, wrap
+ * notices, and the visible-window match-flag highlight mask. OUT (later
+ * slices, NOT frozen here): jump-to-row, filter-to-matches (`ls_filter_*`),
+ * streaming copy, Settings/column-config, dialect override. The find POPOVER
+ * widget and the grid's highlight DRAWING are display-dependent (the author's GUI
+ * pass) — but every signature the implementer wires into main.c is frozen
+ * here, and every non-drawing decision (compose, count, nav, wrap, the
+ * highlight MASK values) is unit-pinned under `g_test`.
  *
  * Contract role (frozen; the prototypes/structs ARE the signatures — compiled
  * with -Werror so any drift against a stub/caller fails compilation). Symbols
@@ -76,7 +77,8 @@ G_BEGIN_DECLS
  */
 typedef enum
 {
-  LSG_FIND_TEXT = 0, /* substring text match over a scope, with smart case */
+  LSG_FIND_TEXT = 0, /* substring text match over a scope (ASCII case folding
+                        per the "Match case" flag) */
   LSG_FIND_PREDICATE
   = 1, /* single-column typed predicate (operator + value)   */
 } LsgFindMode;
@@ -84,10 +86,11 @@ typedef enum
 /*
  * Predicate operators. Values are PINNED to the ABI's `ls_search_op`
  * (LS_SEARCH_OP_*), so the bridge maps them 1:1. EQ/NE compare the cell bytes
- * to the value BYTE-EXACTLY (no case folding, no trimming); LT/GT/LE/GE
- * compare NUMERICALLY under the pinned numeric grammar (a non-numeric cell
- * never matches an ordering op; a non-numeric value is rejected before any
- * core call).
+ * to the value with ASCII case folding per the request's `case_sensitive`
+ * flag (case-INSENSITIVE by default; byte-exact when "Match case" is on; NO
+ * trimming in either mode). LT/GT/LE/GE compare NUMERICALLY under the pinned
+ * numeric grammar and IGNORE case (a non-numeric cell never matches an
+ * ordering op; a non-numeric value is rejected before any core call).
  */
 typedef enum
 {
@@ -192,6 +195,14 @@ typedef struct
   /* PREDICATE only: the target column and operator. TEXT: unused. */
   guint32 column;
   LsgSearchOp op;
+  /* The "Match case" flag, copied verbatim from the draft (see LsgFindDraft).
+   * FALSE (default) = ASCII case-INSENSITIVE (bytes 0x41..0x5A fold to their
+   * lowercase forms; every byte >= 0x80 always compares exactly); TRUE =
+   * byte-exact. Governs TEXT substring matching and predicate EQ/NE ONLY;
+   * ordering ops (LT/GT/LE/GE) are numeric and ignore it. Marshaled 1:1 to
+   * `ls_search_request.case_sensitive` at the single ABI choke point, so find,
+   * filter, navigation, and the highlight mask all inherit it. */
+  gboolean case_sensitive;
 } LsgSearchRequest;
 
 /*
@@ -253,6 +264,16 @@ typedef struct
   guint32 column;    /* WHERE column picker (0-based) */
   LsgSearchOp op;    /* WHERE operator    */
   const char *value; /* WHERE value field */
+  /* The "Match case" checkbox. FALSE (default) = ASCII case-INSENSITIVE;
+   * TRUE = byte-exact. ONE session bool SHARED by both TEXT and WHERE modes
+   * (there is no per-mode case control), and it is NOT derived from the query
+   * — smart case is retired; the checkbox is the ONLY thing that decides
+   * folding. Session-scoped: retained across popover close / dialect re-open
+   * like the rest of the draft (`lsg_find_closed` / `lsg_find_invalidated`
+   * keep it), and reset to FALSE by a fresh session (`lsg_find_initial`); it
+   * is not persisted across app restarts. `lsg_find_submit` copies it verbatim
+   * into the composed request for both modes. */
+  gboolean case_sensitive;
 } LsgFindDraft;
 
 /*
@@ -308,17 +329,6 @@ typedef struct
 } LsgFindSubmit;
 
 /*
- * The SMART-CASE decision (mirrors the ABI's pinned smart-case rule): returns
- * TRUE iff `query` contains at least one ASCII uppercase byte (0x41..0x5A), in
- * which case matching is byte-exact; FALSE (no ASCII uppercase — including an
- * empty or all-non-ASCII query) means ASCII-case-insensitive matching. A pure
- * UI affordance (e.g. a case indicator) and a frontend-side MIRROR of the rule
- * — the frontend never matches; `ls_search_*` / `ls_window_match_flags` do.
- * `query` is NUL-terminated UTF-8 (NULL treated as empty → FALSE).
- */
-gboolean lsg_find_query_case_sensitive (const char *query);
-
-/*
  * The pinned NUMERIC GRAMMAR (verbatim the ABI HEADER RULE / macOS
  * `NumericGrammar`): strip ASCII whitespace (0x09..0x0D, 0x20) from both ends;
  * the remainder must be non-empty and fully match
@@ -330,8 +340,8 @@ gboolean lsg_find_query_case_sensitive (const char *query);
 gboolean lsg_numeric_is_numeric (const char *text);
 
 /* The empty initial session: empty draft (TEXT mode, "" query/value, column 0,
- * op EQ) and empty display (inactive; no current, total 0, not final, no
- * progress, no notice). */
+ * op EQ, "Match case" OFF) and empty display (inactive; no current, total 0,
+ * not final, no progress, no notice). */
 LsgFindSession lsg_find_initial (void);
 
 /*
@@ -348,8 +358,12 @@ LsgFindSession lsg_find_initial (void);
  * accept ANY value, the empty one included — it matches empty cells). A hidden
  * column is a legal predicate target. `visible_columns` lists the `n_visible`
  * visible column indices; it is ignored when `n_visible == column_count` (all
- * columns). The returned `request` BORROWS `session.draft` and
- * `visible_columns` — consume it before they change.
+ * columns).
+ *
+ * In BOTH modes the composed `request.case_sensitive` is copied verbatim from
+ * `session.draft.case_sensitive` (the "Match case" checkbox) — the flag is
+ * never derived from the query. The returned `request` BORROWS `session.draft`
+ * and `visible_columns` — consume it before they change.
  */
 LsgFindSubmit lsg_find_submit (LsgFindSession session,
                                const guint32 *visible_columns, guint n_visible,
@@ -499,13 +513,14 @@ gboolean lsg_document_search_poll (const LsgDocument *doc,
  * (NULL-safe; nothing to free on the empty result).
  *
  * The verdict is the active request's, over the cells AS MATERIALIZED in the
- * window (the same display-capped bytes a cell read serves): TEXT smart-case
- * over IN-SCOPE columns (an out-of-scope column is always 0); PREDICATE eq/ne
- * byte-exact + exact-decimal ordering on the target column only. A FILTER
- * changes only WHICH data rows the window holds, never the per-cell verdict.
- * WINDOW LANE — caller-serialized with `lsg_document_set_window` (issue
- * set_window, then this, for the same range); safe concurrently with the
- * core's background scanning.
+ * window (the same display-capped bytes a cell read serves): TEXT substring
+ * (ASCII case folding per the active request's `case_sensitive` flag) over
+ * IN-SCOPE columns (an out-of-scope column is always 0); PREDICATE eq/ne per
+ * `case_sensitive` + exact-decimal ordering on the target column only. A
+ * FILTER changes only WHICH data rows the window holds, never the per-cell
+ * verdict. WINDOW LANE — caller-serialized with `lsg_document_set_window`
+ * (issue set_window, then this, for the same range); safe concurrently with
+ * the core's background scanning.
  */
 typedef struct
 {
