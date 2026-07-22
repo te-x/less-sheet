@@ -34,22 +34,20 @@ final class SheetTableView: NSTableView {
     }
 
     override func keyDown(with event: NSEvent) {
-        // Translates the raw key event into one of the `moveXxx`/
-        // `moveXxxAndModifySelection` calls below via AppKit's default key
-        // bindings (arrows / shift-arrows) — framework-native, no hand-rolled
-        // key-code switch. Anything the table doesn't handle beeps/forwards
-        // exactly as a plain NSResponder would (the default `doCommand(by:)`).
+        // Translates the raw key event into one of the `moveXxx` / `pageXxx` /
+        // `moveToXxx` (+ `…AndModifySelection`) navigation calls (see
+        // `NativeGrid+KeyNav.swift`) via AppKit's default key bindings (arrows,
+        // Page, Home/End, Cmd+arrows, and their shift variants) — framework-
+        // native, no hand-rolled key-code switch. Anything the table doesn't
+        // handle beeps/forwards exactly as a plain NSResponder would (the
+        // default `doCommand(by:)`).
         interpretKeyEvents([event])
     }
 
-    override func moveUp(_ sender: Any?) { controller?.moveSelection(.upward, extending: false) }
-    override func moveDown(_ sender: Any?) { controller?.moveSelection(.down, extending: false) }
-    override func moveLeft(_ sender: Any?) { controller?.moveSelection(.left, extending: false) }
-    override func moveRight(_ sender: Any?) { controller?.moveSelection(.right, extending: false) }
-    override func moveUpAndModifySelection(_ sender: Any?) { controller?.moveSelection(.upward, extending: true) }
-    override func moveDownAndModifySelection(_ sender: Any?) { controller?.moveSelection(.down, extending: true) }
-    override func moveLeftAndModifySelection(_ sender: Any?) { controller?.moveSelection(.left, extending: true) }
-    override func moveRightAndModifySelection(_ sender: Any?) { controller?.moveSelection(.right, extending: true) }
+    // The arrow / page / document / line motion overrides live in
+    // `NativeGrid+KeyNav.swift` (they route through the pure `KeyboardNavigator`
+    // — ARCH-macos-kbdnav FR1); Cmd+A / Cmd+C / Esc stay here on the standard
+    // responder-chain actions.
 
     override func selectAll(_ sender: Any?) { controller?.selectAll() }
     // `copy(_:)` is not a declared-overridable NSResponder/NSTableView method

@@ -190,6 +190,11 @@ struct SelectionMark: Equatable {
     var borderBottom = false
     var borderLeft = false
     var borderRight = false
+    /// The ACTIVE corner of the selection (`selection.active`) — the keyboard/
+    /// mouse cursor cell (ARCH-macos-kbdnav FR4). Drives the accent focus
+    /// outline drawn atop the muted-gray marquee; set on exactly one visible
+    /// cell when the active corner is on screen.
+    var isActive = false
 
     static let none = SelectionMark()
 }

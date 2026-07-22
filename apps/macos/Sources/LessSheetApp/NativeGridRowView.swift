@@ -123,6 +123,11 @@ final class SheetRowView: NSTableRowView {
         if mark.isSelected {
             SheetRowView.drawSelectionBorder(mark, in: cell, color: palette.selection)
         }
+        // ARCH-macos-kbdnav FR4: the active corner (keyboard OR mouse cursor)
+        // gets an accent focus outline drawn ATOP the muted-gray marquee.
+        if mark.isActive {
+            SheetRowView.drawActiveOutline(in: cell, color: palette.accent)
+        }
         palette.grid.setFill()
         NSRect(x: cell.maxX - NativeGrid.hairline, y: 0,
                width: NativeGrid.hairline, height: cell.height).fill()
@@ -248,6 +253,25 @@ final class SheetRowView: NSTableRowView {
         if mark.borderRight {
             path.move(to: NSPoint(x: rect.maxX, y: rect.minY)); path.line(to: NSPoint(x: rect.maxX, y: rect.maxY))
         }
+        path.stroke()
+    }
+
+    /// The active-cell focus outline (ARCH-macos-kbdnav FR4): a full-cell SQUARE
+    /// outline resolved from the system accent (`controlAccentColor` — no
+    /// hardcoded color, tracks light/dark + live accent changes), stroked atop
+    /// the muted-gray selection marquee to mark the active corner (keyboard or
+    /// mouse cursor). Its 1 pt inset matches the marquee's, so on a bare 1×1
+    /// cursor it coincides with the marquee cell; its full square (all four
+    /// sides) distinguishes it from both the marquee (outer-edge segments only)
+    /// and the rounded, inset find-highlight chips. `activeOutlineWidth` /
+    /// `activeOutlineInset` are the single source for the two metrics.
+    static let activeOutlineWidth: CGFloat = 2
+    static let activeOutlineInset: CGFloat = 1
+    static func drawActiveOutline(in cell: NSRect, color: NSColor) {
+        color.setStroke()
+        let path = NSBezierPath(rect: cell.insetBy(dx: activeOutlineInset, dy: activeOutlineInset))
+        path.lineWidth = activeOutlineWidth
+        path.lineJoinStyle = .miter
         path.stroke()
     }
 

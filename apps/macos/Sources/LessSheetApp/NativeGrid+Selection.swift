@@ -2,6 +2,7 @@
 // Split out of NativeGrid.swift purely to satisfy file/type length limits.
 import AppKit
 import Contracts
+import LessSheetKit
 import SwiftUI
 
 extension NativeGridController {
@@ -169,14 +170,6 @@ extension NativeGridController {
         return true
     }
 
-    /// Arrow / shift-arrow (via `SheetTableView`'s `NSStandardKeyBindingResponding`
-    /// overrides — `interpretKeyEvents` does the key -> action translation,
-    /// framework-native).
-    func moveSelection(_ direction: SelectionDirection, extending: Bool) {
-        model.moveSelection(direction, extending: extending)
-        refreshSelectionDisplay()
-    }
-
     /// Cmd+A (via `SheetTableView.selectAll(_:)`, the standard responder-chain
     /// action the stock Edit menu already sends — no custom menu wiring).
     func selectAll() {
@@ -202,19 +195,31 @@ extension NativeGridController {
 
     /// Esc while the GRID itself is first responder (focus has left the find /
     /// jump popup field — the common case once the user clicks a cell after
-    /// searching, or during a scan when the field never held focus). The primary
-    /// "escape from search": dismiss an open find / jump / dialect popup —
-    /// clearing an active search and its highlights, exactly like clicking the
-    /// dismiss scrim (`PopupDismissScrimView.mouseDown` → `dismissPopups`). With
-    /// no popup open it falls back to cancelling an in-flight copy (the prior
-    /// sole behavior of `SheetTableView.cancelOperation`). `anyPopupOpen`
-    /// excludes a scanning find field by design (scrim stays off mid-scan), so
+    /// searching, or during a scan when the field never held focus). The
+    /// precedence lives ONCE in the pure `EscapeResolver` (ARCH-macos-kbdnav
+    /// FR3 / Decision 2), which this dispatches on rather than duplicating the
+    /// branch order: (1) dismiss an open find / jump / dialect popup — clearing
+    /// an active search and its highlights, exactly like clicking the dismiss
+    /// scrim (`PopupDismissScrimView.mouseDown` → `dismissPopups`); else (2)
+    /// cancel an in-flight copy; else (3) clear the selection/cursor (the new
+    /// lowest-priority fallback); else beep/forward. `anyPopupOpen` excludes a
+    /// scanning find field by design (scrim stays off mid-scan), so
     /// `findFieldActive` is OR'd in to cover that case too.
     func handleEscape() {
-        if model.findFieldActive || model.anyPopupOpen {
+        let action = EscapeResolver().resolve(EscapeContext(
+            popupOrSearchActive: model.findFieldActive || model.anyPopupOpen,
+            copyInFlight: model.copyInFlight,
+            hasSelection: model.selection != nil))
+        switch action {
+        case .dismissPopups:
             model.dismissPopups()
-        } else {
+        case .cancelCopy:
             cancelCopy()
+        case .clearSelection:
+            model.clearSelection()
+            refreshSelectionDisplay()
+        case .none:
+            break
         }
     }
 

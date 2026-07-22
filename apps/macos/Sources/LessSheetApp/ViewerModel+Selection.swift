@@ -47,14 +47,24 @@ extension DocumentModel {
         selection = selectionModel.extend(current, to: GridCell(row: row, column: column), in: selectionExtent())
     }
 
-    /// Arrow / shift-arrow: `extending` false collapses + steps (arrow);
-    /// true keeps the anchor and steps only the active corner (shift-arrow).
-    /// A no-op with nothing selected yet — there is no cell to step from.
-    func moveSelection(_ direction: SelectionDirection, extending: Bool) {
-        guard let current = selection else { return }
-        let extent = selectionExtent()
-        selection = extending ? selectionModel.extend(current, direction, in: extent)
-                               : selectionModel.move(current, direction, in: extent)
+    /// Keyboard navigation (ARCH-macos-kbdnav FR1): the arrow / page / document
+    /// / line command set, plain or shift-extending, routed through the pure
+    /// `KeyboardNavigator` — which COMPOSES the SAME `selectionModel` geometry
+    /// (no duplicated clamp / anchor-active algebra). The grid supplies the
+    /// viewport-derived context (top visible row, leading visible column, page
+    /// size); the reducer owns seed-no-step, visible-column stepping, the
+    /// document/line targets, and clamping. With nothing selected ANY command
+    /// seeds a 1×1 cursor at the top-left visible cell (no step). Assigns only a
+    /// non-nil result, so an empty (nothing-selectable) extent is a no-op.
+    func navigate(_ motion: NavigationMotion, extending: Bool,
+                  topVisibleRow: UInt64, firstVisibleColumn: Int, pageRows: UInt64) {
+        let context = NavigationContext(
+            extent: selectionExtent(), visibleColumns: visibleColumns,
+            topVisibleRow: topVisibleRow, firstVisibleColumn: firstVisibleColumn, pageRows: pageRows)
+        let navigator = KeyboardNavigator(selecting: selectionModel)
+        if let updated = navigator.navigate(from: selection, motion, extending: extending, in: context) {
+            selection = updated
+        }
     }
 
     /// A gutter click: the whole (capped) row.
@@ -109,16 +119,20 @@ extension DocumentModel {
     /// `windowCellHighlights`; `SheetRowView.draw` reads this directly (no
     /// per-cell model call on the draw path).
     func windowSelectionMarks(forRow row: Int) -> [SelectionMark] {
-        guard let rect = selection?.rect else { return [] }
+        guard let selection else { return [] }
+        let rect = selection.rect
+        let active = selection.active
         let cols = windowColumns()
         guard !cols.isEmpty else { return [] }
         let rowValue = UInt64(row)
         return cols.map { column in
-            guard rect.contains(GridCell(row: rowValue, column: column)) else { return .none }
+            let cell = GridCell(row: rowValue, column: column)
+            guard rect.contains(cell) else { return .none }
             return SelectionMark(
                 isSelected: true,
                 borderTop: rowValue == rect.top, borderBottom: rowValue == rect.bottom,
-                borderLeft: column == rect.left, borderRight: column == rect.right
+                borderLeft: column == rect.left, borderRight: column == rect.right,
+                isActive: cell == active
             )
         }
     }
