@@ -105,9 +105,12 @@ rectangle already in `App` (`sel_a_* / sel_b_*` + `sel_mode`) — anchor = the `
 the `_b_` corner, exactly the state a mouse drag already produces. Keyboard and mouse share this single state
 (no parallel cursor state).
 
-- **Seeding.** With nothing selected (`sel_mode == SEL_NONE`), the first arrow press seeds a 1×1 cell
-  selection (`SEL_CELLS`) at the **top-left currently-visible data cell** (first visible view row × first
-  visible column of the current column window), then applies the move.
+- **Seeding (seed-only, no step).** With nothing selected (`sel_mode == SEL_NONE`), the first arrow press
+  seeds a 1×1 cell selection (`SEL_CELLS`) at the **top-left currently-visible data cell** (first visible
+  view row × first visible column of the current column window) **and stops there — it does NOT step on that
+  first press.** The cursor lands at the seed cell; the *next* arrow press is the first one that moves it.
+  (Cross-frontend behavior confirmed by the author 2026-07-21; macOS adopts the same. The frozen
+  `tests/test_a11y.c` and AC G-A1 are authoritative and already encode no-step.)
 - **Plain arrows move the cursor** (this is the approved delta from macOS, where arrows are a no-op with
   nothing selected and pure-scroll never existed): Up/Down step one row; Left/Right step one column; the
   selection **collapses** to the new 1×1 cell (anchor follows active).
@@ -395,8 +398,9 @@ screen-reader automation).
 
 ### HUMAN GUI PASS — the author, on a real GNOME desktop (Orca + `run_gtk_on`; recorded, not gate-blocking)
 
-- **H-A1 — Keyboard-only cell selection + copy.** Tab focus to the grid; arrows seed + move the cursor with
-  the accent outline visible; the viewport auto-scrolls minimally to keep the cursor visible; Shift+arrows
+- **H-A1 — Keyboard-only cell selection + copy.** Tab focus to the grid; the first arrow press seeds the
+  cursor at the top-left visible cell WITHOUT stepping, and subsequent presses move it, with the accent
+  outline visible; the viewport auto-scrolls minimally to keep the cursor visible; Shift+arrows
   extend; Left/Right scroll horizontally; Page/Home/End behave per FR1; `Ctrl+A` selects all; `Ctrl+C` copies
   (a bare cursor copies exactly one cell); `Esc` clears the selection as the last fallback — **all with no
   mouse**. Typing in the find/jump/Where field, `Ctrl+C`/`Ctrl+A` still act on the field, not the grid.
