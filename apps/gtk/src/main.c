@@ -22,6 +22,7 @@
 #include <gdk/gdkkeysyms.h>
 #include <pango/pangocairo.h>
 
+#include <lsg_a11y.h>
 #include <lsg_column.h>
 #include <lsg_copy.h>
 #include <lsg_dialect.h>
@@ -355,6 +356,11 @@ static void copy_update_affordance (App *app);
 static gboolean selection_contains (App *app, guint64 row,
                                     guint col); /* grid_draw marquee */
 
+/* Rebuild the grid's dynamic accessible DESCRIPTION from the pure builder;
+ * called from the single materialize choke point. Defined in the accessibility
+ * section below. */
+static void grid_update_a11y_description (App *app);
+
 /* Reusable header-bar progress (defined in the copy section); the network open
  * also drives it (unified long-op status). */
 static void header_progress_show (App *app, const char *label);
@@ -388,8 +394,8 @@ static void entry_clear_feedback (GtkWidget *entry, guint *id_slot);
  * parity). Defined with the jump helpers; the grid key handler calls it. */
 static void open_jump_with_digit (App *app, char digit);
 
-/* Open the jump popover. Defined with the jump helpers; the window Ctrl+G/L
- * handler (in the find section) calls it. */
+/* Open the jump popover. Defined with the jump helpers; the app.jump action
+ * (Ctrl+G / Ctrl+L) calls it. */
 static void open_jump (App *app);
 
 /* Settings + dialect override (this slice). Defined with the settings region
@@ -719,6 +725,12 @@ grid_materialize (App *app)
   /* Short => rows beyond the frontier are not yet servable; re-issue on poll.
    */
   app->window_short = (lsg_window_row_count (nw) < span.row_count);
+
+  /* Refresh the grid's accessible description (position/extent/filter state)
+   * off the freshly-materialized window. O(1) string build on a discrete state
+   * change (scroll/resize/open/filter), never per frame / per scanned byte;
+   * set as a property, never announced (FR3). */
+  grid_update_a11y_description (app);
 }
 
 /* The header-bar subtitle is the ONE passive-status line (single source of
@@ -940,6 +952,12 @@ grid_draw (GtkDrawingArea *area, cairo_t *cr, int width, int height,
   cairo_clip (cr);
   gdk_cairo_set_source_rgba (cr, &fg);
 
+  /* Keyboard cursor: the active (`_b_`) corner of the selection rectangle gets
+   * a theme-accent focus outline (in addition to the muted marquee). Captured
+   * during the cell loop, stroked after it. */
+  gboolean have_cursor = FALSE;
+  double cur_x = 0.0, cur_y = 0.0, cur_w = 0.0;
+
   for (guint32 ri = 0; ri < got_rows; ri++)
     {
       guint64 view_row = span.first_row + ri;
@@ -955,6 +973,16 @@ grid_draw (GtkDrawingArea *area, cairo_t *cr, int width, int height,
           double colw = (col < app->n_cols && app->col_widths[col] > 0.0)
                             ? app->col_widths[col]
                             : 0.0;
+
+          /* Remember the active-corner cell for the accent focus outline. */
+          if (app->sel_mode != SEL_NONE && view_row == app->sel_b_row
+              && col == app->sel_b_col)
+            {
+              have_cursor = TRUE;
+              cur_x = x;
+              cur_y = y;
+              cur_w = colw;
+            }
 
           /* Selection marquee: a MUTED-GRAY fill (the macOS NSColor.systemGray
            * equivalent, theme-derived from fg so it reads in light + dark),
@@ -1024,6 +1052,24 @@ grid_draw (GtkDrawingArea *area, cairo_t *cr, int width, int height,
       cairo_line_to (cr, (double)width, y + 0.5);
     }
   cairo_stroke (cr);
+
+  /* Accent focus outline on the active cell (keyboard cursor), resolved from
+   * the GNOME theme accent — NO literal color constant (G6/G7), tracks
+   * light/dark + live accent changes. Drawn last so it sits atop the marquee,
+   * any find highlight, and the cell text. */
+  if (have_cursor && cur_w > 0.0)
+    {
+      GdkRGBA *ac = adw_style_manager_get_accent_color_rgba (
+          adw_style_manager_get_default ());
+      GdkRGBA outline = (ac != NULL) ? *ac : fg;
+      if (ac != NULL)
+        gdk_rgba_free (ac);
+      gdk_cairo_set_source_rgba (cr, &outline);
+      cairo_set_line_width (cr, 2.0);
+      cairo_rectangle (cr, cur_x + 1.0, cur_y + 1.0, cur_w - 2.0, row_h - 2.0);
+      cairo_stroke (cr);
+      gdk_cairo_set_source_rgba (cr, &fg);
+    }
   cairo_restore (cr);
 
   /* --- row-number gutter (sticky left; scrolls vertically only) --- */
@@ -1572,6 +1618,307 @@ on_scroll (GtkEventControllerScroll *ctrl, double dx, double dy, gpointer data)
   return GDK_EVENT_STOP;
 }
 
+/* ------------------------------------------------------------------------- */
+/* Accessibility (gtk-a11y): keyboard cell cursor + live announcements over */
+/* the pure lsg_a11y module. The reducer / string builders / accel table are */
+/* in lsg_a11y.c (gate-tested); this is the display/AT glue (human GNOME/Orca
+ */
+/* pass). */
+/* ------------------------------------------------------------------------- */
+
+/* The current displayed view's row count — the ONE resolver every a11y
+ * consumer reads (the cursor-reducer extent, the grid description,
+ * select-all). Filtered-aware: the filtered match count while a filter owns
+ * the view, the document row count otherwise. `*estimated` (may be NULL)
+ * reports whether that count is still growing (an estimate). Never forces a
+ * full scan. */
+static guint64
+a11y_view_rows (App *app, gboolean *estimated)
+{
+  if (app->doc == NULL)
+    {
+      if (estimated != NULL)
+        *estimated = FALSE;
+      return 0;
+    }
+  if (app->filter.active)
+    {
+      LsgFilterBanner b;
+      if (lsg_filter_banner (app->filter, &b))
+        {
+          if (estimated != NULL)
+            *estimated = !app->filter.snapshot.total_exact;
+          return b.matching;
+        }
+    }
+  LsgRowCount rc = lsg_document_row_count (app->doc);
+  if (estimated != NULL)
+    *estimated = !rc.exact;
+  return rc.count;
+}
+
+/* Post `msg` (which this call OWNS and frees) to the grid's live region at
+ * `prio`. A no-op if there is no grid / no message. */
+static void
+a11y_announce (App *app, char *msg, GtkAccessibleAnnouncementPriority prio)
+{
+  if (app->area != NULL && msg != NULL && msg[0] != '\0')
+    gtk_accessible_announce (GTK_ACCESSIBLE (app->area), msg, prio);
+  g_free (msg);
+}
+
+/* Announce the current header-bar subtitle text (MEDIUM) — the existing
+ * "Filtered — N of M rows" / row-count line. Called on the DISCRETE filter
+ * apply/clear events (never per poll tick, which would spam). */
+static void
+a11y_announce_subtitle (App *app)
+{
+  if (app->area == NULL || app->title_status == NULL)
+    return;
+  const char *s = gtk_label_get_text (app->title_status);
+  a11y_announce (app, g_strdup (s != NULL ? s : ""),
+                 GTK_ACCESSIBLE_ANNOUNCEMENT_PRIORITY_MEDIUM);
+}
+
+/* Set a bare control's accessible name (FR4) from the single lsg_a11y source —
+ * no drift from the tooltip text. */
+static void
+a11y_name (GtkWidget *w, LsgA11yControl control)
+{
+  gtk_accessible_update_property (GTK_ACCESSIBLE (w),
+                                  GTK_ACCESSIBLE_PROPERTY_LABEL,
+                                  lsg_a11y_control_name (control), -1);
+}
+
+/* The 1-based gutter row number the grid draws for a view row (the SOURCE row
+ * under a filter). Uses the materialized window when the row is visible (the
+ * common case after a reveal); falls back to `view_row + 1` otherwise (the
+ * identity mapping). */
+static guint64
+a11y_gutter_for_view_row (App *app, guint64 view_row)
+{
+  if (app->win != NULL && view_row >= app->cur_span.first_row)
+    {
+      guint64 ri = view_row - app->cur_span.first_row;
+      if (ri < lsg_window_row_count (app->win))
+        {
+          guint64 src = lsg_window_source_row (app->win, (guint32)ri);
+          if (src != LSG_NO_ROW)
+            return src + 1;
+        }
+    }
+  return view_row + 1;
+}
+
+/* The column's accessible name for an announcement: the header label
+ * (has_header) else the generic spreadsheet name — the SAME label the sticky
+ * header draws. Newly-allocated (free with g_free). */
+static char *
+a11y_column_name (App *app, guint col)
+{
+  if (app->hdr_labels != NULL && col >= app->hdr_first
+      && col < app->hdr_first + app->hdr_count)
+    return g_strdup (app->hdr_labels[col - app->hdr_first]);
+  if (app->has_header)
+    return lsg_document_header_cell_dup (app->doc, col);
+  return lsg_column_generic_name (col);
+}
+
+/* The DISPLAYED (formatted) text of the cell at (view_row, col), mirroring
+ * grid_draw's per-cell rendering (raw for AUTO columns, the type+options
+ * dispatcher for a configured one). Newly-allocated (free with g_free); ""
+ * when the cell is not in the current window. */
+static char *
+a11y_cell_value (App *app, guint64 view_row, guint col)
+{
+  if (app->win == NULL || view_row < app->cur_span.first_row
+      || col < app->cur_colwin.first)
+    return g_strdup ("");
+  guint64 ri = view_row - app->cur_span.first_row;
+  guint ci = col - app->cur_colwin.first;
+  if (ri >= lsg_window_row_count (app->win)
+      || ci >= lsg_window_col_count (app->win))
+    return g_strdup ("");
+
+  const char *raw = lsg_window_cell (app->win, (guint32)ri, ci);
+  if (col < app->n_cols && app->col_settings != NULL
+      && !lsg_column_format_options_is_auto (app->col_settings[col].format))
+    {
+      LsgDisplay disp
+          = lsg_format_cell (raw, app->col_kind[col], app->col_sem[col],
+                             app->col_settings[col].format, app->glyphs);
+      char *out = g_strdup (disp.text != NULL ? disp.text : "");
+      lsg_display_clear (&disp);
+      return out;
+    }
+  return g_strdup (raw != NULL ? raw : "");
+}
+
+static void
+grid_update_a11y_description (App *app)
+{
+  if (app->area == NULL)
+    return;
+
+  const char *name
+      = (app->title_name != NULL) ? gtk_label_get_text (app->title_name) : "";
+  gboolean estimated = FALSE;
+  guint64 rows = a11y_view_rows (app, &estimated);
+
+  /* Gutter numbers of the first / last CURRENTLY-VISIBLE data rows. */
+  guint64 first = 0, last = 0;
+  if (app->doc != NULL && rows > 0 && app->win != NULL)
+    {
+      int h = gtk_widget_get_height (GTK_WIDGET (app->area));
+      double body_h = (double)h - app->header_h;
+      guint64 vis = (body_h > 0.0 && app->row_h > 0.0)
+                        ? (guint64)(body_h / app->row_h)
+                        : 1;
+      if (vis == 0)
+        vis = 1;
+      guint64 first_view = app->cur_top_row;
+      guint64 last_view = first_view + vis - 1;
+      if (last_view > rows - 1)
+        last_view = rows - 1;
+      first = a11y_gutter_for_view_row (app, first_view);
+      last = a11y_gutter_for_view_row (app, last_view);
+    }
+
+  char *desc = lsg_a11y_grid_description (name, app->n_cols, rows, estimated,
+                                          first, last, app->filter.active);
+  gtk_accessible_update_property (GTK_ACCESSIBLE (app->area),
+                                  GTK_ACCESSIBLE_PROPERTY_DESCRIPTION, desc,
+                                  -1);
+  g_free (desc);
+}
+
+/* Scroll the MINIMUM needed to bring cell (row, col) fully into view — no move
+ * if it is already visible (FR1 auto-scroll). Setting the adjustments fires
+ * the existing materialize + repaint (+ net-park drive) via
+ * on_adjustment_changed.
+ */
+static void
+a11y_reveal_cell (App *app, guint64 row, guint col)
+{
+  /* Vertical. */
+  int h = gtk_widget_get_height (GTK_WIDGET (app->area));
+  double body_h = (double)h - app->header_h;
+  if (body_h > 0.0 && app->row_h > 0.0)
+    {
+      guint64 vis = (guint64)(body_h / app->row_h);
+      if (vis == 0)
+        vis = 1;
+      double upper = gtk_adjustment_get_upper (app->vadj);
+      if (row < app->cur_top_row)
+        gtk_adjustment_set_value (
+            app->vadj, lsg_grid_offset_for_top_row (
+                           row, upper, app->row_estimate, app->row_h));
+      else if (row > app->cur_top_row + vis - 1)
+        {
+          guint64 target_top = row - (vis - 1);
+          gtk_adjustment_set_value (
+              app->vadj,
+              lsg_grid_offset_for_top_row (target_top, upper,
+                                           app->row_estimate, app->row_h));
+        }
+    }
+
+  /* Horizontal. */
+  if (col < app->n_cols)
+    {
+      double col_x = 0.0;
+      for (guint c = 0; c < col; c++)
+        col_x += (app->col_widths[c] > 0.0) ? app->col_widths[c] : 0.0;
+      double col_w = (app->col_widths[col] > 0.0) ? app->col_widths[col] : 0.0;
+      double page_w = gtk_adjustment_get_page_size (app->hadj);
+      double hval = gtk_adjustment_get_value (app->hadj);
+      if (col_x < hval)
+        gtk_adjustment_set_value (app->hadj, col_x);
+      else if (col_x + col_w > hval + page_w)
+        {
+          double nv = col_x + col_w - page_w;
+          gtk_adjustment_set_value (app->hadj, (nv < 0.0) ? 0.0 : nv);
+        }
+    }
+}
+
+/* Route one keyboard command through the pure cursor reducer, apply the result
+ * to the ONE shared selection rectangle, auto-scroll, repaint, and announce
+ * per the FR3 verbosity table. */
+static void
+grid_cursor_apply (App *app, LsgA11yCursorCommand command, gboolean extend)
+{
+  if (app->doc == NULL || app->n_cols == 0)
+    return;
+
+  LsgA11yExtent ext = { a11y_view_rows (app, NULL), app->n_cols };
+  if (ext.rows == 0)
+    return; /* empty view: every command is a no-op */
+
+  LsgA11yCursor cur;
+  cur.mode
+      = (app->sel_mode == SEL_NONE) ? LSG_A11Y_SEL_NONE : LSG_A11Y_SEL_CELLS;
+  cur.anchor.row = app->sel_a_row;
+  cur.anchor.col = app->sel_a_col;
+  cur.active.row = app->sel_b_row;
+  cur.active.col = app->sel_b_col;
+
+  int h = gtk_widget_get_height (GTK_WIDGET (app->area));
+  double body_h = (double)h - app->header_h;
+  guint32 page_rows = (body_h > 0.0 && app->row_h > 0.0)
+                          ? (guint32)(body_h / app->row_h)
+                          : 1;
+  LsgA11yView view
+      = { app->cur_top_row, app->cur_colwin.first, page_rows ? page_rows : 1 };
+
+  LsgA11yCursorResult r
+      = lsg_a11y_cursor_apply (cur, ext, view, command, extend);
+
+  app->sel_mode = (r.cursor.mode == LSG_A11Y_SEL_CELLS) ? SEL_CELLS : SEL_NONE;
+  app->sel_a_row = r.cursor.anchor.row;
+  app->sel_a_col = r.cursor.anchor.col;
+  app->sel_b_row = r.cursor.active.row;
+  app->sel_b_col = r.cursor.active.col;
+
+  if (r.should_reveal)
+    a11y_reveal_cell (app, r.reveal.row, r.reveal.col);
+
+  grid_materialize (app);
+  gtk_widget_queue_draw (GTK_WIDGET (app->area));
+  copy_update_affordance (app);
+
+  /* Announcements (FR3): plain move / seed -> the landing cell (LOW); extend /
+   * select-all -> the rect dimensions (MEDIUM); clear -> nothing. */
+  if (command == LSG_A11Y_CURSOR_CLEAR)
+    return;
+
+  if (command == LSG_A11Y_CURSOR_SELECT_ALL
+      || (extend && r.cursor.mode == LSG_A11Y_SEL_CELLS))
+    {
+      guint64 rr = ((r.cursor.active.row >= r.cursor.anchor.row)
+                        ? r.cursor.active.row - r.cursor.anchor.row
+                        : r.cursor.anchor.row - r.cursor.active.row)
+                   + 1;
+      guint cc = ((r.cursor.active.col >= r.cursor.anchor.col)
+                      ? r.cursor.active.col - r.cursor.anchor.col
+                      : r.cursor.anchor.col - r.cursor.active.col)
+                 + 1;
+      a11y_announce (app, lsg_a11y_announce_selection (rr, cc),
+                     GTK_ACCESSIBLE_ANNOUNCEMENT_PRIORITY_MEDIUM);
+    }
+  else if (r.cursor.mode == LSG_A11Y_SEL_CELLS)
+    {
+      guint64 gutter = a11y_gutter_for_view_row (app, r.cursor.active.row);
+      char *col = a11y_column_name (app, r.cursor.active.col);
+      char *val
+          = a11y_cell_value (app, r.cursor.active.row, r.cursor.active.col);
+      a11y_announce (app, lsg_a11y_announce_cursor (gutter, col, val),
+                     GTK_ACCESSIBLE_ANNOUNCEMENT_PRIORITY_LOW);
+      g_free (col);
+      g_free (val);
+    }
+}
+
 static gboolean
 on_key_pressed (GtkEventControllerKey *ctrl, guint keyval, guint keycode,
                 GdkModifierType state, gpointer data)
@@ -1582,13 +1929,21 @@ on_key_pressed (GtkEventControllerKey *ctrl, guint keyval, guint keycode,
   if (app->doc == NULL)
     return GDK_EVENT_PROPAGATE;
 
-  /* Ctrl+C copies the current selection (grid-focused only, so a text entry's
-   * own Ctrl+C is untouched — that's why this lives on the grid controller,
-   * not a window-capture one). */
-  if ((state & GDK_CONTROL_MASK)
-      && (keyval == GDK_KEY_c || keyval == GDK_KEY_C))
+  gboolean ctrl_held = (state & GDK_CONTROL_MASK) != 0;
+  gboolean shift_held = (state & GDK_SHIFT_MASK) != 0;
+
+  /* Ctrl+C copies the current selection; Ctrl+A selects the whole view extent.
+   * BOTH stay on the grid key controller (grid-focus-scoped, G-A7) so a
+   * focused text entry keeps its own Ctrl+C / Ctrl+A — never registered as
+   * global app accelerators. */
+  if (ctrl_held && (keyval == GDK_KEY_c || keyval == GDK_KEY_C))
     {
       do_copy (app);
+      return GDK_EVENT_STOP;
+    }
+  if (ctrl_held && (keyval == GDK_KEY_a || keyval == GDK_KEY_A))
+    {
+      grid_cursor_apply (app, LSG_A11Y_CURSOR_SELECT_ALL, FALSE);
       return GDK_EVENT_STOP;
     }
 
@@ -1607,32 +1962,71 @@ on_key_pressed (GtkEventControllerKey *ctrl, guint keyval, guint keycode,
         }
     }
 
-  double v = gtk_adjustment_get_value (app->vadj);
-  double page = gtk_adjustment_get_page_size (app->vadj);
-  switch (keyval)
+  /* Escape (lowest-priority fallback): cancel an in-flight copy, else clear
+   * the cursor/selection; otherwise propagate. An open find/jump/dialect
+   * popover dismisses via its own controller (it holds focus), so when the
+   * event reaches the grid no popover is open. */
+  if (keyval == GDK_KEY_Escape && !ctrl_held)
     {
-    case GDK_KEY_Down:
-      gtk_adjustment_set_value (app->vadj, v + app->row_h);
-      return GDK_EVENT_STOP;
-    case GDK_KEY_Up:
-      gtk_adjustment_set_value (app->vadj, v - app->row_h);
-      return GDK_EVENT_STOP;
-    case GDK_KEY_Page_Down:
-      gtk_adjustment_set_value (app->vadj, v + page);
-      return GDK_EVENT_STOP;
-    case GDK_KEY_Page_Up:
-      gtk_adjustment_set_value (app->vadj, v - page);
-      return GDK_EVENT_STOP;
-    case GDK_KEY_Home:
-      gtk_adjustment_set_value (app->vadj, 0.0);
-      return GDK_EVENT_STOP;
-    case GDK_KEY_End:
-      gtk_adjustment_set_value (app->vadj,
-                                gtk_adjustment_get_upper (app->vadj));
-      return GDK_EVENT_STOP;
-    default:
+      if (app->copy_op != NULL)
+        {
+          copy_stop_and_join (app);
+          return GDK_EVENT_STOP;
+        }
+      if (app->sel_mode != SEL_NONE)
+        {
+          grid_cursor_apply (app, LSG_A11Y_CURSOR_CLEAR, FALSE);
+          return GDK_EVENT_STOP;
+        }
       return GDK_EVENT_PROPAGATE;
     }
+
+  /* Cursor navigation (no Ctrl); Shift extends the selection. Arrows move a
+   * cell cursor (seeding at the top-left visible cell on the first press),
+   * Page/Home/End reposition it, Left/Right also scroll horizontally — all via
+   * the pure reducer + minimal auto-scroll. */
+  if (!ctrl_held)
+    {
+      LsgA11yCursorCommand cmd;
+      gboolean is_cmd = TRUE;
+      switch (keyval)
+        {
+        case GDK_KEY_Down:
+          cmd = LSG_A11Y_CURSOR_DOWN;
+          break;
+        case GDK_KEY_Up:
+          cmd = LSG_A11Y_CURSOR_UP;
+          break;
+        case GDK_KEY_Left:
+          cmd = LSG_A11Y_CURSOR_LEFT;
+          break;
+        case GDK_KEY_Right:
+          cmd = LSG_A11Y_CURSOR_RIGHT;
+          break;
+        case GDK_KEY_Page_Down:
+          cmd = LSG_A11Y_CURSOR_PAGE_DOWN;
+          break;
+        case GDK_KEY_Page_Up:
+          cmd = LSG_A11Y_CURSOR_PAGE_UP;
+          break;
+        case GDK_KEY_Home:
+          cmd = LSG_A11Y_CURSOR_HOME;
+          break;
+        case GDK_KEY_End:
+          cmd = LSG_A11Y_CURSOR_END;
+          break;
+        default:
+          is_cmd = FALSE;
+          break;
+        }
+      if (is_cmd)
+        {
+          grid_cursor_apply (app, cmd, shift_held);
+          return GDK_EVENT_STOP;
+        }
+    }
+
+  return GDK_EVENT_PROPAGATE;
 }
 
 static void
@@ -1932,13 +2326,26 @@ find_poll_fold (App *app)
       app->find_wrap_issued = FALSE;
     }
 
-  if (app->find.display.has_current
-      && (!prev_has || app->find.display.current.row != prev_row))
+  gboolean landed
+      = app->find.display.has_current
+        && (!prev_has || app->find.display.current.row != prev_row);
+  if (landed)
     scroll_to_match (app, app->find.display.current.row);
 
   grid_materialize (app); /* refresh the highlight mask as the scan advances */
   find_update_labels (app);
   gtk_widget_queue_draw (GTK_WIDGET (app->area));
+
+  /* Find-navigation landing (MEDIUM): "Match n of m, row R" — the same n/m the
+   * status shows, R the landing's gutter row number (read off the now-
+   * materialized window). Only on a NEW landing, never on plain scan ticks. */
+  if (landed)
+    a11y_announce (
+        app,
+        lsg_a11y_announce_find_landing (
+            app->find.display.position, app->find.display.total,
+            a11y_gutter_for_view_row (app, app->find.display.current.row)),
+        GTK_ACCESSIBLE_ANNOUNCEMENT_PRIORITY_MEDIUM);
 }
 
 static void
@@ -2071,43 +2478,13 @@ open_find (App *app)
   gtk_menu_button_popup (app->find_button);
 }
 
-static gboolean
-on_window_key (GtkEventControllerKey *ctrl, guint keyval, guint keycode,
-               GdkModifierType state, gpointer data)
-{
-  (void)ctrl;
-  (void)keycode;
-  App *app = data;
-  if (state & GDK_CONTROL_MASK)
-    {
-      if (keyval == GDK_KEY_f || keyval == GDK_KEY_F)
-        {
-          open_find (app);
-          return GDK_EVENT_STOP;
-        }
-      /* Ctrl+G / Ctrl+L both open jump-to-row (go to line). */
-      if (keyval == GDK_KEY_g || keyval == GDK_KEY_G || keyval == GDK_KEY_l
-          || keyval == GDK_KEY_L)
-        {
-          open_jump (app);
-          return GDK_EVENT_STOP;
-        }
-      /* Ctrl+O opens a local file, Ctrl+Shift+O opens a network URL —
-       * mirroring macOS ⌘O / ⌘⇧O. The two map to different actions, so the
-       * Shift modifier (not the keyval case, which is layout-dependent)
-       * selects between them. action_open / action_open_url ignore their
-       * button arg. */
-      if (keyval == GDK_KEY_o || keyval == GDK_KEY_O)
-        {
-          if (state & GDK_SHIFT_MASK)
-            action_open_url (NULL, app);
-          else
-            action_open (NULL, app);
-          return GDK_EVENT_STOP;
-        }
-    }
-  return GDK_EVENT_PROPAGATE;
-}
+/* The app-level keyboard shortcuts (Ctrl+F Find, Ctrl+G/L Jump, Ctrl+O Open,
+ * Ctrl+Shift+O Open URL, Ctrl+comma Preferences, Ctrl+?/F1 Shortcuts) are no
+ * longer handled by an ad-hoc window key controller: they are promoted to
+ * GActions with gtk_application_set_accels_for_action, sourced from the single
+ * lsg_a11y accelerator table (see register_app_shortcuts). Grid-contextual
+ * keys (arrows / digits / Ctrl+C / Ctrl+A / Esc) stay on the grid key
+ * controller so they never fire while a text entry is focused (FR5 / G-A7). */
 
 /* The WHERE operator dropdown: glyphs shown, names in per-item tooltips +
  * accessible labels. Index i maps 1:1 to LsgSearchOp i (EQ..GE). */
@@ -2343,6 +2720,7 @@ build_find_popover (App *app)
   GtkWidget *entry = gtk_search_entry_new ();
   gtk_widget_set_hexpand (entry, TRUE);
   gtk_widget_set_size_request (entry, 220, -1);
+  a11y_name (entry, LSG_A11Y_CONTROL_SEARCH_ENTRY);
   app->find_entry = GTK_EDITABLE (entry);
   gtk_stack_add_titled (GTK_STACK (stack), entry, "text", "Text");
 
@@ -2353,10 +2731,12 @@ build_find_popover (App *app)
   /* Shared find navigation (both modes): prev / next beside the mode body. */
   GtkWidget *prev = gtk_button_new_from_icon_name ("go-up-symbolic");
   gtk_widget_set_tooltip_text (prev, "Previous match (Shift+Enter)");
+  a11y_name (prev, LSG_A11Y_CONTROL_FIND_PREV);
   gtk_widget_add_css_class (prev, "flat");
   gtk_widget_set_valign (prev, GTK_ALIGN_CENTER);
   GtkWidget *next = gtk_button_new_from_icon_name ("go-down-symbolic");
   gtk_widget_set_tooltip_text (next, "Next match (Enter)");
+  a11y_name (next, LSG_A11Y_CONTROL_FIND_NEXT);
   gtk_widget_add_css_class (next, "flat");
   gtk_widget_set_valign (next, GTK_ALIGN_CENTER);
 
@@ -3165,6 +3545,7 @@ do_apply_filter (App *app)
    * doc. */
   net_drive_begin (app, 0);
   update_title_subtitle (app);
+  a11y_announce_subtitle (app); /* filter apply -> the new status (MEDIUM) */
   filter_update_toggle_sensitivity (app);
   ensure_poll (app);
 }
@@ -3200,6 +3581,8 @@ do_clear_filter (App *app)
   filter_set_toggle (app, FALSE); /* the (x) path also un-presses the toggle */
   filter_rebuild_grid (app, restore); /* identity view, re-anchored */
   update_title_subtitle (app);
+  a11y_announce_subtitle (
+      app); /* filter clear -> the row-count line (MEDIUM) */
   filter_update_toggle_sensitivity (app);
 }
 
@@ -3605,6 +3988,9 @@ copy_tick (gpointer data)
           char *note = g_strdup_printf ("Copied %" G_GUINT64_FORMAT " rows",
                                         op->rows_done);
           title_set_status (app, note);
+          /* Copy completion (MEDIUM): announce the same copy-complete text. */
+          a11y_announce (app, g_strdup (note),
+                         GTK_ACCESSIBLE_ANNOUNCEMENT_PRIORITY_MEDIUM);
           g_free (note);
         }
     }
@@ -3777,7 +4163,17 @@ build_grid_page (App *app)
   app->vadj = g_object_ref_sink (gtk_adjustment_new (0, 0, 1, 1, 1, 1));
   app->hadj = g_object_ref_sink (gtk_adjustment_new (0, 0, 1, 1, 1, 1));
 
-  app->area = GTK_DRAWING_AREA (gtk_drawing_area_new ());
+  /* The grid is a labeled region for AT (FR3, Decision 3): a GROUP role (set
+   * as a construct property — roles are immutable post-construction) + the
+   * fixed name "Data grid"; the dynamic description is set from
+   * grid_materialize. NOT a per-cell GRID/ROW/CELL tree (the
+   * deliberately-deferred deepening). */
+  app->area = GTK_DRAWING_AREA (
+      g_object_new (GTK_TYPE_DRAWING_AREA, "accessible-role",
+                    GTK_ACCESSIBLE_ROLE_GROUP, NULL));
+  gtk_accessible_update_property (GTK_ACCESSIBLE (app->area),
+                                  GTK_ACCESSIBLE_PROPERTY_LABEL,
+                                  LSG_A11Y_GRID_NAME, -1);
   gtk_widget_set_hexpand (GTK_WIDGET (app->area), TRUE);
   gtk_widget_set_vexpand (GTK_WIDGET (app->area), TRUE);
   gtk_widget_set_focusable (GTK_WIDGET (app->area), TRUE);
@@ -4596,17 +4992,13 @@ build_dialect_dropdown_popover (App *app, int kind)
 
 /* -------- primary menu: Preferences / Keyboard Shortcuts / About --------- */
 
-static void
-add_shortcut_row (GtkWidget *group, const char *action, const char *accel)
-{
-  GtkWidget *row = adw_action_row_new ();
-  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (row), action);
-  GtkWidget *lbl = gtk_label_new (accel);
-  gtk_widget_add_css_class (lbl, "dim-label");
-  adw_action_row_add_suffix (ADW_ACTION_ROW (row), lbl);
-  adw_preferences_group_add (ADW_PREFERENCES_GROUP (group), row);
-}
-
+/* The native shortcuts surface (Decision 1: AdwShortcutsDialog, the modern
+ * replacement for the deprecated GtkShortcutsWindow) generated ENTIRELY from
+ * the single lsg_a11y accelerator table — one AdwShortcutsSection per group,
+ * one AdwShortcutsItem per command. APP-scope entries use the action name so
+ * the displayed accelerator is resolved from the registered app accels (which
+ * the SAME table drives); GRID / DISPLAY entries carry the table's accel /
+ * display token directly. No hand-typed list anywhere (FR5 / G-A4). */
 static void
 action_shortcuts (GSimpleAction *a, GVariant *p, gpointer data)
 {
@@ -4615,23 +5007,46 @@ action_shortcuts (GSimpleAction *a, GVariant *p, gpointer data)
   App *app = data;
   if (app->window == NULL)
     return;
-  AdwDialog *dlg = ADW_DIALOG (adw_preferences_dialog_new ());
-  GtkWidget *page = adw_preferences_page_new ();
-  adw_preferences_page_set_title (ADW_PREFERENCES_PAGE (page),
-                                  "Keyboard Shortcuts");
-  adw_preferences_page_set_icon_name (ADW_PREFERENCES_PAGE (page),
-                                      "preferences-desktop-keyboard-symbolic");
-  GtkWidget *grp = adw_preferences_group_new ();
-  add_shortcut_row (grp, "Open file", "Ctrl+O");
-  add_shortcut_row (grp, "Open URL", "Ctrl+Shift+O");
-  add_shortcut_row (grp, "Find", "Ctrl+F");
-  add_shortcut_row (grp, "Jump to row", "Ctrl+G");
-  add_shortcut_row (grp, "Copy selection", "Ctrl+C");
-  add_shortcut_row (grp, "Preferences", "Ctrl+comma");
-  adw_preferences_page_add (ADW_PREFERENCES_PAGE (page),
-                            ADW_PREFERENCES_GROUP (grp));
-  adw_preferences_dialog_add (ADW_PREFERENCES_DIALOG (dlg),
-                              ADW_PREFERENCES_PAGE (page));
+
+  static const char *const group_titles[] = {
+    [LSG_A11Y_GROUP_GENERAL] = "General",
+    [LSG_A11Y_GROUP_FIND] = "Find",
+    [LSG_A11Y_GROUP_NAVIGATION] = "Navigation",
+    [LSG_A11Y_GROUP_SELECTION] = "Selection",
+  };
+
+  guint n = 0;
+  const LsgA11yShortcut *t = lsg_a11y_shortcuts (&n);
+  AdwDialog *dlg = adw_shortcuts_dialog_new ();
+
+  for (guint g = 0; g < G_N_ELEMENTS (group_titles); g++)
+    {
+      AdwShortcutsSection *sec = adw_shortcuts_section_new (group_titles[g]);
+      for (guint i = 0; i < n; i++)
+        {
+          if ((guint)t[i].group != g)
+            continue;
+          AdwShortcutsItem *item;
+          if (t[i].scope == LSG_A11Y_SCOPE_APP && t[i].action_name != NULL)
+            {
+              /* Accelerator(s) resolved from the registered app action —
+               * single-sourced, and shows every registered alternative (e.g.
+               * both Ctrl+G and Ctrl+L for Jump). */
+              item = adw_shortcuts_item_new_from_action (t[i].title,
+                                                         t[i].action_name);
+            }
+          else
+            {
+              /* GRID / DISPLAY: the table's accel string / display token
+               * (accel2 is NULL for every non-APP entry). */
+              item = adw_shortcuts_item_new (t[i].title, t[i].accel);
+            }
+          adw_shortcuts_section_add (sec, item); /* takes ownership */
+        }
+      adw_shortcuts_dialog_add (ADW_SHORTCUTS_DIALOG (dlg),
+                                sec); /* takes ownership */
+    }
+
   adw_dialog_present (dlg, GTK_WIDGET (app->window));
 }
 
@@ -4668,22 +5083,14 @@ action_preferences (GSimpleAction *a, GVariant *p, gpointer data)
 static GMenuModel *
 build_primary_menu (App *app)
 {
-  GSimpleActionGroup *grp = g_simple_action_group_new ();
-  const GActionEntry entries[] = {
-    { "preferences", action_preferences, NULL, NULL, NULL, { 0, 0, 0 } },
-    { "shortcuts", action_shortcuts, NULL, NULL, NULL, { 0, 0, 0 } },
-    { "about", action_about, NULL, NULL, NULL, { 0, 0, 0 } },
-  };
-  g_action_map_add_action_entries (G_ACTION_MAP (grp), entries,
-                                   G_N_ELEMENTS (entries), app);
-  gtk_widget_insert_action_group (GTK_WIDGET (app->window), "win",
-                                  G_ACTION_GROUP (grp));
-  g_object_unref (grp);
-
+  (void)app;
+  /* Preferences / Shortcuts / About are now APP-level GActions (registered in
+   * register_app_shortcuts, so their accelerators are real and the menu shares
+   * the one action set); the menu just references them. */
   GMenu *menu = g_menu_new ();
-  g_menu_append (menu, "Preferences", "win.preferences");
-  g_menu_append (menu, "Keyboard Shortcuts", "win.shortcuts");
-  g_menu_append (menu, "About less-sheet", "win.about");
+  g_menu_append (menu, "Preferences", "app.preferences");
+  g_menu_append (menu, "Keyboard Shortcuts", "app.shortcuts");
+  g_menu_append (menu, "About less-sheet", "app.about");
   return G_MENU_MODEL (menu);
 }
 
@@ -5910,11 +6317,9 @@ ensure_window (App *app, GtkApplication *gtk_app)
   g_signal_connect (win, "map", G_CALLBACK (on_window_map), app);
   g_signal_connect (win, "destroy", G_CALLBACK (on_window_destroy), app);
 
-  /* Ctrl+F opens find from anywhere in the window (capture phase). */
-  GtkEventController *win_keys = gtk_event_controller_key_new ();
-  gtk_event_controller_set_propagation_phase (win_keys, GTK_PHASE_CAPTURE);
-  g_signal_connect (win_keys, "key-pressed", G_CALLBACK (on_window_key), app);
-  gtk_widget_add_controller (win, win_keys);
+  /* App-level shortcuts (Find / Jump / Open / Preferences / Shortcuts) are
+   * GActions with accelerators (register_app_shortcuts, from the single accel
+   * table), so no window-level key controller is needed here. */
   gtk_window_set_title (app->window, "less-sheet");
   gtk_window_set_default_size (app->window, 1024, 720);
 
@@ -5955,6 +6360,7 @@ ensure_window (App *app, GtkApplication *gtk_app)
   gtk_widget_add_css_class (fx, "flat");
   gtk_widget_add_css_class (fx, "circular");
   gtk_widget_set_tooltip_text (fx, "Clear filter");
+  a11y_name (fx, LSG_A11Y_CONTROL_CLEAR_FILTER);
   gtk_widget_set_valign (fx, GTK_ALIGN_CENTER);
   gtk_widget_set_visible (fx, FALSE); /* filtered-only; no space when hidden */
   g_signal_connect (fx, "clicked", G_CALLBACK (on_filter_clear_clicked), app);
@@ -5972,6 +6378,7 @@ ensure_window (App *app, GtkApplication *gtk_app)
   GtkWidget *open_btn
       = gtk_button_new_from_icon_name ("document-open-symbolic");
   gtk_widget_set_tooltip_text (open_btn, "Open File (Ctrl+O)");
+  a11y_name (open_btn, LSG_A11Y_CONTROL_OPEN_FILE);
   g_signal_connect (open_btn, "clicked", G_CALLBACK (action_open), app);
   adw_header_bar_pack_start (ADW_HEADER_BAR (header), open_btn);
 
@@ -5980,6 +6387,7 @@ ensure_window (App *app, GtkApplication *gtk_app)
    * blank. */
   GtkWidget *url_btn = gtk_button_new_from_icon_name ("insert-link-symbolic");
   gtk_widget_set_tooltip_text (url_btn, "Open URL (Ctrl+Shift+O)");
+  a11y_name (url_btn, LSG_A11Y_CONTROL_OPEN_URL);
   g_signal_connect (url_btn, "clicked", G_CALLBACK (action_open_url), app);
   adw_header_bar_pack_start (ADW_HEADER_BAR (header), url_btn);
 
@@ -5988,6 +6396,7 @@ ensure_window (App *app, GtkApplication *gtk_app)
   gtk_menu_button_set_icon_name (GTK_MENU_BUTTON (find_btn),
                                  "edit-find-symbolic");
   gtk_widget_set_tooltip_text (find_btn, "Find (Ctrl+F)");
+  a11y_name (find_btn, LSG_A11Y_CONTROL_FIND);
   app->find_button = GTK_MENU_BUTTON (find_btn);
   build_find_popover (app);
   gtk_menu_button_set_popover (GTK_MENU_BUTTON (find_btn),
@@ -6004,7 +6413,11 @@ ensure_window (App *app, GtkApplication *gtk_app)
    * doesn't get the `image-button` flattening `set_icon_name` gives the find
    * button, so without this the jump button looks permanently highlighted. */
   gtk_menu_button_set_has_frame (GTK_MENU_BUTTON (jump_btn), FALSE);
-  GtkWidget *jump_glyph = gtk_drawing_area_new ();
+  /* The drawn glyph is decorative (role NONE / presentational, construct-only)
+   * so the interactive parent button is the single named AT stop (FR3). */
+  GtkWidget *jump_glyph
+      = g_object_new (GTK_TYPE_DRAWING_AREA, "accessible-role",
+                      GTK_ACCESSIBLE_ROLE_NONE, NULL);
   gtk_widget_set_size_request (jump_glyph, 16, 16);
   gtk_widget_set_halign (jump_glyph, GTK_ALIGN_CENTER);
   gtk_widget_set_valign (jump_glyph, GTK_ALIGN_CENTER);
@@ -6012,6 +6425,7 @@ ensure_window (App *app, GtkApplication *gtk_app)
                                   jump_glyph_draw, NULL, NULL);
   gtk_menu_button_set_child (GTK_MENU_BUTTON (jump_btn), jump_glyph);
   gtk_widget_set_tooltip_text (jump_btn, "Jump to row (Ctrl+G)");
+  a11y_name (jump_btn, LSG_A11Y_CONTROL_JUMP);
   app->jump_button = GTK_MENU_BUTTON (jump_btn);
   build_jump_popover (app);
   gtk_menu_button_set_popover (GTK_MENU_BUTTON (jump_btn),
@@ -6027,8 +6441,12 @@ ensure_window (App *app, GtkApplication *gtk_app)
    * report (kept in sync by dialect_sync_quick_controls after every open). */
   GtkWidget *hdr_toggle = gtk_toggle_button_new ();
   gtk_widget_set_tooltip_text (hdr_toggle, "First row is a header");
+  a11y_name (hdr_toggle, LSG_A11Y_CONTROL_HEADER_TOGGLE);
   app->header_toggle = GTK_TOGGLE_BUTTON (hdr_toggle);
-  app->header_glyph = gtk_drawing_area_new ();
+  /* Decorative drawn glyph -> role NONE (the toggle button is the named stop).
+   */
+  app->header_glyph = g_object_new (GTK_TYPE_DRAWING_AREA, "accessible-role",
+                                    GTK_ACCESSIBLE_ROLE_NONE, NULL);
   gtk_widget_set_size_request (app->header_glyph, 16, 16);
   gtk_widget_set_halign (app->header_glyph, GTK_ALIGN_CENTER);
   gtk_widget_set_valign (app->header_glyph, GTK_ALIGN_CENTER);
@@ -6043,6 +6461,7 @@ ensure_window (App *app, GtkApplication *gtk_app)
       GTK_MENU_BUTTON (sep_btn),
       build_dialect_button_child ("Sep", &app->sep_glyph_label));
   gtk_widget_set_tooltip_text (sep_btn, "Field separator");
+  a11y_name (sep_btn, LSG_A11Y_CONTROL_SEPARATOR);
   app->sep_button = GTK_MENU_BUTTON (sep_btn);
   gtk_menu_button_set_popover (
       GTK_MENU_BUTTON (sep_btn),
@@ -6053,6 +6472,7 @@ ensure_window (App *app, GtkApplication *gtk_app)
       GTK_MENU_BUTTON (quote_btn),
       build_dialect_button_child ("Quote", &app->quote_glyph_label));
   gtk_widget_set_tooltip_text (quote_btn, "Quote character");
+  a11y_name (quote_btn, LSG_A11Y_CONTROL_QUOTE);
   app->quote_button = GTK_MENU_BUTTON (quote_btn);
   gtk_menu_button_set_popover (
       GTK_MENU_BUTTON (quote_btn),
@@ -6064,6 +6484,7 @@ ensure_window (App *app, GtkApplication *gtk_app)
   gtk_menu_button_set_icon_name (GTK_MENU_BUTTON (settings_btn),
                                  "open-menu-symbolic");
   gtk_widget_set_tooltip_text (settings_btn, "Main menu");
+  a11y_name (settings_btn, LSG_A11Y_CONTROL_MENU);
   GMenuModel *primary = build_primary_menu (app);
   gtk_menu_button_set_menu_model (GTK_MENU_BUTTON (settings_btn), primary);
   g_object_unref (primary); /* the button holds its own ref */
@@ -6111,6 +6532,78 @@ ensure_window (App *app, GtkApplication *gtk_app)
   adw_toolbar_view_set_content (ADW_TOOLBAR_VIEW (toolbar), toasts);
 
   adw_application_window_set_content (ADW_APPLICATION_WINDOW (win), toolbar);
+}
+
+/* GAction wrappers: adapt the existing button/open helpers to the
+ * GSimpleAction activate signature so the app-level accelerators can drive
+ * them. action_open / action_open_url ignore their button arg (comment above),
+ * so NULL is fine. */
+static void
+act_open (GSimpleAction *a, GVariant *p, gpointer d)
+{
+  (void)a;
+  (void)p;
+  action_open (NULL, d);
+}
+
+static void
+act_open_url (GSimpleAction *a, GVariant *p, gpointer d)
+{
+  (void)a;
+  (void)p;
+  action_open_url (NULL, d);
+}
+
+static void
+act_find (GSimpleAction *a, GVariant *p, gpointer d)
+{
+  (void)a;
+  (void)p;
+  open_find (d);
+}
+
+static void
+act_jump (GSimpleAction *a, GVariant *p, gpointer d)
+{
+  (void)a;
+  (void)p;
+  open_jump (d);
+}
+
+/* Register the app-level GActions and wire their accelerators from the SINGLE
+ * lsg_a11y accelerator table (SCOPE_APP entries) via
+ * gtk_application_set_accels_for_action — so every app accelerator is real,
+ * centrally defined, and identical to what the shortcuts surface displays (FR5
+ * / G-A4). Grid-scoped keys (Copy / Select-All / cursor moves / digit-jump /
+ * Esc) are deliberately NOT here — they stay on the grid key controller so a
+ * focused text entry keeps its own Ctrl+C / Ctrl+A (G-A7). */
+static void
+register_app_shortcuts (App *app, GApplication *gapp)
+{
+  const GActionEntry entries[] = {
+    { "open", act_open, NULL, NULL, NULL, { 0, 0, 0 } },
+    { "open-url", act_open_url, NULL, NULL, NULL, { 0, 0, 0 } },
+    { "find", act_find, NULL, NULL, NULL, { 0, 0, 0 } },
+    { "jump", act_jump, NULL, NULL, NULL, { 0, 0, 0 } },
+    { "preferences", action_preferences, NULL, NULL, NULL, { 0, 0, 0 } },
+    { "shortcuts", action_shortcuts, NULL, NULL, NULL, { 0, 0, 0 } },
+    { "about", action_about, NULL, NULL, NULL, { 0, 0, 0 } },
+  };
+  g_action_map_add_action_entries (G_ACTION_MAP (gapp), entries,
+                                   G_N_ELEMENTS (entries), app);
+
+  guint n = 0;
+  const LsgA11yShortcut *t = lsg_a11y_shortcuts (&n);
+  for (guint i = 0; i < n; i++)
+    {
+      if (t[i].scope != LSG_A11Y_SCOPE_APP || t[i].action_name == NULL)
+        continue;
+      /* NULL-terminated: {accel, NULL} for a single accel, {accel, accel2,
+       * NULL} for two (accel2 is NULL for single-accel entries). */
+      const char *accels[] = { t[i].accel, t[i].accel2, NULL };
+      gtk_application_set_accels_for_action (GTK_APPLICATION (gapp),
+                                             t[i].action_name, accels);
+    }
 }
 
 /* No file: launch screen. */
@@ -6161,6 +6654,7 @@ main (int argc, char *argv[])
       = adw_application_new ("dev.lesssheet.Gtk", G_APPLICATION_HANDLES_OPEN);
   g_signal_connect (application, "activate", G_CALLBACK (on_activate), &app);
   g_signal_connect (application, "open", G_CALLBACK (on_open), &app);
+  register_app_shortcuts (&app, G_APPLICATION (application));
   int status = g_application_run (G_APPLICATION (application), argc, argv);
 
   app_reset_document (&app);
