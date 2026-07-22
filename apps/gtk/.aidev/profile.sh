@@ -11,8 +11,9 @@ DEPENDENCY_PATHS=( "meson.build" ".ci/Dockerfile" ".clang-format" )
 # THE WHOLE GATE RUNS IN A PINNED LINUX GNOME CONTAINER (ARCH gtk-frontend
 # decision 5/6 + the 2026-07-17 amendment): the dev Mac has no GTK/Meson
 # toolchain, only Docker/Podman. Both CONFORMANCE (Meson compile, -Werror) and
-# BEHAVIOR (Meson test) execute inside less-sheet-gtk-ci:fedora42 (built once from
-# .ci/Dockerfile; GTK 4.18 / libadwaita 1.7 / meson 1.7 / gcc 15).
+# BEHAVIOR (Meson test) execute inside less-sheet-gtk-ci:fedora43 (built once from
+# .ci/Dockerfile; GTK 4.20 / libadwaita 1.8 / meson 1.8 / gcc 15 — the a11y-slice
+# floor bump fedora:42 -> fedora:43 for AdwShortcutsDialog, ARCH-gtk-a11y dec. 1).
 #
 # The Zig core is cross-built to the container's arch as a GLIBC static archive
 # (NOT musl — the container's GTK stack is glibc) into .core-linux/ before Meson
@@ -31,7 +32,7 @@ CONFORMANCE_CMD='( set -e
     x86_64|amd64)  ZT=x86_64-linux-gnu;  PLAT=linux/amd64 ;;
     *) echo "GATE: unsupported host arch $(uname -m)" >&2; exit 1 ;;
   esac
-  CORE_OUT="$PWD/.core-linux"; REPO="$(cd ../.. && pwd)"; IMG=less-sheet-gtk-ci:fedora42
+  CORE_OUT="$PWD/.core-linux"; REPO="$(cd ../.. && pwd)"; IMG=less-sheet-gtk-ci:fedora43
   ( cd ../../backend && zig build -Dtarget="$ZT" -Doptimize=ReleaseFast -p "$CORE_OUT" )
   "$CTR" image inspect "$IMG" >/dev/null 2>&1 || "$CTR" build --platform "$PLAT" -t "$IMG" -f .ci/Dockerfile .ci
   "$CTR" run --rm --platform "$PLAT" --security-opt label=disable -v "$REPO":/src -w /src/apps/gtk "$IMG" \
@@ -47,7 +48,7 @@ BEHAVIOR_CMD='( set -e
     x86_64|amd64)  PLAT=linux/amd64 ;;
     *) echo "GATE: unsupported host arch $(uname -m)" >&2; exit 1 ;;
   esac
-  REPO="$(cd ../.. && pwd)"; IMG=less-sheet-gtk-ci:fedora42
+  REPO="$(cd ../.. && pwd)"; IMG=less-sheet-gtk-ci:fedora43
   "$CTR" run --rm --platform "$PLAT" --security-opt label=disable -v "$REPO":/src -w /src/apps/gtk "$IMG" \
     meson test -C build --print-errorlogs )'
 CONTRACT_HOWTO="Contract: function prototypes + structs in frozen include/*.h — the planner's headers ARE the signatures; compile with -Werror so drift fails compilation. include/lesssheet.h is a SYMLINK to the workspace-frozen ../../../api/lesssheet.h (single source of truth, never a copy; matches apps/macos). Tests: GLib g_test under tests/, linked against the Zig core. Implementations under src/. THE WHOLE GATE RUNS IN A LINUX CONTAINER (see CONFORMANCE_CMD/BEHAVIOR_CMD above): GTK needs a real toolchain the Mac lacks. The core is cross-built by zig to a glibc static archive (.core-linux/, arch-matched to the container) and linked by meson. Real GUI/visual checks are the author's human pass on a GNOME desktop, never headless."

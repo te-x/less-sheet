@@ -6,12 +6,15 @@ project('less-sheet-gtk', 'c',
 
 cc = meson.get_compiler('c')
 
-# GNOME stack. Minimum versions are the ARCH decision-7 floor (GTK 4.16 /
-# libadwaita 1.6 — the AdwStyleManager accent-color API). include_type:'system'
-# emits -isystem for these third-party headers so their own warnings do not
-# trip -Werror on our code.
-gtk_dep  = dependency('gtk4',         version : '>= 4.16', include_type : 'system')
-adw_dep  = dependency('libadwaita-1', version : '>= 1.6',  include_type : 'system')
+# GNOME stack. Minimum versions are the ARCH decision-7 floor — bumped
+# GTK 4.16 -> 4.20 / libadwaita 1.6 -> 1.8 by the gtk-a11y slice (ARCH-gtk-a11y
+# decision 1, the author-signed 2026-07-21): AdwShortcutsDialog (the native,
+# non-deprecated shortcuts surface) needs libadwaita 1.8, whose GNOME-49-cycle
+# GTK is 4.20; both also carry the AdwStyleManager accent-color API and
+# gtk_accessible_announce. include_type:'system' emits -isystem for these
+# third-party headers so their own warnings do not trip -Werror on our code.
+gtk_dep  = dependency('gtk4',         version : '>= 4.20', include_type : 'system')
+adw_dep  = dependency('libadwaita-1', version : '>= 1.8',  include_type : 'system')
 glib_dep = dependency('glib-2.0',                          include_type : 'system')
 
 # The Zig core, cross-built to this container's arch (glibc target) and placed
@@ -32,7 +35,8 @@ core_inc = include_directories('include')
 # match the frozen headers exactly or the build fails. The surface grows per
 # slice (slice 1: open/display/scroll; slice 2: find; slice 3: jump; slice 4:
 # filter; slice 5: streaming copy; settings + dialect: dialect compose + column
-# config + the formatter's type+options dispatcher).
+# config + the formatter's type+options dispatcher; a11y: the display-free
+# cursor reducer + announcement/description builders + accelerator/name tables).
 # ---------------------------------------------------------------------------
 lsg_sources = files(
   'src/lsg_document.c',
@@ -46,6 +50,7 @@ lsg_sources = files(
   'src/lsg_copy.c',
   'src/lsg_dialect.c',
   'src/lsg_column.c',
+  'src/lsg_a11y.c',
 )
 lsgkit = static_library('lsgkit',
   lsg_sources,
@@ -236,3 +241,20 @@ test_column = executable('test-column',
   install : false,
 )
 test('column', test_column)
+
+# Accessibility (gtk-a11y slice): PURE display-free view-model — the keyboard
+# cursor/selection reducer (seed / move / extend / page / home-end / horizontal
+# / select-all / clear, all clamped), the byte-exact announcement + grid
+# description builders, the single accelerator table (the one source both the
+# accel registration and the shortcuts surface consume), and the FR4
+# accessible-name table. No core, no fixture, no display (the widget role/label
+# wiring + the AdwShortcutsDialog + live announcements are the container smoke
+# render + the author's Orca/GNOME human pass, not this gate).
+test_a11y = executable('test-a11y',
+  'tests/test_a11y.c',
+  dependencies : test_deps,
+  link_with : lsgkit,
+  include_directories : core_inc,
+  install : false,
+)
+test('a11y', test_a11y)

@@ -1,6 +1,6 @@
 # ARCH — gtk-frontend (a GNOME-native GTK4 frontend at feature/interaction parity with macOS)
 
-Status: APPROVED — signed off by the author 2026-07-17 (decisions 7 & 8 ratified; decision 5 amended to whole-gate-in-container). Roadmap priority #2. Greenfield new component
+Status: APPROVED — signed off by the author 2026-07-17 (decisions 7 & 8 ratified; decision 5 amended to whole-gate-in-container). AMENDED 2026-07-21 (the author-signed, via `ARCH-gtk-a11y.md`): decision 6 gate container `fedora:42` → `fedora:43`; decision 7 floor → GTK 4.20 / libadwaita 1.8 (for `AdwShortcutsDialog`). Roadmap priority #2. Greenfield new component
 `apps/gtk/` (analogous to `apps/macos/`). Workspace-level ARCH.
 Prerequisite MET: backend Linux portability merged to master (`4b2b338`) — the core cross-compiles and
 runs on `aarch64`/`x86_64` Linux (`ARCH-backend-linux-portability.md`).
@@ -239,6 +239,11 @@ them when he signs off this ARCH (no separate question round).
    (ii) a **headless GTK smoke** (init GTK + open a small CSV + render one frame) under a virtual display
    (Xvfb or the Broadway backend) in the container; (iii) the **real GUI/visual pass is the author's**, on a
    real GNOME desktop. The core links as the native-Linux archive (glibc), built by `zig build`.
+   **AMENDED 2026-07-21 (the author-signed, by the a11y slice `ARCH-gtk-a11y.md`): the pinned gate-container
+   image bumps `fedora:42` → `fedora:43`** (GTK 4.20 / libadwaita 1.8.1 / GNOME 49). Reason: the a11y slice
+   adopts `AdwShortcutsDialog`, which requires libadwaita 1.8 (see decision 7's amendment); fedora:42 ships
+   only libadwaita 1.7, so the symbol is absent there. The planner re-pins the `.ci/Dockerfile` base to
+   `fedora:43` with a fresh digest during that slice's freeze.
 7. **CONFIRMED (the author 2026-07-17) — Minimum versions = GTK 4.16 / libadwaita 1.6 (GNOME 47, Sept 2024) floor;
    build against latest stable (GTK 4.22 / libadwaita 1.9 / GNOME 50).** Rationale: following the *system
    accent color* (a stated requirement) needs `AdwStyleManager:accent-color` / `:accent-color-rgba` /
@@ -246,6 +251,15 @@ them when he signs off this ARCH (no separate question round).
    "prefer native and latest" workspace rule, we target the current stable and treat 1.6 as the minimum a
    distro must ship. *Alternative considered:* an older floor (e.g. 1.4) — rejected because it loses the
    accent-color API and forces hardcoding, violating the no-hardcoded-color requirement.
+   **AMENDED 2026-07-21 (the author-signed, by the a11y slice `ARCH-gtk-a11y.md`): the floor bumps to GTK 4.20 /
+   libadwaita 1.8 (GNOME 49, Sept 2025).** The a11y slice's shortcuts surface adopts `AdwShortcutsDialog`
+   (introduced in libadwaita 1.8; the native replacement for `GtkShortcutsWindow`, which was deprecated in
+   GTK 4.18 and is removed in GTK 5). libadwaita 1.8 is paired to its GNOME-49-cycle GTK, so the GTK floor
+   rises to 4.20 alongside it. *Accepted trade-off (the author):* the minimum supported distro base narrows by
+   ~1 year (drops GNOME 47/48 — e.g. Debian trixie / older Ubuntu LTS); accepted under "prefer native and
+   latest" over building on a GTK-5-removed widget. The planner sets `gtk4 >= 4.20` / `libadwaita-1 >= 1.8`
+   in `apps/gtk/meson.build` during the a11y freeze (confirming the exact minimums libadwaita 1.8 pulls
+   in-container). "Build against latest stable" is unchanged.
 8. **CONFIRMED (the author 2026-07-17) — Locale/number-format stack = GLib/GIO + the C-library locale + `GDateTime`,
    NOT ICU.** The lossless exact-decimal round-trip that macOS gets from `Decimal.FormatStyle` is
    **arithmetic** (parse under the shared numeric grammar the core already defines, verify round-trip,
