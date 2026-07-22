@@ -5205,6 +5205,141 @@ test "gz_ac22: uses ONLY the pinned Zig-0.16 std gzip decoder — no runtime dep
 }
 
 // ===========================================================================
+// REGRESSION (csv-gz tail near EOF) — planner-frozen. A `.csv.gz` whose INFLATED
+// size exceeds the O(head) open budget (LS_OPEN_HEAD_MAX_BYTES == 4 MiB) rendered
+// its FINAL ~chunk_bytes (256 KiB) of rows as EMPTY cells while the row COUNT
+// stayed EXACT. Field repro: eagleData_berlinTile.csv.gz — 37,317,552 rows,
+// 1,909,011,715 inflated bytes, single member — showed the last 5,162 rows
+// (~256 KiB) blank; the equivalent uncompressed `.csv` read correctly.
+//
+// Diagnosed to the gzip Source streaming-inflate path (src/source.zig): rows
+// BEYOND the resident `head` buffer are served by inflating forward — fresh, or
+// replayed from a durable 32-MiB checkpoint — and the LAST inflate chunk before
+// the true logical EOF is never materialized. So BOTH the display path
+// (ls_window_set -> ls_cell, via window.zig) AND the copy path (ls_cell_copy,
+// via window.cellCopy) return empty for the final 256 KiB of content, even
+// though the forward index scan reached true EOF and counted every row (hence
+// the exact-but-blank symptom). Reproduced deterministically and shown to be:
+//   * SIZE-independent      — a constant ~256 KiB (~chunk_bytes) dead zone at 5,
+//                             6, 40 and 70 MiB inflated;
+//   * HEAD-gated            — a 3 MiB fixture (fully inside the 4 MiB head) has
+//                             NO dead zone, so the defect is in the streaming
+//                             inflate path, not the lexer;
+//   * CHECKPOINT-independent— reproduces below the 32 MiB checkpoint interval,
+//                             so it is an end-of-stream defect, not a bad restore.
+//
+// The minimal faithful fixture therefore only needs to EXCEED the 4 MiB head; a
+// second fixture crosses a durable 32 MiB checkpoint to also lock the
+// behind-frontier REPLAY tail (the field file's actual 1.9 GB path). Both assert
+// a DIFFERENTIAL: after scanning to EOF, the gzip tail window is byte-equal to
+// the plain oracle (identical exact counts; every tail cell PRESENT, not blank).
+//
+// RED NOW: the gzip tail cells are empty and diverge from the non-empty oracle.
+// GREEN once the Source serves inflated output all the way to true logical EOF.
+// FIX SCOPE: src/source.zig only (implementer) — do NOT relax these assertions.
+// ===========================================================================
+
+/// Differential tail check: a distinct-per-row CSV that inflates PAST the 4 MiB
+/// open head, opened directly (plain oracle) vs. as gzip, must — after scanning
+/// to EOF — agree on the exact row count AND on every cell of the LAST window
+/// (the tail rows the field bug rendered blank). Exercises the SAME public path
+/// the frontend paints through: ls_open -> ls_window_set -> ls_cell.
+fn expectGzTailEqualsPlain(gpa: std.mem.Allocator, plain: []const u8, sep: u8) !void {
+    const g = try gz(gpa, plain);
+    defer gpa.free(g);
+    var pod = try openWith(plain, .{ .separator = sep, .index_mode = api.index_manual });
+    defer pod.deinit();
+    var god = try openWith(g, .{ .separator = sep, .index_mode = api.index_manual });
+    defer god.deinit();
+    try scanToEnd(pod.doc);
+    try scanToEnd(god.doc);
+
+    // The COUNT path is NOT the bug: gzip and plain agree, both exact.
+    const prc = api.ls_row_count_get(pod.doc);
+    const grc = api.ls_row_count_get(god.doc);
+    try std.testing.expectEqual(true, prc.exact);
+    try std.testing.expectEqual(prc.count, grc.count);
+    try std.testing.expectEqual(prc.exact, grc.exact);
+
+    const cols = api.ls_column_count(god.doc);
+    try std.testing.expectEqual(api.ls_column_count(pod.doc), cols);
+    try std.testing.expect(cols > 0);
+    const total = grc.count;
+    // The fixture MUST exceed one window (i.e. reach past the head into the
+    // streaming-inflate zone); otherwise the tail would sit in the resident head
+    // and the regression would not be exercised.
+    try std.testing.expect(total > api.window_max_rows);
+
+    // Materialize the LAST window (the tail the bug blanks) on BOTH documents.
+    const count: u32 = api.window_max_rows;
+    const first: u64 = total - count;
+    const gr = api.ls_window_set(god.doc, first, count);
+    const pr = api.ls_window_set(pod.doc, first, count);
+    try std.testing.expectEqual(pr.row_count, gr.row_count);
+    try std.testing.expect(gr.row_count > 0);
+
+    // Every tail cell: gzip == plain, byte-for-byte, AND present (non-empty).
+    var r: u64 = first;
+    while (r < first + gr.row_count) : (r += 1) {
+        var c: u32 = 0;
+        while (c < cols) : (c += 1) {
+            const gc = api.ls_cell(god.doc, r, c).slice();
+            const pc = api.ls_cell(pod.doc, r, c).slice();
+            errdefer std.debug.print("\n[gz-tail] divergence at row {d} col {d}: gz='{s}' plain='{s}'\n", .{ r, c, gc, pc });
+            try std.testing.expect(pc.len > 0); // plain oracle is never blank here
+            try std.testing.expectEqualStrings(pc, gc); // RED: gz tail is empty
+        }
+    }
+}
+
+test "gz_tail_eof: rows past the open head materialize byte-equal to plain (final inflate chunk not blank)" {
+    const gpa = std.testing.allocator;
+    // ~9 MiB inflated (500k x 18-byte DISTINCT rows) — well past the 4 MiB head
+    // so the tail is served by streaming inflate; below the 32 MiB checkpoint
+    // interval, so this isolates the pure end-of-stream defect (no checkpoint
+    // replay). Distinct rows make the differential also catch any misalignment.
+    const plain = try genFixedRows(gpa, 500_000);
+    defer gpa.free(plain);
+    try expectGzTailEqualsPlain(gpa, plain, ',');
+}
+
+test "gz_tail_eof: behind-frontier REPLAY tail past a durable 32 MiB checkpoint stays byte-equal (field path)" {
+    const gpa = std.testing.allocator;
+    // ~40 MiB inflated: crosses a durable 32 MiB gzip checkpoint, so the tail
+    // window lands behind the frontier and is served by REPLAY from a NONZERO
+    // checkpoint — the field file's (1.9 GB) actual path. Identical 10-byte rows
+    // via the streaming high-expansion builder (no multi-MiB plain allocation);
+    // the deterministic unit content IS the oracle.
+    const unit = "aaaa,bbbb\n";
+    const repeat: usize = (40 * 1024 * 1024) / unit.len;
+    const g = try gzHighExpansion(gpa, unit, repeat);
+    defer gpa.free(g);
+    var god = try openWith(g, .{ .separator = ',', .index_mode = api.index_manual });
+    defer god.deinit();
+    try scanToEnd(god.doc);
+    const total = api.ls_row_count_get(god.doc).count;
+    try std.testing.expect(total > 3 * 1024 * 1024); // >32 MiB inflated => a durable checkpoint crossed
+
+    // Materialize the LAST window (all within the ~256 KiB dead zone the bug blanks).
+    const count: u32 = api.window_max_rows;
+    const first: u64 = total - count;
+    const rr = api.ls_window_set(god.doc, first, count);
+    try std.testing.expect(rr.row_count > 0);
+    var r: u64 = first;
+    while (r < first + rr.row_count) : (r += 1) {
+        errdefer std.debug.print("\n[gz-tail-replay] blank/wrong tail at row {d}\n", .{r});
+        try std.testing.expectEqualStrings("aaaa", api.ls_cell(god.doc, r, 0).slice()); // RED: empty
+        try std.testing.expectEqualStrings("bbbb", api.ls_cell(god.doc, r, 1).slice()); // RED: empty
+    }
+    // The copy path (ls_cell_copy) shares the same gzip Source cursor — guard the
+    // very last row through it too (also RED in the seed: empty content).
+    var buf: [64]u8 = undefined;
+    const cc = copyCell(god.doc, total - 1, 0, &buf);
+    try std.testing.expectEqual(api.CopyResult.ok, cc.result);
+    try std.testing.expectEqualStrings("aaaa", buf[0..cc.len]); // RED: empty
+}
+
+// ===========================================================================
 // window-budget slice (ARCH-window-budget). Frozen; planner-owned. Bounds the
 // SYNCHRONOUS work of ls_window_set to a fixed 8 MiB (8,388,608-byte) aggregate
 // charged-work ceiling and repairs the filtered ls_search_nav lane (backlog #6),
