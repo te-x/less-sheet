@@ -298,6 +298,9 @@ pub const FakeServer = struct {
     body: []u8,
     released: ?*std.atomic.Value(u64) = null,
     drop_after: ?u64 = null,
+    /// security-hardening (e) AC-e3 short-body seam: the server delivers body bytes
+    /// only within [0, short_body_at); a range fetch beyond it is SHORT. null = full.
+    short_body_at: ?u64 = null,
 };
 
 pub const Transport = union(enum) {
@@ -310,13 +313,20 @@ pub const Transport = union(enum) {
     pub fn fetchInto(self: Transport, dest: []u8, offset: u64) bool {
         switch (self) {
             .fake => |fs| {
-                const body = fs.body;
-                if (offset >= body.len) {
+                // security-hardening (e) short-body seam (AC-e3): the fake advertises
+                // its full length but delivers body bytes only within [0, deliver). The
+                // UN-HARDENED path below still zero-fills the undelivered tail and returns
+                // true -- the silent zero-fill AC-e3 corrects. The fix must DETECT the
+                // shortfall (bytes requested but not delivered) instead of fabricating
+                // zero content. deliver == body.len when short_body_at is null, so every
+                // existing net test is byte-unaffected.
+                const deliver: u64 = if (fs.short_body_at) |s| @min(s, @as(u64, fs.body.len)) else fs.body.len;
+                if (offset >= deliver) {
                     @memset(dest, 0);
                     return true;
                 }
-                const avail = @min(@as(u64, dest.len), body.len - offset);
-                @memcpy(dest[0..@intCast(avail)], body[@intCast(offset)..][0..@intCast(avail)]);
+                const avail = @min(@as(u64, dest.len), deliver - offset);
+                @memcpy(dest[0..@intCast(avail)], fs.body[@intCast(offset)..][0..@intCast(avail)]);
                 if (avail < dest.len) @memset(dest[@intCast(avail)..], 0);
                 return true;
             },

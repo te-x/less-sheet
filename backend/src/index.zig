@@ -507,17 +507,23 @@ pub fn indexPoll(d: *Document) api.ScanProgress {
             .bytes_scanned = if (d.complete) phys_total else @min(phys_total, frontier_phys),
             .bytes_total = phys_total,
             .complete = d.complete,
+            // security-hardening (d) SEED: no bomb-cap trip yet. The gzip Source
+            // will drive this true when it stops decode/scan on a sustained abnormal
+            // expansion ratio (AC-d1); false for every non-gzip / normal document.
+            .expansion_capped = false,
         };
         return .{
             .bytes_scanned = frontier_phys,
             .bytes_total = api.bytes_total_unknown,
             .complete = d.complete,
+            .expansion_capped = false, // security-hardening (d) SEED — see above.
         };
     }
     return .{
         .bytes_scanned = if (d.complete) d.file_size else @min(d.file_size, d.reader.physicalBytes(d.source, d.frontier_pos)),
         .bytes_total = d.file_size,
         .complete = d.complete,
+        .expansion_capped = false, // security-hardening (d) SEED — see above.
     };
 }
 

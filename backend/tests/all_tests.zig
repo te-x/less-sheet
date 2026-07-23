@@ -8936,3 +8936,242 @@ test "cp_abi: the streaming-copy symbols link through extern linkage; ls_copy_st
 test "shipped optimize mode is ReleaseSafe (security-hardening MUST a / AC-a1)" {
     try std.testing.expectEqual(std.builtin.OptimizeMode.ReleaseSafe, @import("builtin").mode);
 }
+
+// ---------------------------------------------------------------------------
+// Security-hardening MUST (d) gzip-bomb cap, (e) network hardening,
+// (f) copy formula-injection neutralization (ARCH-security-hardening).
+// ---------------------------------------------------------------------------
+// Planner-frozen behavior tests for Wave 2b. Each maps to a [gate] acceptance
+// criterion of ARCH-security-hardening. They ride the EXISTING seams (the gz
+// helpers, the NetFixture injected transport + openUrlStartFake, the copy
+// helpers); (e) also rides the two Zig-only NetFixture fields this freeze added
+// (`redirect_downgrade`, `short_body_at`). The api/ ABI is byte-identical
+// (root-planner freeze added only `expansion_capped`, LS_NET_ERROR_INSECURE_REDIRECT
+// / _SHORT_BODY, and the copy-output prose).
+//
+// SEED / RED map (the shipped core is still un-hardened):
+//   (d) ls_index_poll().expansion_capped is hard-wired false in src/index.zig, so a
+//       bomb scans to completion instead of tripping -> sec_d1 / sec_d1_net RED;
+//       sec_d2 is the false-positive GUARD (green now, must stay green).
+//   (e) runFake ignores `redirect_downgrade` (follows the downgrade -> DONE) and the
+//       fake `fetchInto` still zero-fills a short range and marks it present -> the
+//       open fails no differently / the frontier advances over zeros: sec_e2 /
+//       sec_e3 / sec_e3_post_open RED.
+//   (f) window.cellCopy serves the RAW value (no apostrophe) -> sec_f1 RED, plus the
+//       length assertion in sec_f2; sec_f2's no-over-neutralization / idempotence and
+//       sec_f3's display+search+filter checks are GUARDS (green now, must stay green).
+// The heavy/real-transport halves (real TLS/redirect/timeout mapping, the ratio
+// bench AC-d3, the apps clipboard/banner ACs) are reviewer/human probes, not gate.
+
+test "sec_d1: a synthetic high-ratio gzip trips the abnormal-expansion cap; the decoded prefix stays servable (local, AC-d1)" {
+    const gpa = std.testing.allocator;
+    // A MODEST bomb (not a real 10 GB file): a 15-byte unit repeated ~0.56M times
+    // inflates to ~8 MiB from a few-KB compressed stream (ratio in the thousands:1,
+    // far above the ~100:1 floor), so a sliding-window sustained-ratio guard must
+    // STOP decode/scan well before the logical end -- without materializing GiBs.
+    const bomb = try gzHighExpansion(gpa, "aaaa,bbbb,cccc\n", (8 * 1024 * 1024) / 15);
+    defer gpa.free(bomb);
+    try std.testing.expect(bomb.len < 512 * 1024); // compressed stays tiny
+    var od = try openWith(bomb, .{ .separator = ',', .index_mode = api.index_manual });
+    defer od.deinit();
+    // Decode forward through the public jump machinery (the same decode work the AUTO
+    // indexer feeds). Terminates in BOTH modes: the seed decodes the whole 8 MiB; the
+    // guard stops early and normalizes to a terminal prefix.
+    try scanToEnd(od.doc);
+    const ip = api.ls_index_poll(od.doc);
+    // RED SEED: no guard, so the whole bomb decodes -> expansion_capped == false.
+    try std.testing.expectEqual(true, ip.expansion_capped);
+    // Terminal like a salvaged prefix: complete, count exact over the decoded prefix.
+    try std.testing.expectEqual(true, ip.complete);
+    try std.testing.expectEqual(true, api.ls_row_count_get(od.doc).exact);
+    // Already-decoded rows stay fully servable (row 0 of the repeated unit).
+    winAll(od.doc);
+    try expectCell(od.doc, 0, 0, "aaaa");
+    try expectCell(od.doc, 0, 2, "cccc");
+}
+
+test "sec_d1_net: a high-ratio gzip served over the network trips the expansion cap; received rows stay servable (AC-d1)" {
+    const gpa = std.testing.allocator;
+    const bomb = try gzHighExpansion(gpa, "aaaa,bbbb,cccc\n", (8 * 1024 * 1024) / 15);
+    defer gpa.free(bomb);
+    var fx: api.NetFixture = .{ .body = bomb, .honor_ranges = true, .advertise_length = true };
+    const doc = try openFakeToDone(&fx); // opens O(head) like any .csv.gz
+    defer api.ls_close(doc);
+    try scanToEnd(doc); // demand-scan forward over the compressed spool
+    const ip = api.ls_index_poll(doc);
+    try std.testing.expectEqual(true, ip.expansion_capped); // RED SEED: full decode -> false
+    try std.testing.expectEqual(true, ip.complete);
+    winAll(doc);
+    try expectCell(doc, 0, 0, "aaaa");
+}
+
+test "sec_d2: a legit-ratio .csv.gz never trips the cap and fully scans (AC-d2 false-positive guard)" {
+    const gpa = std.testing.allocator;
+    // Real-shaped CSV (distinct incrementing values -> a normal text ratio, well
+    // under the ~100:1 bomb floor) larger than the 4 MiB open head, so the scan runs
+    // the ratio logic PAST the head on legitimate data and must never trip.
+    const plain = try genFixedRows(gpa, 300_000); // ~5.4 MiB logical
+    defer gpa.free(plain);
+    const g = try gz(gpa, plain);
+    defer gpa.free(g);
+    var od = try openWith(g, .{ .separator = ',', .index_mode = api.index_manual });
+    defer od.deinit();
+    try scanToEnd(od.doc);
+    const ip = api.ls_index_poll(od.doc);
+    try std.testing.expectEqual(false, ip.expansion_capped); // legit ratio: never trips (GUARD)
+    try std.testing.expectEqual(true, ip.complete);
+    const rc = api.ls_row_count_get(od.doc);
+    try std.testing.expectEqual(true, rc.exact);
+    try std.testing.expectEqual(@as(u64, 300_000), rc.count); // fully scanned, not cut short
+    winAll(od.doc);
+    var b: [8]u8 = undefined;
+    try expectCell(od.doc, 0, 0, fixedCell(&b, 0));
+}
+
+test "sec_e2: an https->http redirect downgrade is refused (INSECURE_REDIRECT); a same-scheme/upgrade chain within the cap still opens (AC-e2)" {
+    // The frozen enum value (root-planner freeze).
+    try std.testing.expectEqual(@as(c_int, 8), @intFromEnum(api.NetStatus.insecure_redirect));
+    const body = "a,b\n1,2\n";
+    // A redirect whose Location downgrades the transport https->http is REFUSED with a
+    // distinct code. RED SEED: the fake follows the downgrade and opens DONE, modelling
+    // today's std.http.Client (which follows it) -> state is .done, not .failed.
+    {
+        var fx: api.NetFixture = .{ .body = body, .redirect_hops = 1, .redirect_downgrade = true, .honor_ranges = true, .advertise_length = true };
+        const job = api.openUrlStartFake(&fx, net_url.ptr, net_url.len, null) orelse return error.NetJobAllocFailed;
+        defer api.ls_net_open_release(job);
+        const s = try pollNetTerminal(job);
+        try std.testing.expectEqual(api.NetOpenState.failed, s.state);
+        try std.testing.expectEqual(api.NetStatus.insecure_redirect, s.err);
+    }
+    // http->https and same-scheme (incl. cross-host) redirects within the 3-hop cap
+    // still SUCCEED -- a NON-downgrade chain is unaffected (GUARD).
+    {
+        var ok_fx: api.NetFixture = .{ .body = body, .redirect_hops = 2, .redirect_downgrade = false, .honor_ranges = true, .advertise_length = true };
+        const doc = try openFakeToDone(&ok_fx);
+        defer api.ls_close(doc);
+        try std.testing.expectEqual(@as(u32, 2), api.ls_column_count(doc));
+    }
+}
+
+test "sec_e3: a short/zero range body at open fails SHORT_BODY and is never served as document content (AC-e3)" {
+    // The frozen enum value (root-planner freeze).
+    try std.testing.expectEqual(@as(c_int, 9), @intFromEnum(api.NetStatus.short_body));
+    const gpa = std.testing.allocator;
+    const body = try genFixedRows(gpa, 5_000); // advertised in full
+    defer gpa.free(body);
+    // A range server that advertises `body.len` but delivers ZERO body bytes: the head
+    // fetch is short. AC-e3 correctness: the un-fetched bytes are NEVER served as
+    // zero-filled document content -- the open fails SHORT_BODY (retryable).
+    // RED SEED: the fake zero-fills the head and the open reaches DONE over the zeros.
+    var fx: api.NetFixture = .{ .body = body, .honor_ranges = true, .advertise_length = true, .short_body_at = 0 };
+    const job = api.openUrlStartFake(&fx, net_url.ptr, net_url.len, null) orelse return error.NetJobAllocFailed;
+    defer api.ls_net_open_release(job);
+    const s = try pollNetTerminal(job);
+    try std.testing.expectEqual(api.NetOpenState.failed, s.state);
+    try std.testing.expectEqual(api.NetStatus.short_body, s.err);
+}
+
+test "sec_e3_post_open: a post-open short range never advances the frontier over zero-fill (AC-e3 correctness)" {
+    const gpa = std.testing.allocator;
+    const body = try genFixedRows(gpa, 600_000); // ~10.8 MiB, advertised in full
+    defer gpa.free(body);
+    // A range server that serves [0, 5 MiB) then answers every later range SHORT.
+    var fx: api.NetFixture = .{ .body = body, .honor_ranges = true, .advertise_length = true, .short_body_at = 5 * 1024 * 1024 };
+    const doc = try openFakeToDone(&fx);
+    defer api.ls_close(doc);
+    try std.testing.expectEqual(api.NetRangeMode.random_access, api.netRangeMode(doc));
+    // The delivered prefix is fully functional (row 250k sits at byte ~4.5 MiB < 5 MiB).
+    api.ls_jump_start(doc, 250_000);
+    _ = try waitJumpDone(doc);
+    _ = api.ls_window_set(doc, 250_000, 8);
+    var b: [8]u8 = undefined;
+    try expectCell(doc, 250_000, 0, fixedCell(&b, 250_000));
+    // A demand PAST the short point must not mark the un-fetched tail present: the
+    // frontier stays at the short boundary and is NEVER zero-filled. Bounded + no hang.
+    api.ls_jump_start(doc, 500_000); // byte ~9 MiB, past the 5 MiB short point
+    defer api.ls_jump_cancel(doc);
+    netWait(200);
+    const ip = api.ls_index_poll(doc);
+    // RED SEED: the fake zero-fills the short chunks and marks them present, so the
+    // frontier climbs to EOF (~10.8 MiB). The fix keeps it at the ~5 MiB boundary.
+    errdefer std.debug.print("\n[sec_e3_post_open] frontier bytes_scanned={d} (expected < 6 MiB: the un-fetched tail was zero-filled + marked present)\n", .{ip.bytes_scanned});
+    try std.testing.expect(ip.bytes_scanned < 6 * 1024 * 1024);
+}
+
+test "sec_f1: copy neutralizes a leading = + - @ with one apostrophe in ls_cell_copy and ls_copy_next; orthogonal to quoting (AC-f1)" {
+    const gpa = std.testing.allocator;
+    var od = try openWith("=SUM(A1),+2+3,-5,@ref\n", .{ .separator = ',', .quote = api.quote_none, .header = api.header_off, .index_mode = api.index_manual });
+    defer od.deinit();
+    winAll(od.doc);
+    var buf: [64]u8 = undefined;
+    // ls_cell_copy: each leading-trigger cell gets exactly ONE apostrophe prefix.
+    // RED SEED: window.cellCopy serves the raw value with no prefix.
+    const c0 = copyCell(od.doc, 0, 0, &buf);
+    try std.testing.expectEqual(api.CopyResult.ok, c0.result);
+    try std.testing.expectEqualStrings("'=SUM(A1)", buf[0..c0.len]);
+    try std.testing.expectEqualStrings("'+2+3", buf[0..copyCell(od.doc, 0, 1, &buf).len]);
+    try std.testing.expectEqualStrings("'-5", buf[0..copyCell(od.doc, 0, 2, &buf).len]);
+    try std.testing.expectEqualStrings("'@ref", buf[0..copyCell(od.doc, 0, 3, &buf).len]);
+
+    // ls_copy_next (streaming TSV): the whole row is neutralized field-by-field.
+    {
+        var d = try driveCopy(gpa, od.doc, copyRect(0, 1, 0, 4), 64);
+        defer d.deinit(gpa);
+        try std.testing.expectEqualStrings("'=SUM(A1)\t'+2+3\t'-5\t'@ref", d.bytes.items);
+    }
+    // Single-cell 1x1 raw copy still neutralizes (never quoted, no trailing LF).
+    {
+        var d = try driveCopy(gpa, od.doc, copyRect(0, 1, 0, 1), 64);
+        defer d.deinit(gpa);
+        try std.testing.expectEqualStrings("'=SUM(A1)", d.bytes.items);
+    }
+
+    // Orthogonal to TSV quoting: a cell containing a TAB and starting with '=' carries
+    // the apostrophe INSIDE the quotes. RED SEED: "=a<TAB>b" is quoted with no '.
+    var qd = try openWith("=a\tb,plain\n", .{ .separator = ',', .quote = api.quote_none, .header = api.header_off, .index_mode = api.index_manual });
+    defer qd.deinit();
+    winAll(qd.doc);
+    var d2 = try driveCopy(gpa, qd.doc, copyRect(0, 1, 0, 2), 64);
+    defer d2.deinit(gpa);
+    try std.testing.expectEqualStrings("\"'=a\tb\"\tplain", d2.bytes.items);
+}
+
+test "sec_f2: non-trigger cells copy byte-identical; the prefix is idempotent and counts toward the length (AC-f2)" {
+    var od = try openWith("=x,'lit,plain\nx=y,3-4,\n", .{ .separator = ',', .quote = api.quote_none, .header = api.header_off, .index_mode = api.index_manual });
+    defer od.deinit();
+    winAll(od.doc);
+    var buf: [64]u8 = undefined;
+    // A neutralized cell's apostrophe COUNTS toward out_len. RED SEED: len == 2.
+    const t = copyCell(od.doc, 0, 0, &buf);
+    try std.testing.expectEqualStrings("'=x", buf[0..t.len]);
+    try std.testing.expectEqual(@as(usize, 3), t.len);
+    // Idempotent / first-byte-only: a value already starting with ' is UNCHANGED (its
+    // first byte ' is not a trigger), so re-copying never doubles it (GUARD).
+    try std.testing.expectEqualStrings("'lit", buf[0..copyCell(od.doc, 0, 1, &buf).len]);
+    // No over-neutralization: a plain cell, and a trigger byte that is NOT first, are
+    // untouched (GUARD -- would catch an over-eager matcher).
+    try std.testing.expectEqualStrings("plain", buf[0..copyCell(od.doc, 0, 2, &buf).len]);
+    try std.testing.expectEqualStrings("x=y", buf[0..copyCell(od.doc, 1, 0, &buf).len]);
+    try std.testing.expectEqualStrings("3-4", buf[0..copyCell(od.doc, 1, 1, &buf).len]);
+    // An EMPTY cell is never prefixed (OK, zero length) (GUARD).
+    const e = copyCell(od.doc, 1, 2, &buf);
+    try std.testing.expectEqual(api.CopyResult.ok, e.result);
+    try std.testing.expectEqual(@as(usize, 0), e.len);
+}
+
+test "sec_f3: display, search, and filter see the RAW cell -- neutralization is confined to copy (AC-f1 scope guard)" {
+    var od = try openWith("=SUM(A1),plain\n+2+3,other\n", .{ .separator = ',', .quote = api.quote_none, .header = api.header_off, .index_mode = api.index_manual });
+    defer od.deinit();
+    winAll(od.doc);
+    // DISPLAY: ls_cell serves the RAW cell (no apostrophe). An implementation that
+    // leaked neutralization into display would fail here (GUARD).
+    try expectCell(od.doc, 0, 0, "=SUM(A1)");
+    try expectCell(od.doc, 1, 0, "+2+3");
+    // SEARCH: a byte-exact predicate over the RAW value matches (it would MISS a
+    // neutralized "'=SUM(A1)") -- proves the matcher sees raw bytes (GUARD).
+    try std.testing.expectEqual(@as(u64, 1), try searchTotal(od.doc, predReqCase(0, .eq, "=SUM(A1)", true)));
+    // FILTER: the same predicate yields exactly the one matching row (GUARD).
+    try setFilter(od.doc, predReqCase(0, .eq, "=SUM(A1)", true));
+    const f = try waitFilterDone(od.doc);
+    try std.testing.expectEqual(@as(u64, 1), f.total);
+}

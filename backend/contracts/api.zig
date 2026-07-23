@@ -1264,6 +1264,26 @@ pub const NetFixture = struct {
     /// rows stay servable; index/search/filter reach their terminal states over
     /// the received prefix). `null` == the stream delivers the whole body.
     drop_after: ?u64 = null,
+    /// security-hardening (e) AC-e2: the redirect chain's Location would DOWNGRADE
+    /// the transport https->http, which must be REFUSED with
+    /// LS_NET_ERROR_INSECURE_REDIRECT. false (default) = a same-scheme / http->https
+    /// upgrade chain that, within `redirect_hops` <= the cap, still opens normally
+    /// (cross-host included). The real std.http.Client scheme check over a live
+    /// server is a REVIEWER/human target-host probe (like the other real-transport
+    /// mappings); the fake pins the TAXONOMY MAPPING (a downgrade condition -> the
+    /// distinct terminal code). Zig-only (never the C ABI).
+    redirect_downgrade: bool = false,
+    /// security-hardening (e) AC-e3: a TRUNCATED transfer -- the server advertises
+    /// its full length (advertise_length) but delivers body bytes only within
+    /// [0, short_body_at); a RANGE fetch for bytes at/after it comes back SHORT
+    /// (fewer than requested / zero). DISTINCT from `drop_after` (a clean stream END
+    /// on an unknown-length stream -> damaged-EOF) and `withhold` (bytes not yet
+    /// sent -> wait): a short body is a retryable FAULT whose un-fetched bytes are
+    /// NEVER zero-filled or marked present. A short HEAD at open fails
+    /// LS_NET_ERROR_SHORT_BODY; a post-open short range simply does not advance the
+    /// frontier (root-planner boundary: no new post-open error state). `null` (the
+    /// default) delivers the whole body. Random-fill (range) fixtures. Zig-only.
+    short_body_at: ?u64 = null,
 };
 
 /// netSpoolStore result: the private local spool file's state (AC14 spool

@@ -169,6 +169,7 @@ fn runFake(job: *NetOpenJob, fx: *const api.NetFixture) void {
         },
         .released = fx.withhold,
         .drop_after = fx.drop_after,
+        .short_body_at = fx.short_body_at, // security-hardening (e) AC-e3 short-body seam
     };
     const transport: net_source.Transport = .{ .fake = fs };
     const progress: net_source.Progress = .{ .ctx = job, .callback = onProgress };
