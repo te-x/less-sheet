@@ -8914,3 +8914,25 @@ test "cp_abi: the streaming-copy symbols link through extern linkage; ls_copy_st
     try std.testing.expect(p.step == .more or p.step == .done or p.step == .stalled);
     c_linked_copy_job.ls_copy_close(job);
 }
+
+// ---------------------------------------------------------------------------
+// Security-hardening MUST (a): the shipped optimize mode is the SAFE baseline.
+// ---------------------------------------------------------------------------
+// ARCH-security-hardening AC-a1 + PROJECT.md "Build & gate": the distributed
+// core ships ReleaseSafe (runtime safety checks ON) so a bug on untrusted
+// CSV/gzip/network input faults cleanly instead of becoming undefined behavior.
+// The gate builds AND tests this exact mode (profile.sh pins `-Doptimize=ReleaseSafe`
+// for both conformance and behavior).
+//
+// This guard is the anti-regression tripwire: it is GREEN only under ReleaseSafe
+// and RED under Debug / ReleaseFast / ReleaseSmall, so the safe baseline cannot
+// silently drift back to a safety-checks-off build. It is a pure runtime assertion
+// (it compiles in every mode and fails at test time in the wrong mode), so a RED
+// here is a behavior failure, never a compile error.
+//
+// Wave-1 seam: the `@setRuntimeSafety(false)` carve-out enumeration and its bench
+// justification (AC-a3/AC-a4) are the implementer's work under src/; this guard
+// pins only the GLOBAL shipped mode, not the carve-out list.
+test "shipped optimize mode is ReleaseSafe (security-hardening MUST a / AC-a1)" {
+    try std.testing.expectEqual(std.builtin.OptimizeMode.ReleaseSafe, @import("builtin").mode);
+}

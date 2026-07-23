@@ -2,7 +2,26 @@ const std = @import("std");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
+    // Shipped/default optimize mode = ReleaseSafe (security-hardening MUST a,
+    // ARCH-security-hardening + PROJECT.md "Build & gate"): the distributed core
+    // runs with runtime safety checks ON, so a bug on untrusted CSV/gzip/network
+    // input faults cleanly instead of becoming undefined behavior. `@setRuntimeSafety(false)`
+    // carve-outs are added ONLY on bench-proven-over-budget loops (src/, implementer).
+    //
+    // We resolve `-Doptimize` MANUALLY (mirroring standardOptimizeOption's own
+    // `-Doptimize` branch) rather than via `standardOptimizeOption(.{})` so that
+    // (1) a bare `zig build` defaults to the shipped-safe mode, while
+    // (2) `-Doptimize=<mode>` stays a valid flag: the differential C-ABI bench needs
+    //     `-Doptimize=ReleaseFast` for the ReleaseSafe-vs-ReleaseFast measurement, and
+    //     the gate pins `-Doptimize=ReleaseSafe` to certify exactly the shipped mode.
+    // (standardOptimizeOption's `preferred_optimize_mode` would instead REMOVE
+    //  `-Doptimize` in favor of `--release`, breaking those callers — verified against
+    //  the installed 0.16.0 std.)
+    const optimize = b.option(
+        std.builtin.OptimizeMode,
+        "optimize",
+        "Prioritize performance, safety, or binary size",
+    ) orelse .ReleaseSafe;
 
     // Implementation module (implementer-owned, src/).
     // Links libc: the core opens/stats files and mmaps their head via the
