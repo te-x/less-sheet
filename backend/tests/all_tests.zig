@@ -5340,6 +5340,122 @@ test "gz_tail_eof: behind-frontier REPLAY tail past a durable 32 MiB checkpoint 
 }
 
 // ===========================================================================
+// gz_net_tail — NETWORK-path regression for the gz Source tail materialization
+// (frozen; planner-owned). Pins the ROUND-2 fix in src/source.zig (commit
+// 26abe2e): the byteAtLane forward-lane guards. A budget-stalled forward lane
+// must NOT leave a stale, CLOBBERED op buffer that a later fwd_buffered read
+// (the round-1 fast path) then trusts.
+//
+// The two gz_tail_eof tests above are LOCAL: mapping.len IS the physical end, so
+// the only forward stop is clean EOF and these guards are no-ops. This is the
+// NETWORK twin — a sequential-fill .csv.gz over the AC13 `withhold` gate whose
+// COMPRESSED high-water is pinned BEHIND the true end, so the forward inflater
+// hits a resumable *budget* stop MID-STREAM (input.end < physicalLen). That is
+// the only path where a partial-then-stalled discardTo scratches lane_buf while
+// leaving op_start/op_len pointing at the now-corrupt bytes.
+//
+// The withhold boundary is a gzip MEMBER edge (a two-member fixture) on purpose:
+// the inflater finishes member 1 and nextMember finds member 2 withheld, i.e. a
+// clean, byte-aligned budget stop with NO split DEFLATE symbol. (Truncating
+// mid-symbol instead overflows std.compress.flate's peekBitsEnding — a distinct
+// decoder concern, not what this test is about.)
+//
+// Choreography (public C ABI + the gz/net TEST seams only):
+//   1. Open a sequential-fill network .csv.gz, releasing ONLY member 1 (member 2
+//      withheld for the job's whole life). member 1 == rows [0, cut), past the
+//      4 MiB head; the whole fixture is under the 32 MiB checkpoint interval
+//      (isolates the op-buffer clobber — no replay-from-checkpoint).
+//   2. Jump to a mid-member-1 row R_J past the head: indexes [0, R_J] AND leaves
+//      the forward session's resident op buffer covering the frontier
+//      (op_len > 0, op_end ~ byte(R_J)).
+//   3. Drive a FORWARD-lane seek PAST the frontier toward EOF (gzTouchReplayLane).
+//      scanCursorAt picks the forward lane (target > forward_logical); byteAtLane's
+//      discardTo inflates the rest of member 1 INTO lane_buf (clobbering the
+//      resident op buffer) then budget-STALLS at the member boundary (member 2
+//      withheld). forward.logical is now cut (past op_end).
+//        - FIXED: the guard drops the clobbered buffer (op_len = 0), so a later
+//          read inside [op_start, op_end) reroutes to a REPLAY lane -> correct.
+//        - REVERTED: op_len stays > 0 (stale) with lane_buf holding member-1 tail
+//          bytes; the widened fwd_buffered path routes the read onto lane 0 and
+//          serves those clobbered bytes -> wrong / blank cell.
+//   4. DIFFERENTIAL: read the top band of the indexed region (the rows over
+//      [op_start, op_end)) and assert every cell byte-equal to the plain oracle.
+//
+// RED when the byteAtLane guards are reverted; GREEN with the committed fix.
+// FIX SCOPE: src/source.zig only. Do NOT relax these assertions.
+// ===========================================================================
+
+test "gz_net_tail: a budget-stalled forward lane never serves a clobbered op buffer to a behind-frontier read (network)" {
+    const gpa = std.testing.allocator;
+    // ~12.6 MiB inflated (700k x 18-byte DISTINCT rows); distinct rows catch a
+    // WRONG byte, not just a blank one.
+    const plain = try genFixedRows(gpa, 700_000);
+    defer gpa.free(plain);
+
+    // TWO-member .csv.gz: member 1 = rows [0, cut) (byte 9 MiB), member 2 = the
+    // rest. c1 (member-1 compressed size) is the withhold boundary.
+    const cut: usize = 500_000 * 18; // member-1 payload end, byte 9 MiB
+    const m1 = try gzMember(gpa, plain[0..cut], .{});
+    defer gpa.free(m1);
+    const m2 = try gzMember(gpa, plain[cut..], .{});
+    defer gpa.free(m2);
+    var gbuf: std.ArrayList(u8) = .empty;
+    defer gbuf.deinit(gpa);
+    try gbuf.appendSlice(gpa, m1);
+    try gbuf.appendSlice(gpa, m2);
+    const g = gbuf.items;
+    const c1: u64 = m1.len; // release member 1 only; withhold member 2
+
+    // Plain oracle (all rows indexed).
+    var pod = try openWith(plain, .{ .separator = ',', .index_mode = api.index_manual });
+    defer pod.deinit();
+    try scanToEnd(pod.doc);
+
+    // (1) Sequential-fill network .csv.gz; withhold member 2.
+    var gate: std.atomic.Value(u64) = .init(c1);
+    var fx: api.NetFixture = .{ .body = g, .honor_ranges = false, .advertise_length = true, .withhold = &gate };
+    const doc = try openFakeToDone(&fx);
+    defer api.ls_close(doc);
+
+    // (2) Jump to a mid-member-1 row past the 4 MiB head: indexes [0, R_J] and
+    // leaves a resident forward op buffer covering the frontier.
+    const R_J: u64 = 400_000; // byte 7.2 MiB: past the head, inside member 1
+    api.ls_jump_start(doc, R_J);
+    const js = try waitJumpDone(doc);
+    try std.testing.expectEqual(R_J, js.landed_row);
+
+    // (3) Forward-lane seek PAST the frontier -> discardTo clobbers the resident
+    // op buffer with member-1 tail bytes, then budget-stalls CLEANLY at the
+    // member boundary. The target (> cut) forces the stall (a discardTo that
+    // REACHED its target would reset the op buffer instead of leaving it stale).
+    api.gzTouchReplayLane(doc, @as(u64, plain.len));
+
+    // (4) DIFFERENTIAL tail read over the frontier band [R_J - band, R_J]: every
+    // cell must equal the plain oracle. RED (reverted): the rows landing in the
+    // clobbered [op_start, op_end) read member-1 tail bytes from far ahead.
+    const band: u64 = 4 * @as(u64, api.window_max_rows); // ~295 KiB >= one op buffer (256 KiB)
+    const start_row: u64 = R_J - band;
+    var base_row: u64 = start_row;
+    while (base_row <= R_J) : (base_row += api.window_max_rows) {
+        const count: u32 = @intCast(@min(@as(u64, api.window_max_rows), R_J - base_row + 1));
+        const gr = api.ls_window_set(doc, base_row, count);
+        _ = api.ls_window_set(pod.doc, base_row, count);
+        try std.testing.expect(gr.row_count > 0);
+        var r: u64 = base_row;
+        while (r < base_row + gr.row_count) : (r += 1) {
+            const gc0 = api.ls_cell(doc, r, 0).slice();
+            const pc0 = api.ls_cell(pod.doc, r, 0).slice();
+            const gc1 = api.ls_cell(doc, r, 1).slice();
+            const pc1 = api.ls_cell(pod.doc, r, 1).slice();
+            errdefer std.debug.print("\n[gz-net-tail] divergence at row {d}: gz=('{s}','{s}') plain=('{s}','{s}') [R_J={d} c1={d} g.len={d}]\n", .{ r, gc0, gc1, pc0, pc1, R_J, c1, g.len });
+            try std.testing.expect(pc0.len > 0); // oracle never blank here
+            try std.testing.expectEqualStrings(pc0, gc0); // RED: clobbered / blank
+            try std.testing.expectEqualStrings(pc1, gc1);
+        }
+    }
+}
+
+// ===========================================================================
 // window-budget slice (ARCH-window-budget). Frozen; planner-owned. Bounds the
 // SYNCHRONOUS work of ls_window_set to a fixed 8 MiB (8,388,608-byte) aggregate
 // charged-work ceiling and repairs the filtered ls_search_nav lane (backlog #6),
