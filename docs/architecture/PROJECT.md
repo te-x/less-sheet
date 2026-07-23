@@ -30,6 +30,12 @@ in seconds and choke on large files; for less-sheet, **time-to-first-rows is the
   (Arrow/DuckDB-class readers are excluded by the budget).
 - **Build & gate**: `zig build` / `zig build test` (core), `swift build` / `swift test` (macOS).
   Per-component `.aidev/gate.sh`, chained by the workspace root gate.
+- **Shipped core = `ReleaseSafe`** (runtime safety checks ON — since it ingests untrusted local and
+  network input, a parser/decompressor bug must fault cleanly, never become UB). `@setRuntimeSafety(false)`
+  carve-outs are allowed **only** on loops the differential C-ABI scan bench proves miss budget, each
+  enumerated in one named list and re-measured. The gate must build **and** test the exact shipped mode
+  (`ReleaseSafe`) — never gate a Debug/`ReleaseFast` core while shipping another. (Security-hardening
+  program, `docs/architecture/ARCH-security-hardening.md`, signed 2026-07-23.)
 
 ## Hard constraints
 - **Cold start < 500 ms** on Apple Silicon: app launch → first rows of the target file visible.
