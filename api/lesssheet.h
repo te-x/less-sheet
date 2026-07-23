@@ -23,10 +23,17 @@
  * ls_search_request and the row accessors, jumps, and searches then operate
  * in FILTERED coordinates (row i = the i-th matching data row), with each
  * match's original row number retrievable — see FILTERED VIEWS. select-copy
- * adds ls_cell_copy: a bounded, window-INDEPENDENT LOSSLESS read of a single
+ * adds ls_cell_copy: a bounded, window-INDEPENDENT full read of a single
  * cell's COMPLETE transcoded content into a caller-owned buffer (up to a
  * caller-provided byte cap), so a frontend can faithfully copy cells whose
- * content runs past the ls_cell display cap — see FULL-CELL READ. The
+ * content runs past the ls_cell display cap — see FULL-CELL READ.
+ * security-hardening adds one output-only behavior: ALL clipboard-bound copy —
+ * ls_cell_copy AND the streaming copy job (ls_copy_open / ls_copy_next /
+ * ls_copy_close) — NEUTRALIZES spreadsheet formula-injection (a cell whose first
+ * byte is '=', '+', '-', or '@' is emitted with a single leading apostrophe) so
+ * a copied cell can never become a live formula when pasted into Excel / Sheets
+ * / Numbers. Display (ls_cell) and search are byte-for-byte unaffected — see
+ * COPY OUTPUT SAFETY. The
  * walking-skeleton head-window surface is superseded.
  *
  * csv-hardening adds two things to the delimited-text path without changing
@@ -384,10 +391,40 @@
  *     whether a served cell was cut. This cap is DISPLAY-ONLY: it never alters
  *     the source file, and SEARCH scans the full cell, not the capped bytes
  *     (see SEARCH and ls_search_request). Normal cells (<= the cap) are served
- *     whole with the flag false. For a LOSSLESS read of a cell's COMPLETE
+ *     whole with the flag false. For a read of a cell's COMPLETE
  *     transcoded content PAST this display cap (e.g. clipboard copy), use
  *     ls_cell_copy, which fills a caller buffer up to a caller-provided byte
- *     cap — see FULL-CELL READ.
+ *     cap (and neutralizes copy-injection — see COPY OUTPUT SAFETY and
+ *     FULL-CELL READ).
+ *
+ * COPY OUTPUT SAFETY (spreadsheet formula-injection neutralization; security-
+ * hardening slice — always on, no opt-out)
+ *   - MOTIVE. A cell like =cmd|'/C calc'!A0 or +2+3 is inert TEXT in this viewer
+ *     (there is no formula engine), but pasting it into Excel / Google Sheets /
+ *     Numbers can execute it. The core therefore neutralizes such values in the
+ *     bytes it emits for CLIPBOARD COPY, so no frontend has to (single source of
+ *     truth; both current frontends and every future one inherit it for free).
+ *   - THE RULE. When the value the core would emit for a copied cell has a first
+ *     byte of '=' (0x3D), '+' (0x2B), '-' (0x2D), or '@' (0x40), a single
+ *     APOSTROPHE ' (0x27) is prepended to that value. Any other first byte —
+ *     including an apostrophe already present — is emitted unchanged, and an
+ *     EMPTY cell (no first byte) is never prefixed. The transform keys ONLY on
+ *     the first byte, so it is applied AT MOST ONCE per cell and re-copying an
+ *     already-neutralized value never adds a second apostrophe (idempotent).
+ *   - WHERE IT APPLIES. Exactly the two clipboard-bound read paths: ls_cell_copy
+ *     (the full-cell read) and ls_copy_next (each field of the streaming TSV).
+ *     It is applied to the cell's transcoded value (after quote removal, the
+ *     column-count truncate/pad rule, and encoding transcode) BEFORE the
+ *     streaming copy's TSV framing, so it is ORTHOGONAL to spreadsheet quoting:
+ *     a quoted field carries the apostrophe on its value inside the quotes, and
+ *     the single-cell raw 1x1 copy still neutralizes (=SUM(A1) copies as
+ *     '=SUM(A1)). The apostrophe is one output byte and counts against
+ *     ls_cell_copy's buf_len / *out_len and ls_copy_next's `written`.
+ *   - WHERE IT DOES NOT APPLY. ls_cell / ls_header_cell (on-screen display) and
+ *     the search / predicate / filter / ls_window_match_flags matchers all see
+ *     the RAW cell text, unchanged — the grid shows and search matches the true
+ *     content; only the clipboard-bound bytes are neutralized. The source file
+ *     is never modified (read-only core).
  *
  * DELIMITED-TEXT DIALECT (parameterized; RFC-4180 generalized)
  *   - Effective separator: one byte. Effective quote: one byte, or NONE
@@ -663,7 +700,9 @@ typedef struct ls_row_range {
  * frontier (monotone non-decreasing over the document's lifetime, including
  * across cancelled jobs); bytes_total is the file size. complete is true
  * iff every record is indexed (bytes_scanned == bytes_total) — from then on
- * ls_row_count_get reports exact. Empty file: {0, 0, true}.
+ * ls_row_count_get reports exact. Empty file: {0, 0, true, false}.
+ * expansion_capped (below) is normally false; see it for the decompression-
+ * bomb cap trip (security-hardening (d)).
  *
  * NETWORK (never-full-download-streaming slice — see NEVER-FULL-DOWNLOAD
  * STREAMING EXTENSION at the end of this header): for a network-sourced
@@ -680,6 +719,19 @@ typedef struct ls_scan_progress {
     uint64_t bytes_scanned;
     uint64_t bytes_total;
     bool complete;
+    /* Abnormal-expansion CAP (security-hardening (d), a decompression-"bomb"
+     * guard): true iff background/decode work STOPPED because a compressed
+     * source (today only .csv.gz — local or network) sustained an abnormal
+     * decompressed-to-compressed expansion ratio. When true the scan is
+     * TERMINAL exactly like a salvaged prefix — already-decoded rows stay fully
+     * servable, `complete` is true, and the row count is exact over that prefix
+     * — but the terminus is the CAP, not a natural/clean stream end, so a
+     * frontend surfaces a non-blocking "stream expands abnormally" banner while
+     * the document stays interactive. false for every normal document (a clean
+     * or damaged EOF, or a still-advancing frontier) and for every non-gzip
+     * source. Format-agnostic: any future format whose decode expands
+     * abnormally reports it here. */
+    bool expansion_capped;
 } ls_scan_progress;
 
 /* State of the document's (single) jump slot. */
@@ -999,7 +1051,8 @@ uint32_t ls_column_count(const ls_doc *doc);
  * VIEWS. */
 ls_row_count ls_row_count_get(const ls_doc *doc);
 
-/* Current index/scan progress (see ls_scan_progress). */
+/* Current index/scan progress (see ls_scan_progress, including the
+ * expansion_capped abnormal-expansion trip). */
 ls_scan_progress ls_index_poll(const ls_doc *doc);
 
 /* ------------------------------------------------------------------------- */
@@ -1115,10 +1168,18 @@ bool ls_row_oversized(const ls_doc *doc, uint64_t row);
  * Copy the COMPLETE content of the data cell at (row, col) — the same cell
  * ls_cell addresses (quoting removed, the column-count truncate/pad rule
  * applied, transcoded to UTF-8 per the resolved encoding) — into the caller's
- * buffer, WITHOUT the LS_CELL_MAX_BYTES display cap. This is the LOSSLESS
- * full-cell read the display-capped ls_cell cannot provide (a cell longer than
- * the display cap is searchable but not readable through ls_cell); a frontend
- * uses it to copy a selection to the clipboard faithfully.
+ * buffer, WITHOUT the LS_CELL_MAX_BYTES display cap. This is the full-cell read
+ * the display-capped ls_cell cannot provide (a cell longer than the display cap
+ * is searchable but not readable through ls_cell); a frontend uses it to copy a
+ * cell to the clipboard faithfully.
+ *
+ * FORMULA-INJECTION NEUTRALIZATION (security-hardening (f), always on): because
+ * this is a CLIPBOARD-bound read, a value whose first byte is '=', '+', '-', or
+ * '@' is emitted with a single leading apostrophe (0x27) — see COPY OUTPUT
+ * SAFETY for the exact, idempotent rule. The apostrophe is part of the copied
+ * value: it counts toward *out_len and the buf_len cap, and it is the only way
+ * the output differs from the cell's raw transcoded bytes. (It keys on the
+ * first byte only, so it is applied at most once and never to an empty cell.)
  *
  *   row, col — addressed exactly as ls_cell: 0-based, 64-bit, view-relative
  *              (a FILTERED index while a filter is active — see FILTERED VIEWS;
@@ -1383,6 +1444,17 @@ uint64_t ls_source_row(const ls_doc *doc, uint64_t row);
  * Only ls_search_request changed shape; every other symbol's layout is
  * unchanged. See ls_search_request and
  * docs/architecture/ARCH-search-case-mode.md.
+ *
+ * FROZEN-SURFACE AMENDMENT — security-hardening (v1; pre-launch MUST items d/e/
+ * f). A second audited, lock-step frozen-surface edit (root-planner freeze; see
+ * docs/architecture/ARCH-security-hardening.md). It (d) GROWS ls_scan_progress
+ * by one trailing `bool expansion_capped` (the decompression-bomb cap trip);
+ * (e) adds two trailing ls_net_status cases, LS_NET_ERROR_INSECURE_REDIRECT (8)
+ * and LS_NET_ERROR_SHORT_BODY (9); and (f) documents an always-on copy-output
+ * change (COPY OUTPUT SAFETY: ls_cell_copy / ls_copy_next neutralize a leading
+ * = + - @ with a ' prefix) with NO signature or struct change. Every other
+ * symbol's layout is byte-identical; sound for the same reason — one header,
+ * lock-step static-linked rebuild, no external pinned-binary consumer.
  *
  * WHAT IT DOES NOT CHANGE. The document / window / index / jump / row-count /
  * search / filter / raw-cell / full-cell-copy surface above is untouched. This
@@ -1939,7 +2011,11 @@ ls_column_result ls_column_conflict_example_copy(const ls_doc *doc, uint32_t col
  * http/https is accepted (ftp://, file://, … reject synchronously as
  * LS_NET_ERROR_INVALID_ARGUMENT, untouched). Redirects are followed up to a
  * small fixed cap (no user-facing configuration; exceeding it is
- * LS_NET_ERROR_TOO_MANY_REDIRECTS).
+ * LS_NET_ERROR_TOO_MANY_REDIRECTS). A redirect that would DOWNGRADE the
+ * transport from https to http is REFUSED with LS_NET_ERROR_INSECURE_REDIRECT
+ * (security-hardening (e)); http->https and same-scheme redirects, including
+ * cross-host, are still followed within the cap. TLS verification (system
+ * roots + hostname) stays on.
  *
  * NO COLD-START BUDGET. The <500 ms cold-start budget and its
  * first_rows_visible_ms marker explicitly DO NOT apply to a network open; the
@@ -1979,7 +2055,11 @@ typedef enum ls_net_status {
     /* DNS resolution or TCP/TLS connection failure — the host could not be
      * reached (a TLS handshake failure is a connection failure). */
     LS_NET_ERROR_UNREACHABLE = 2,
-    /* No forward progress within the implementation's connect/read timeout. */
+    /* No forward progress within the implementation's timeout — the CONNECT
+     * timeout (no connection established) or the IDLE-READ timeout (connected,
+     * but no bytes within the idle window; a slow-but-progressing large fetch
+     * does NOT trip it). Retryable: re-open / re-issue the demand. (security-
+     * hardening (e) hardens both timeouts; this code is unchanged.) */
     LS_NET_ERROR_TIMEOUT = 3,
     /* The server returned a non-2xx status after following redirects. The
      * numeric status is carried in ls_net_open_status.http_status (e.g. 404,
@@ -1993,6 +2073,25 @@ typedef enum ls_net_status {
     LS_NET_ERROR_IO = 6,
     /* The job was cancelled (ls_net_open_cancel) before reaching DONE. */
     LS_NET_ERROR_CANCELLED = 7,
+    /* A redirect's Location would DOWNGRADE the transport from https to http
+     * (security-hardening (e)): it is REFUSED with this distinct code.
+     * http->https and same-scheme redirects (including cross-host) are still
+     * followed within the redirect cap; a pure http->http chain that merely
+     * exceeds the cap remains LS_NET_ERROR_TOO_MANY_REDIRECTS, not this. */
+    LS_NET_ERROR_INSECURE_REDIRECT = 8,
+    /* The server delivered FEWER body bytes than it promised, or a zero-length
+     * body where content was expected (a truncated / malformed transfer).
+     * Distinct from TIMEOUT (bytes did arrive, just too few) and from IO (that
+     * is LOCAL spool failure). Retryable. security-hardening (e) correctness
+     * guarantee: a short/zero body NEVER becomes document content — the
+     * un-fetched bytes are not marked present and are never served as zero-fill
+     * (this corrects the prior silent zero-fill). A POST-OPEN demand (jump /
+     * search / scroll) that hit a short range simply did not advance over it and
+     * is retried by re-issuing the demand; the document stays open and
+     * interactive on its fetched prefix. (This code is reported by the open job
+     * when the failing fetch is the head fetch; a post-open short range surfaces
+     * as a stalled/unadvanced demand, not as a new document-level error state.) */
+    LS_NET_ERROR_SHORT_BODY = 9,
 } ls_net_status;
 
 /* State of an ls_open_url_* job (ls_net_open_status.state). */
@@ -2309,9 +2408,11 @@ ls_str ls_window_match_flags(const ls_doc *doc, uint32_t first_col, uint32_t col
  * off-main; and every frontend re-implements the fiddly quoting. This job family
  * hands the frontend a core-framed TSV byte stream over a demand-served
  * rectangle — the core owns the framing (byte-identical to the deleted
- * TSVCopyBuilder), the sweep reuses the O(1) forward copy cursor already behind
- * ls_cell_copy, and every future frontend reuses the one implementation with no
- * per-cell round-trip and no main-thread stall.
+ * TSVCopyBuilder EXCEPT for the always-on formula-injection neutralization added
+ * by security-hardening (f) — see COPY OUTPUT SAFETY and ls_copy_next), the
+ * sweep reuses the O(1) forward copy cursor already behind ls_cell_copy, and
+ * every future frontend reuses the one implementation with no per-cell
+ * round-trip and no main-thread stall.
  */
 
 /*
@@ -2412,8 +2513,9 @@ ls_copy_job *ls_copy_open(const ls_doc *doc, const ls_copy_rect *rect);
  * it (this is NOT a borrow — the bytes have no tie to the ls_str eviction rule
  * and survive any later ls_window_set on any thread).
  *
- * THE FRAMING (core-owned; BYTE-IDENTICAL to the deleted TSVCopyBuilder, pinned
- * by the existing copy fixtures):
+ * THE FRAMING (core-owned; byte-identical to the deleted TSVCopyBuilder EXCEPT
+ * for the (f) formula-injection neutralization below, pinned by the copy
+ * fixtures):
  *   - Fields in a row are separated by a TAB (0x09); rows are separated by a LF
  *     (0x0A); there is NO trailing separator after the final row.
  *   - SPREADSHEET QUOTING: a cell whose content contains a TAB, CR (0x0D), LF,
@@ -2421,12 +2523,20 @@ ls_copy_job *ls_copy_open(const ls_doc *doc, const ls_copy_rect *rect);
  *     double-quote DOUBLED; any other cell is emitted raw.
  *   - SINGLE-CELL RAW: a 1x1 rect (row_count == 1 AND col_count == 1) emits the
  *     cell's raw content verbatim — NEVER quoted, no trailing LF.
- *   - Cells are read LOSSLESSLY: the COMPLETE transcoded cell content, WITHOUT
+ *   - Cells are read in full: the COMPLETE transcoded cell content, WITHOUT
  *     the LS_CELL_MAX_BYTES display cap ls_cell applies (exactly as ls_cell_copy
  *     reads it), with the column-count truncate/pad rule (a missing cell of a
  *     ragged record is the empty string). An OVERSIZED row (source extent past
  *     LS_WINDOW_ROW_SCAN_MAX_BYTES) is served as the same bounded prefix
  *     ls_cell_copy serves.
+ *   - FORMULA-INJECTION NEUTRALIZATION (security-hardening (f), always on): each
+ *     field's value is neutralized exactly as ls_cell_copy neutralizes it — a
+ *     leading '=', '+', '-', or '@' gets a single apostrophe (0x27) prefix (see
+ *     COPY OUTPUT SAFETY). It is applied to the VALUE and is ORTHOGONAL to the
+ *     spreadsheet quoting above (the apostrophe is inside the quotes when the
+ *     value is quoted), and the single-cell raw 1x1 case still neutralizes. The
+ *     prefix counts toward `written`; it is the ONLY difference from the
+ *     byte-identical-to-TSVCopyBuilder framing.
  *
  * PROGRESS & STEP (see ls_copy_progress):
  *   - LS_COPY_STEP_MORE: `written` bytes were framed; more chunks remain — call

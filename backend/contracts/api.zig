@@ -179,11 +179,18 @@ pub const RowRange = extern struct {
 };
 
 /// Mirrors `ls_scan_progress`: monotone bytes_scanned, file-size bytes_total,
-/// complete iff every record is indexed.
+/// complete iff every record is indexed. `expansion_capped` (security-hardening
+/// (d)) is true iff decode/scan work STOPPED on a sustained abnormal
+/// decompression-expansion ratio (a .csv.gz "bomb" guard, local or network):
+/// the scan is then terminal like a salvaged prefix (decoded rows servable,
+/// complete true, count exact over the prefix) but the terminus is the CAP, not
+/// a clean/natural EOF, so a frontend shows a non-blocking "expands abnormally"
+/// banner. false for every normal / non-gzip document. See api/lesssheet.h.
 pub const ScanProgress = extern struct {
     bytes_scanned: u64,
     bytes_total: u64,
     complete: bool,
+    expansion_capped: bool,
 };
 
 /// Mirrors `ls_jump_state`.
@@ -305,7 +312,9 @@ pub const FilterStatus = extern struct {
 };
 
 /// Mirrors `ls_copy_result`: the result of `ls_cell_copy` (the bounded full-cell
-/// read — see api/lesssheet.h FULL-CELL READ). Distinct, stable values.
+/// read — see api/lesssheet.h FULL-CELL READ). Distinct, stable values. Copy
+/// output is formula-injection NEUTRALIZED (a leading =, +, -, or @ gets a single
+/// ' prefix; security-hardening (f)) — see api/lesssheet.h COPY OUTPUT SAFETY.
 ///   ok      — the cell was read (out_len bytes written, out_truncated valid).
 ///   pending — `row` is at/beyond the scan frontier and not yet servable;
 ///             advance the frontier (ls_jump_start) and retry. Never scans.
@@ -1131,6 +1140,16 @@ pub const NetStatus = enum(c_int) {
     too_many_redirects = 5,
     io = 6,
     cancelled = 7,
+    /// security-hardening (e): a redirect Location would downgrade https->http
+    /// (refused; http->https and same-scheme incl. cross-host still followed
+    /// within the cap). Mirrors LS_NET_ERROR_INSECURE_REDIRECT.
+    insecure_redirect = 8,
+    /// security-hardening (e): the server sent fewer body bytes than promised,
+    /// or a zero-length body where content was expected (retryable). The
+    /// un-fetched bytes are NEVER marked present or served as zero-fill document
+    /// content — corrects the prior silent zero-fill. Mirrors
+    /// LS_NET_ERROR_SHORT_BODY.
+    short_body = 9,
 };
 
 /// Mirrors `ls_net_open_state`: the async open-job state.
@@ -1467,8 +1486,10 @@ pub const ls_copy_open = core.ls_copy_open;
 
 /// C ABI -- frame the next TSV chunk into the caller's buffer (cut at a field/row
 /// boundary, never a split code point; COPIES, no borrow) and return progress.
-/// Framing is byte-identical to the deleted TSVCopyBuilder; STALLED when the next
-/// row is at/beyond the frontier. See api/lesssheet.h.
+/// Framing is byte-identical to the deleted TSVCopyBuilder EXCEPT for the
+/// always-on formula-injection neutralization (leading = + - @ -> ' prefix;
+/// security-hardening (f)); STALLED when the next row is at/beyond the frontier.
+/// See api/lesssheet.h COPY OUTPUT SAFETY.
 pub const ls_copy_next = core.ls_copy_next;
 
 /// C ABI -- release the job (exactly once). Cancel = stop calling next + close;
