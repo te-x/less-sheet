@@ -116,7 +116,6 @@ pub const Gzip = struct {
     lane_busy: [3]bool = @splat(false),
     lane_physical_budget: [3]?u64 = @splat(null),
     forward_logical: std.atomic.Value(u64) = .init(0),
-    forward_resume: std.atomic.Value(u64) = .init(0),
     forward_physical: std.atomic.Value(u64) = .init(0),
     terminal_end: std.atomic.Value(u64) = .init(std.math.maxInt(u64)),
     terminal_kind: std.atomic.Value(u8) = .init(0), // 0 unknown, 1 clean, 2 damaged
@@ -520,7 +519,22 @@ pub const Gzip = struct {
         const replay = lane != 0;
         const s = if (lane == 0) self.forward else if (lane == 1) self.replay else self.replay2;
         if (!replay) {
-            if (!self.discardTo(s, internal, false, lane)) return null;
+            // The final `return lane_buf[lane][0]` is only correct when the
+            // forward session lands EXACTLY on `internal`. Two ways it can't,
+            // both routed to a replay session by returning null (the caller's
+            // next cursorAt sees no forward coverage and picks lane 1/2):
+            //  * over-produced PAST `internal` (and not in the op buffer — the
+            //    fast path above already handled that): it cannot rewind.
+            //  * a budget/EOF stop SHORT of `internal`: discardTo scratches
+            //    lane_buf[lane] as it advances, so a partial-then-stalled skip
+            //    leaves the resident op buffer CLOBBERED and stale — drop it
+            //    (op_len = 0) so no later fwd_buffered read trusts corrupt bytes
+            //    (the network gzip tail hazard).
+            if (s.logical > internal) return null;
+            if (!self.discardTo(s, internal, false, lane)) {
+                self.op_len[lane] = 0;
+                return null;
+            }
         } else {
             var nearest: u64 = 0;
             self.lock();
@@ -622,10 +636,6 @@ pub const Cursor = struct {
             .http_range => {}, // random-access: no lane lease to release
             .gzip => |g| {
                 g.lock();
-                const internal = self.logical +| g.bom_len;
-                const frontier = g.forward_logical.load(.acquire);
-                if (self.lane == 0 or (internal <= frontier and frontier - internal <= chunk_bytes))
-                    g.forward_resume.store(internal, .release);
                 g.lane_busy[self.lane] = false;
                 g.lane_physical_budget[self.lane] = null;
                 if (self.physical_limit != null) {
@@ -974,12 +984,37 @@ pub fn cursorAt(source: Source, logical: u64, logical_limit: ?u64, physical_budg
             const internal = logical +| g.bom_len;
             while (true) {
                 const forward_logical = g.forward_logical.load(.acquire);
-                const forward_resume = g.forward_resume.load(.acquire);
-                if ((internal >= forward_logical or internal == forward_resume) and !g.lane_busy[0]) {
-                    cur.lane = 0;
-                    break;
-                }
-                if (internal < forward_logical and internal != forward_resume) {
+                if (!g.lane_busy[0]) {
+                    // Lane 0 idle ⇒ the forward session's op buffer is stable
+                    // (only a lane-0 op mutates op_start[0]/op_len[0]). The
+                    // forward lane can serve `internal` iff it can still inflate
+                    // FORWARD to it (internal >= its logical position) OR its
+                    // resident op buffer already covers it — the latter reuses
+                    // the just-produced chunk for a read just behind the
+                    // advancing frontier without a replay. Once the forward
+                    // session over-produces PAST `internal` and no longer
+                    // buffers it (notably when it parks at clean EOF, where the
+                    // buffer becomes empty at the logical end), it can neither
+                    // rewind nor produce it, so that read MUST replay — routing
+                    // it to lane 0 there yields a 0-byte produce and blanks the
+                    // record (the gz tail dead zone).
+                    const fwd_buffered = g.op_len[0] > 0 and
+                        internal >= g.op_start[0] and internal < g.op_start[0] + g.op_len[0];
+                    if (internal >= forward_logical or fwd_buffered) {
+                        cur.lane = 0;
+                        break;
+                    }
+                    if (!g.lane_busy[1]) {
+                        cur.lane = 1;
+                        break;
+                    }
+                    if (!g.lane_busy[2]) {
+                        cur.lane = 2;
+                        break;
+                    }
+                } else if (internal < forward_logical) {
+                    // Forward lane busy AND `internal` is behind the frontier ⇒
+                    // serve it from an independent replay session.
                     if (!g.lane_busy[1]) {
                         cur.lane = 1;
                         break;
