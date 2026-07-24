@@ -29,8 +29,9 @@
  * content runs past the ls_cell display cap — see FULL-CELL READ.
  * security-hardening adds one output-only behavior: ALL clipboard-bound copy —
  * ls_cell_copy AND the streaming copy job (ls_copy_open / ls_copy_next /
- * ls_copy_close) — NEUTRALIZES spreadsheet formula-injection (a cell whose first
- * byte is '=', '+', '-', or '@' is emitted with a single leading apostrophe) so
+ * ls_copy_close) — NEUTRALIZES spreadsheet formula-injection: a cell whose first
+ * byte is '=' or '@' ALWAYS, and a '+'/'-' cell UNLESS it is a plain number
+ * (e.g. -3, +2.5 copy raw), is emitted with a single leading apostrophe, so
  * a copied cell can never become a live formula when pasted into Excel / Sheets
  * / Numbers. Display (ls_cell) and search are byte-for-byte unaffected — see
  * COPY OUTPUT SAFETY. The
@@ -404,13 +405,33 @@
  *     Numbers can execute it. The core therefore neutralizes such values in the
  *     bytes it emits for CLIPBOARD COPY, so no frontend has to (single source of
  *     truth; both current frontends and every future one inherit it for free).
- *   - THE RULE. When the value the core would emit for a copied cell has a first
- *     byte of '=' (0x3D), '+' (0x2B), '-' (0x2D), or '@' (0x40), a single
- *     APOSTROPHE ' (0x27) is prepended to that value. Any other first byte —
- *     including an apostrophe already present — is emitted unchanged, and an
- *     EMPTY cell (no first byte) is never prefixed. The transform keys ONLY on
- *     the first byte, so it is applied AT MOST ONCE per cell and re-copying an
- *     already-neutralized value never adds a second apostrophe (idempotent).
+ *   - THE RULE (number-aware). Keyed on the value's FIRST byte:
+ *       * '=' (0x3D) or '@' (0x40): a single APOSTROPHE ' (0x27) is ALWAYS
+ *         prepended to the value.
+ *       * '+' (0x2B) or '-' (0x2D): the apostrophe is prepended ONLY when the
+ *         value is NOT a plain number (grammar below). A plain number (e.g. -3,
+ *         +2.5, -1.5e3) is emitted RAW — it is inert text, not an injection
+ *         vector, and the raw form is what a spreadsheet should receive.
+ *     Any other first byte — including an apostrophe already present — is
+ *     emitted unchanged, and an EMPTY cell (no first byte) is never prefixed.
+ *     The transform keys only on the first byte (and, for '+'/'-', on whether
+ *     the whole value is a plain number), so it is applied AT MOST ONCE per cell
+ *     and re-copying an already-neutralized value never adds a second apostrophe
+ *     (idempotent).
+ *   - PLAIN NUMBER (the testable grammar). A '+'/'-'-led value is a plain number
+ *     IFF, after consuming that single leading sign, the ENTIRE remaining byte
+ *     sequence matches
+ *         digit+ ( '.' digit+ )? ( ('e'|'E') ('+'|'-')? digit+ )?
+ *     where digit is ASCII 0-9. The match must consume the whole value: NO
+ *     whitespace, NO thousands separators, NO leading or trailing '.', NO second
+ *     sign outside the exponent, NO trailing bytes. Anything that fails is
+ *     neutralized — the fail-safe direction is to OVER-neutralize, never under.
+ *     This is deliberately STRICTER than the HEADER RULE numeric grammar (which
+ *     strips surrounding whitespace and admits a bare leading/trailing '.'):
+ *     reusing that parser here would UNDER-neutralize, so it must not be reused.
+ *       * RAW (emitted unchanged): -3, +2.5, -0.5, +1e9, -2.5E-3.
+ *       * NEUTRALIZED: =SUM(A1), @ref, +cmd, +2+3, -1+x, --3, -.5, -3., "-3 "
+ *         (trailing space), -1,000, -3e, and a bare '+' or '-'.
  *   - WHERE IT APPLIES. Exactly the two clipboard-bound read paths: ls_cell_copy
  *     (the full-cell read) and ls_copy_next (each field of the streaming TSV).
  *     It is applied to the cell's transcoded value (after quote removal, the
@@ -418,8 +439,9 @@
  *     streaming copy's TSV framing, so it is ORTHOGONAL to spreadsheet quoting:
  *     a quoted field carries the apostrophe on its value inside the quotes, and
  *     the single-cell raw 1x1 copy still neutralizes (=SUM(A1) copies as
- *     '=SUM(A1)). The apostrophe is one output byte and counts against
- *     ls_cell_copy's buf_len / *out_len and ls_copy_next's `written`.
+ *     '=SUM(A1), +cmd as '+cmd, while a plain -3 stays -3). The apostrophe, when
+ *     added, is one output byte and counts against ls_cell_copy's buf_len /
+ *     *out_len and ls_copy_next's `written`.
  *   - WHERE IT DOES NOT APPLY. ls_cell / ls_header_cell (on-screen display) and
  *     the search / predicate / filter / ls_window_match_flags matchers all see
  *     the RAW cell text, unchanged — the grid shows and search matches the true
@@ -700,9 +722,7 @@ typedef struct ls_row_range {
  * frontier (monotone non-decreasing over the document's lifetime, including
  * across cancelled jobs); bytes_total is the file size. complete is true
  * iff every record is indexed (bytes_scanned == bytes_total) — from then on
- * ls_row_count_get reports exact. Empty file: {0, 0, true, false}.
- * expansion_capped (below) is normally false; see it for the decompression-
- * bomb cap trip (security-hardening (d)).
+ * ls_row_count_get reports exact. Empty file: {0, 0, true}.
  *
  * NETWORK (never-full-download-streaming slice — see NEVER-FULL-DOWNLOAD
  * STREAMING EXTENSION at the end of this header): for a network-sourced
@@ -719,19 +739,6 @@ typedef struct ls_scan_progress {
     uint64_t bytes_scanned;
     uint64_t bytes_total;
     bool complete;
-    /* Abnormal-expansion CAP (security-hardening (d), a decompression-"bomb"
-     * guard): true iff background/decode work STOPPED because a compressed
-     * source (today only .csv.gz — local or network) sustained an abnormal
-     * decompressed-to-compressed expansion ratio. When true the scan is
-     * TERMINAL exactly like a salvaged prefix — already-decoded rows stay fully
-     * servable, `complete` is true, and the row count is exact over that prefix
-     * — but the terminus is the CAP, not a natural/clean stream end, so a
-     * frontend surfaces a non-blocking "stream expands abnormally" banner while
-     * the document stays interactive. false for every normal document (a clean
-     * or damaged EOF, or a still-advancing frontier) and for every non-gzip
-     * source. Format-agnostic: any future format whose decode expands
-     * abnormally reports it here. */
-    bool expansion_capped;
 } ls_scan_progress;
 
 /* State of the document's (single) jump slot. */
@@ -1051,8 +1058,7 @@ uint32_t ls_column_count(const ls_doc *doc);
  * VIEWS. */
 ls_row_count ls_row_count_get(const ls_doc *doc);
 
-/* Current index/scan progress (see ls_scan_progress, including the
- * expansion_capped abnormal-expansion trip). */
+/* Current index/scan progress (see ls_scan_progress). */
 ls_scan_progress ls_index_poll(const ls_doc *doc);
 
 /* ------------------------------------------------------------------------- */
@@ -1174,12 +1180,13 @@ bool ls_row_oversized(const ls_doc *doc, uint64_t row);
  * cell to the clipboard faithfully.
  *
  * FORMULA-INJECTION NEUTRALIZATION (security-hardening (f), always on): because
- * this is a CLIPBOARD-bound read, a value whose first byte is '=', '+', '-', or
- * '@' is emitted with a single leading apostrophe (0x27) — see COPY OUTPUT
- * SAFETY for the exact, idempotent rule. The apostrophe is part of the copied
- * value: it counts toward *out_len and the buf_len cap, and it is the only way
- * the output differs from the cell's raw transcoded bytes. (It keys on the
- * first byte only, so it is applied at most once and never to an empty cell.)
+ * this is a CLIPBOARD-bound read, a value whose first byte is '=' or '@', or a
+ * '+'/'-' value that is NOT a plain number, is emitted with a single leading
+ * apostrophe (0x27) — see COPY OUTPUT SAFETY for the exact, number-aware,
+ * idempotent rule (a plain number like -3 or +2.5 copies raw). The apostrophe,
+ * when added, is part of the copied value: it counts toward *out_len and the
+ * buf_len cap, and it is the only way the output differs from the cell's raw
+ * transcoded bytes. (Applied at most once, and never to an empty cell.)
  *
  *   row, col — addressed exactly as ls_cell: 0-based, 64-bit, view-relative
  *              (a FILTERED index while a filter is active — see FILTERED VIEWS;
@@ -1446,15 +1453,22 @@ uint64_t ls_source_row(const ls_doc *doc, uint64_t row);
  * docs/architecture/ARCH-search-case-mode.md.
  *
  * FROZEN-SURFACE AMENDMENT — security-hardening (v1; pre-launch MUST items d/e/
- * f). A second audited, lock-step frozen-surface edit (root-planner freeze; see
- * docs/architecture/ARCH-security-hardening.md). It (d) GROWS ls_scan_progress
- * by one trailing `bool expansion_capped` (the decompression-bomb cap trip);
- * (e) adds two trailing ls_net_status cases, LS_NET_ERROR_INSECURE_REDIRECT (8)
- * and LS_NET_ERROR_SHORT_BODY (9); and (f) documents an always-on copy-output
- * change (COPY OUTPUT SAFETY: ls_cell_copy / ls_copy_next neutralize a leading
- * = + - @ with a ' prefix) with NO signature or struct change. Every other
- * symbol's layout is byte-identical; sound for the same reason — one header,
- * lock-step static-linked rebuild, no external pinned-binary consumer.
+ * f), as converged by its 2026-07-24 amendment. An audited, lock-step frozen-
+ * surface edit (root-planner freeze; see docs/architecture/ARCH-security-
+ * hardening.md). As it now stands: (d) is WITHDRAWN — a benchmark disproved the
+ * decompression-"bomb" ratio cap (no signal separates a bomb from a legitimate
+ * highly-compressible CSV), so gzip work-amplification is an accepted known risk
+ * and ls_scan_progress carries NO expansion/bomb field at all (an earlier freeze
+ * had added one; it was RETIRED, not deprecated — no-backcompat v1); (e) adds
+ * two trailing ls_net_status cases, LS_NET_ERROR_INSECURE_REDIRECT (8) and
+ * LS_NET_ERROR_SHORT_BODY (9), and ships the CONNECT timeout only for v1 (the
+ * idle-read timeout is deferred — Zig 0.16 std has no per-read deadline hook);
+ * and (f) documents an always-on, NUMBER-AWARE copy-output change (COPY OUTPUT
+ * SAFETY: ls_cell_copy / ls_copy_next prefix a ' to a leading '=' / '@' always,
+ * and to a leading '+' / '-' unless the cell is a plain number) with NO
+ * signature or struct change beyond (d)'s field removal. Every other symbol's
+ * layout is byte-identical; sound for the same reason — one header, lock-step
+ * static-linked rebuild, no external pinned-binary consumer.
  *
  * WHAT IT DOES NOT CHANGE. The document / window / index / jump / row-count /
  * search / filter / raw-cell / full-cell-copy surface above is untouched. This
@@ -2055,11 +2069,12 @@ typedef enum ls_net_status {
     /* DNS resolution or TCP/TLS connection failure — the host could not be
      * reached (a TLS handshake failure is a connection failure). */
     LS_NET_ERROR_UNREACHABLE = 2,
-    /* No forward progress within the implementation's timeout — the CONNECT
-     * timeout (no connection established) or the IDLE-READ timeout (connected,
-     * but no bytes within the idle window; a slow-but-progressing large fetch
-     * does NOT trip it). Retryable: re-open / re-issue the demand. (security-
-     * hardening (e) hardens both timeouts; this code is unchanged.) */
+    /* The CONNECT timeout fired: no connection was established within the
+     * implementation's connect deadline (a single named const). Retryable:
+     * re-open / re-issue the demand. (security-hardening (e) ships the connect
+     * timeout only for v1; an idle-read deadline is deferred — Zig 0.16
+     * std.http.Client has no per-read timeout hook — so this code signals a
+     * failed CONNECT, never a mid-stream stall. The code number 3 is unchanged.) */
     LS_NET_ERROR_TIMEOUT = 3,
     /* The server returned a non-2xx status after following redirects. The
      * numeric status is carried in ls_net_open_status.http_status (e.g. 404,
@@ -2531,12 +2546,13 @@ ls_copy_job *ls_copy_open(const ls_doc *doc, const ls_copy_rect *rect);
  *     ls_cell_copy serves.
  *   - FORMULA-INJECTION NEUTRALIZATION (security-hardening (f), always on): each
  *     field's value is neutralized exactly as ls_cell_copy neutralizes it — a
- *     leading '=', '+', '-', or '@' gets a single apostrophe (0x27) prefix (see
- *     COPY OUTPUT SAFETY). It is applied to the VALUE and is ORTHOGONAL to the
- *     spreadsheet quoting above (the apostrophe is inside the quotes when the
- *     value is quoted), and the single-cell raw 1x1 case still neutralizes. The
- *     prefix counts toward `written`; it is the ONLY difference from the
- *     byte-identical-to-TSVCopyBuilder framing.
+ *     leading '=' or '@' ALWAYS, and a leading '+' or '-' UNLESS the value is a
+ *     plain number, gets a single apostrophe (0x27) prefix (see COPY OUTPUT
+ *     SAFETY for the number-aware grammar). It is applied to the VALUE and is
+ *     ORTHOGONAL to the spreadsheet quoting above (the apostrophe is inside the
+ *     quotes when the value is quoted), and the single-cell raw 1x1 case still
+ *     neutralizes. When added, the prefix counts toward `written`; it is the
+ *     ONLY difference from the byte-identical-to-TSVCopyBuilder framing.
  *
  * PROGRESS & STEP (see ls_copy_progress):
  *   - LS_COPY_STEP_MORE: `written` bytes were framed; more chunks remain — call

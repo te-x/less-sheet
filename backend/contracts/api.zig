@@ -179,18 +179,11 @@ pub const RowRange = extern struct {
 };
 
 /// Mirrors `ls_scan_progress`: monotone bytes_scanned, file-size bytes_total,
-/// complete iff every record is indexed. `expansion_capped` (security-hardening
-/// (d)) is true iff decode/scan work STOPPED on a sustained abnormal
-/// decompression-expansion ratio (a .csv.gz "bomb" guard, local or network):
-/// the scan is then terminal like a salvaged prefix (decoded rows servable,
-/// complete true, count exact over the prefix) but the terminus is the CAP, not
-/// a clean/natural EOF, so a frontend shows a non-blocking "expands abnormally"
-/// banner. false for every normal / non-gzip document. See api/lesssheet.h.
+/// complete iff every record is indexed. See api/lesssheet.h.
 pub const ScanProgress = extern struct {
     bytes_scanned: u64,
     bytes_total: u64,
     complete: bool,
-    expansion_capped: bool,
 };
 
 /// Mirrors `ls_jump_state`.
@@ -313,8 +306,9 @@ pub const FilterStatus = extern struct {
 
 /// Mirrors `ls_copy_result`: the result of `ls_cell_copy` (the bounded full-cell
 /// read — see api/lesssheet.h FULL-CELL READ). Distinct, stable values. Copy
-/// output is formula-injection NEUTRALIZED (a leading =, +, -, or @ gets a single
-/// ' prefix; security-hardening (f)) — see api/lesssheet.h COPY OUTPUT SAFETY.
+/// output is formula-injection NEUTRALIZED (number-aware: a leading = or @ always
+/// gets a single ' prefix; a leading + or - only when the cell is NOT a plain
+/// number; security-hardening (f)) — see api/lesssheet.h COPY OUTPUT SAFETY.
 ///   ok      — the cell was read (out_len bytes written, out_truncated valid).
 ///   pending — `row` is at/beyond the scan frontier and not yet servable;
 ///             advance the frontier (ls_jump_start) and retry. Never scans.
@@ -1187,7 +1181,7 @@ pub const NetOpenStatus = extern struct {
 /// is reproducible hermetically:
 ///   none    — serve normally.
 ///   connect — DNS/TCP/TLS connection failure -> `.unreachable_`.
-///   timeout — no forward progress within the timeout -> `.timeout`.
+///   timeout — the connect deadline fires (no connection established) -> `.timeout`.
 ///   io      — local spool create/write failure -> `.io`.
 pub const NetFault = enum(u8) {
     none = 0,
@@ -1507,9 +1501,10 @@ pub const ls_copy_open = core.ls_copy_open;
 /// C ABI -- frame the next TSV chunk into the caller's buffer (cut at a field/row
 /// boundary, never a split code point; COPIES, no borrow) and return progress.
 /// Framing is byte-identical to the deleted TSVCopyBuilder EXCEPT for the
-/// always-on formula-injection neutralization (leading = + - @ -> ' prefix;
-/// security-hardening (f)); STALLED when the next row is at/beyond the frontier.
-/// See api/lesssheet.h COPY OUTPUT SAFETY.
+/// always-on, number-aware formula-injection neutralization (leading = or @ ->
+/// ' prefix always; leading + or - -> ' prefix unless the cell is a plain
+/// number; security-hardening (f)); STALLED when the next row is at/beyond the
+/// frontier. See api/lesssheet.h COPY OUTPUT SAFETY.
 pub const ls_copy_next = core.ls_copy_next;
 
 /// C ABI -- release the job (exactly once). Cancel = stop calling next + close;

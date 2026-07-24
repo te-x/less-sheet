@@ -93,8 +93,21 @@ struct AmendmentContractGuardTests {
         // ABI consumer), NOT a byte-identical layout change — every OTHER symbol's
         // layout is unchanged. Updated through the change-authority process, exactly
         // as this guard provides for an approved header amendment.
+        // Baseline re-bumped for the ARCH-security-hardening (v1) frozen-surface
+        // work, resolving accumulated staleness in ONE pass: the guard had been left
+        // pinned at the search-case-mode SHA through TWO api/ changes — the original
+        // security-hardening freeze and its 2026-07-24 convergence amendment. The
+        // header now reflects the CONVERGED contract: (d) is WITHDRAWN, so
+        // ls_scan_progress carries NO expansion field (the original freeze's trailing
+        // `bool expansion_capped` was RETIRED, not deprecated — no-backcompat v1);
+        // (e) keeps LS_NET_ERROR_INSECURE_REDIRECT (8) / LS_NET_ERROR_SHORT_BODY (9)
+        // and narrows LS_NET_ERROR_TIMEOUT (3) to connect-only (idle-read deferred);
+        // (f) is NUMBER-AWARE copy neutralization (leading = / @ always; + / - only
+        // for non-plain-number cells). A v1 frozen-surface change under lock-step
+        // rebuild (no external ABI consumer). Updated through the change-authority
+        // process. See docs/architecture/ARCH-security-hardening.md.
         expectEmptyDiff("api/lesssheet.h",
-                        baseline: "df0436b6ea29211fd0634c40c857b626b6d85466db2a802c190d4a77c85cdd42")
+                        baseline: "39b998743a82fc6fcedb75607387bffc33e9ca1f15efdefc0d8bddc4d6eb02d1")
     }
 
     // AC23 — the public Swift search/layout contracts are byte-identical:
