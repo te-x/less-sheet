@@ -823,6 +823,19 @@ pub const Cursor = struct {
         };
     }
 
+    /// security-hardening (e) AC-e3: whether an EMPTY span at the current position
+    /// is a genuine end-of-source, vs. bytes merely NOT-YET-AVAILABLE. A NETWORK
+    /// short/failed range leaves un-fetched bytes BELOW the known end, so an empty
+    /// span there is a retryable STALL, not EOF -- the frontier must not complete
+    /// over it. mmap and gzip keep today's behavior (an empty span is terminal:
+    /// end-of-mapping, or a clean/damaged inflate terminus).
+    pub fn spanTerminal(self: *const Cursor) bool {
+        return switch (self.source.?) {
+            .mmap, .gzip => true,
+            .http_range => |hr| if (hr.knownEnd()) |ke| self.logical >= ke else hr.eof.load(.acquire),
+        };
+    }
+
     pub fn span(self: *Cursor) []const u8 {
         if (self.source.? == .http_range) return self.spanHttp();
         if (self.limit) |lim| if (self.logical >= lim) return &.{};

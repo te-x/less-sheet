@@ -331,7 +331,9 @@ pub const CsvReader = struct {
             _ = boundsFromCursor(&cur, self.sep, self.quote, self.encoding);
             rows += 1;
         }
-        const eof = streamUnit(&cur, self.encoding) == null and !streamAtLimit(&cur);
+        // security-hardening (e) AC-e3: as scanUtf8Rows -- an empty stream unit is
+        // EOF only at a genuine end-of-source, never a network short-body stall.
+        const eof = streamUnit(&cur, self.encoding) == null and !streamAtLimit(&cur) and cur.spanTerminal();
         return .{ .next = cursorPos(&cur), .rows = rows, .eof = eof };
     }
 
@@ -581,7 +583,11 @@ fn scanUtf8Rows(cur: *source_mod.Cursor, sep: u8, quote: ?u8, max_rows: u64) rea
         }
         cur.advance(i);
     }
-    const eof = cur.span().len == 0;
+    // security-hardening (e) AC-e3: an empty span is EOF only at a genuine
+    // end-of-source; a NETWORK short body leaves un-fetched bytes below the known
+    // end, so an empty span there is a retryable STALL (the worker ends the jump
+    // WITHOUT completing) -- never a clean EOF that would count a phantom tail row.
+    const eof = cur.span().len == 0 and cur.spanTerminal();
     if (eof and saw and rows < max_rows) rows += 1;
     return .{ .next = cursorPos(cur), .rows = rows, .eof = eof };
 }

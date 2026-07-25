@@ -347,6 +347,20 @@ pub fn workerMain(doc: *Document) void {
         if (res.eof) {
             doc.complete = true;
             doc.total_rows = doc.frontier_rows;
+        } else if (doc.net and doc.jump_state == .scanning and res.end_row == start_row and
+            doc.reader.physicalBytes(doc.source, res.end_pos) == doc.reader.physicalBytes(doc.source, start_pos))
+        {
+            // security-hardening (e) AC-e3: a NETWORK jump that made NO forward
+            // progress because the next bytes are un-fetched (a short/failed range
+            // left them not-present, below the known end) is a STALL, not EOF. End
+            // the jump at the current frontier WITHOUT marking the doc complete (the
+            // un-fetched tail is never zero-filled or counted) and stop driving, so
+            // the worker neither spins nor hammers the transport re-fetching a byte
+            // that will not arrive. A retry, or a demand for already-present bytes,
+            // still resolves normally.
+            doc.jump_state = .done;
+            doc.jump_progress = 1.0;
+            doc.jump_landed = if (doc.frontier_rows > 0) doc.frontier_rows - 1 else 0;
         }
         column.sourceCompletedLocked(doc);
         if (doc.jump_state == .scanning) updateJump(doc);
@@ -507,23 +521,17 @@ pub fn indexPoll(d: *Document) api.ScanProgress {
             .bytes_scanned = if (d.complete) phys_total else @min(phys_total, frontier_phys),
             .bytes_total = phys_total,
             .complete = d.complete,
-            // security-hardening (d) SEED: no bomb-cap trip yet. The gzip Source
-            // will drive this true when it stops decode/scan on a sustained abnormal
-            // expansion ratio (AC-d1); false for every non-gzip / normal document.
-            .expansion_capped = false,
         };
         return .{
             .bytes_scanned = frontier_phys,
             .bytes_total = api.bytes_total_unknown,
             .complete = d.complete,
-            .expansion_capped = false, // security-hardening (d) SEED — see above.
         };
     }
     return .{
         .bytes_scanned = if (d.complete) d.file_size else @min(d.file_size, d.reader.physicalBytes(d.source, d.frontier_pos)),
         .bytes_total = d.file_size,
         .complete = d.complete,
-        .expansion_capped = false, // security-hardening (d) SEED — see above.
     };
 }
 

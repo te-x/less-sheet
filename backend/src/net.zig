@@ -87,8 +87,8 @@ fn failLocked(job: *NetOpenJob, err: api.NetStatus) void {
 /// the Source build failed (transport already freed). Runs OUTSIDE the job lock
 /// for the heavy fetch/build, taking the lock only to publish the terminal
 /// state, so poll never blocks on a slow open.
-fn publish(job: *NetOpenJob, built: ?net_source.BuiltSource) void {
-    const b = built orelse return failLocked(job, .io);
+fn publish(job: *NetOpenJob, built: ?net_source.BuiltSource, build_err: api.NetStatus) void {
+    const b = built orelse return failLocked(job, build_err);
     const doc = open.buildDocument(job.gpa, b.source, b.mapping, b.file_size, job.opt) orelse return failLocked(job, .io);
     doc.net_range_mode = b.range_mode;
     if (job.cancel_flag.load(.acquire)) {
@@ -144,6 +144,13 @@ fn runFake(job: *NetOpenJob, fx: *const api.NetFixture) void {
         .io => return failLocked(job, .io),
     }
     if (fx.redirect_hops > redirect_cap) return failLocked(job, .too_many_redirects);
+    // security-hardening (e) AC-e2: a redirect whose Location downgrades the
+    // transport https->http is refused with a distinct code. The fixture models
+    // the downgrade condition; routing it through the PURE decision
+    // (net_source.redirectDowngrades) pins the taxonomy mapping the real
+    // std.http.Client redirect path uses too (same seam, hermetically testable).
+    if (fx.redirect_downgrade and net_source.redirectDowngrades("https", "http"))
+        return failLocked(job, .insecure_redirect);
     if (fx.http_status != 200 and fx.http_status != 206) {
         job.http_status = @intCast(fx.http_status);
         return failLocked(job, .http_status);
@@ -173,8 +180,9 @@ fn runFake(job: *NetOpenJob, fx: *const api.NetFixture) void {
     };
     const transport: net_source.Transport = .{ .fake = fs };
     const progress: net_source.Progress = .{ .ctx = job, .callback = onProgress };
-    const built = net_source.buildNet(job.gpa, transport, .{ .range = range, .total_known = known, .total = total }, progress);
-    publish(job, built);
+    var build_err: api.NetStatus = .io;
+    const built = net_source.buildNet(job.gpa, transport, .{ .range = range, .total_known = known, .total = total }, progress, &build_err);
+    publish(job, built, build_err);
 }
 
 /// Background real-transport worker (std.http.Client). Not exercised by the
@@ -213,8 +221,9 @@ fn realWorker(job: *NetOpenJob) void {
     // download): `probe.range` picks random vs sequential fill, and a gzip
     // resource composes the gzip Source over that spool (TD4) — buildNet detects
     // the magic on the fetched head.
-    const built = net_source.buildNet(job.gpa, transport, .{ .range = probe.range, .total_known = probe.length_known, .total = probe.total }, progress);
-    publish(job, built);
+    var build_err: api.NetStatus = .io;
+    const built = net_source.buildNet(job.gpa, transport, .{ .range = probe.range, .total_known = probe.length_known, .total = probe.total }, progress, &build_err);
+    publish(job, built, build_err);
 }
 
 /// Shared job constructor for the real (`fixture == null`, std.http.Client) and

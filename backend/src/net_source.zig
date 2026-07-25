@@ -35,6 +35,37 @@ pub const cache_ceiling: u64 = 16 * 1024 * 1024; // 16 MiB resident RAM bound (A
 const open_bytes: u64 = base.net_head_budget;
 const redirect_cap: u32 = 3; // Zig std's small fixed redirect cap (AC12)
 
+/// security-hardening (e) AC-e1: the real-transport CONNECT timeout (the single
+/// named knob, single source of truth). ~10 s: a non-responding connect fails
+/// retryably, WIRED via ConnectTcpOptions.timeout in `RealTransport.dial`, so the
+/// fetch thread/document never hangs on a dead host. There is NO idle-read
+/// timeout in v1 (deferred): Zig 0.16 `std.http.Client`'s blocking response
+/// reader exposes no per-read deadline hook, so a stalled ESTABLISHED stream is
+/// covered by the cancellable/retry fetch model + user cancel instead. The
+/// hermetic connect-timeout taxonomy (a stalled connect -> LS_NET_ERROR_TIMEOUT)
+/// is exercised by the fake (NetFault.timeout).
+pub const connect_timeout_secs: i64 = 10;
+
+/// security-hardening (e) AC-e2: the PURE redirect scheme-downgrade decision — a
+/// small, unit-testable seam used by BOTH the fake taxonomy mapping (net.runFake)
+/// and the real std.http.Client redirect handling (RealTransport). A redirect
+/// DOWNGRADES the transport iff it leaves an https origin for a plaintext http
+/// one; that alone is refused (LS_NET_ERROR_INSECURE_REDIRECT). http->https
+/// (upgrade), https->https and http->http (same-scheme, incl. cross-host) are all
+/// allowed within the cap. Case-insensitive on the scheme text.
+pub fn redirectDowngrades(from_scheme: []const u8, to_scheme: []const u8) bool {
+    const from_secure = std.ascii.eqlIgnoreCase(from_scheme, "https");
+    const to_secure = std.ascii.eqlIgnoreCase(to_scheme, "https");
+    return from_secure and !to_secure;
+}
+
+/// The URL's scheme text ("https" / "http" / …) for the downgrade check, without
+/// a full parse (a leading-token scan is enough and never fails).
+fn schemeOf(url: []const u8) []const u8 {
+    const colon = std.mem.indexOfScalar(u8, url, ':') orelse return url;
+    return url[0..colon];
+}
+
 /// Live-progress callback (round-2 review finding 1): invoked with the running
 /// (bytes fetched so far, resource total) every time a NEW range is actually
 /// fetched over the transport (never on a cache/spool hit), so a poller
@@ -220,6 +251,27 @@ pub const RealTransport = struct {
         return .{ .n = n, .eof = n == 0 };
     }
 
+    /// security-hardening (e) AC-e1: acquire a connection to `uri`'s host with the
+    /// CONNECT timeout applied. Reuses a pooled connection when present (no
+    /// re-handshake), so the timeout bounds only a FRESH connect (e.g. a
+    /// non-responding server on the initial probe). null on failure.
+    fn dial(self: *RealTransport, uri: std.Uri) ?*std.http.Client.Connection {
+        const protocol = std.http.Client.Protocol.fromUri(uri) orelse return null;
+        var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
+        const host = uri.getHost(&host_buf) catch return null;
+        const default_port: u16 = switch (protocol) {
+            .plain => 80,
+            .tls => 443,
+        };
+        const port = uri.port orelse default_port;
+        return self.client.connectTcpOptions(.{
+            .host = host,
+            .port = port,
+            .protocol = protocol,
+            .timeout = .{ .duration = .{ .raw = std.Io.Duration.fromSeconds(connect_timeout_secs), .clock = .awake } },
+        }) catch null;
+    }
+
     /// One ranged GET for the head bound. 206 + Content-Range total => random
     /// fill; 200 + Content-Length => sequential fill (known); no usable length
     /// => sequential fill of an unknown-length stream. Also reads the first 2
@@ -231,7 +283,9 @@ pub const RealTransport = struct {
         const uri = std.Uri.parse(self.url) catch return .{ .err = .invalid_argument };
         var range_buf: [64]u8 = undefined;
         const range_val = std.fmt.bufPrint(&range_buf, "bytes=0-{d}", .{open_bytes - 1}) catch return .{ .err = .io };
+        const conn = self.dial(uri) orelse return .{ .err = .unreachable_ };
         var req = self.client.request(.GET, uri, .{
+            .connection = conn,
             .redirect_behavior = .init(redirect_cap),
             .extra_headers = &.{.{ .name = "range", .value = range_val }},
         }) catch return .{ .err = .unreachable_ };
@@ -242,6 +296,11 @@ pub const RealTransport = struct {
             error.TooManyHttpRedirects => .{ .err = .too_many_redirects },
             else => .{ .err = .unreachable_ },
         };
+        // security-hardening (e) AC-e2: std auto-followed any redirect; `req.uri` is
+        // the FINAL hop. Refuse if the chain downgraded the transport https->http
+        // (the material downgrade -- serving content over plaintext after starting
+        // secure). http->https / same-scheme (incl. cross-host) are unaffected.
+        if (redirectDowngrades(schemeOf(self.url), req.uri.scheme)) return .{ .err = .insecure_redirect };
         const code: i32 = @intCast(@intFromEnum(response.head.status));
         if (code < 200 or code >= 300) return .{ .err = .http_status, .http_status = code };
         // Extract every needed field from `response.head` (a view into
@@ -262,28 +321,31 @@ pub const RealTransport = struct {
         return .{ .ok = true, .total = d.total, .range = d.range, .is_gz = d.is_gz, .length_known = d.length_known };
     }
 
-    fn fetchInto(self: *RealTransport, dest: []u8, offset: u64) bool {
-        if (dest.len == 0) return true;
-        const uri = std.Uri.parse(self.url) catch return false;
+    fn fetchInto(self: *RealTransport, dest: []u8, offset: u64) FetchOutcome {
+        if (dest.len == 0) return .ok;
+        const uri = std.Uri.parse(self.url) catch return .failed;
         var range_buf: [64]u8 = undefined;
-        const range_val = std.fmt.bufPrint(&range_buf, "bytes={d}-{d}", .{ offset, offset + dest.len - 1 }) catch return false;
+        const range_val = std.fmt.bufPrint(&range_buf, "bytes={d}-{d}", .{ offset, offset + dest.len - 1 }) catch return .failed;
+        const conn = self.dial(uri) orelse return .failed;
         var req = self.client.request(.GET, uri, .{
+            .connection = conn,
             .redirect_behavior = .init(redirect_cap),
             .extra_headers = &.{.{ .name = "range", .value = range_val }},
-        }) catch return false;
+        }) catch return .failed;
         defer req.deinit();
-        req.sendBodiless() catch return false;
+        req.sendBodiless() catch return .failed;
         var redirect_buf: [8192]u8 = undefined;
-        var response = req.receiveHead(&redirect_buf) catch return false;
+        var response = req.receiveHead(&redirect_buf) catch return .failed;
+        // security-hardening (e) AC-e2: refuse an https->http downgrade redirect.
+        if (redirectDowngrades(schemeOf(self.url), req.uri.scheme)) return .failed;
         const code = @intFromEnum(response.head.status);
-        if (code < 200 or code >= 300) return false;
+        if (code < 200 or code >= 300) return .failed;
         var transfer_buf: [64 * 1024]u8 = undefined;
         const body = response.reader(&transfer_buf);
-        body.readSliceAll(dest) catch |err| switch (err) {
-            error.EndOfStream => {}, // server returned a short body; keep what we got
-            else => return false,
-        };
-        return true;
+        // security-hardening (e) AC-e3: a short body delivers fewer bytes than the
+        // requested range -- report it (never zero-fill the undelivered tail).
+        const got = body.readSliceShort(dest) catch return .failed;
+        return if (got < dest.len) .short else .ok;
     }
 };
 
@@ -303,32 +365,37 @@ pub const FakeServer = struct {
     short_body_at: ?u64 = null,
 };
 
+/// security-hardening (e) AC-e3: the outcome of a ranged fetch. `.ok` delivered
+/// every requested byte; `.short` delivered FEWER (a short/zero body -- the
+/// undelivered tail is neither fabricated nor marked present); `.failed` is a
+/// transport error. Replaces the old `bool` so a short body is distinct from a
+/// full one AND from a hard failure (the caller flags `.short` for the open-time
+/// LS_NET_ERROR_SHORT_BODY classification and, either way, never marks the run
+/// present).
+pub const FetchOutcome = enum { ok, short, failed };
+
 pub const Transport = union(enum) {
     fake: *FakeServer,
     real: *RealTransport,
 
     /// RANDOM fill: fetch `dest.len` bytes at `offset` (a ranged GET). A range
     /// server delivers any range in full (withhold/drop are SEQUENTIAL-only
-    /// controls, never used with a range fixture). Returns false on failure.
-    pub fn fetchInto(self: Transport, dest: []u8, offset: u64) bool {
+    /// controls, never used with a range fixture).
+    pub fn fetchInto(self: Transport, dest: []u8, offset: u64) FetchOutcome {
         switch (self) {
             .fake => |fs| {
-                // security-hardening (e) short-body seam (AC-e3): the fake advertises
-                // its full length but delivers body bytes only within [0, deliver). The
-                // UN-HARDENED path below still zero-fills the undelivered tail and returns
-                // true -- the silent zero-fill AC-e3 corrects. The fix must DETECT the
-                // shortfall (bytes requested but not delivered) instead of fabricating
-                // zero content. deliver == body.len when short_body_at is null, so every
-                // existing net test is byte-unaffected.
+                // security-hardening (e) AC-e3 short body: the fake advertises its
+                // full length but delivers body bytes only within [0, deliver). A
+                // request that reaches at/beyond `deliver` comes back SHORT -- the
+                // undelivered tail is NEVER zero-filled (correcting the prior silent
+                // zero-fill) and the caller never marks it present. deliver ==
+                // body.len when short_body_at is null, so every other net test is
+                // byte-unaffected.
                 const deliver: u64 = if (fs.short_body_at) |s| @min(s, @as(u64, fs.body.len)) else fs.body.len;
-                if (offset >= deliver) {
-                    @memset(dest, 0);
-                    return true;
-                }
+                if (offset >= deliver) return .short; // zero body bytes here
                 const avail = @min(@as(u64, dest.len), deliver - offset);
                 @memcpy(dest[0..@intCast(avail)], fs.body[@intCast(offset)..][0..@intCast(avail)]);
-                if (avail < dest.len) @memset(dest[@intCast(avail)..], 0);
-                return true;
+                return if (avail < dest.len) .short else .ok;
             },
             .real => |rt| return rt.fetchInto(dest, offset),
         }
@@ -419,6 +486,12 @@ pub const HttpRange = struct {
     // region, no concurrent use of the shared transport client).
     fetching: bool = false,
     progress: ?Progress = null,
+    /// security-hardening (e) AC-e3: set once any ranged fetch came back SHORT
+    /// (server advertised its length but delivered fewer bytes / a zero body).
+    /// buildNet reads it right after the head fetch to fail the OPEN with
+    /// LS_NET_ERROR_SHORT_BODY; post-open it only records that the un-fetched
+    /// tail stays not-present (no post-open error state -- root-planner boundary).
+    short_fetch: std.atomic.Value(bool) = .init(false),
 
     pub fn lock(self: *HttpRange) void {
         self.mutex.lockUncancelable(sysio.io());
@@ -511,7 +584,16 @@ pub const HttpRange = struct {
             const start = @as(u64, c_idx) * chunk_bytes;
             const len = self.chunkLen(c_idx);
             const dest = self.spool[@intCast(start)..@intCast(start + len)];
-            if (!self.transport.fetchInto(dest, start)) return;
+            switch (self.transport.fetchInto(dest, start)) {
+                .ok => {},
+                // security-hardening (e) AC-e3: leave the chunk not-present (no
+                // zero-fill served) and flag a short body for the open-time check.
+                .short => {
+                    self.short_fetch.store(true, .release);
+                    return;
+                },
+                .failed => return,
+            }
             self.present[c_idx] = true;
             self.fetch_count += 1;
             self.spool_bytes += len;
@@ -556,10 +638,21 @@ pub const HttpRange = struct {
             const dest = self.spool[@intCast(start)..@intCast(stop)];
             self.fetching = true;
             self.unlock();
-            const ok = self.transport.fetchInto(dest, start); // ~1 RTT, mutex down
+            const outcome = self.transport.fetchInto(dest, start); // ~1 RTT, mutex down
             self.lock();
             self.fetching = false;
-            if (!ok) return; // failed GET: leave the run not-present (short slice)
+            switch (outcome) {
+                .ok => {},
+                // security-hardening (e) AC-e3: a short/failed GET leaves the whole
+                // run not-present (ensureSlice then clamps to the present prefix, so
+                // the frontier never advances over un-fetched bytes). `.short` also
+                // flags the open-time short-body classification.
+                .short => {
+                    self.short_fetch.store(true, .release);
+                    return;
+                },
+                .failed => return,
+            }
             self.fetch_count += 1; // ROUND-TRIPS, not chunks
             var k = ci;
             while (k < run_end) : (k += 1) {
@@ -697,7 +790,20 @@ pub const HttpRange = struct {
         const first = internal / chunk_bytes;
         const last = (end - 1) / chunk_bytes;
         self.ensureChunkRangeLocked(@intCast(first), @intCast(last));
-        return self.spool[@intCast(internal)..@intCast(end)];
+        // security-hardening (e) AC-e3: never serve un-fetched bytes. A short/
+        // failed range leaves its chunks not-present, so clamp the returned slice
+        // to the CONTIGUOUS PRESENT prefix from `internal` -- the un-fetched tail
+        // is neither returned as (zero-fill) content nor allowed to advance the
+        // frontier over it. When every requested chunk is present (the normal
+        // case) this equals `end`, so behavior is byte-identical.
+        var present_end: u64 = @as(u64, first) * chunk_bytes;
+        var ci: usize = @intCast(first);
+        while (ci <= @as(usize, @intCast(last)) and self.present[ci]) : (ci += 1) {
+            present_end = @min(self.total, @as(u64, ci + 1) * chunk_bytes);
+        }
+        const served_end = @min(end, present_end);
+        if (served_end <= internal) return &.{};
+        return self.spool[@intCast(internal)..@intCast(served_end)];
     }
 
     /// gzip compressed provider (TD4): ensure the contiguous compressed prefix
@@ -794,7 +900,7 @@ pub const NetBuildOpts = struct {
 /// head to classify (magic) + serve the first viewport, and (for a gzip resource)
 /// composes the gzip Source over the growing compressed spool. Fails cleanly
 /// (spool + transport freed) returning null.
-pub fn buildNet(gpa: std.mem.Allocator, transport: Transport, opts: NetBuildOpts, progress: ?Progress) ?BuiltSource {
+pub fn buildNet(gpa: std.mem.Allocator, transport: Transport, opts: NetBuildOpts, progress: ?Progress, err_out: *api.NetStatus) ?BuiltSource {
     const hr = gpa.create(HttpRange) catch {
         transport.deinit(gpa);
         return null;
@@ -836,6 +942,17 @@ pub fn buildNet(gpa: std.mem.Allocator, transport: Transport, opts: NetBuildOpts
         hr.lock();
         hr.drainToLocked(chunk_bytes); // enough for the magic
         hr.unlock();
+    }
+
+    // security-hardening (e) AC-e3: a SHORT / zero-length HEAD fetch is a
+    // retryable short body -- fail the open with LS_NET_ERROR_SHORT_BODY rather
+    // than serving zero-filled (un-fetched) bytes as document content. (A short
+    // range fetched POST-open is handled by the present-prefix clamp in
+    // ensureSlice; there is no post-open error state -- root-planner boundary.)
+    if (hr.short_fetch.load(.acquire)) {
+        err_out.* = .short_body;
+        hr.deinit();
+        return null;
     }
 
     // Classify from the fetched head: a `.csv.gz` magic (1f 8b) composes the

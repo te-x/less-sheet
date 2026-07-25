@@ -810,5 +810,91 @@ fn decodeCellAt(d: *Document, pos: Pos, col: u32, buf: ?[*]u8, buf_len: usize, o
     const res = d.reader.cell(d.source, pos, col, row_limit, buf, buf_len);
     out_len.* = res.len;
     out_truncated.* = res.truncated;
+    // security-hardening (f): neutralize a formula-injection lead byte on the
+    // COPY output only. This is THE single choke point for every copy path
+    // (identity / filtered / pinned-record-1, and the streaming ls_copy_next
+    // sweep via readCell -> window.cellCopy), so it applies once, uniformly,
+    // and BEFORE any TSV framing/quoting. Display (ls_cell) and search/filter
+    // never reach here, so they keep the RAW bytes (sec_f3 scope guard).
+    neutralizeCopyCell(buf, buf_len, out_len, out_truncated);
     return .ok;
+}
+
+/// security-hardening (f) AC-f1: the NUMBER-AWARE copy formula-injection
+/// decision (single source of truth; every copy path shares it). Keyed on the
+/// COPIED cell value's first byte:
+///   - `=` (0x3D) / `@` (0x40): ALWAYS neutralized.
+///   - `+` (0x2B) / `-` (0x2D): neutralized ONLY when the value is NOT a plain
+///     number (`isPlainNumber` below) — a plain number like `-3` / `+2.5` is
+///     inert text, not an injection vector, so it copies RAW.
+///   - anything else (incl. a leading `'`, so re-copying never doubles): never.
+/// A display-TRUNCATED value can never be confirmed a plain number (its tail is
+/// not in the buffer), so a truncated `+`/`-` value neutralizes — the fail-safe
+/// direction is to OVER-neutralize, never under. `value` is non-empty.
+fn copyCellNeutralizes(value: []const u8, truncated: bool) bool {
+    return switch (value[0]) {
+        '=', '@' => true,
+        '+', '-' => truncated or !isPlainNumber(value),
+        else => false,
+    };
+}
+
+/// security-hardening (f) AC-f1: the plain-number grammar, DELIBERATELY stricter
+/// than the header/matcher numeric grammar (which trims whitespace and admits a
+/// bare leading/trailing `.`) — reusing that here would UNDER-neutralize `-.5` /
+/// `-3.`. `value` starts with the single leading `+`/`-` (the only callers);
+/// after consuming it, the ENTIRE remainder must match
+///     digit+ ( '.' digit+ )? ( ('e'|'E') ('+'|'-')? digit+ )?
+/// with `digit` = ASCII 0-9 and the match consuming every remaining byte (no
+/// whitespace, no separators, no bare/leading/trailing dot, no trailing bytes).
+fn isPlainNumber(value: []const u8) bool {
+    const rest = value[1..]; // drop the single leading sign
+    const n = rest.len;
+    var i: usize = 0;
+    // digit+ (integer part, at least one digit)
+    const int_start = i;
+    while (i < n and asciiDigit(rest[i])) i += 1;
+    if (i == int_start) return false;
+    // optional ( '.' digit+ )
+    if (i < n and rest[i] == '.') {
+        i += 1;
+        const frac_start = i;
+        while (i < n and asciiDigit(rest[i])) i += 1;
+        if (i == frac_start) return false; // a dot needs >= 1 fractional digit
+    }
+    // optional ( ('e'|'E') ('+'|'-')? digit+ )
+    if (i < n and (rest[i] == 'e' or rest[i] == 'E')) {
+        i += 1;
+        if (i < n and (rest[i] == '+' or rest[i] == '-')) i += 1;
+        const exp_start = i;
+        while (i < n and asciiDigit(rest[i])) i += 1;
+        if (i == exp_start) return false; // an exponent needs >= 1 digit
+    }
+    return i == n; // the whole remainder was consumed
+}
+
+fn asciiDigit(c: u8) bool {
+    return c >= '0' and c <= '9';
+}
+
+/// Prepend a single apostrophe to `buf[0..out_len]` iff `copyCellNeutralizes`
+/// (number-aware, first-byte keyed). Applied at most once; never on an empty
+/// cell; the apostrophe COUNTS toward out_len. The content is shifted one byte
+/// right in place; if the prefix would exceed `buf_len` the trailing byte(s) are
+/// dropped at a UTF-8 code-point boundary and out_truncated is set (the streaming
+/// copy path grows its scratch, so this only bites a caller's small fixed
+/// ls_cell_copy buffer).
+fn neutralizeCopyCell(buf: ?[*]u8, buf_len: usize, out_len: *usize, out_truncated: *bool) void {
+    const b = buf orelse return;
+    const len = out_len.*;
+    if (len == 0 or buf_len == 0) return;
+    if (!copyCellNeutralizes(b[0..len], out_truncated.*)) return;
+    var keep = @min(len, buf_len - 1);
+    // Never split a UTF-8 code point when the prefix forces a drop.
+    if (keep < len) while (keep > 0 and (b[keep] & 0xC0) == 0x80) : (keep -= 1) {};
+    var i = keep;
+    while (i > 0) : (i -= 1) b[i] = b[i - 1];
+    b[0] = '\'';
+    out_len.* = keep + 1;
+    if (keep < len) out_truncated.* = true;
 }
