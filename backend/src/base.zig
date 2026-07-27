@@ -687,6 +687,29 @@ pub fn freeDoc(doc: *Document) void {
     doc.gpa.destroy(doc);
 }
 
+/// security-hardening (e) AC-e3: the ONE stall predicate shared by all three
+/// frontier drivers (index.scanChunk's jump/plain-index branch,
+/// search.searchScanChunk, filter.filterScanChunk) — a row lex that consumed
+/// ZERO logical bytes.
+///
+/// `logical` is the exact test, not a proxy: for a NETWORK GZIP source many
+/// distinct logical positions share one physical (compressed) offset, so a
+/// physical-byte comparison both misses real progress and reports false stalls.
+///
+/// A zero-byte row can only mean the bytes at `from` are NOT PRESENT: a short or
+/// failed ranged fetch left them un-fetched BELOW the source's advertised end, so
+/// the span is empty while `atEnd` (which only knows the advertised end) is still
+/// false. Counting a row there would fabricate a phantom row with no bytes behind
+/// it — silently wrong data — and re-entering would spin at 100% CPU forever.
+///
+/// Restricted to `doc.net` deliberately: a local mmap/gzip source always has its
+/// bytes, so a zero-byte lex there is a genuine terminus that the existing
+/// `atEnd`/`spanTerminal` paths already classify correctly, and only the network
+/// source can park indefinitely.
+pub fn scanStalled(doc: *const Document, from: Pos, to: Pos) bool {
+    return doc.net and to.logical == from.logical;
+}
+
 /// Fraction of the data region covered by position `pos`, clamped to 1.0.
 /// Shared progress calculation for the search match-scan and the filter scan
 /// (both report progress over the same [data_start, content_len) span).

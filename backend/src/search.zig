@@ -29,6 +29,12 @@ const SearchChunk = struct {
     end_pos: Pos,
     end_row: u64,
     eof: bool,
+    /// security-hardening (e) AC-e3: the chunk ended because the next bytes are
+    /// NOT PRESENT (a network short/failed range below the known end), not
+    /// because the source ended. Distinct from `eof` in every way that matters:
+    /// nothing is counted, the document is NOT complete, and the caller must
+    /// stop driving instead of re-entering on a zero-progress cursor.
+    stalled: bool = false,
     checkpoint: ?Checkpoint,
     matches: u64, // rows satisfying find (AND the filter, when one is active)
     filter_matches: u64, // rows satisfying the filter alone; meaningful only when filtered
@@ -107,6 +113,13 @@ pub fn searchScanChunk(doc: *Document, start_pos: Pos, start_row: u64, filtered:
             reader_mod.readerMatchRowAtScanCursor(doc.reader, cur, doc.w_ctx, if (filtered) doc.wf_ctx else null)
         else
             reader_mod.readerMatchRow(doc.reader, doc.source, pos, doc.w_ctx, if (filtered) doc.wf_ctx else null, .{});
+        // security-hardening (e) AC-e3: bail BEFORE counting this row if it
+        // consumed no bytes (base.scanStalled) — the un-fetched tail must never
+        // be counted, matched against, or staged.
+        if (base.scanStalled(doc, pos, res.next)) {
+            doc.endMatchScanIf(.search, generation);
+            return .{ .end_pos = pos, .end_row = row, .eof = false, .stalled = true, .checkpoint = null, .matches = matches, .filter_matches = filter_matches };
+        }
         if (filtered and res.filter_matched) filter_matches += 1;
         if (res.matched_col != null) matches += 1;
         base.stageOversized(doc, row, pos, res.next);
@@ -119,6 +132,16 @@ pub fn searchScanChunk(doc: *Document, start_pos: Pos, start_row: u64, filtered:
         }
     }
     return .{ .end_pos = pos, .end_row = row, .eof = false, .checkpoint = .{ .row = row, .pos = pos }, .matches = matches, .filter_matches = filter_matches };
+}
+
+/// security-hardening (e) AC-e3: terminate a search whose chunk STALLED on
+/// un-fetched bytes (`SearchChunk.stalled`). Call this AFTER `resolveNavLocked`
+/// at every driver, so a navigation answerable within the rows that ARE present
+/// is served first and only a nav that needed the un-fetched tail resolves to
+/// NONE. Freezes counts exactly where the delivered bytes end; never marks the
+/// document complete or the total exact. Idempotent.
+pub fn finishStalledLocked(d: *Document) void {
+    if (d.search_state == .scanning) failSearchLocked(d);
 }
 
 /// Terminate the active search cleanly at its last consistent state (caller
@@ -768,6 +791,9 @@ pub fn startSearch(d: *Document, request: *const api.SearchRequest) bool {
         const res = searchScanChunk(d, d.search_pos, d.search_rows, filtered, generation);
         commitSearch(d, res, filtered);
         resolveNavLocked(d);
+        // security-hardening (e) AC-e3: without this the stalled chunk makes no
+        // progress and the loop never exits (an unbounded hang holding the lock).
+        if (res.stalled) finishStalledLocked(d);
     }
     d.unlock();
     return true;
@@ -831,6 +857,9 @@ pub fn navSearch(d: *Document, anchor_row: u64, dir: api.SearchDir) void {
                 commitSearch(d, res, filtered);
                 resolveNavLocked(d);
                 if (d.search_state == .scanning and !d.search_to_eof and !d.nav_pending) d.search_state = .cancelled;
+                // security-hardening (e) AC-e3: as the startSearch degraded loop
+                // — a stalled chunk would otherwise never exit this loop.
+                if (res.stalled) finishStalledLocked(d);
             }
         }
     }

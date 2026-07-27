@@ -80,6 +80,10 @@ const FilterChunk = struct {
     end_pos: Pos,
     end_row: u64,
     eof: bool,
+    /// security-hardening (e) AC-e3: see search.SearchChunk.stalled — the next
+    /// bytes are not present, so the chunk ended without counting anything and
+    /// the caller must stop driving rather than spin on a zero-progress cursor.
+    stalled: bool = false,
     checkpoint: ?Checkpoint,
     matches: u64,
 };
@@ -141,6 +145,12 @@ pub fn filterScanChunk(doc: *Document, start_pos: Pos, start_row: u64, generatio
             reader_mod.readerMatchRowAtScanCursor(doc.reader, cur, doc.wf_ctx, null)
         else
             reader_mod.readerMatchRow(doc.reader, doc.source, pos, doc.wf_ctx, null, .{});
+        // security-hardening (e) AC-e3: see search.searchScanChunk — a row that
+        // consumed no bytes is an un-fetched tail, never a row.
+        if (base.scanStalled(doc, pos, res.next)) {
+            doc.endMatchScanIf(.filter, generation);
+            return .{ .end_pos = pos, .end_row = row, .eof = false, .stalled = true, .checkpoint = null, .matches = matches };
+        }
         const matched = res.matched_col != null;
         if (matched) matches += 1;
         // This scan also feeds the base row index (ARCH-huge-row-budget): see
@@ -156,6 +166,14 @@ pub fn filterScanChunk(doc: *Document, start_pos: Pos, start_row: u64, generatio
         }
     }
     return .{ .end_pos = pos, .end_row = row, .eof = false, .checkpoint = .{ .row = row, .pos = pos }, .matches = matches };
+}
+
+/// security-hardening (e) AC-e3: terminate a filter-scan whose chunk STALLED on
+/// un-fetched bytes (`FilterChunk.stalled`) — the mirror of
+/// search.finishStalledLocked. Counts stay exact for the rows that ARE present;
+/// the view is NEVER marked complete/exact over an un-fetched tail. Idempotent.
+pub fn finishStalledLocked(d: *Document) void {
+    if (d.filter_state == .scanning) failFilterLocked(d);
 }
 
 /// Terminate the active filter-scan cleanly at its last consistent state
@@ -425,6 +443,9 @@ pub fn setFilter(d: *Document, request: *const api.SearchRequest) bool {
     while (d.filter_state == .scanning) {
         const res = filterScanChunk(d, d.filter_pos, d.filter_rows, generation);
         commitFilter(d, res);
+        // security-hardening (e) AC-e3: a stalled chunk makes no progress, so
+        // without this the loop never exits.
+        if (res.stalled) finishStalledLocked(d);
     }
     d.unlock();
     return true;

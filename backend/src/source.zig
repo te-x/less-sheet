@@ -511,13 +511,36 @@ pub const Gzip = struct {
         return self.discardTo(session, target, true, lane);
     }
 
+    /// The inflate Session driving `lane` (0 = forward, 1 = replay, 2 = replay2)
+    /// — the ONE place that mapping is resolved (it used to be re-derived
+    /// inline at six call sites).
+    fn sessionForLane(self: *const Gzip, lane: usize) *Session {
+        return if (lane == forward_lane) self.forward else if (lane == 1) self.replay else self.replay2;
+    }
+
+    /// The forward (non-replay) inflate lane — named once so a lane-0-specific
+    /// check reads as one.
+    const forward_lane: usize = 0;
+
+    /// security-hardening (e) AC-e3: whether `lane`'s inflate is parked on a
+    /// RESUMABLE budget stop — it ran out of COMPRESSED bytes (`produce`:
+    /// `s.input.end < physicalLen() and s.input.seek >= s.input.end`) rather than
+    /// reaching a clean or damaged terminus. `.budget` deliberately leaves
+    /// `terminal_kind` unset precisely because it is NOT an end-of-source: for a
+    /// NETWORK gzip whose ranged fetch came back short, `ensureCompressed` cannot
+    /// grow `input.end`, so the session parks here indefinitely and an empty span
+    /// at this point is a STALL, never EOF.
+    pub fn laneAtBudget(self: *const Gzip, lane: usize) bool {
+        return self.sessionForLane(lane).terminal == .budget;
+    }
+
     fn byteAtLane(self: *Gzip, lane: usize, internal: u64) ?u8 {
         if (internal < self.head.items.len) return self.head.items[@intCast(internal)];
         if (self.op_len[lane] > 0 and internal >= self.op_start[lane] and internal < self.op_start[lane] + self.op_len[lane])
             return self.lane_buf[lane][@intCast(internal - self.op_start[lane])];
 
         const replay = lane != 0;
-        const s = if (lane == 0) self.forward else if (lane == 1) self.replay else self.replay2;
+        const s = self.sessionForLane(lane);
         if (!replay) {
             // The final `return lane_buf[lane][0]` is only correct when the
             // forward session lands EXACTLY on `internal`. Two ways it can't,
@@ -639,7 +662,7 @@ pub const Cursor = struct {
                 g.lane_busy[self.lane] = false;
                 g.lane_physical_budget[self.lane] = null;
                 if (self.physical_limit != null) {
-                    const session = if (self.lane == 0) g.forward else if (self.lane == 1) g.replay else g.replay2;
+                    const session = g.sessionForLane(self.lane);
                     session.input.end = self.saved_input_end;
                     if (session.terminal == .budget) {
                         session.dec.err = null;
@@ -783,7 +806,7 @@ pub const Cursor = struct {
                 if (internal <= g.head.items.len) break :blk g.physicalFor(internal -| g.bom_len);
                 const lane: usize = self.lane;
                 if (internal >= g.op_start[lane] and internal <= g.op_start[lane] + g.op_len[lane]) break :blk g.op_physical[lane];
-                const session = if (lane == 0) g.forward else if (lane == 1) g.replay else g.replay2;
+                const session = g.sessionForLane(lane);
                 break :blk session.input.seek;
             },
         };
@@ -794,10 +817,7 @@ pub const Cursor = struct {
         return switch (self.source.?) {
             .mmap => |m| m.physical_base +| self.logical >= self.physical_limit.?,
             .http_range => |hr| hr.physical_base +| self.logical >= self.physical_limit.?,
-            .gzip => |g| blk: {
-                const session = if (self.lane == 0) g.forward else if (self.lane == 1) g.replay else g.replay2;
-                break :blk session.terminal == .budget;
-            },
+            .gzip => |g| g.laneAtBudget(self.lane),
         };
     }
 
@@ -819,7 +839,7 @@ pub const Cursor = struct {
         return switch (self.source.?) {
             .mmap => false,
             .http_range => false,
-            .gzip => |g| g.opening and g.forward.terminal == .budget,
+            .gzip => |g| g.opening and g.laneAtBudget(Gzip.forward_lane),
         };
     }
 
@@ -827,11 +847,33 @@ pub const Cursor = struct {
     /// is a genuine end-of-source, vs. bytes merely NOT-YET-AVAILABLE. A NETWORK
     /// short/failed range leaves un-fetched bytes BELOW the known end, so an empty
     /// span there is a retryable STALL, not EOF -- the frontier must not complete
-    /// over it. mmap and gzip keep today's behavior (an empty span is terminal:
-    /// end-of-mapping, or a clean/damaged inflate terminus).
+    /// over it.
+    ///   * mmap: an empty span is always end-of-mapping (no provider, nothing to
+    ///     wait for).
+    ///   * gzip: an empty span is a clean/damaged inflate terminus -- EXCEPT for a
+    ///     NETWORK gzip (`provider != null`) parked on a `.budget` stop, which
+    ///     means the compressed bytes have not arrived, not that the stream ended.
+    ///     A LOCAL gzip can also park on `.budget`, but only against a mapping it
+    ///     already fully owns, so it always resumes; only the network one can park
+    ///     forever. Without this the short-body gz path reports a truncated
+    ///     document as COMPLETE with a wrong row count.
+    ///
+    /// VERIFICATION STATUS of the gzip arm below
+    /// (`!(g.provider != null and g.laneAtBudget(self.lane))`): REASONED-CORRECT,
+    /// NOT PROBE-CONFIRMED. It must not be written up anywhere as tested — the
+    /// 273/273 suite does not cover it either. The fixture built to discriminate
+    /// it FAILED to: `probe_gz.zig` with a FULL gzip body, `advertise_length =
+    /// true`, and `short_body_at` swept over 20-95% produced BYTE-IDENTICAL
+    /// results with and without this arm, on every cut. Advertising the full
+    /// plain length while short-circuiting delivery never parks the forward lane
+    /// on `.budget` at an empty span, so the arm is never the deciding predicate
+    /// there. A discriminating fixture must drive a network gzip to a `.budget`
+    /// stop with no compressed bytes left to hand out. Until one exists, treat
+    /// this arm as unexercised: reason about it, do not cite a test for it.
     pub fn spanTerminal(self: *const Cursor) bool {
         return switch (self.source.?) {
-            .mmap, .gzip => true,
+            .mmap => true,
+            .gzip => |g| !(g.provider != null and g.laneAtBudget(self.lane)),
             .http_range => |hr| if (hr.knownEnd()) |ke| self.logical >= ke else hr.eof.load(.acquire),
         };
     }
@@ -1041,7 +1083,7 @@ pub fn cursorAt(source: Source, logical: u64, logical_limit: ?u64, physical_budg
             }
             g.lane_busy[cur.lane] = true;
             g.lane_physical_budget[cur.lane] = physical_budget;
-            const session = if (cur.lane == 0) g.forward else if (cur.lane == 1) g.replay else g.replay2;
+            const session = g.sessionForLane(cur.lane);
             cur.physical = session.input.seek;
             if (physical_budget) |budget| {
                 cur.saved_input_end = session.input.end;
@@ -1087,7 +1129,7 @@ pub fn scanCursorAt(source: Source, logical: u64) Cursor {
                 g.cond.waitUncancelable(sysio.io(), &g.mutex);
             }
             g.lane_busy[cur.lane] = true;
-            const session = if (cur.lane == 0) g.forward else if (cur.lane == 1) g.replay else g.replay2;
+            const session = g.sessionForLane(cur.lane);
             cur.physical = session.input.seek;
             g.unlock();
             cur.locked = true;

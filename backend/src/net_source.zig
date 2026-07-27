@@ -35,16 +35,87 @@ pub const cache_ceiling: u64 = 16 * 1024 * 1024; // 16 MiB resident RAM bound (A
 const open_bytes: u64 = base.net_head_budget;
 const redirect_cap: u32 = 3; // Zig std's small fixed redirect cap (AC12)
 
-/// security-hardening (e) AC-e1: the real-transport CONNECT timeout (the single
-/// named knob, single source of truth). ~10 s: a non-responding connect fails
-/// retryably, WIRED via ConnectTcpOptions.timeout in `RealTransport.dial`, so the
-/// fetch thread/document never hangs on a dead host. There is NO idle-read
-/// timeout in v1 (deferred): Zig 0.16 `std.http.Client`'s blocking response
-/// reader exposes no per-read deadline hook, so a stalled ESTABLISHED stream is
-/// covered by the cancellable/retry fetch model + user cancel instead. The
-/// hermetic connect-timeout taxonomy (a stalled connect -> LS_NET_ERROR_TIMEOUT)
-/// is exercised by the fake (NetFault.timeout).
-pub const connect_timeout_secs: i64 = 10;
+// security-hardening (e) AC-e1 — NOT DELIVERABLE IN v1, see `.aidev/CHANGE-REQUEST.md`
+// (sec_w2b2). There is NO connect deadline and NO idle-read deadline on the real
+// transport in Zig 0.16, and deliberately NO knob that pretends otherwise:
+//   * connect: `std.http.Client.ConnectTcpOptions.timeout` is DECLARED AND NEVER
+//     READ (`std/http/Client.zig:1442` is the field's only occurrence in the file;
+//     `connectTcpOptions` at :1445 calls `host.connect(io, port, .{ .mode = .stream })`
+//     with no deadline). The working plumbing is one level down
+//     (`Io.net.IpAddress.ConnectOptions.timeout`, `Io/net.zig:335`), unreachable
+//     through `std.http.Client` without owning connection setup — which is exactly
+//     what caused the round-1 TLS crash (finding 1).
+//   * idle read: no per-read deadline hook on the blocking response reader.
+// Both are therefore covered by the cancellable fetch model + user cancel, and
+// that cover is SCOPED TO OPEN. No deadline fires on its own. DURING OPEN, a hung
+// or non-responding host is bounded by user cancel: the open-job worker is an
+// `io.concurrent` TASK (see `netIo`), so `ls_net_open_release` INTERRUPTS the
+// blocked connect/read rather than waiting it out, and neither a black-holed
+// host's 75 s OS connect timeout nor a peer that accepts and then answers nothing
+// is ever waited through.
+//   THIS BOUND DOES NOT EXTEND PAST OPEN: a document's background scan worker is
+//   NOT an executor task (`open.zig` spawns it with a raw `std.Thread.spawn`, so
+//   `Thread.current` is unset and `Threaded.Syscall.start` hands it an
+//   UNCANCELLABLE syscall — Io/Threaded.zig:1347-1348), `sourceShutdown` only
+//   stores a flag that is read BETWEEN chunks, and an in-flight `fetchInto` on
+//   that worker therefore cannot be interrupted: `ls_close` can block on a silent
+//   peer. Tracked separately; see finding 9 (sec_w2b2).
+// Do not restate the open-path claim without re-running the silent-peer probe.
+// That probe covers the OPEN JOB ONLY — it says nothing about the document's scan
+// worker or `ls_close`, which finding 9 measured as an indefinite block.
+// The hermetic timeout TAXONOMY (a stalled connect -> LS_NET_ERROR_TIMEOUT) is
+// still exercised by the fake (NetFault.timeout); only real-transport enforcement
+// is absent.
+
+// ---------------------------------------------------------------------------
+// The ONE `std.Io` behind every real network operation: the open-job worker TASK
+// and the `std.http.Client` that task drives. Process-global, initialized at
+// most once, deliberately never deinitialized. Both reasons are correctness, not
+// convenience:
+//
+//   * CANCELLATION (round-3). `std.Io.Threaded` can only interrupt a blocking
+//     syscall on a thread IT owns: `Threaded.Syscall.start` takes the
+//     module-global `Thread.current` threadlocal and, when it is unset, returns
+//     `.{ .thread = null }` — an UNCANCELLABLE syscall (Io/Threaded.zig:1348).
+//     A worker on a raw `std.Thread.spawn` therefore parks forever in the TLS
+//     handshake read, and the `ls_net_open_release` join never returns. Running
+//     the worker as an `io.concurrent` TASK of this executor is what makes each
+//     socket syscall a cancellation point: `netReadPosix` re-enters `readv` on
+//     EINTR through `syscall.checkCancel` (Io/Threaded.zig:12602-12611), and
+//     `Future.cancel` interrupts it with `pthread_kill(handle, .IO)`
+//     (Io/Threaded.zig:1277), repeating until the thread acknowledges.
+//   * LIFETIME. A DONE job hands its `RealTransport` to the document, and the
+//     ABI states the job and the doc are released in EITHER order — so the `Io`
+//     the client was built with can be owned by neither. One immortal instance
+//     is the only shape under which both orders are safe.
+//
+// Never deinitialized because `Threaded.init` installs a do-nothing SIGIO/SIGPIPE
+// handler and `deinit` restores whatever preceded it (Io/Threaded.zig:1652-1662,
+// :1714-1716): per-job instances nest that save/restore, so the first job to
+// finish would disarm the very signal a concurrent job's cancellation depends on.
+// The cost is one idle pooled thread per concurrently-open job and a permanently
+// installed no-op SIGIO/SIGPIPE handler (which is what a library wants anyway:
+// EPIPE returned rather than the host process killed). Local-file opens never
+// reach here, so a non-network process never pays it.
+var net_io_lock: sysio.Mutex = .init;
+var net_io_ready: bool = false;
+var net_io_threaded: std.Io.Threaded = undefined;
+
+/// The process-global network `Io` (see the comment above). Cheap but not free
+/// (one uncontended lock), so callers cache it — it is fetched once per job and
+/// once per transport, never on a fetch hot path.
+pub fn netIo() std.Io {
+    const blocking = sysio.io();
+    net_io_lock.lockUncancelable(blocking);
+    defer net_io_lock.unlock(blocking);
+    if (!net_io_ready) {
+        // A process-global instance must not borrow a caller's (possibly
+        // arena/testing) allocator: it outlives every caller.
+        net_io_threaded = .init(std.heap.smp_allocator, .{});
+        net_io_ready = true;
+    }
+    return net_io_threaded.io();
+}
 
 /// security-hardening (e) AC-e2: the PURE redirect scheme-downgrade decision — a
 /// small, unit-testable seam used by BOTH the fake taxonomy mapping (net.runFake)
@@ -57,13 +128,6 @@ pub fn redirectDowngrades(from_scheme: []const u8, to_scheme: []const u8) bool {
     const from_secure = std.ascii.eqlIgnoreCase(from_scheme, "https");
     const to_secure = std.ascii.eqlIgnoreCase(to_scheme, "https");
     return from_secure and !to_secure;
-}
-
-/// The URL's scheme text ("https" / "http" / …) for the downgrade check, without
-/// a full parse (a leading-token scan is enough and never fails).
-fn schemeOf(url: []const u8) []const u8 {
-    const colon = std.mem.indexOfScalar(u8, url, ':') orelse return url;
-    return url[0..colon];
 }
 
 /// Live-progress callback (round-2 review finding 1): invoked with the running
@@ -153,12 +217,13 @@ pub fn decideProbe(status: i32, content_length: ?u64, content_range_total: ?u64,
 }
 
 /// One real host connection for the whole job's lifetime: ONE `std.http.Client`
-/// (and its `Io.Threaded` executor), constructed once and reused across the
-/// probe AND every subsequent ranged fetch — `std.http.Client`'s connection
+/// (over the process-global `netIo` executor), constructed once and reused across
+/// the probe AND every subsequent ranged fetch — `std.http.Client`'s connection
 /// pool then keeps the underlying TCP/TLS connection alive across requests to
 /// the same host instead of a fresh handshake per 256 KiB chunk (round-2 review
-/// finding 5). Heap-allocated so its address (captured by `Io.Threaded.io()`)
-/// stays stable for the transport's whole lifetime.
+/// finding 5). Heap-allocated so its address stays stable for the transport's
+/// whole lifetime — which, on a DONE open, is the DOCUMENT's lifetime, not the
+/// job's (hence the executor cannot live in here; see `netIo`).
 /// The result of one forward drain of a sequential body reader: bytes copied
 /// into `dest` and whether the stream ended (clean or dropped).
 pub const DrainResult = struct { n: usize, eof: bool };
@@ -180,7 +245,6 @@ const SeqStream = struct {
 pub const RealTransport = struct {
     gpa: std.mem.Allocator,
     url: []u8, // owned NUL-free copy
-    threaded: std.Io.Threaded,
     client: std.http.Client,
     seq: ?*SeqStream = null, // the persistent sequential body reader (lazy)
 
@@ -189,8 +253,8 @@ pub const RealTransport = struct {
         errdefer gpa.destroy(self);
         const url_copy = try gpa.dupe(u8, url);
         errdefer gpa.free(url_copy);
-        self.* = .{ .gpa = gpa, .url = url_copy, .threaded = std.Io.Threaded.init(gpa, .{}), .client = undefined };
-        self.client = .{ .allocator = gpa, .io = self.threaded.io() };
+        self.* = .{ .gpa = gpa, .url = url_copy, .client = undefined };
+        self.client = .{ .allocator = gpa, .io = netIo() };
         return self;
     }
 
@@ -200,7 +264,6 @@ pub const RealTransport = struct {
             self.gpa.destroy(ss);
         }
         self.client.deinit();
-        self.threaded.deinit();
         self.gpa.free(self.url);
         self.gpa.destroy(self);
     }
@@ -251,27 +314,6 @@ pub const RealTransport = struct {
         return .{ .n = n, .eof = n == 0 };
     }
 
-    /// security-hardening (e) AC-e1: acquire a connection to `uri`'s host with the
-    /// CONNECT timeout applied. Reuses a pooled connection when present (no
-    /// re-handshake), so the timeout bounds only a FRESH connect (e.g. a
-    /// non-responding server on the initial probe). null on failure.
-    fn dial(self: *RealTransport, uri: std.Uri) ?*std.http.Client.Connection {
-        const protocol = std.http.Client.Protocol.fromUri(uri) orelse return null;
-        var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
-        const host = uri.getHost(&host_buf) catch return null;
-        const default_port: u16 = switch (protocol) {
-            .plain => 80,
-            .tls => 443,
-        };
-        const port = uri.port orelse default_port;
-        return self.client.connectTcpOptions(.{
-            .host = host,
-            .port = port,
-            .protocol = protocol,
-            .timeout = .{ .duration = .{ .raw = std.Io.Duration.fromSeconds(connect_timeout_secs), .clock = .awake } },
-        }) catch null;
-    }
-
     /// One ranged GET for the head bound. 206 + Content-Range total => random
     /// fill; 200 + Content-Length => sequential fill (known); no usable length
     /// => sequential fill of an unknown-length stream. Also reads the first 2
@@ -283,9 +325,15 @@ pub const RealTransport = struct {
         const uri = std.Uri.parse(self.url) catch return .{ .err = .invalid_argument };
         var range_buf: [64]u8 = undefined;
         const range_val = std.fmt.bufPrint(&range_buf, "bytes=0-{d}", .{open_bytes - 1}) catch return .{ .err = .io };
-        const conn = self.dial(uri) orelse return .{ .err = .unreachable_ };
+        // `request()` MUST own connection acquisition: its TLS prelude
+        // (std/http/Client.zig:1705-1723) is the ONLY code that rescans the CA
+        // bundle under `ca_bundle_lock` and populates `client.now`, and it runs
+        // BEFORE `options.connection orelse …` at :1725. Passing a pre-dialed
+        // `.connection` skips it, and `Connection.Tls.create` then unwraps
+        // `client.now.?` (:357, documented "Asserts that `client.now` is
+        // non-null." at :303) -> ReleaseSafe panic on every https open, plus a
+        // handshake against an unscanned CA bundle. Never hand-roll this.
         var req = self.client.request(.GET, uri, .{
-            .connection = conn,
             .redirect_behavior = .init(redirect_cap),
             .extra_headers = &.{.{ .name = "range", .value = range_val }},
         }) catch return .{ .err = .unreachable_ };
@@ -300,7 +348,14 @@ pub const RealTransport = struct {
         // the FINAL hop. Refuse if the chain downgraded the transport https->http
         // (the material downgrade -- serving content over plaintext after starting
         // secure). http->https / same-scheme (incl. cross-host) are unaffected.
-        if (redirectDowngrades(schemeOf(self.url), req.uri.scheme)) return .{ .err = .insecure_redirect };
+        // DETECT-AND-DISCARD, not prevention: std's `Request.redirect`
+        // (Client.zig:1211-1277) reconnects and re-sends inside `receiveHead`, so
+        // by the time we look the plaintext GET has already been issued and
+        // answered; we discard the response. See `.aidev/CHANGE-REQUEST.md`
+        // (sec_w2b2) for the ARCH wording amendment. `uri.scheme` is the
+        // already-parsed origin scheme -- the single source of truth (no second
+        // hand-rolled scheme scan).
+        if (redirectDowngrades(uri.scheme, req.uri.scheme)) return .{ .err = .insecure_redirect };
         const code: i32 = @intCast(@intFromEnum(response.head.status));
         if (code < 200 or code >= 300) return .{ .err = .http_status, .http_status = code };
         // Extract every needed field from `response.head` (a view into
@@ -326,9 +381,8 @@ pub const RealTransport = struct {
         const uri = std.Uri.parse(self.url) catch return .failed;
         var range_buf: [64]u8 = undefined;
         const range_val = std.fmt.bufPrint(&range_buf, "bytes={d}-{d}", .{ offset, offset + dest.len - 1 }) catch return .failed;
-        const conn = self.dial(uri) orelse return .failed;
+        // See `probe()`: `request()` owns connect (TLS prelude / `client.now`).
         var req = self.client.request(.GET, uri, .{
-            .connection = conn,
             .redirect_behavior = .init(redirect_cap),
             .extra_headers = &.{.{ .name = "range", .value = range_val }},
         }) catch return .failed;
@@ -336,8 +390,9 @@ pub const RealTransport = struct {
         req.sendBodiless() catch return .failed;
         var redirect_buf: [8192]u8 = undefined;
         var response = req.receiveHead(&redirect_buf) catch return .failed;
-        // security-hardening (e) AC-e2: refuse an https->http downgrade redirect.
-        if (redirectDowngrades(schemeOf(self.url), req.uri.scheme)) return .failed;
+        // security-hardening (e) AC-e2: discard an https->http downgraded response
+        // (see `probe()` -- detect-and-discard, and `uri.scheme` is the origin).
+        if (redirectDowngrades(uri.scheme, req.uri.scheme)) return .failed;
         const code = @intFromEnum(response.head.status);
         if (code < 200 or code >= 300) return .failed;
         var transfer_buf: [64 * 1024]u8 = undefined;

@@ -823,6 +823,9 @@ pub fn gzScanStep(doc: *api.Doc) api.GzScanStep {
                 search.commitSearch(d, res, filtered);
                 search.resolveNavLocked(d);
                 if (d.search_state == .scanning and !d.search_to_eof and !d.nav_pending) d.search_state = .cancelled;
+                // security-hardening (e) AC-e3: otherwise this step keeps
+                // reporting .scanning forever and its driver spins.
+                if (res.stalled) search.finishStalledLocked(d);
             }
         }
         const st = d.search_state;
@@ -840,7 +843,11 @@ pub fn gzScanStep(doc: *api.Doc) api.GzScanStep {
             d.unlock();
             const res = filter.filterScanChunk(d, start_pos, start_row, gen);
             d.lock();
-            if (d.filter_gen == gen and d.filter_state == .scanning) filter.commitFilter(d, res);
+            if (d.filter_gen == gen and d.filter_state == .scanning) {
+                filter.commitFilter(d, res);
+                // security-hardening (e) AC-e3: see the search arm above.
+                if (res.stalled) filter.finishStalledLocked(d);
+            }
         }
         const st = d.filter_state;
         d.unlock();

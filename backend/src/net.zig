@@ -47,7 +47,12 @@ pub const NetOpenJob = struct {
     // Real-transport background fetch.
     url: []u8 = &.{},
     opt: api.OpenOptions = .{},
-    thread: ?std.Thread = null,
+    /// The in-flight `realWorker` task (real transport only). A `Future`, not a
+    /// `std.Thread`: only a task of a `std.Io.Threaded` executor can have its
+    /// blocking socket syscalls interrupted, which is what lets `release` join a
+    /// worker parked in a TLS handshake instead of hanging on it forever. See
+    /// `net_source.netIo`.
+    future: ?std.Io.Future(void) = null,
     cancel_flag: std.atomic.Value(bool) = .init(false),
 
     fn lock(self: *NetOpenJob) void {
@@ -76,9 +81,31 @@ fn validScheme(url: []const u8) bool {
     return std.ascii.startsWithIgnoreCase(url, "http://") or std.ascii.startsWithIgnoreCase(url, "https://");
 }
 
+/// Terminate the job as FAILED — except that a failure observed after the caller
+/// asked to cancel IS the cancellation: now that the worker is a cancellable task
+/// (see `NetOpenJob.future`), an interrupted syscall surfaces as an ordinary
+/// error (`error.Canceled` -> a failed fetch / a failed spool write), and
+/// reporting that as FAILED/IO would contradict the state `cancel` already
+/// published.
+///
+/// SCOPE — this is the predicate for every failure routed THROUGH here, not the
+/// only site that maintains the invariant. Two terminal paths set state inline
+/// and each repeats its own `cancel_flag` check first: `realWorker`'s
+/// probe-failure arm (it also publishes `http_status`, which this helper does not
+/// carry, so it cannot call in) and `publish`'s cancelled-while-building arm.
+/// Three sites agree today; they are not one site. Any new terminal path must
+/// either call `failLocked` or repeat the cancel-wins check — and if a third
+/// inline site is ever needed, lift the shared part into a helper that can carry
+/// `http_status` instead of adding another copy.
 fn failLocked(job: *NetOpenJob, err: api.NetStatus) void {
     job.lock();
     defer job.unlock();
+    if (job.cancel_flag.load(.acquire)) {
+        job.state = .cancelled;
+        job.err = .cancelled;
+        job.spool_present = false;
+        return;
+    }
     job.state = .failed;
     job.err = err;
 }
@@ -250,7 +277,12 @@ pub fn startJob(gpa: std.mem.Allocator, url: [*]const u8, url_len: usize, option
         return job;
     };
     job.state = .pending;
-    job.thread = std.Thread.spawn(.{}, realWorker, .{job}) catch {
+    // `concurrent`, never `async`: `async` is allowed to run the task EAGERLY on
+    // this thread when no unit of concurrency is free (Io.zig:2358-2364), which
+    // would turn `ls_open_url_start` — documented to return immediately — into a
+    // blocking whole-open call. `concurrent` guarantees a separate thread or
+    // fails, and that thread is executor-owned, hence cancellable.
+    job.future = net_source.netIo().concurrent(realWorker, .{job}) catch {
         job.state = .failed;
         job.err = .unreachable_;
         return job;
@@ -292,9 +324,18 @@ pub fn release(job: *NetOpenJob) void {
     // If a real fetch is still in flight, signal cancel and join it first (like
     // ls_close on a scanning document). Never closes job.doc.
     job.cancel_flag.store(true, .release);
-    if (job.thread) |t| {
-        t.join();
-        job.thread = null;
+    if (job.future) |*f| {
+        // `Future.cancel` = request cancellation + await. The request is what
+        // actually TEARS DOWN a parked fetch: the executor interrupts the
+        // worker's blocking socket syscall (SIGIO) until it acknowledges, the
+        // read fails with `error.Canceled`, and the worker unwinds — so this
+        // join terminates even when the peer accepted the TCP connection and
+        // then answered nothing. Idempotent; a already-finished task returns at
+        // once. There is no request-WITHOUT-await primitive in the 0.16 `Io`
+        // vtable, which is why the teardown lands here (release joins, and is
+        // documented to) rather than in the non-blocking `cancel`.
+        f.cancel(net_source.netIo());
+        job.future = null;
     } else {
         cancel(job);
     }

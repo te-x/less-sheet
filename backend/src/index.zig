@@ -225,6 +225,20 @@ pub fn workerMain(doc: *Document) void {
                 filter.commitFilter(doc, res);
                 filter.resolveFilterJumpLocked(doc);
                 column.sourceCompletedLocked(doc);
+                // security-hardening (e) AC-e3: the filtered jump is the LIVE
+                // network filter driver (`do_filter` is gated off for net docs),
+                // so this is where a short body strands it. The scan made no
+                // progress and cannot: end the jump at the last match we DO have
+                // (mirroring resolveFilterJumpLocked's clamp, but WITHOUT
+                // filter_total_exact — the tail is un-fetched, not empty) and
+                // re-park the filter, so the worker stops re-entering on a
+                // zero-progress cursor.
+                if (res.stalled and doc.jump_state == .scanning) {
+                    doc.jump_state = .done;
+                    doc.jump_progress = 1.0;
+                    doc.jump_landed = if (doc.filter_total > 0) doc.filter_total - 1 else 0;
+                }
+                if (res.stalled) filter.finishStalledLocked(doc);
             }
             const advanced = doc.reader.physicalBytes(doc.source, doc.frontier_pos);
             doc.unlock();
@@ -260,6 +274,11 @@ pub fn workerMain(doc: *Document) void {
             if (doc.filter_gen == gen and doc.filter_state == .scanning) {
                 filter.commitFilter(doc, res);
                 column.sourceCompletedLocked(doc);
+                // security-hardening (e) AC-e3: the scan stalled on un-fetched
+                // bytes. Freeze the filter at its last consistent state
+                // (CANCELLED — counts exact for what IS present, view NOT
+                // complete) instead of re-entering on a zero-progress cursor.
+                if (res.stalled) filter.finishStalledLocked(doc);
             }
             const advanced = doc.reader.physicalBytes(doc.source, doc.frontier_pos);
             doc.unlock();
@@ -316,6 +335,13 @@ pub fn workerMain(doc: *Document) void {
                     // A nav-limited resume served its navigation before EOF.
                     doc.search_state = .cancelled;
                 }
+                // security-hardening (e) AC-e3: the scan stalled on un-fetched
+                // bytes. `resolveNavLocked` above already served any navigation
+                // reachable within the PRESENT rows; freeze the search there
+                // (CANCELLED, counts frozen, pending nav -> NONE) rather than
+                // spinning and inflating the row/match counts. Runs after the
+                // commit so everything actually scanned is kept.
+                if (res.stalled) search.finishStalledLocked(doc);
             }
             const advanced = doc.reader.physicalBytes(doc.source, doc.frontier_pos);
             doc.unlock();
@@ -347,8 +373,8 @@ pub fn workerMain(doc: *Document) void {
         if (res.eof) {
             doc.complete = true;
             doc.total_rows = doc.frontier_rows;
-        } else if (doc.net and doc.jump_state == .scanning and res.end_row == start_row and
-            doc.reader.physicalBytes(doc.source, res.end_pos) == doc.reader.physicalBytes(doc.source, start_pos))
+        } else if (doc.jump_state == .scanning and !doc.stop_atomic.load(.monotonic) and
+            res.end_row == start_row and base.scanStalled(doc, start_pos, res.end_pos))
         {
             // security-hardening (e) AC-e3: a NETWORK jump that made NO forward
             // progress because the next bytes are un-fetched (a short/failed range
@@ -358,6 +384,11 @@ pub fn workerMain(doc: *Document) void {
             // the worker neither spins nor hammers the transport re-fetching a byte
             // that will not arrive. A retry, or a demand for already-present bytes,
             // still resolves normally.
+            // The predicate is exact, not a proxy (see base.scanStalled: LOGICAL
+            // bytes — a net gzip shares one physical offset across many logical
+            // positions). `stop_atomic` is excluded explicitly: `scanChunk`
+            // returns the same no-progress shape on cancellation, which would
+            // otherwise land here and publish a bogus `.done` / 1.0 jump.
             doc.jump_state = .done;
             doc.jump_progress = 1.0;
             doc.jump_landed = if (doc.frontier_rows > 0) doc.frontier_rows - 1 else 0;
