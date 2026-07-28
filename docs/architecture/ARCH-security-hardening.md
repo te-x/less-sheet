@@ -41,7 +41,7 @@ sections carry an *(amended 2026-07-24)* tag. Summary of the decisions:
 
 Downstream convergence order for these amendments: see the Sequencing note at the end.
 
-## Amendment — 2026-07-28 (CHANGE-REQUEST sec_w2b2; two-key complete, awaiting the author sign-off)
+## Amendment — 2026-07-28 (CHANGE-REQUEST sec_w2b2, adjudicated; the author sign-off)
 
 The `sec_w2b2` build cell's contract change request (`backend/.aidev/CHANGE-REQUEST.md`, signed by
 the implementer, **co-signed by the reviewer**; decision records `review/REVIEW-security-w2b-net.md`
@@ -70,6 +70,8 @@ change rides on this amendment; `api/lesssheet.h` is byte-identical throughout t
    short-body fix is **REASONED-CORRECT, NOT PROBE-CONFIRMED** — the prescribed discriminating
    fixture is byte-identical on the fixed and unfixed trees, and the green 273/273 suite does not
    cover it. Recorded at AC-e3 and at the `spanTerminal` site in `backend/src/source.zig`.
+
+**SIGNED by the author 2026-07-28**, including the departures from the co-signed CR text recorded below.
 
 ### Departures from the co-signed CR text (read before signing)
 

@@ -4,8 +4,18 @@
 recorded in full at `.aidev/DECISION-2.md`. This supersedes the file contents; it does not
 reopen anything adjudicated there.)
 
-Signed:  [x] implementer   [ ] reviewer
+Signed:  [x] implementer   [x] reviewer
 (both required; the reviewer's signature also certifies the evidence below was independently re-checked)
+
+**ADJUDICATED 2026-07-28 — APPROVED, with amended wording. Signed by the author.**
+Recorded in `docs/architecture/ARCH-security-hardening.md`, "Amendment — 2026-07-28". Both items
+were approved in substance; item 1's WORDING is NOT the text proposed below, because the behaviour
+it described changed underneath this request after it was written (commits `bade23e` and `b69f765`).
+The reviewer's second key was given against its own scoped replacement text, and the signed
+amendment departs from that too — the departures are enumerated in the amendment's
+"Departures from the co-signed CR text" subsection, which is what the author signed against.
+Decision records: `review/REVIEW-security-w2b-net.md`, `review/REVIEW-net-close-hang.md`.
+This file is preserved unaltered below as the audit record of what was REQUESTED.
 
 ## Grounds (tick at least one)
 - [x] A. Infeasible within the current contract
