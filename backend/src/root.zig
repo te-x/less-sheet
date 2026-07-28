@@ -145,7 +145,7 @@ pub export fn ls_close(doc: *api.Doc) callconv(.c) void {
     source_mod.sourceShutdown(&d.source);
     d.wakeWorker();
     d.unlock();
-    if (d.worker) |w| w.join();
+    d.joinWorker();
     freeDoc(d);
 }
 

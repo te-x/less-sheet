@@ -13,6 +13,10 @@ const api = @import("api");
 const reader_mod = @import("reader.zig");
 const source_mod = @import("source.zig");
 const column_state = @import("column_state.zig");
+// Only for `netIo()` (the one process-global network executor) in
+// `startWorker`/`joinWorker`. Not a new module cycle: base -> source_mod ->
+// net_source -> base already exists.
+const net_source = @import("net_source.zig");
 
 const posix = std.posix;
 const sysio = @import("sysio.zig");
@@ -115,6 +119,28 @@ pub const CopyView = enum { identity, filtered };
 pub const MatchScanOwner = enum { none, filter, search };
 pub const ColumnSampleKind = enum { head, window };
 pub const ColumnWindowRow = struct { row: u64, pos: Pos, oversized: bool };
+
+/// The document's single background scan worker, in the two shapes it can take.
+/// `Document.startWorker` is the ONE place that decides between them and
+/// `Document.joinWorker` the ONE place that tears either down; no other module
+/// re-derives the policy (every other site only null-tests `doc.worker`).
+///
+///   * `.thread` — a raw `std.Thread`, the shape every document used before.
+///     Shut down by `stop` + `wakeWorker` + `join`: the worker observes `stop`
+///     between chunks and returns on its own.
+///   * `.task` — an `io.concurrent` task of the process-global network executor
+///     (`net_source.netIo`). Identical code on a DIFFERENT kind of thread: one
+///     the executor owns, so `Thread.current` is set and every blocking socket
+///     syscall it makes becomes a cancellation point (`Threaded.Syscall.start`,
+///     Io/Threaded.zig:1345-1366) instead of the uncancellable
+///     `.{ .thread = null }` a raw thread gets at :1348. `Future.cancel` then
+///     interrupts a parked read with `pthread_kill(handle, .IO)` until the
+///     thread acknowledges, which is what makes `ls_close` terminate against a
+///     peer that accepts the connection and then answers nothing.
+pub const Worker = union(enum) {
+    thread: std.Thread,
+    task: std.Io.Future(void),
+};
 
 pub const Document = struct {
     gpa: std.mem.Allocator,
@@ -300,7 +326,7 @@ pub const Document = struct {
     wf_gen: u64,
 
     // Worker control.
-    worker: ?std.Thread,
+    worker: ?Worker,
     stop: bool,
     stop_atomic: std.atomic.Value(bool),
 
@@ -586,6 +612,68 @@ pub const Document = struct {
     }
     pub fn waitWork(self: *Document) void {
         self.cond.waitUncancelable(sysio.io(), &self.mutex);
+    }
+
+    /// Start the single background scan worker. THE decision point for
+    /// `Worker`'s two shapes, and it keys on `self.net` — the ONE
+    /// already-computed network resolver (set once in `open.buildDocument`
+    /// from `source_mod.sourceIsNetwork`, and the same field the lazy-frontier
+    /// gate reads). No new policy, no second predicate.
+    ///
+    /// Only a NETWORK document becomes an executor task, because only a
+    /// network document can park in a syscall that `stop` cannot reach: an
+    /// in-flight `fetchInto` on a silent peer. A local mmap/gzip scan makes no
+    /// interruptible blocking syscall — it faults pages in and checks `stop`
+    /// between chunks — so for it the task shape would buy nothing and cost
+    /// three things: `Threaded.init`'s process-wide SIGIO/SIGPIPE handlers
+    /// (Io/Threaded.zig:1652-1664) installed in hosts that never touch the
+    /// network, an executor thread that is never retired, and a brand-new
+    /// `error.Canceled` path through the local scan. The local path therefore
+    /// stays a raw `std.Thread`, byte-identical to before.
+    ///
+    /// Degraded fallback preserved: on failure `worker` stays null and the
+    /// callers that null-test it drive the scan inline under the mutex.
+    pub fn startWorker(self: *Document, comptime entry: fn (*Document) void) void {
+        if (self.net) {
+            const future = net_source.netIo().concurrent(entry, .{self}) catch return;
+            self.worker = .{ .task = future };
+        } else {
+            const thread = std.Thread.spawn(.{}, entry, .{self}) catch return;
+            self.worker = .{ .thread = thread };
+        }
+    }
+
+    /// Stop and join the worker. Caller must ALREADY have published `stop`,
+    /// called `source_mod.sourceShutdown`, woken the worker and dropped the
+    /// mutex (see `ls_close`) — this only performs the join half.
+    ///
+    /// The two halves compose, and both are required for a network document:
+    ///   * `shutdown` (stored by `sourceShutdown`) is what stops the source
+    ///     from entering ANOTHER blocking fetch — every net_source wait loop
+    ///     re-reads it at the top of each iteration. It cannot interrupt the
+    ///     fetch already in flight.
+    ///   * `Future.cancel` is what unblocks the fetch already in flight. It is
+    ///     request-plus-await; 0.16's `Io` vtable has no request-without-await
+    ///     primitive (`Io.zig:1190`), which is why the teardown lands here.
+    ///     Cancellation is ONE-SHOT, not sticky — only the next cancellation
+    ///     point returns `error.Canceled` (Io.zig:1183-1188, and
+    ///     Threaded.zig:1363-1364 where a `.canceled` thread goes back to
+    ///     uninterruptible syscalls) — so it could not on its own stop a retry
+    ///     loop from re-blocking. `shutdown` is what guarantees there is no
+    ///     next fetch to re-block on.
+    /// A worker parked in `waitWork` instead of a socket read needs neither:
+    /// the caller's `wakeWorker` broadcast already returned it to the loop
+    /// head, where `stop` ends it. `lock`/`waitWork` use the UNCANCELABLE
+    /// Mutex/Condition variants, so a pending cancel request cannot break the
+    /// teardown path itself.
+    pub fn joinWorker(self: *Document) void {
+        if (self.worker) |*w| switch (w.*) {
+            .thread => |t| t.join(),
+            // In place, never a copy: cancel writes the task's result through
+            // this pointer.
+            .task => |*future| future.cancel(net_source.netIo()),
+        };
+        self.worker = null;
     }
 
     /// Return the whole-job FILTER/SEARCH cursor, replacing a stale cursor

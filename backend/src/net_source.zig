@@ -53,16 +53,18 @@ const redirect_cap: u32 = 3; // Zig std's small fixed redirect cap (AC12)
 // blocked connect/read rather than waiting it out, and neither a black-holed
 // host's 75 s OS connect timeout nor a peer that accepts and then answers nothing
 // is ever waited through.
-//   THIS BOUND DOES NOT EXTEND PAST OPEN: a document's background scan worker is
-//   NOT an executor task (`open.zig` spawns it with a raw `std.Thread.spawn`, so
-//   `Thread.current` is unset and `Threaded.Syscall.start` hands it an
-//   UNCANCELLABLE syscall — Io/Threaded.zig:1347-1348), `sourceShutdown` only
-//   stores a flag that is read BETWEEN chunks, and an in-flight `fetchInto` on
-//   that worker therefore cannot be interrupted: `ls_close` can block on a silent
-//   peer. Tracked separately; see finding 9 (sec_w2b2).
-// Do not restate the open-path claim without re-running the silent-peer probe.
-// That probe covers the OPEN JOB ONLY — it says nothing about the document's scan
-// worker or `ls_close`, which finding 9 measured as an indefinite block.
+//   THE SAME BOUND NOW EXTENDS PAST OPEN (net_close_hang; was finding 9 of
+//   sec_w2b2, an indefinite `ls_close`). A NETWORK document's background scan
+//   worker is an `io.concurrent` task too — `base.Document.startWorker` — so an
+//   in-flight `fetchInto` on it is interruptible for exactly the reason the open
+//   job's is, and `base.Document.joinWorker` cancels it. `sourceShutdown` still
+//   only stores a flag read BETWEEN chunks; that flag is what stops the NEXT
+//   fetch, the cancel is what unblocks the CURRENT one, and `ls_close` needs
+//   both. A LOCAL document's worker stays a raw `std.Thread.spawn` (uncancellable
+//   — `Thread.current` unset, Io/Threaded.zig:1347-1348) because it never makes
+//   an interruptible blocking syscall; `stop` alone terminates it.
+// Do not restate either claim without re-running the silent-peer probes — one
+// covers the OPEN JOB (`ls_net_open_release`), one the SCAN WORKER (`ls_close`).
 // The hermetic timeout TAXONOMY (a stalled connect -> LS_NET_ERROR_TIMEOUT) is
 // still exercised by the fake (NetFault.timeout); only real-transport enforcement
 // is absent.

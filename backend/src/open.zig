@@ -208,7 +208,7 @@ pub fn buildDocument(
     };
 
     source_mod.sourceFinishOpen(&doc.source);
-    doc.worker = std.Thread.spawn(.{}, index.workerMain, .{doc}) catch null;
+    doc.startWorker(index.workerMain);
     return doc;
 }
 
