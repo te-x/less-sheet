@@ -101,9 +101,15 @@ and departs from the two earlier texts as follows:
   `=cmd|…` cell is shown as literal text, never run. The CSV *content* is not the RCE risk.
 - **The real RCE risk is memory-safety in OUR own Zig parser / decompressor / sources.** A crafted
   CSV / gzip / network byte-stream that trips an out-of-bounds read, integer overflow, or
-  use-after-free is the actual code-execution path. Today the shipped core is **`ReleaseFast`
-  (safety checks OFF)**, so such a bug is undefined behavior, not a clean panic. This is the single
-  largest exploit-surface item and drives MUST item (a).
+  use-after-free is the actual code-execution path. This was the single largest exploit-surface item
+  and is what drove MUST item (a): when this document was written the shipped core was
+  **`ReleaseFast` (safety checks OFF)**, so such a bug was undefined behavior rather than a clean
+  panic. **RESOLVED as of Wave 1 (a) — the shipped core is now `ReleaseSafe` with zero
+  `@setRuntimeSafety(false)` carve-outs, and the gate certifies the shipped mode** (see AC-a1/a2 and
+  Decision 1; the requirement text below is preserved as written, in the pre-(a) present tense).
+  The residual risk is therefore no longer UB but a `ReleaseSafe` panic on adversarial input — which
+  still counts as a crash against the standing bar, and is what MUST item (c), the fuzz campaign,
+  exists to find.
 - **Secondary surfaces:** gzip-decompression work amplification (a "bomb" — accepted known risk
   as of the 2026-07-24 amendment; see Decision 3); network TLS/redirect/
   timeout behavior; the COPY feature propagating formula-injection into Excel/Sheets on paste; and
