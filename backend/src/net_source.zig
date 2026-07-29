@@ -523,6 +523,15 @@ pub const HttpRange = struct {
     physical_base: u64 = 0,
     // RANDOM fill (range server): per-chunk fetched + RAM-cache residency.
     present: []bool = &.{},
+    /// RANDOM fill: the CONTIGUOUS present prefix of `present[]`, in internal
+    /// bytes, exclusive — the frontier commit guard's `present_extent`
+    /// (see source.Source.commitBound). Maintained monotonically under the mutex
+    /// by `bumpPresentPrefixLocked` wherever a chunk is marked present, so a
+    /// per-row guard check is one atomic load instead of an O(chunks) walk;
+    /// published atomically so that check needs no lock. A hole left by a short
+    /// or failed range parks it AT the hole (never past it) and a later retry that
+    /// fills the hole advances it again.
+    present_prefix: std.atomic.Value(u64) = .init(0),
     resident: []bool = &.{},
     resident_order: std.ArrayList(usize) = .empty,
     resident_bytes: u64 = 0,
@@ -634,6 +643,18 @@ pub const HttpRange = struct {
         self.eof.store(true, .release);
     }
 
+    /// Advance `present_prefix` over every newly-contiguous present chunk. Called
+    /// under the mutex right after any `present[] = true`; amortized O(1) per chunk
+    /// over the resource's life (it never re-walks a chunk it already counted).
+    fn bumpPresentPrefixLocked(self: *HttpRange) void {
+        var at = self.present_prefix.load(.monotonic);
+        var ci: usize = @intCast(at / chunk_bytes);
+        while (ci < self.present.len and self.present[ci]) : (ci += 1) {
+            at = @min(self.total, @as(u64, ci + 1) * chunk_bytes);
+        }
+        self.present_prefix.store(at, .release);
+    }
+
     // --- RANDOM fill --------------------------------------------------------
 
     fn ensureChunkLocked(self: *HttpRange, c_idx: usize) void {
@@ -652,6 +673,7 @@ pub const HttpRange = struct {
                 .failed => return,
             }
             self.present[c_idx] = true;
+            self.bumpPresentPrefixLocked();
             self.fetch_count += 1;
             self.spool_bytes += len;
             if (self.progress) |p| p.callback(p.ctx, self.spool_bytes, self.total);
@@ -719,6 +741,7 @@ pub const HttpRange = struct {
                 }
                 self.markResidentLocked(k);
             }
+            self.bumpPresentPrefixLocked();
             if (self.progress) |p| p.callback(p.ctx, self.spool_bytes, self.total);
             ci = run_end;
         }
@@ -910,6 +933,62 @@ pub const HttpRange = struct {
         if (self.total_known) return self.total -| self.bom_len;
         if (self.eof.load(.acquire)) return self.final_len.load(.acquire) -| self.bom_len;
         return self.seq_hw.load(.acquire) -| self.bom_len;
+    }
+
+    /// The CONTIGUOUS PRESENT PREFIX, exclusive, in internal (pre-BOM) bytes: the
+    /// frontier commit guard's `present_extent`. Two fill modes, one meaning —
+    /// random fill reads the `present[]` prefix cache, sequential fill the download
+    /// high-water. Lock-free (both are atomics).
+    fn presentExtent(self: *const HttpRange) u64 {
+        if (self.range_mode == 2) return self.seq_hw.load(.acquire);
+        return self.present_prefix.load(.acquire);
+    }
+
+    /// The `http_range` arm of the FRONTIER COMMIT GUARD — see
+    /// `source.Source.commitBound` for the invariant, the two failure modes it
+    /// prevents, and why `reach`'s lookahead is secured on the CALLER's thread.
+    /// `need` is `max_lookahead` — the FULL peek width, since a bare-CR row's
+    /// successor test peeks AT `row_end` — passed in so that knob keeps ONE
+    /// definition. Both demands below are parametric in `need`, so they already
+    /// request exactly `[reach, reach + max_lookahead)` INCLUDING the far byte
+    /// `reach + max_lookahead - 1`; widening the knob needed no change here.
+    pub fn commitBound(self: *HttpRange, reach: u64, need: u64) u64 {
+        // Already secured? Then this is two atomic loads and no lock -- which is the
+        // case for every row but the one that ends within `need` bytes of the
+        // present edge, so the per-row cost of the guard on a network scan stays off
+        // the transport and off this Source's mutex.
+        const present = self.commitBoundNoFetch(need);
+        if (reach <= present) return present;
+        // Secure it here: random fill fetches the covering chunks, sequential fill
+        // drains forward to them (blocking, but on the async scan worker — the path
+        // that already pays for fetches — never under the document mutex).
+        // TWO demands, because the two fills bound a request differently and a
+        // partially-secured window would withhold an edge row FOREVER (no progress,
+        // nothing left to fetch — a healthy document would stall at a chunk edge):
+        //   * the WHOLE window, for random fill: `ensureSlice` turns [internal,
+        //     internal+want) into a chunk range, so this is what covers the case
+        //     where the window straddles a chunk boundary (both chunks fetched in
+        //     one coalesced GET).
+        //   * its LAST byte, for sequential fill: `ensureSliceSequentialLocked`
+        //     returns as soon as the byte AT `internal` is available and ignores
+        //     `want` entirely, so only asking for the FAR end drains the prefix far
+        //     enough. Blocking here is the documented withhold-then-release
+        //     behavior (AC13): the scan stays SCANNING until the bytes arrive.
+        _ = self.ensureSlice(reach + self.bom_len, need);
+        _ = self.ensureSlice(reach + self.bom_len + need - 1, 1);
+        return self.commitBoundNoFetch(need);
+    }
+
+    /// The bound itself — the ONE formula, over whatever is present right now. See
+    /// `source.Source.commitBoundNoFetch` for the two callers that must not fetch.
+    pub fn commitBoundNoFetch(self: *const HttpRange, need: u64) u64 {
+        const extent = self.presentExtent() -| self.bom_len;
+        // EOF EXEMPT (1f-b): with every byte up to the true end present, no peek
+        // past any row can fetch (`peekHttp` caps at `knownEnd`), so the last row
+        // of the document commits normally. Omitting this would permanently drop
+        // the final row of every network document.
+        if (self.knownEnd()) |ke| if (extent >= ke) return std.math.maxInt(u64);
+        return extent -| need;
     }
 
     /// The Source's true END, or null while unknown (mirrors gzip.terminalLogical

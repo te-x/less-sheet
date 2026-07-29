@@ -433,11 +433,20 @@ one-time campaign). The planner turns these into frozen tests.
   - **After open**, a network document's background scan worker is likewise an `io.concurrent`
     executor task (net_close_hang fix, commit `b69f765`), so `ls_close` cancels an in-flight fetch
     on a silent peer (measured 0.003 s; previously never returned).
-  - **One route remains UNBOUNDED — OPEN SHIP-BLOCKER, its own cell:** `windowSetFiltered` holds
-    the Document mutex across a `Cursor.peekHttp` that is deliberately not capped by the fetched
-    extent, so a frontier read can issue an unbounded fetch and `ls_close` blocks at `d.lock()`
-    before it can cancel anything (`review/REVIEW-net-close-hang.md`). Until that cell closes,
-    "bounded by user cancel" holds for open and for close-via-the-worker — NOT universally.
+  - **That route is now CLOSED for plain net CSV** *(fact correction 2026-07-29, cell
+    `net_peek_mutex`, `review/REVIEW-net-peek-mutex.md`)*. It was real and reproduced:
+    `windowSetFiltered` held the Document mutex across a `Cursor.peekHttp` deliberately not capped
+    by the fetched extent, so a frontier read issued an unbounded fetch and `ls_close` then blocked
+    at `d.lock()` before it could cancel anything. Fixed on the **frontier-commit** side rather than
+    the peek side (a peek clamp would have traded the hang for silent UTF-16 corruption): a row is
+    committed only when `row_end + max_lookahead <= present_extent`, or `row_end` is the source's
+    genuine end. Mutex-held re-lex therefore never touches an absent byte.
+  - **STILL UNBOUNDED for network gzip — open, its own cell:** a commit-side bound cannot cover it.
+    `Gzip.produce` calls `ensureCompressed(seek + chunk_bytes)` unconditionally on every inflate op
+    — a fixed read-ahead, not a demand the row needs — so it can require un-fetched chunks however
+    far behind the frontier a mutex-held re-lex sits; `column.zig`'s mutex-held gzip-lane acquire
+    (`waitUncancelable`) is the same family. So **"bounded by user cancel" holds for open, for
+    close-via-the-worker, and for plain net CSV — NOT for network gzip.**
   The timeout **taxonomy** (`LS_NET_ERROR_TIMEOUT`) remains contractual and hermetically tested
   via the fake (`NetFault.timeout`); only real-transport enforcement is out of scope for v1. No
   frozen test may assert a real-transport deadline, connect or idle-read; the cancel bounds above

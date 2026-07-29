@@ -132,6 +132,9 @@ pub fn filterScanChunk(doc: *Document, start_pos: Pos, start_row: u64, generatio
     const target = ((start_row / checkpoint_interval) + 1) * checkpoint_interval;
     base.beginOversizedChunk(doc);
     doc.filter_oversized_stage.clearRetainingCapacity(); // ARCH-huge-row-filtered
+    // FRONTIER COMMIT GUARD (source.Source.commitBound) -- see the hoist and the
+    // withhold in search.searchScanChunk; identical rule, identical reasons.
+    const guarded = doc.source.commitGuarded();
     while (row < target) {
         if (doc.stop_atomic.load(.monotonic)) {
             doc.endMatchScanIf(.filter, generation);
@@ -150,6 +153,16 @@ pub fn filterScanChunk(doc: *Document, start_pos: Pos, start_row: u64, generatio
         if (base.scanStalled(doc, pos, res.next)) {
             doc.endMatchScanIf(.filter, generation);
             return .{ .end_pos = pos, .end_row = row, .eof = false, .stalled = true, .checkpoint = null, .matches = matches };
+        }
+        // FRONTIER COMMIT GUARD: see search.searchScanChunk's withhold. The filtered
+        // JUMP is the LIVE network filter driver (`do_filter` is net-gated), so this
+        // is the arm a network filtered view actually reaches.
+        if (guarded) {
+            const row_end = doc.reader.logicalBytes(doc.source, res.next);
+            if (row_end > doc.source.commitBound(row_end)) {
+                doc.endMatchScanIf(.filter, generation);
+                return .{ .end_pos = pos, .end_row = row, .eof = false, .stalled = true, .checkpoint = null, .matches = matches };
+            }
         }
         const matched = res.matched_col != null;
         if (matched) matches += 1;

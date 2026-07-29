@@ -326,9 +326,17 @@ pub const CsvReader = struct {
         defer cur.deinit();
         if (self.encoding == api.encoding_utf8) return scanUtf8Rows(&cur, self.sep, self.quote, max_rows);
         var rows: u64 = 0;
+        // FRONTIER COMMIT GUARD (source.Source.commitBound), UTF-16 arm. Hoisted:
+        // a local document never enters the guarded branch at all.
+        const guarded = source.commitGuarded();
         while (rows < max_rows) {
             if (streamUnit(&cur, self.encoding) == null) break;
+            // The row's OWN start, which is where the frontier stays if the row
+            // turns out not to be committable (the lex below cannot be un-run).
+            const row_start = if (guarded) cursorPos(&cur) else undefined;
             _ = boundsFromCursor(&cur, self.sep, self.quote, self.encoding);
+            if (guarded and cur.logical > source.commitBound(cur.logical))
+                return .{ .next = row_start, .rows = rows, .eof = false };
             rows += 1;
         }
         // security-hardening (e) AC-e3: as scanUtf8Rows -- an empty stream unit is
@@ -529,10 +537,32 @@ fn scanUtf8Rows(cur: *source_mod.Cursor, sep: u8, quote: ?u8, max_rows: u64) rea
     var quoted = false;
     var saw = false;
     var skip_lf = false;
+    // FRONTIER COMMIT GUARD (source.Source.commitBound). Hoisted: a LOCAL document
+    // leaves `commit_end` at maxInt, so the only per-row cost is one compare
+    // against a loop-invariant register (and this loop is never reached for an mmap
+    // Source at all -- index.scanChunk routes mmap through its own boundsAfter
+    // loop). Offsets here are ABSOLUTE, never span-relative: the quoted-field
+    // escape below advances the cursor MID-span, which would strand an index.
+    const guarded = cur.source.?.commitGuarded();
+    // The last row boundary that IS committable, and the row count there. A bulk
+    // span walk otherwise leaves the cursor MID-ROW when the present region ends
+    // inside a row, which would publish a frontier whose own lookahead is absent —
+    // the wedge again, by a second route — and a row count that does not describe
+    // that position. Only a FULLY consumed terminator qualifies: with `skip_lf`
+    // pending the frontier would sit between a CR and its LF, which a later scan
+    // starting fresh there cannot reproduce.
+    var commit_logical: u64 = cur.logical;
+    var commit_rows: u64 = 0;
+    var withheld = false;
     while (rows < max_rows) {
         const bytes = cur.span();
         if (bytes.len == 0) break;
         var i: usize = 0;
+        // Cheap bound, NO demand (this span's bytes are present by construction, so
+        // a demand here could only be a no-op): two atomic reads, once per 256 KiB.
+        // A row ending past it re-checks WITH a demand below -- so the common row
+        // pays one compare and no fetch.
+        const commit_end: u64 = if (guarded) cur.source.?.commitBoundNoFetch() else std.math.maxInt(u64);
         while (i < bytes.len and rows < max_rows) {
             const b = bytes[i];
             if (skip_lf) {
@@ -572,15 +602,40 @@ fn scanUtf8Rows(cur: *source_mod.Cursor, sep: u8, quote: ?u8, max_rows: u64) rea
             } else if (b == '\n' or b == '\r') {
                 if (b == '\r' and i + 1 < bytes.len and bytes[i + 1] == '\n') i += 1;
                 if (b == '\r' and i + 1 == bytes.len) skip_lf = true;
+                // FRONTIER COMMIT GUARD: this row ends at `cur.logical + i + 1`.
+                // Count it only if the lookahead a later mutex-held re-lex will
+                // peek there is already present; the second call DEMANDS that
+                // lookahead on this (scan-worker) thread and re-reads the bound, so
+                // a healthy document always proceeds and only a short/failed range
+                // withholds. Reached at most once per row and, because a row
+                // boundary rarely lands within `max_lookahead` of the present edge,
+                // it demands at most once per chunk.
+                const row_end = cur.logical + i + 1;
+                if (row_end > commit_end and row_end > cur.source.?.commitBound(row_end)) {
+                    withheld = true;
+                    break;
+                }
                 rows += 1;
                 field_start = true;
                 saw = false;
                 i += 1;
+                // Gated, so an UNGUARDED source (local gzip -- mmap never reaches
+                // this loop) pays no per-row store at all; these are read only under
+                // `guarded` below.
+                if (guarded and !skip_lf) {
+                    commit_logical = cur.logical + i;
+                    commit_rows = rows;
+                }
             } else {
                 field_start = false;
                 i += 1;
             }
         }
+        // Give the row back: the frontier stays at the last committable boundary
+        // (applied once, below). The SCAN is not stopped for the caller's purposes
+        // -- it returns normally with the rows it did count, and the withheld row is
+        // picked up by the next chunk as soon as its successor bytes arrive.
+        if (withheld) break;
         cur.advance(i);
     }
     // security-hardening (e) AC-e3: an empty span is EOF only at a genuine
@@ -589,11 +644,23 @@ fn scanUtf8Rows(cur: *source_mod.Cursor, sep: u8, quote: ?u8, max_rows: u64) rea
     // WITHOUT completing) -- never a clean EOF that would count a phantom tail row.
     const eof = cur.span().len == 0 and cur.spanTerminal();
     if (eof and saw and rows < max_rows) rows += 1;
+    // FRONTIER COMMIT GUARD, final position: hand back the last COMMITTABLE row
+    // boundary. At a genuine end there is nothing to withhold (every byte is
+    // present and `peekHttp` caps at the known end), so EOF keeps the true end —
+    // that is the 1f-b exemption, and without it every network document would
+    // permanently lose its last row.
+    if (guarded and !eof) {
+        cur.seekTo(commit_logical);
+        rows = commit_rows;
+    }
     return .{ .next = cursorPos(cur), .rows = rows, .eof = eof };
 }
 
 fn streamUnit(cur: anytype, encoding: u8) ?enc.Unit {
-    const bytes = cur.peek(4);
+    // The ONE max-width peek in the lexer (a 4-byte UTF-16 surrogate pair). The
+    // frontier commit guard sizes itself from the same const — see
+    // source.max_lookahead.
+    const bytes = cur.peek(source_mod.max_lookahead);
     return enc.decodeUnit(bytes, 0, bytes.len, encoding);
 }
 

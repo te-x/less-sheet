@@ -58,10 +58,21 @@ pub fn headScan(doc: *Document) void {
     var pos = doc.data_start;
     var row: u64 = 0;
     base.beginOversizedChunk(doc);
+    // FRONTIER COMMIT GUARD (source.Source.commitBound), hoisted. This is the
+    // document's FIRST frontier commit, and for a NETWORK doc the head budget is
+    // exactly one 256 KiB chunk (headBudget above) -- so a row whose end lands on
+    // that chunk's edge is precisely the un-committable case, reachable at OPEN
+    // before any scan runs. The NO-FETCH bound: the head is deliberately one chunk
+    // and must not pull a second one over the wire, and a row withheld here costs
+    // nothing -- the first demand scan (jump / search nav / filtered jump) picks it
+    // up with the full demand.
+    const guarded = doc.source.commitGuarded();
+    const commit_end = if (guarded) doc.source.commitBoundNoFetch() else std.math.maxInt(u64);
     while (!doc.reader.atEnd(doc.source, pos)) {
         const b = doc.reader.boundsAfter(doc.source, pos, lim);
         if (b.capped) break; // record spills past the head budget: leave for later
         if (doc.bom_len + doc.reader.bytesConsumed(doc.source, b.next) > hb) break; // keep bytes_scanned <= budget
+        if (guarded and doc.reader.logicalBytes(doc.source, b.next) > commit_end) break;
         // ARCH-huge-row-budget: this row's source extent may exceed the
         // WINDOW's per-row scan cap (LS_WINDOW_ROW_SCAN_MAX_BYTES, much
         // smaller than the O(head) budget above) even though headScan itself

@@ -19,6 +19,15 @@ pub const chunk_bytes: usize = 256 * 1024;
 pub const checkpoint_interval: u64 = 32 * 1024 * 1024;
 const open_bytes: usize = @intCast(api.open_head_max_bytes);
 
+/// The deepest LOOKAHEAD any lexer issues past its read cursor — ONE named knob
+/// with exactly three consumers: `Cursor.look`'s capacity (the peek buffer),
+/// `csv_reader.streamUnit`'s `peek()` (the only max-width peek caller: a 4-byte
+/// UTF-16 surrogate pair), and the FRONTIER COMMIT GUARD (`Source.commitBound`),
+/// which must know it EXACTLY. Widening a peek without widening this would let
+/// the guard commit a row whose lookahead is un-fetched — the wedge it exists to
+/// prevent — so all three read this const and none writes `4`.
+pub const max_lookahead: usize = 4;
+
 pub const Mmap = struct { bytes: []const u8, physical_base: u64 = 0 };
 pub const SourceKind = enum { mmap, gzip };
 
@@ -622,6 +631,103 @@ pub const Source = union(enum) {
         };
     }
 
+    /// FRONTIER COMMIT GUARD, hoist half: whether `commitBound` can EVER bound
+    /// this Source. Scan loops hoist this out of their row loop so a LOCAL
+    /// document pays a single register test, not a call, per row. Exactly the
+    /// sources whose lookahead can be absent-but-fetchable answer true.
+    ///
+    /// SCOPE OF THE CURE: this guard closes AC-e1 for PLAIN NET CSV ONLY. Net GZIP
+    /// stays UNCURED — `commitGuarded` is false for `.gzip`, so neither the wedge
+    /// below nor the mid-row-frontier fix in `commitSearch`/`commitFilter` applies
+    /// to it — pending the net-gz cell, which must also carry the
+    /// `g.cond.waitUncancelable` mutex-held lane acquire (:1192/:1239).
+    pub fn commitGuarded(self: Source) bool {
+        return switch (self) {
+            .mmap => false, // every byte is in the mapping; a peek never blocks
+            // NET GZIP IS DELIBERATELY OUT OF SCOPE HERE (net_peek_mutex 3c) and a
+            // commit-side bound cannot cover it: `produce` calls
+            // `ensureCompressed(s.input.seek + chunk_bytes)` UNCONDITIONALLY on
+            // every inflate op (:266-268), including on a REPLAY lane driven by a
+            // mutex-held re-lex. That is a fixed 256 KiB compressed READ-AHEAD, not
+            // a read of bytes the row needs, so it can demand an un-fetched chunk
+            // however far behind the frontier the re-lex sits — bounding where the
+            // frontier commits changes nothing. Its fix is `produce`-side
+            // (demand-only / non-blocking `ensureCompressed` on replay lanes) and
+            // belongs with `column.zig`'s mutex-held lane acquire (:1051, blocks on
+            // `g.cond`) in a net-gz cell of its own. LOCAL gzip needs no guard at
+            // all: `provider == null`, so every compressed byte is already mapped.
+            .gzip => false,
+            .http_range => true,
+        };
+    }
+
+    /// FRONTIER COMMIT GUARD (security-hardening (e) AC-e1 residual, cell
+    /// `net_peek_mutex`) — the ONE resolver every scan loop reads. Returns the
+    /// highest LOGICAL offset at which a row may END and still be COMMITTED to the
+    /// frontier; `maxInt` means unbounded. The invariant it encodes:
+    ///
+    ///     row_end + max_lookahead <= present_extent   OR   row_end is the
+    ///                                                      source's TRUE end
+    ///
+    /// WHY. A row inside the counted region is later re-lexed by `window`/`nav`
+    /// WHILE THE DOCUMENT MUTEX IS HELD. Finishing that row's terminator issues a
+    /// `peek(max_lookahead)` AT `row_end`, which reads through `row_end +
+    /// max_lookahead - 1` — past the row. That is not a corner case: a BARE CR
+    /// terminator makes `csv_reader.finishTerminator` advance past the CR to
+    /// `row_end` and then call `streamUnit` to test the successor for an LF, so the
+    /// deepest byte a committed row can DEMAND is `row_end + max_lookahead - 1` and
+    /// the bound must reserve the FULL width, not width - 1. On a network Source
+    /// that read is an
+    /// `ensureSlice`, i.e. a BLOCKING FETCH, and on the sequential arm an
+    /// unbounded `sleepMs(2)` spin (`net_source.ensureSliceSequentialLocked`) — so
+    /// the whole document wedges: every poll, cancel and close blocks behind it.
+    /// Two failure modes, both cured by never committing such a row:
+    ///   * the wedge above (AC-e1 named it "One route remains UNBOUNDED");
+    ///   * SILENT WRONG DATA, reachable TODAY with no clamp anywhere: `ensureSlice`
+    ///     already returns the contiguous present PREFIX on a short/failed fetch
+    ///     (:850-863), so the decoder can receive a TRUNCATED peek. A UTF-16
+    ///     surrogate pair straddling that edge fails `off + 4 <= limit`, and the
+    ///     deferral branch is dead on the peek path (`streamUnit` passes
+    ///     `bytes.len` as `limit`), so `encoding.decodeUtf16Unit` falls through to
+    ///     `replacementUnit(2)`: an astral character silently becomes U+FFFD
+    ///     U+FFFD in served cell text.
+    ///
+    /// `reach` is the highest offset the caller is about to consider — its span
+    /// end, or the row end it is about to count. This call SECURES that offset's
+    /// lookahead first, on the CALLER's (scan worker's) thread and never under the
+    /// document mutex: the scan is the designated fetcher, so the cost lands on
+    /// the async, cancellable path that already pays it instead of on a mutex-held
+    /// re-lex. Healthy documents therefore never see a bound (`reach` is secured,
+    /// so the answer is >= `reach`) and the scan does not stop `max_lookahead`
+    /// bytes short at every chunk boundary; a short/failed range alone bounds it,
+    /// which is exactly AC-e3's "the un-fetched tail is never served as content".
+    ///
+    /// EOF IS EXEMPT: when every byte up to the true end is present the answer is
+    /// unbounded, so the last row of a network document is committed normally.
+    /// Without that a fully-fetched document would permanently lose its last row.
+    pub fn commitBound(self: Source, reach: u64) u64 {
+        return switch (self) {
+            .mmap, .gzip => std.math.maxInt(u64), // see commitGuarded
+            .http_range => |hr| hr.commitBound(reach, max_lookahead),
+        };
+    }
+
+    /// `commitBound` WITHOUT the demand: bounds on what is already present and
+    /// never fetches. Same one bound formula (`commitBound` resolves through this),
+    /// two uses:
+    ///   * the O(head) open scan (`index.headScan`), which must NOT pull a second
+    ///     chunk over the wire — the net head budget is deliberately ONE chunk, and
+    ///     a row it withholds costs nothing because the first demand scan picks the
+    ///     row up straight away;
+    ///   * the cheap per-span pre-check in a bulk scan, where the span's own bytes
+    ///     are present by construction, so a demand there could only be a no-op.
+    pub fn commitBoundNoFetch(self: Source) u64 {
+        return switch (self) {
+            .mmap, .gzip => std.math.maxInt(u64), // see commitGuarded
+            .http_range => |hr| hr.commitBoundNoFetch(max_lookahead),
+        };
+    }
+
     pub fn openHead(self: Source) []const u8 {
         return switch (self) {
             .mmap => |m| m.bytes[0..@min(m.bytes.len, open_bytes)],
@@ -650,7 +756,7 @@ pub const Cursor = struct {
     saved_input_end: usize = 0,
     locked: bool = false,
     lane: u8 = 0,
-    look: [4]u8 = undefined,
+    look: [max_lookahead]u8 = undefined,
     look_start: u64 = 0,
     look_len: usize = 0,
 
@@ -795,6 +901,21 @@ pub const Cursor = struct {
 
     pub fn advance(self: *Cursor, n: usize) void {
         self.logical += n;
+    }
+
+    /// Move to `logical` in EITHER direction. Sound only for a POSITION-ONLY
+    /// source — one where peek/span/physicalPosition are pure functions of
+    /// `logical` with no retained lane/decoder state to unwind. That is exactly
+    /// the set `commitGuarded` answers true for (`http_range`: a random-access
+    /// spool), which is also the only caller: the frontier commit guard settling a
+    /// bulk span scan on the last COMMITTABLE row boundary, which may be behind a
+    /// cursor that walked into the next row or ahead of one whose span-end advance
+    /// was skipped. A gzip cursor must NEVER be moved this way — its inflate
+    /// session cannot run backwards.
+    pub fn seekTo(self: *Cursor, logical: u64) void {
+        std.debug.assert(self.source.?.commitGuarded());
+        self.logical = logical;
+        self.look_len = 0;
     }
 
     pub fn physicalPosition(self: *Cursor) u64 {

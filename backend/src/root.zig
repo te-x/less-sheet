@@ -870,7 +870,7 @@ pub fn gzTouchReplayLane(doc: *api.Doc, logical: u64) void {
     if (d.source != .gzip) return;
     var cur = source_mod.scanCursorAt(d.source, logical);
     defer cur.deinit();
-    _ = cur.peek(4);
+    _ = cur.peek(source_mod.max_lookahead);
 }
 
 // ===========================================================================

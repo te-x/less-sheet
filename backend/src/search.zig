@@ -100,6 +100,9 @@ pub fn searchScanChunk(doc: *Document, start_pos: Pos, start_row: u64, filtered:
     const scan = doc.beginMatchScan(.search, generation, start_pos);
     const target = ((start_row / checkpoint_interval) + 1) * checkpoint_interval;
     base.beginOversizedChunk(doc);
+    // FRONTIER COMMIT GUARD (source.Source.commitBound), hoisted out of the row
+    // loop: a LOCAL document pays one register test per row, no call.
+    const guarded = doc.source.commitGuarded();
     while (row < target) {
         if (doc.stop_atomic.load(.monotonic)) {
             doc.endMatchScanIf(.search, generation);
@@ -119,6 +122,23 @@ pub fn searchScanChunk(doc: *Document, start_pos: Pos, start_row: u64, filtered:
         if (base.scanStalled(doc, pos, res.next)) {
             doc.endMatchScanIf(.search, generation);
             return .{ .end_pos = pos, .end_row = row, .eof = false, .stalled = true, .checkpoint = null, .matches = matches, .filter_matches = filter_matches };
+        }
+        // FRONTIER COMMIT GUARD (source.Source.commitBound): withhold a row whose
+        // LOOKAHEAD is not present -- counting it would let a later MUTEX-HELD
+        // re-lex of that same row block the whole document on a network fetch, and
+        // can already hand the decoder a truncated peek (a UTF-16 surrogate pair
+        // straddling the present edge silently becomes U+FFFD U+FFFD). The frontier
+        // stays at `pos`, this row's own start. The demand inside `commitBound`
+        // means a HEALTHY document never gets here; only a short/failed range does,
+        // so this reports `stalled` exactly like the check above -- which is also
+        // what keeps `commitSearch`'s one-block-count-per-chunk accounting intact
+        // (a withheld partial chunk must not be re-entered and counted twice).
+        if (guarded) {
+            const row_end = doc.reader.logicalBytes(doc.source, res.next);
+            if (row_end > doc.source.commitBound(row_end)) {
+                doc.endMatchScanIf(.search, generation);
+                return .{ .end_pos = pos, .end_row = row, .eof = false, .stalled = true, .checkpoint = null, .matches = matches, .filter_matches = filter_matches };
+            }
         }
         if (filtered and res.filter_matched) filter_matches += 1;
         if (res.matched_col != null) matches += 1;
@@ -842,6 +862,22 @@ pub fn navSearch(d: *Document, anchor_row: u64, dir: api.SearchDir) void {
         }
         if (d.worker != null) {
             d.wakeWorker();
+        } else if (d.net) {
+            // never-full-download-streaming (TD7) + security-hardening (e) AC-e1:
+            // a NETWORK document must NOT run the degraded synchronous loop below.
+            // It calls searchScanChunk WHILE HOLDING THE DOCUMENT MUTEX, and that
+            // scan is *supposed* to touch absent bytes (it fetches to advance the
+            // frontier), so no commit-side guard can help: with `search_to_eof`
+            // false it still runs until the nav resolves, i.e. potentially to EOF,
+            // fetching over the wire with the mutex held — every poll, cancel and
+            // close blocked behind it, and "No full download, ever" broken. This
+            // arm is reachable whenever `base.Document.startWorker`'s
+            // `netIo().concurrent(...)` failed at open. Park exactly as
+            // `startSearch` (:768) and `filter.startFilter` (:427) already do for
+            // the same reason: the nav resolves to NONE and the search freezes at
+            // its last consistent state, which is a clean answer rather than a
+            // wedged document. LOCAL is byte-identical (d.net == false).
+            failSearchLocked(d);
         } else {
             // Degraded (no worker): scan synchronously until the nav resolves.
             if (d.search_gen != d.w_gen) {
