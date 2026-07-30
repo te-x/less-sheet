@@ -420,6 +420,17 @@ pub const FakeServer = struct {
     /// security-hardening (e) AC-e3 short-body seam: the server delivers body bytes
     /// only within [0, short_body_at); a range fetch beyond it is SHORT. null = full.
     short_body_at: ?u64 = null,
+    /// Frontier-commit-guard lock (`api.NetFixture.fetch_attempts`): borrowed
+    /// REQUEST-ATTEMPT tally, bumped once per request this server is ASKED to serve
+    /// -- including one that delivers nothing. Distinct from `HttpRange.fetch_count`
+    /// (successful round-trips only), which cannot see a doomed GET. null = off.
+    attempts: ?*std.atomic.Value(u64) = null,
+
+    /// The ONE bump site for `attempts` (a monotone tally; the reader synchronizes
+    /// through the operation it measures, so a relaxed add is enough).
+    fn countAttempt(self: *FakeServer) void {
+        if (self.attempts) |a| _ = a.fetchAdd(1, .monotonic);
+    }
 };
 
 /// security-hardening (e) AC-e3: the outcome of a ranged fetch. `.ok` delivered
@@ -441,6 +452,7 @@ pub const Transport = union(enum) {
     pub fn fetchInto(self: Transport, dest: []u8, offset: u64) FetchOutcome {
         switch (self) {
             .fake => |fs| {
+                fs.countAttempt(); // the request was ASKED for, whatever it delivers
                 // security-hardening (e) AC-e3 short body: the fake advertises its
                 // full length but delivers body bytes only within [0, deliver). A
                 // request that reaches at/beyond `deliver` comes back SHORT -- the
@@ -464,6 +476,7 @@ pub const Transport = union(enum) {
     pub fn drainForward(self: Transport, dest: []u8, offset: u64) DrainResult {
         switch (self) {
             .fake => |fs| {
+                fs.countAttempt(); // the drain was ASKED for, whatever it delivers
                 const eff: u64 = if (fs.drop_after) |d| @min(d, fs.body.len) else fs.body.len;
                 const released: u64 = if (fs.released) |g| @min(g.load(.acquire), eff) else eff;
                 if (offset >= released) return .{ .n = 0, .eof = offset >= eff and released >= eff };

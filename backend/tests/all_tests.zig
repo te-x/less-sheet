@@ -9167,3 +9167,487 @@ test "sec_f3: display, search, and filter see the RAW cell -- neutralization is 
     const f = try waitFilterDone(od.doc);
     try std.testing.expectEqual(@as(u64, 1), f.total);
 }
+
+// ===========================================================================
+// FRONTIER COMMIT GUARD + the span-boundary row-count DRIFT — planner-frozen
+// locks filed forward by the reviewer of cell `net_peek_mutex`
+// (review/REVIEW-net-peek-mutex.md, "Filed forward").
+// ---------------------------------------------------------------------------
+// fcg1/fcg2/fcg3 lock the guard that landed in a5c3a69: a row is committed to the
+// frontier only when `row_end + max_lookahead <= present_extent`, or `row_end` is
+// the source's genuine end (EOF exempt). They ride the EXISTING fake transport
+// (api.NetFixture -> openUrlStartFake) and share one alignment property: a row
+// boundary that lands EXACTLY ON the 256 KiB chunk boundary. 256-byte rows give
+// that; the default 18-byte `genFixedRows` records do NOT divide 262144, and with
+// them the guarded and unguarded frontiers coincide — the reviewer called that
+// vacuity out explicitly, so it is asserted as a fixture self-check below.
+//
+// Each fixture uses `short_body_at = 262144`: the head fetch [0, 262144) is
+// delivered in FULL (so the open succeeds), and every range at/after it comes
+// back SHORT. That is what makes these tests hermetic and deterministic — the
+// wedge they lock is a BLOCKING fetch on a mutex-held path, and a fetch that can
+// never succeed pins the boundary condition without depending on timing.
+//
+// drift1 is RED ON PURPOSE — task #14, the silent-wrong-data class. It locks the
+// row-count DRIFT the reviewer escalated: `csv_reader.scanUtf8Rows` sets its
+// pending-LF flag against an ALREADY-INCREMENTED index, so a CRLF pair ending
+// exactly at a span end leaves the flag set spuriously and the next span's first
+// byte, if it is a LONE LF, is swallowed as that CRLF's LF instead of terminating
+// its own (empty) row. The bulk span walk then counts one row FEWER than the
+// streaming lexer from that boundary onward, so every checkpoint-anchored re-lex
+// serves row T+k for row T. The fix belongs to the implementer; this test is the
+// lock that must go GREEN with it, and it must never have been absent from
+// history while the row-count semantics changed.
+// ===========================================================================
+
+/// Exactly 256 bytes per row — 256 divides the 256 KiB net chunk, so a row
+/// boundary lands ON the chunk boundary (the alignment the guard needs).
+const fcg_row: usize = 256;
+
+/// Deterministic dialect + MANUAL indexing for the synthetic bodies below (no
+/// sniffing surprises, and only the test drives the frontier).
+const fcg_opts: api.OpenOptions = .{
+    .separator = ',',
+    .quote = api.quote_none,
+    .header = api.header_off,
+    .index_mode = api.index_manual,
+};
+
+/// `n` rows of exactly `fcg_row` bytes: "{d:0>12},xxx…\n" (cell 0 is the row's own
+/// index, so a served row identifies itself).
+fn genRows256(gpa: std.mem.Allocator, n: usize) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(gpa);
+    var line: [fcg_row]u8 = undefined;
+    for (0..n) |i| {
+        @memset(&line, 'x');
+        _ = std.fmt.bufPrint(line[0..13], "{d:0>12},", .{i}) catch unreachable;
+        line[fcg_row - 1] = '\n';
+        try buf.appendSlice(gpa, &line);
+    }
+    return buf.toOwnedSlice(gpa);
+}
+
+/// The 12-digit cell-0 text of row `row` in the `genRows256` / drift fixtures.
+fn rowLabel(buf: *[12]u8, row: u64) []const u8 {
+    return std.fmt.bufPrint(buf, "{d:0>12}", .{row}) catch unreachable;
+}
+
+/// `openFakeToDone` with an explicit dialect (the plain helper sniffs).
+fn openFakeToDoneOpts(fixture: *const api.NetFixture, options: *const api.OpenOptions) !*api.Doc {
+    const job = api.openUrlStartFake(fixture, net_url.ptr, net_url.len, options) orelse return error.NetJobAllocFailed;
+    defer api.ls_net_open_release(job);
+    const s = try pollNetTerminal(job);
+    try std.testing.expectEqual(api.NetOpenState.done, s.state);
+    try std.testing.expect(s.doc != null);
+    return s.doc.?;
+}
+
+/// Drive one DEMAND scan past the fetch frontier and settle. On a short body the
+/// scan makes no progress and the jump ends stall-aware (AC-e3) WITHOUT completing
+/// the document, so the background lane parks — which the callers below rely on:
+/// a still-spinning lane would move the transport tally on its own.
+fn fcgDemandAndSettle(doc: *api.Doc) !void {
+    api.ls_jump_start(doc, 5_000);
+    _ = try waitJumpDone(doc);
+    netWait(50);
+}
+
+test "fcg1: the frontier commit guard withholds the boundary row — bytes_scanned == 261888, never the unguarded 262144" {
+    const gpa = std.testing.allocator;
+    const body = try genRows256(gpa, 1_040); // 266240 B: one chunk + margin
+    defer gpa.free(body);
+    // FIXTURE SELF-CHECKS (anti-vacuity). A row must END exactly on the chunk
+    // boundary — that alignment is the whole discriminator — and the resource must
+    // continue well past it, or the guard's EOF exemption would apply instead.
+    try std.testing.expectEqual(@as(u64, 0), net_chunk % fcg_row);
+    try std.testing.expectEqual(@as(u8, '\n'), body[net_chunk - 1]);
+    try std.testing.expect(body.len > net_chunk + fcg_row);
+
+    var fx: api.NetFixture = .{ .body = body, .honor_ranges = true, .advertise_length = true, .short_body_at = net_chunk };
+    const doc = try openFakeToDoneOpts(&fx, &fcg_opts);
+    defer api.ls_close(doc);
+    try std.testing.expectEqual(api.NetRangeMode.random_access, api.netRangeMode(doc));
+
+    const guarded: u64 = net_chunk - fcg_row; // 261888 — one row short of the fetched extent
+    // AT OPEN. `index.headScan` is the document's FIRST frontier write and a net
+    // head is exactly ONE chunk, so the aligned row ending at 262144 is withheld
+    // there already — with the NO-FETCH bound (the head must not pull a second
+    // chunk over the wire).
+    errdefer std.debug.print("\n[fcg1] at open: bytes_scanned={d} (guard expects {d}; 262144 is the UNGUARDED value)\n", .{ api.ls_index_poll(doc).bytes_scanned, guarded });
+    try std.testing.expectEqual(guarded, api.ls_index_poll(doc).bytes_scanned);
+
+    // AFTER A DEMAND SCAN. `commitBound` secures the lookahead on the scan
+    // worker's thread; here it can never be secured (every range at/after 262144
+    // is short), so the row stays withheld rather than being committed with a
+    // terminator peek that a later mutex-held re-lex would have to fetch.
+    try fcgDemandAndSettle(doc);
+    const ip = api.ls_index_poll(doc);
+    errdefer std.debug.print("\n[fcg1] after demand: bytes_scanned={d} (guard expects {d})\n", .{ ip.bytes_scanned, guarded });
+    try std.testing.expectEqual(guarded, ip.bytes_scanned);
+    try std.testing.expectEqual(false, ip.complete); // a short body is NOT end-of-source
+    // The guard WITHHOLDS one row; it does not truncate the document: every row
+    // below the frontier still materializes and serves normally.
+    const r = api.ls_window_set(doc, 1_020, 8);
+    try std.testing.expectEqual(@as(u64, 3), r.row_count); // rows 1020..1022
+    var lb: [12]u8 = undefined;
+    try expectCell(doc, 1_022, 0, rowLabel(&lb, 1_022));
+}
+
+/// UTF-8 text whose UTF-16LE-with-BOM encoding puts an ASTRAL character's
+/// surrogate pair exactly ACROSS internal byte 262144: 1023 rows of 128 code
+/// units (= 256 bytes each) fill [2, 261890), then 126 code units (252 bytes)
+/// carry the row up to 262142, where U+1D11E's pair D834 DD1E straddles the
+/// boundary. The row continues past it, so it is a MID-ROW straddle, not a
+/// terminator.
+fn genAstralUtf16Body(gpa: std.mem.Allocator) ![]u8 {
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(gpa);
+    var line: [128]u8 = undefined;
+    for (0..1_023) |i| {
+        @memset(&line, 'a');
+        _ = std.fmt.bufPrint(line[0..7], "r{d:0>5},", .{i}) catch unreachable;
+        line[127] = '\n';
+        try text.appendSlice(gpa, &line);
+    }
+    try text.appendSlice(gpa, fcg_astral_row); // 126 units, the pair, then "z" + LF
+    for (1_024..1_044) |i| {
+        @memset(&line, 'a');
+        _ = std.fmt.bufPrint(line[0..7], "r{d:0>5},", .{i}) catch unreachable;
+        line[127] = '\n';
+        try text.appendSlice(gpa, &line);
+    }
+    return toUtf16(gpa, text.items, true, true);
+}
+
+/// The astral row: "m," + 124 'q' (126 code units, ending at internal 262142),
+/// then U+1D11E, then "z" and the terminator.
+const fcg_astral_row = "m," ++ ("q" ** 124) ++ "\u{1D11E}z\n";
+/// Its second cell, byte-exact in served (UTF-8) form: the astral character is
+/// F0 9D 84 9E, never the U+FFFD U+FFFD a truncated surrogate-pair decode yields.
+const fcg_astral_cell = ("q" ** 124) ++ "\u{1D11E}z";
+
+test "fcg2: a UTF-16LE astral character straddling the chunk boundary is never served as U+FFFD U+FFFD, and IS served byte-exact once its bytes arrive" {
+    const gpa = std.testing.allocator;
+    const body = try genAstralUtf16Body(gpa);
+    defer gpa.free(body);
+    // FIXTURE SELF-CHECK (anti-vacuity): the surrogate PAIR straddles the chunk
+    // boundary — high surrogate at 262142, low surrogate at 262144 — so a peek
+    // clamped to the present prefix hands the decoder only half of it.
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x34, 0xD8, 0x1E, 0xDD }, body[net_chunk - 2 ..][0..4]);
+    try std.testing.expect(body.len > net_chunk + 8);
+    const opts: api.OpenOptions = .{
+        .separator = ',',
+        .quote = api.quote_none,
+        .header = api.header_off,
+        .index_mode = api.index_manual,
+        .encoding = api.encoding_utf16le,
+    };
+
+    // ARM 1 — the boundary bytes NEVER arrive. `ensureSlice` clamps a short fetch
+    // to the contiguous present prefix, so committing the straddling row would
+    // hand `encoding.decodeUtf16Unit` a 2-byte peek for a 4-byte pair; its
+    // deferral branch is dead on the peek path (`streamUnit` passes `bytes.len` as
+    // the limit), so the character would silently become U+FFFD U+FFFD in SERVED
+    // cell text. The guard's answer is to withhold the row.
+    {
+        var fx: api.NetFixture = .{ .body = body, .honor_ranges = true, .advertise_length = true, .short_body_at = net_chunk };
+        const doc = try openFakeToDoneOpts(&fx, &opts);
+        defer api.ls_close(doc);
+        try expectEncoding(doc, api.encoding_utf16le, true);
+        try fcgDemandAndSettle(doc);
+        const r = api.ls_window_set(doc, 1_020, 8);
+        errdefer std.debug.print("\n[fcg2] arm 1 materialized {d} rows from 1020 (expected 3: the straddling row must be withheld)\n", .{r.row_count});
+        try std.testing.expectEqual(@as(u64, 3), r.row_count);
+        // Nothing servable carries the replacement character.
+        var row: u64 = 1_020;
+        while (row < 1_020 + r.row_count) : (row += 1) {
+            var col: u32 = 0;
+            while (col < api.ls_column_count(doc)) : (col += 1) {
+                errdefer std.debug.print("\n[fcg2] arm 1: U+FFFD served in cell ({d},{d}) — a truncated surrogate-pair decode\n", .{ row, col });
+                try std.testing.expect(std.mem.indexOf(u8, api.ls_cell(doc, row, col).slice(), "\u{FFFD}") == null);
+            }
+        }
+    }
+    // ARM 2 — the same body served in FULL. The guard withholds, it must not DROP:
+    // once the next chunk is present the pair decodes from a complete peek and the
+    // cell is served byte-exact. (This half also guards against a future "clamp
+    // the peek" fix, which would trade the wedge for exactly this corruption.)
+    {
+        var fx: api.NetFixture = .{ .body = body, .honor_ranges = true, .advertise_length = true };
+        const doc = try openFakeToDoneOpts(&fx, &opts);
+        defer api.ls_close(doc);
+        api.ls_jump_start(doc, 1_030);
+        _ = try waitJumpDone(doc);
+        _ = api.ls_window_set(doc, 1_020, 8);
+        try expectCell(doc, 1_023, 1, fcg_astral_cell);
+    }
+}
+
+test "fcg3: a bare-CR row ending at extent-4 stays withheld, and NO mutex-held path issues a transport request (need == max_lookahead, not max_lookahead-1)" {
+    const gpa = std.testing.allocator;
+    // 1023 x 256-byte rows (= 261888), then a 253-byte row whose terminator is a
+    // BARE CR at 262140. `csv_reader.finishTerminator` advances PAST a bare CR to
+    // `row_end` (262141) and then peeks for an LF there, so the deepest byte this
+    // row demands is 262144 — the first absent one. Under a bound that reserves
+    // only max_lookahead - 1 the row still commits, and its mutex-held re-lex
+    // fetches; under the full width it is withheld.
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(gpa);
+    {
+        const head = try genRows256(gpa, 1_023);
+        defer gpa.free(head);
+        try body.appendSlice(gpa, head);
+    }
+    try std.testing.expectEqual(@as(usize, 261_888), body.items.len);
+    {
+        var line: [253]u8 = undefined;
+        @memset(&line, 'x');
+        _ = std.fmt.bufPrint(line[0..13], "{d:0>12},", .{@as(usize, 1_023)}) catch unreachable;
+        line[252] = '\r'; // BARE CR at 262140
+        try body.appendSlice(gpa, &line);
+    }
+    {
+        const tail = try genRows256(gpa, 20); // the true end stays far past the chunk
+        defer gpa.free(tail);
+        try body.appendSlice(gpa, tail);
+    }
+    // FIXTURE SELF-CHECKS (anti-vacuity): a BARE CR at 262140 — its successor must
+    // NOT be an LF, or this would be an ordinary CRLF whose peek never reaches
+    // 262144 and the discriminator would evaporate.
+    try std.testing.expectEqual(@as(u8, '\r'), body.items[net_chunk - 4]);
+    try std.testing.expect(body.items[net_chunk - 3] != '\n');
+    try std.testing.expect(body.items.len > net_chunk + 4);
+
+    var attempts: std.atomic.Value(u64) = .init(0);
+    var fx: api.NetFixture = .{
+        .body = body.items,
+        .honor_ranges = true,
+        .advertise_length = true,
+        .short_body_at = net_chunk,
+        .fetch_attempts = &attempts,
+    };
+    const doc = try openFakeToDoneOpts(&fx, &fcg_opts);
+    defer api.ls_close(doc);
+    // The observable is WIRED: the open itself asked the transport for bytes. A
+    // dead counter would satisfy every "did not increase" assertion below
+    // trivially, so this is the tally's own anti-vacuity check.
+    try std.testing.expect(attempts.load(.acquire) > 0);
+
+    // The bare-CR row is not committed, at open or after a demand scan.
+    try std.testing.expectEqual(@as(u64, 261_888), api.ls_index_poll(doc).bytes_scanned);
+    try fcgDemandAndSettle(doc);
+    errdefer std.debug.print("\n[fcg3] bytes_scanned={d} (expected 261888; 262141 == the bare-CR row committed under a too-narrow bound)\n", .{api.ls_index_poll(doc).bytes_scanned});
+    try std.testing.expectEqual(@as(u64, 261_888), api.ls_index_poll(doc).bytes_scanned);
+
+    // The background lane must be QUIESCENT before the measurement — a spinning
+    // demand retry would move the tally on its own and the lock would be noise.
+    const quiet = attempts.load(.acquire);
+    netWait(100);
+    try std.testing.expectEqual(quiet, attempts.load(.acquire));
+
+    // THE LOCK. `window.windowSetFiltered` holds the document mutex for its whole
+    // call and re-lexes every row it materializes. The window deliberately reaches
+    // PAST the frontier, so an over-committed bare-CR row WOULD be materialized
+    // here — and its terminator peek would issue a ranged GET while the mutex is
+    // held, which is the wedge (on a peer that answers short-then-silent, this
+    // call never returns and `ls_close` then blocks behind it forever).
+    const before = attempts.load(.acquire);
+    const r = api.ls_window_set(doc, 1_020, 8);
+    const after = attempts.load(.acquire);
+    errdefer std.debug.print("\n[fcg3] window rows={d}, transport requests {d} -> {d} (a mutex-held path must issue NONE)\n", .{ r.row_count, before, after });
+    try std.testing.expectEqual(@as(u64, 3), r.row_count); // 1020..1022; the bare-CR row is withheld
+    var lb: [12]u8 = undefined;
+    try expectCell(doc, 1_022, 0, rowLabel(&lb, 1_022)); // the re-lex really ran
+    try std.testing.expectEqual(before, after);
+}
+
+// ---------------------------------------------------------------------------
+// drift1 — task #14: the silent row-count DRIFT at span boundaries. RED.
+// ---------------------------------------------------------------------------
+// `csv_reader.scanUtf8Rows` walks a streamed Source span by span and carries a
+// pending-LF flag across span boundaries so a CRLF split by one is still ONE
+// terminator. The flag is set against an ALREADY-INCREMENTED index, so a CRLF
+// PAIR that ends exactly at a span end sets it spuriously — and if the next
+// span's first byte is a LONE LF, that byte is swallowed as the pair's LF instead
+// of terminating its own (empty) row. The bulk walk then counts one row FEWER
+// than the streaming lexer from that boundary onward, so the scan count and every
+// checkpoint-anchored re-lex disagree: requesting row T serves file row T+k.
+// Silent wrong data — reviewer-escalated, and this test is RED until the fix.
+//
+// The lock is a LEXER-VS-LEXER equality: a plain local mmap document is the
+// ground truth (`index.scanChunk` routes an mmap Source through its own per-row
+// `boundsAfter` loop and never reaches `scanUtf8Rows`), and the fixture's own
+// generator supplies a THIRD, independent count so a wrong reference cannot pass
+// unnoticed. Both streamed Sources that DO use the bulk walk are covered:
+// network (spans bounded at the 256 KiB chunk boundary) and local `.csv.gz`
+// (inflated spans, forced small so the boundary case is reachable).
+
+/// The generated drift fixture: the bytes plus what the generator KNOWS about
+/// them, so the test never has to infer the layout it just built.
+const DriftFixture = struct {
+    body: []u8,
+    /// Row index just past the dense stretch (the forced-span scan's target).
+    dense_end_row: u64,
+    /// The generator's own row count — an independent third opinion on the two
+    /// lexers under test.
+    total_rows: u64,
+};
+
+/// Periods of the dense "\r\n\n" stretch (see `genDriftBody`).
+const drift_dense_periods: usize = 128;
+
+/// One identifiable row whose first cell is its OWN row index: 16 bytes ending
+/// CRLF when `crlf`, else 15 bytes ending LF. `pad` (0..2) stretches the second
+/// cell to set the byte-phase of whatever follows.
+fn appendDriftRow(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), row: u64, crlf: bool, pad: usize) !void {
+    var line: [18]u8 = undefined;
+    _ = std.fmt.bufPrint(line[0..14], "{d:0>12},y", .{row}) catch unreachable;
+    var n: usize = 14;
+    while (n < 14 + pad) : (n += 1) line[n] = 'y';
+    if (crlf) {
+        line[n] = '\r';
+        n += 1;
+    }
+    line[n] = '\n';
+    try buf.appendSlice(gpa, line[0 .. n + 1]);
+}
+
+/// The drift fixture. Two deliberate span-boundary constructions, one per Source:
+///
+///   * NETWORK — 16-byte CRLF rows tile [0, 262144) exactly (16 divides the chunk
+///     size), so a CRLF PAIR ends precisely at 262144, where `Cursor.spanHttp`
+///     bounds every span; the byte AT 262144 is a LONE LF.
+///   * LOCAL `.csv.gz` — a dense "\r\n\n" stretch (an empty CRLF row, then an
+///     empty LONE-LF row) straddling 4194304, the local head end, where the
+///     inflated-span walk takes over from `index.headScan`. Its start is
+///     PHASE-ALIGNED so that with forced 3-byte spans every span end lands exactly
+///     on a CRLF pair end — and never between a CR and its LF.
+///
+/// THE CRUX (vacuity): the byte after a span-ending CRLF must be a LONE LF. Put a
+/// `\r` there instead — an ordinary blank line in a CRLF file — and the drift does
+/// NOT fire and this whole test passes with the bug present.
+///
+/// WHY THE OTHER PHASE IS EXCLUDED, deliberately: a span ending on a BARE CR
+/// leaves a pending LF that is CORRECT to carry, but `scanUtf8Rows` cannot carry
+/// it across CALLS — so when a 2048-row batch ends there, an UNGUARDED source
+/// (local gzip) counts the LF as its own row and OVERcounts. That is a DISTINCT
+/// defect from the one locked here (measured: it is what a 2-byte-span variant of
+/// this fixture trips, +1 row, with the drift fix in place). Rows outside the
+/// dense stretch are LF-terminated so no forced span can end on a bare CR, keeping
+/// this test a lock on ONE bug.
+fn genDriftBody(gpa: std.mem.Allocator) !DriftFixture {
+    const gz_head_end: usize = @intCast(api.open_head_max_bytes); // where the local gzip head ends
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(gpa);
+    var row: u64 = 0;
+    // (1) CRLF rows tiling [0, 262144) exactly.
+    while (buf.items.len < net_chunk) : (row += 1) try appendDriftRow(gpa, &buf, row, true, 0);
+    std.debug.assert(buf.items.len == net_chunk);
+    // (2) the LONE LF at 262144 — the empty row the drift swallows (NETWORK arm).
+    try buf.append(gpa, '\n');
+    row += 1;
+    // (3) LF-only rows up to just short of the local gzip head end.
+    while (buf.items.len < gz_head_end - 128) : (row += 1) try appendDriftRow(gpa, &buf, row, false, 0);
+    // (4) one padded row setting the dense stretch's phase: `dense_start` must
+    // satisfy (gz_head_end - dense_start) % 3 == 2, which puts every forced 3-byte
+    // span end of the stretch on a CRLF pair end (and none on a bare CR).
+    {
+        const want = (gz_head_end + 3 - 2) % 3;
+        const pad = (want + 3 - (buf.items.len % 3)) % 3;
+        try appendDriftRow(gpa, &buf, row, false, pad);
+        row += 1;
+    }
+    const dense_start = buf.items.len;
+    std.debug.assert((gz_head_end - dense_start) % 3 == 2);
+    // (5) the dense stretch, straddling the head end (~100 B before it, ~280 after).
+    for (0..drift_dense_periods) |_| {
+        try buf.appendSlice(gpa, "\r\n\n");
+        row += 2;
+    }
+    std.debug.assert(dense_start < gz_head_end and buf.items.len > gz_head_end + 128);
+    const dense_end_row = row;
+    // (6) LF-only rows again, well past the head end.
+    while (buf.items.len < gz_head_end + 32 * 1024) : (row += 1) try appendDriftRow(gpa, &buf, row, false, 0);
+    return .{ .body = try buf.toOwnedSlice(gpa), .dense_end_row = dense_end_row, .total_rows = row };
+}
+
+/// Both documents must report the SAME exact row count and serve the SAME cells at
+/// `probes` — the drift's two faces: a count one short, and row T serving file row
+/// T+k from that boundary onward.
+fn expectSameRows(arm: []const u8, ref: *api.Doc, sub: *api.Doc, ref_count: u64, probes: []const u64) !void {
+    const rc = api.ls_row_count_get(sub);
+    errdefer std.debug.print("\n[drift1/{s}] row count {d}, reference {d} (exact={any}) — the bulk span walk swallowed the lone LF after a span-ending CRLF\n", .{ arm, rc.count, ref_count, rc.exact });
+    try std.testing.expectEqual(ref_count, rc.count);
+    try std.testing.expectEqual(true, rc.exact); // and the scan REACHED the end
+    for (probes) |t| {
+        _ = api.ls_window_set(ref, t, 1);
+        _ = api.ls_window_set(sub, t, 1);
+        var col: u32 = 0;
+        while (col < api.ls_column_count(ref)) : (col += 1) {
+            errdefer std.debug.print("\n[drift1/{s}] row {d} col {d}: serves \"{s}\", reference \"{s}\" — requesting row T served file row T+k\n", .{ arm, t, col, api.ls_cell(sub, t, col).slice(), api.ls_cell(ref, t, col).slice() });
+            try std.testing.expectEqualStrings(api.ls_cell(ref, t, col).slice(), api.ls_cell(sub, t, col).slice());
+        }
+    }
+}
+
+test "drift1: a CRLF pair ending a span, followed by a lone LF — the bulk span walk counts the same rows as the streaming lexer (network AND local .csv.gz)" {
+    const gpa = std.testing.allocator;
+    const fixture = try genDriftBody(gpa);
+    defer gpa.free(fixture.body);
+    const body = fixture.body;
+    // FIXTURE SELF-CHECKS (anti-vacuity, the crux): a CRLF pair ends EXACTLY at the
+    // net chunk boundary and the byte AT the boundary is a LONE LF.
+    try std.testing.expectEqual(@as(u8, '\r'), body[net_chunk - 2]);
+    try std.testing.expectEqual(@as(u8, '\n'), body[net_chunk - 1]);
+    try std.testing.expectEqual(@as(u8, '\n'), body[net_chunk]);
+    try std.testing.expect(body[net_chunk + 1] != '\n');
+
+    // GROUND TRUTH: a plain local mmap document — the OTHER lexer, per-row
+    // `boundsAfter`, which never reaches the bulk span walk. Cross-checked against
+    // the generator's own count, so a reference that were itself wrong cannot make
+    // this test pass.
+    var ref = try openWith(body, fcg_opts);
+    defer ref.deinit();
+    try scanToEnd(ref.doc);
+    const rc = api.ls_row_count_get(ref.doc);
+    try std.testing.expectEqual(true, rc.exact);
+    try std.testing.expectEqual(fixture.total_rows, rc.count);
+    // ... and the fixture really contains the empty row: cell 0 of row T is T,
+    // except for the one row the lone LF terminates.
+    const boundary_row: u64 = net_chunk / 16; // 16-byte CRLF rows tile [0, 262144)
+    _ = api.ls_window_set(ref.doc, boundary_row - 1, 4);
+    var lb: [12]u8 = undefined;
+    try expectCell(ref.doc, boundary_row - 1, 0, rowLabel(&lb, boundary_row - 1));
+    try expectCell(ref.doc, boundary_row, 0, ""); // the empty row EXISTS
+    try expectCell(ref.doc, boundary_row + 1, 0, rowLabel(&lb, boundary_row + 1));
+
+    const probes = [_]u64{ boundary_row, boundary_row + 1, boundary_row + 2, fixture.dense_end_row, rc.count - 1 };
+
+    // (1) NETWORK. `spanHttp` bounds every span at the 256 KiB chunk boundary, so
+    // the CRLF pair at 262142..262143 ends a span exactly and the lone LF at
+    // 262144 opens the next one.
+    {
+        var fx: api.NetFixture = .{ .body = body, .honor_ranges = true, .advertise_length = true };
+        const doc = try openFakeToDoneOpts(&fx, &fcg_opts);
+        defer api.ls_close(doc);
+        try scanToEnd(doc);
+        try expectSameRows("net", ref.doc, doc, rc.count, &probes);
+    }
+    // (2) LOCAL .csv.gz — the same bulk walk over inflated spans. `index.headScan`
+    // covers the 4 MiB head per row, so the walk starts at the head end, which the
+    // dense stretch straddles; forced 3-byte spans there put a span end on a CRLF
+    // pair end immediately (see `genDriftBody` for the phase alignment).
+    {
+        const g = try gz(gpa, body);
+        defer gpa.free(g);
+        var gd = try openWith(g, fcg_opts);
+        defer gd.deinit();
+        api.gzForceChunkBytes(gd.doc, 3);
+        api.ls_jump_start(gd.doc, fixture.dense_end_row); // through the dense stretch
+        _ = try waitJumpDone(gd.doc);
+        try scanToEnd(gd.doc);
+        api.gzForceChunkBytes(gd.doc, 0); // natural spans again for the serve path
+        try expectSameRows("gz", ref.doc, gd.doc, rc.count, &probes);
+    }
+}

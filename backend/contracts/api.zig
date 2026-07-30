@@ -1278,6 +1278,27 @@ pub const NetFixture = struct {
     /// frontier (root-planner boundary: no new post-open error state). `null` (the
     /// default) delivers the whole body. Random-fill (range) fixtures. Zig-only.
     short_body_at: ?u64 = null,
+    /// FRONTIER COMMIT GUARD lock (cell `net_peek_mutex`, reviewer-filed): a
+    /// borrowed REQUEST-ATTEMPT tally the fake transport bumps once per request it
+    /// is ASKED to make -- every ranged GET (`fetchInto`) and every forward drain of
+    /// the sequential GET (`drainForward`) -- INCLUDING attempts that deliver
+    /// nothing (a short body, withheld bytes, an ended stream). `null` (the default)
+    /// counts nothing, so every other net test is byte-unaffected. The pointee is
+    /// borrowed for the whole life of the job AND of the document it produces (the
+    /// test owns it and must outlive both), exactly like `withhold`. Zig-only
+    /// (never the C ABI).
+    ///
+    /// DELIBERATELY DISTINCT FROM `netFetchCount`, which counts SUCCESSFUL
+    /// round-trips off the Source (`HttpRange.fetch_count` is bumped only after a
+    /// fetch delivered every requested byte). A DOOMED GET -- exactly what a
+    /// mutex-held re-lex at the fetch frontier issues, and what wedges the UI thread
+    /// on a real peer that answers short-then-silent -- is therefore INVISIBLE to
+    /// `netFetchCount` and visible here. That is what makes "no mutex-held path
+    /// issues a transport request" a hermetic, deterministic invariant instead of a
+    /// flaky timing/freeze probe (and the timing probe is blind to this case: it
+    /// cannot distinguish a withheld row from a row whose fetch merely came back
+    /// short).
+    fetch_attempts: ?*std.atomic.Value(u64) = null,
 };
 
 /// netSpoolStore result: the private local spool file's state (AC14 spool
