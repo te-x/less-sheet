@@ -9573,11 +9573,11 @@ fn genDriftBody(gpa: std.mem.Allocator) !DriftFixture {
 }
 
 /// Both documents must report the SAME exact row count and serve the SAME cells at
-/// `probes` — the drift's two faces: a count one short, and row T serving file row
-/// T+k from that boundary onward.
+/// `probes` — a drift's two faces: a count off by one per affected boundary (short
+/// for drift1, long for drift2), and row T serving file row T+k from there onward.
 fn expectSameRows(arm: []const u8, ref: *api.Doc, sub: *api.Doc, ref_count: u64, probes: []const u64) !void {
     const rc = api.ls_row_count_get(sub);
-    errdefer std.debug.print("\n[drift1/{s}] row count {d}, reference {d} (exact={any}) — the bulk span walk swallowed the lone LF after a span-ending CRLF\n", .{ arm, rc.count, ref_count, rc.exact });
+    errdefer std.debug.print("\n[{s}] row count {d}, reference {d} (exact={any}) — the bulk span walk and the streaming lexer disagree across a span boundary\n", .{ arm, rc.count, ref_count, rc.exact });
     try std.testing.expectEqual(ref_count, rc.count);
     try std.testing.expectEqual(true, rc.exact); // and the scan REACHED the end
     for (probes) |t| {
@@ -9585,7 +9585,7 @@ fn expectSameRows(arm: []const u8, ref: *api.Doc, sub: *api.Doc, ref_count: u64,
         _ = api.ls_window_set(sub, t, 1);
         var col: u32 = 0;
         while (col < api.ls_column_count(ref)) : (col += 1) {
-            errdefer std.debug.print("\n[drift1/{s}] row {d} col {d}: serves \"{s}\", reference \"{s}\" — requesting row T served file row T+k\n", .{ arm, t, col, api.ls_cell(sub, t, col).slice(), api.ls_cell(ref, t, col).slice() });
+            errdefer std.debug.print("\n[{s}] row {d} col {d}: serves \"{s}\", reference \"{s}\" — requesting row T served file row T+k\n", .{ arm, t, col, api.ls_cell(sub, t, col).slice(), api.ls_cell(ref, t, col).slice() });
             try std.testing.expectEqualStrings(api.ls_cell(ref, t, col).slice(), api.ls_cell(sub, t, col).slice());
         }
     }
@@ -9632,7 +9632,7 @@ test "drift1: a CRLF pair ending a span, followed by a lone LF — the bulk span
         const doc = try openFakeToDoneOpts(&fx, &fcg_opts);
         defer api.ls_close(doc);
         try scanToEnd(doc);
-        try expectSameRows("net", ref.doc, doc, rc.count, &probes);
+        try expectSameRows("drift1/net", ref.doc, doc, rc.count, &probes);
     }
     // (2) LOCAL .csv.gz — the same bulk walk over inflated spans. `index.headScan`
     // covers the 4 MiB head per row, so the walk starts at the head end, which the
@@ -9648,6 +9648,99 @@ test "drift1: a CRLF pair ending a span, followed by a lone LF — the bulk span
         _ = try waitJumpDone(gd.doc);
         try scanToEnd(gd.doc);
         api.gzForceChunkBytes(gd.doc, 0); // natural spans again for the serve path
-        try expectSameRows("gz", ref.doc, gd.doc, rc.count, &probes);
+        try expectSameRows("drift1/gz", ref.doc, gd.doc, rc.count, &probes);
     }
+}
+
+// ---------------------------------------------------------------------------
+// drift2 — the CROSS-CALL half of the same pending-LF state machine. RED.
+// ---------------------------------------------------------------------------
+// `scanUtf8Rows` carries its pending-LF flag across the SPANS of one call, but
+// `index.scanChunk` calls it once per checkpoint batch and the flag does not
+// survive the RETURN. So when a batch ends on a row whose CRLF was SPLIT by a span
+// boundary — the CR consumed, its LF not yet — the walk hands back a position
+// BETWEEN the CR and the LF (which its own comment calls a frontier "a later scan
+// starting fresh there cannot reproduce"), and the next call, starting fresh with
+// no pending LF, counts that LF as its own EMPTY row. The bulk walk then counts one
+// row MORE than the streaming lexer from that batch onward — the same
+// silent-wrong-data class as drift1 with the opposite sign, one phantom row per
+// affected batch, and every checkpoint-anchored re-lex past it serves row T+k.
+//
+// UNGUARDED SOURCES ONLY, which is why this is the local `.csv.gz` arm: on a plain
+// NETWORK document `Source.commitGuarded` is true, so the `!skip_lf` commit gating
+// never publishes such a boundary — it reverts to the previous row and re-lexes it
+// (measured: drift1's network arm agrees exactly once the drift1 fix is applied).
+// `commitGuarded` answers FALSE for `.gzip`, network or not.
+//
+// INDEPENDENT OF drift1 BY CONSTRUCTION, in both directions: one-byte spans cannot
+// put a CRLF PAIR inside a single span, which is precisely what drift1's defect
+// needs, so this test fires on the cross-call defect alone; and drift1's dense
+// stretch is phase-aligned so no span there ends on a bare CR. The implementer must
+// be able to see the two fail and pass separately.
+//
+// The `gzForceChunkBytes` seam (AC12 — gz_ac12 uses it the same way) makes a
+// naturally rare coincidence deterministic: the defect needs an inflate-span
+// boundary to land between a CR and its LF at exactly a batch boundary. The state
+// machine's flaw is span-size independent; the seam only removes the luck.
+
+test "drift2: a batch boundary between a CR and its LF must not lose the pending LF — one-byte spans over CRLF rows count the same rows as the streaming lexer (local .csv.gz)" {
+    const gpa = std.testing.allocator;
+    const head_end: usize = @intCast(api.open_head_max_bytes); // where index.headScan stops
+    const walked_rows: usize = 16 * 1024; // rows the BULK span walk covers past it
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    var row: u64 = 0;
+    const want: usize = head_end + walked_rows * 16;
+    while (buf.items.len < want) : (row += 1) try appendDriftRow(gpa, &buf, row, true, 0);
+    const body = buf.items;
+    const total_rows = row;
+
+    // FIXTURE SELF-CHECKS (anti-vacuity — the whole job here):
+    //  * every row is 16 bytes ending CRLF, so a pending LF exists at EVERY row end
+    //    and one-byte spans put each CR at a span end;
+    try std.testing.expectEqual(want, body.len);
+    try std.testing.expectEqual(@as(u8, '\r'), body[14]);
+    try std.testing.expectEqual(@as(u8, '\n'), body[15]);
+    //  * 16 divides the head budget, so headScan stops ON a row boundary (its last
+    //    row's CRLF ends exactly there) and the bulk walk starts on one;
+    try std.testing.expectEqual(@as(usize, 0), head_end % 16);
+    try std.testing.expectEqual(@as(u8, '\r'), body[head_end - 2]);
+    try std.testing.expectEqual(@as(u8, '\n'), body[head_end - 1]);
+    //  * and the walked region is 16384 rows — EIGHT checkpoint batches at the
+    //    shipped interval (2048, src/base.zig), so a batch boundary certainly falls
+    //    inside it. The interval is implementation-owned, so the region is sized to
+    //    span it many times over rather than to match it; raising it above 16384
+    //    rows is what would make this test go quiet, nothing else.
+    try std.testing.expectEqual(@as(u64, @intCast(head_end / 16 + walked_rows)), total_rows);
+
+    // GROUND TRUTH: the plain local mmap document (per-row `boundsAfter`, never the
+    // bulk walk), cross-checked against the generator's own count.
+    var ref = try openWith(body, fcg_opts);
+    defer ref.deinit();
+    try scanToEnd(ref.doc);
+    const rc = api.ls_row_count_get(ref.doc);
+    try std.testing.expectEqual(true, rc.exact);
+    try std.testing.expectEqual(total_rows, rc.count);
+    const head_rows: u64 = @intCast(head_end / 16);
+    var lb: [12]u8 = undefined;
+    _ = api.ls_window_set(ref.doc, head_rows, 2);
+    try expectCell(ref.doc, head_rows, 0, rowLabel(&lb, head_rows)); // no empty rows anywhere
+    const probes = [_]u64{ head_rows, head_rows + 8_192, rc.count - 2, rc.count - 1 };
+
+    // The SUBJECT: the same bytes as a local `.csv.gz`, whose tail past the 4 MiB
+    // head is lexed by the bulk span walk, one byte per span.
+    const g = try gz(gpa, body);
+    defer gpa.free(g);
+    var gd = try openWith(g, fcg_opts);
+    defer gd.deinit();
+    // The head scan really did stop at the head end, so the walk below starts on the
+    // row boundary the construction above pins (and not somewhere else): the last
+    // head row is materializable and the next one is not yet. (Row terms, not bytes:
+    // ls_index_poll reports the PHYSICAL — i.e. compressed — frontier for a gzip
+    // document, which is not comparable to a logical offset.)
+    try std.testing.expectEqual(@as(u64, 1), api.ls_window_set(gd.doc, head_rows - 1, 4).row_count);
+    api.gzForceChunkBytes(gd.doc, 1); // every CR is now a span-ending CR
+    try scanToEnd(gd.doc);
+    api.gzForceChunkBytes(gd.doc, 0); // natural spans again for the serve path
+    try expectSameRows("drift2/gz", ref.doc, gd.doc, rc.count, &probes);
 }
