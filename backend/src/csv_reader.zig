@@ -536,7 +536,20 @@ fn scanUtf8Rows(cur: *source_mod.Cursor, sep: u8, quote: ?u8, max_rows: u64) rea
     var field_start = true;
     var quoted = false;
     var saw = false;
-    var skip_lf = false;
+    // A TERMINATOR IS CONSUMED WHOLE, OR NOT AT ALL — the one rule that keeps this
+    // walk's row count equal to the streaming lexer's (`boundsAfter`/`materialize`,
+    // which re-lex from the positions this walk publishes). A CR whose LF falls in
+    // the NEXT span is the only terminator a span cannot settle from its own bytes,
+    // and it is settled AT the boundary below (`peek` reads through a span end;
+    // `span` does not), never by carrying a pending-LF flag: such a flag drifted the
+    // count in BOTH directions — set against an already-incremented index it
+    // swallowed a following lone LF as a CRLF's second byte (UNDERcount), and since
+    // `index.scanChunk` calls this once per checkpoint batch it did not survive the
+    // RETURN, leaving a published position BETWEEN a CR and its LF where the next
+    // call — and every re-lex from that checkpoint — counted the LF as its own empty
+    // row (OVERcount). Neither is expressible now: there is no pending state to
+    // mis-set or to drop, and every position this walk hands back is a row START.
+
     // FRONTIER COMMIT GUARD (source.Source.commitBound). Hoisted: a LOCAL document
     // leaves `commit_end` at maxInt, so the only per-row cost is one compare
     // against a loop-invariant register (and this loop is never reached for an mmap
@@ -548,9 +561,8 @@ fn scanUtf8Rows(cur: *source_mod.Cursor, sep: u8, quote: ?u8, max_rows: u64) rea
     // span walk otherwise leaves the cursor MID-ROW when the present region ends
     // inside a row, which would publish a frontier whose own lookahead is absent —
     // the wedge again, by a second route — and a row count that does not describe
-    // that position. Only a FULLY consumed terminator qualifies: with `skip_lf`
-    // pending the frontier would sit between a CR and its LF, which a later scan
-    // starting fresh there cannot reproduce.
+    // that position. Only a FULLY consumed terminator qualifies — guaranteed by the
+    // whole-terminator rule above, so this records a row START unconditionally.
     var commit_logical: u64 = cur.logical;
     var commit_rows: u64 = 0;
     var withheld = false;
@@ -565,13 +577,6 @@ fn scanUtf8Rows(cur: *source_mod.Cursor, sep: u8, quote: ?u8, max_rows: u64) rea
         const commit_end: u64 = if (guarded) cur.source.?.commitBoundNoFetch() else std.math.maxInt(u64);
         while (i < bytes.len and rows < max_rows) {
             const b = bytes[i];
-            if (skip_lf) {
-                skip_lf = false;
-                if (b == '\n') {
-                    i += 1;
-                    continue;
-                }
-            }
             saw = true;
             if (quoted) {
                 if (quote != null and b == quote.?) {
@@ -600,9 +605,49 @@ fn scanUtf8Rows(cur: *source_mod.Cursor, sep: u8, quote: ?u8, max_rows: u64) rea
                 field_start = true;
                 i += 1;
             } else if (b == '\n' or b == '\r') {
-                if (b == '\r' and i + 1 < bytes.len and bytes[i + 1] == '\n') i += 1;
-                if (b == '\r' and i + 1 == bytes.len) skip_lf = true;
-                // FRONTIER COMMIT GUARD: this row ends at `cur.logical + i + 1`.
+                // How many bytes this terminator occupies (1, or 2 for CRLF). One
+                // `b == '\r'` test, one bound test: the span-end case is the ELSE of
+                // "the LF is in this span", so it can no longer be reached with the
+                // LF already consumed.
+                var term: usize = 1;
+                var boundary_cr = false;
+                if (b == '\r') {
+                    if (i + 1 < bytes.len) {
+                        if (bytes[i + 1] == '\n') term = 2;
+                    } else {
+                        // SPAN-ENDING CR — at most once per span, never per row.
+                        // Advance ONTO it so `peek` (which, unlike `span`, inflates
+                        // and fetches through a span end) can read the terminator
+                        // whole. `bytes` and the original `i` are DEAD from here: a
+                        // gzip peek may re-fill the lane buffer `bytes` points into,
+                        // so this branch reads neither again and ends the span pass
+                        // (the quoted-field escape above follows the same rule).
+                        boundary_cr = true;
+                        cur.advance(i);
+                        i = 0;
+                        const p = cur.peek(2);
+                        if (p.len > 1) {
+                            if (p[1] == '\n') term = 2;
+                        } else if (!guarded and !cur.spanTerminal()) {
+                            // The successor byte has NOT ARRIVED (a parked network
+                            // gzip lane), so CR-vs-CRLF is not yet decidable. Guessing
+                            // a bare CR would publish a position between the CR and a
+                            // later-arriving LF, i.e. the OVERcount above — so give
+                            // the row back exactly as the commit guard does, with the
+                            // position ON the CR, and let the call that can see the
+                            // byte count it. Correct for the sources it covers and
+                            // only those: for LOCAL gzip `spanTerminal` is true
+                            // (provider == null — an absent successor IS the end), and
+                            // a GUARDED source is excluded because `commitBound`
+                            // already refuses to count a row whose successor is absent
+                            // (and `spanTerminal`'s http arm answers for the CURRENT
+                            // offset, which here is the CR, not the successor).
+                            withheld = true;
+                            break;
+                        }
+                    }
+                }
+                // FRONTIER COMMIT GUARD: this row ends at `cur.logical + i + term`.
                 // Count it only if the lookahead a later mutex-held re-lex will
                 // peek there is already present; the second call DEMANDS that
                 // lookahead on this (scan-worker) thread and re-reads the bound, so
@@ -610,7 +655,7 @@ fn scanUtf8Rows(cur: *source_mod.Cursor, sep: u8, quote: ?u8, max_rows: u64) rea
                 // withholds. Reached at most once per row and, because a row
                 // boundary rarely lands within `max_lookahead` of the present edge,
                 // it demands at most once per chunk.
-                const row_end = cur.logical + i + 1;
+                const row_end = cur.logical + i + term;
                 if (row_end > commit_end and row_end > cur.source.?.commitBound(row_end)) {
                     withheld = true;
                     break;
@@ -618,23 +663,31 @@ fn scanUtf8Rows(cur: *source_mod.Cursor, sep: u8, quote: ?u8, max_rows: u64) rea
                 rows += 1;
                 field_start = true;
                 saw = false;
-                i += 1;
+                i += term;
                 // Gated, so an UNGUARDED source (local gzip -- mmap never reaches
                 // this loop) pays no per-row store at all; these are read only under
                 // `guarded` below.
-                if (guarded and !skip_lf) {
+                if (guarded) {
                     commit_logical = cur.logical + i;
                     commit_rows = rows;
                 }
+                // `bytes` is dead (see above): end the pass and re-span. `i` is the
+                // terminator width relative to the CR the cursor now sits on, so the
+                // `cur.advance(i)` below lands exactly past the terminator.
+                if (boundary_cr) break;
             } else {
                 field_start = false;
                 i += 1;
             }
         }
-        // Give the row back: the frontier stays at the last committable boundary
-        // (applied once, below). The SCAN is not stopped for the caller's purposes
-        // -- it returns normally with the rows it did count, and the withheld row is
-        // picked up by the next chunk as soon as its successor bytes arrive.
+        // Give the row back — either because its lookahead is not committable
+        // (guarded) or because its terminator's second byte has not arrived
+        // (unguarded, above). Both leave the row uncounted at a position a later call
+        // can lex identically: a guarded frontier stays at the last committable
+        // boundary (applied once, below), an unguarded one sits ON the CR. The SCAN
+        // is not stopped for the caller's purposes -- it returns normally with the
+        // rows it did count, and the withheld row is picked up by the next chunk as
+        // soon as its successor bytes arrive.
         if (withheld) break;
         cur.advance(i);
     }
