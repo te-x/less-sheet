@@ -557,19 +557,24 @@ fn scanUtf8Rows(cur: *source_mod.Cursor, sep: u8, quote: ?u8, max_rows: u64) rea
     // loop). Offsets here are ABSOLUTE, never span-relative: the quoted-field
     // escape below advances the cursor MID-span, which would strand an index.
     const guarded = cur.source.?.commitGuarded();
-    // The last row boundary that IS committable, and the row count there. A bulk
-    // span walk otherwise leaves the cursor MID-ROW when the present region ends
-    // inside a row, which would publish a frontier whose own lookahead is absent —
-    // the wedge again, by a second route — and a row count that does not describe
-    // that position. Only a FULLY consumed terminator qualifies — guaranteed by the
-    // whole-terminator rule above, so this records a row START unconditionally.
+    // The last row boundary that is BOTH whole and committable — the position this
+    // call publishes, paired with `rows` (see the final position, below). A bulk span
+    // walk otherwise leaves the cursor MID-ROW when the present region ends inside a
+    // row, which would publish a frontier whose own lookahead is absent (the wedge
+    // again, by a second route) and a row count that does not describe that position.
     var commit_logical: u64 = cur.logical;
-    var commit_rows: u64 = 0;
     var withheld = false;
     while (rows < max_rows) {
         const bytes = cur.span();
         if (bytes.len == 0) break;
         var i: usize = 0;
+        // ABSOLUTE logical offset of `bytes[i]`, minus `i` — the pass's anchor, so
+        // the two offsets the row path needs (`row_end`, `commit_logical`) are one
+        // add on a register instead of a load through `cur` per row. Sound because
+        // the cursor moves only where the pass ENDS: the quoted-field escape (which
+        // breaks, so the next pass re-anchors) and the span-ending CR below (which
+        // re-anchors here). Still absolute, so a mid-span advance strands nothing.
+        var span_base = cur.logical;
         // Cheap bound, NO demand (this span's bytes are present by construction, so
         // a demand here could only be a no-op): two atomic reads, once per 256 KiB.
         // A row ending past it re-checks WITH a demand below -- so the common row
@@ -605,7 +610,9 @@ fn scanUtf8Rows(cur: *source_mod.Cursor, sep: u8, quote: ?u8, max_rows: u64) rea
                 field_start = true;
                 i += 1;
             } else if (b == '\n' or b == '\r') {
-                // How many bytes this terminator occupies (1, or 2 for CRLF). One
+                // Terminator bytes NOT YET CONSUMED at `span_base + i` (1 for a lone
+                // LF or a bare CR, 2 for a CRLF still whole in this span, 0 for a
+                // bare CR already consumed by the boundary case below). One
                 // `b == '\r'` test, one bound test: the span-end case is the ELSE of
                 // "the LF is in this span", so it can no longer be reached with the
                 // LF already consumed.
@@ -615,39 +622,49 @@ fn scanUtf8Rows(cur: *source_mod.Cursor, sep: u8, quote: ?u8, max_rows: u64) rea
                     if (i + 1 < bytes.len) {
                         if (bytes[i + 1] == '\n') term = 2;
                     } else {
-                        // SPAN-ENDING CR — at most once per span, never per row.
-                        // Advance ONTO it so `peek` (which, unlike `span`, inflates
-                        // and fetches through a span end) can read the terminator
-                        // whole. `bytes` and the original `i` are DEAD from here: a
-                        // gzip peek may re-fill the lane buffer `bytes` points into,
-                        // so this branch reads neither again and ends the span pass
-                        // (the quoted-field escape above follows the same rule).
+                        // SPAN-ENDING CR — at most once per span, never per row. The
+                        // question is about the SUCCESSOR byte, so consume the CR and
+                        // ask it AT the successor's own offset, which is the only way
+                        // to ask either half of it correctly:
+                        //   * `peek(1)` here demands the byte AT the cursor, and on
+                        //     the sequential net arm that is the ONLY demand honored
+                        //     -- `net_source.ensureSliceSequentialLocked` waits for
+                        //     `internal` and IGNORES `want`, so a 2-byte peek AT the
+                        //     CR comes back 1 byte long whenever the drain high-water
+                        //     is CR+1 and would silently read a CRLF as a bare CR.
+                        //     `commitBound` documents that same trap and works around
+                        //     it the same way, by demanding its far byte separately
+                        //     (net_source.zig:985-989).
+                        //   * `spanTerminal` answers for the CURRENT offset only, so
+                        //     asking it here asks about the successor -- the true-end
+                        //     question this decision actually turns on, on EVERY
+                        //     Source, with no `guarded` special case.
+                        // `bytes` and the original `i` are DEAD from here: a gzip peek
+                        // may re-fill the lane buffer `bytes` points into, so this
+                        // branch reads neither again and ends the span pass (the
+                        // quoted-field escape above follows the same rule).
                         boundary_cr = true;
-                        cur.advance(i);
+                        cur.advance(i + 1);
                         i = 0;
-                        const p = cur.peek(2);
-                        if (p.len > 1) {
-                            if (p[1] == '\n') term = 2;
-                        } else if (!guarded and !cur.spanTerminal()) {
-                            // The successor byte has NOT ARRIVED (a parked network
-                            // gzip lane), so CR-vs-CRLF is not yet decidable. Guessing
-                            // a bare CR would publish a position between the CR and a
-                            // later-arriving LF, i.e. the OVERcount above — so give
-                            // the row back exactly as the commit guard does, with the
-                            // position ON the CR, and let the call that can see the
-                            // byte count it. Correct for the sources it covers and
-                            // only those: for LOCAL gzip `spanTerminal` is true
-                            // (provider == null — an absent successor IS the end), and
-                            // a GUARDED source is excluded because `commitBound`
-                            // already refuses to count a row whose successor is absent
-                            // (and `spanTerminal`'s http arm answers for the CURRENT
-                            // offset, which here is the CR, not the successor).
+                        span_base = cur.logical; // re-anchor: the cursor moved, `bytes` is dead
+                        const p = cur.peek(1);
+                        if (p.len > 0) {
+                            term = if (p[0] == '\n') 1 else 0;
+                        } else if (cur.spanTerminal()) {
+                            term = 0; // a bare CR at the true end: nothing follows it
+                        } else {
+                            // The successor has NOT ARRIVED (a parked network stream),
+                            // so CR-vs-CRLF is not decidable yet and guessing either
+                            // way drifts the count. Give the row back exactly as the
+                            // commit guard does -- uncounted, with the position rewound
+                            // to the last whole terminator below -- and let the call
+                            // that can see the byte count it.
                             withheld = true;
                             break;
                         }
                     }
                 }
-                // FRONTIER COMMIT GUARD: this row ends at `cur.logical + i + term`.
+                // FRONTIER COMMIT GUARD: this row ends at `span_base + i + term`.
                 // Count it only if the lookahead a later mutex-held re-lex will
                 // peek there is already present; the second call DEMANDS that
                 // lookahead on this (scan-worker) thread and re-reads the bound, so
@@ -655,7 +672,7 @@ fn scanUtf8Rows(cur: *source_mod.Cursor, sep: u8, quote: ?u8, max_rows: u64) rea
                 // withholds. Reached at most once per row and, because a row
                 // boundary rarely lands within `max_lookahead` of the present edge,
                 // it demands at most once per chunk.
-                const row_end = cur.logical + i + term;
+                const row_end = span_base + i + term;
                 if (row_end > commit_end and row_end > cur.source.?.commitBound(row_end)) {
                     withheld = true;
                     break;
@@ -664,16 +681,15 @@ fn scanUtf8Rows(cur: *source_mod.Cursor, sep: u8, quote: ?u8, max_rows: u64) rea
                 field_start = true;
                 saw = false;
                 i += term;
-                // Gated, so an UNGUARDED source (local gzip -- mmap never reaches
-                // this loop) pays no per-row store at all; these are read only under
-                // `guarded` below.
-                if (guarded) {
-                    commit_logical = cur.logical + i;
-                    commit_rows = rows;
-                }
-                // `bytes` is dead (see above): end the pass and re-span. `i` is the
-                // terminator width relative to the CR the cursor now sits on, so the
-                // `cur.advance(i)` below lands exactly past the terminator.
+                // The TRUTHFUL PAIR, updated with the count it belongs to and never
+                // apart from it: `(commit_logical, rows)` -- so `rows` needs no
+                // shadow copy, and there is no state to fall out of step. One store
+                // per row on every Source now, because the position this walk
+                // publishes must be a row START on every Source (below).
+                commit_logical = span_base + i;
+                // `bytes` is dead (see above): end the pass and re-span. The cursor
+                // sits just past the CR and `i` is what is left of the terminator (the
+                // LF, or nothing), so the `cur.advance(i)` below lands exactly past it.
                 if (boundary_cr) break;
             } else {
                 field_start = false;
@@ -681,13 +697,12 @@ fn scanUtf8Rows(cur: *source_mod.Cursor, sep: u8, quote: ?u8, max_rows: u64) rea
             }
         }
         // Give the row back — either because its lookahead is not committable
-        // (guarded) or because its terminator's second byte has not arrived
-        // (unguarded, above). Both leave the row uncounted at a position a later call
-        // can lex identically: a guarded frontier stays at the last committable
-        // boundary (applied once, below), an unguarded one sits ON the CR. The SCAN
-        // is not stopped for the caller's purposes -- it returns normally with the
-        // rows it did count, and the withheld row is picked up by the next chunk as
-        // soon as its successor bytes arrive.
+        // (guarded) or because its terminator is not yet decidable (above). Both
+        // leave the row UNCOUNTED, and the final position below rewinds to the last
+        // whole terminator, so what is published is a pair a later call reproduces
+        // exactly. The SCAN is not stopped for the caller's purposes -- it returns
+        // normally with the rows it did count, and the withheld row is picked up by
+        // the next chunk as soon as its successor bytes arrive.
         if (withheld) break;
         cur.advance(i);
     }
@@ -697,14 +712,31 @@ fn scanUtf8Rows(cur: *source_mod.Cursor, sep: u8, quote: ?u8, max_rows: u64) rea
     // WITHOUT completing) -- never a clean EOF that would count a phantom tail row.
     const eof = cur.span().len == 0 and cur.spanTerminal();
     if (eof and saw and rows < max_rows) rows += 1;
-    // FRONTIER COMMIT GUARD, final position: hand back the last COMMITTABLE row
-    // boundary. At a genuine end there is nothing to withhold (every byte is
-    // present and `peekHttp` caps at the known end), so EOF keeps the true end —
-    // that is the 1f-b exemption, and without it every network document would
-    // permanently lose its last row.
-    if (guarded and !eof) {
-        cur.seekTo(commit_logical);
-        rows = commit_rows;
+    // FINAL POSITION: the last WHOLE terminator, i.e. a row START, paired with the
+    // `rows` that describes it. At a genuine end there is nothing to withhold (every
+    // byte is present and `peekHttp` caps at the known end), so EOF keeps the true
+    // end — that is the 1f-b exemption, and without it every network document would
+    // permanently lose its last row (the unterminated tail row counted just above is
+    // exactly one such row).
+    if (!eof and cur.logical != commit_logical) {
+        // The walk stopped MID-ROW: the span ran out inside a row, or the row was
+        // given back (commit guard, or an undecidable terminator). The bytes from
+        // `commit_logical` to here belong to a row this call does not count, so
+        // publishing THIS position would anchor the next row on its own middle --
+        // `index.scanChunk` stores `{row, pos}` as the checkpoint verbatim, and every
+        // re-lex from it would then serve that row's TAIL as a whole row and lose its
+        // first cells. Rewinding costs only the re-lex of one row, which is what the
+        // guarded arm has always paid here.
+        if (guarded) {
+            cur.seekTo(commit_logical); // position-only Source: sound (see seekTo)
+        } else {
+            // A gzip cursor can NEVER be rewound (`seekTo` asserts `commitGuarded`:
+            // an inflate session cannot run backwards), so hand the `Pos` back
+            // directly, its physical derived from `commit_logical` itself rather than
+            // from the position we stopped at, or the two halves would describe
+            // different places.
+            return .{ .next = toPos(@intCast(commit_logical), cur.physicalAt(commit_logical)), .rows = rows, .eof = false };
+        }
     }
     return .{ .next = cursorPos(cur), .rows = rows, .eof = eof };
 }
