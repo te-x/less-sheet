@@ -732,10 +732,21 @@ fn scanUtf8Rows(cur: *source_mod.Cursor, sep: u8, quote: ?u8, max_rows: u64) rea
         } else {
             // A gzip cursor can NEVER be rewound (`seekTo` asserts `commitGuarded`:
             // an inflate session cannot run backwards), so hand the `Pos` back
-            // directly, its physical derived from `commit_logical` itself rather than
-            // from the position we stopped at, or the two halves would describe
-            // different places.
-            return .{ .next = toPos(@intCast(commit_logical), cur.physicalAt(commit_logical)), .rows = rows, .eof = false };
+            // directly. Its physical is the CURSOR's, i.e. exactly what `cursorPos`
+            // below would publish, because `physical` is a conservative progress
+            // byte-count and NOT a companion coordinate: nothing derives a position
+            // from it (`cursorAt` takes `pos.logical` only, `reader.posPhysicalBytes`
+            // hands it verbatim to progress/madvise, `base.scanStalled` compares
+            // `logical`), while `ls_index_poll` DOES pin it as monotone
+            // non-decreasing (api/lesssheet.h: "bytes_scanned ... monotone
+            // non-decreasing over the document's lifetime") and clamps only from
+            // above. Publishing the one formula every other publisher uses, on this
+            // same cursor and lane, is what keeps that guarantee: a compressed
+            // high-water for `commit_logical` computed some other way can sit AHEAD
+            // of the op window the next chunk publishes from and tick the counter
+            // backward. Overstating the compressed bytes behind `commit_logical` by
+            // the tail of one op is the safe direction; understating is not.
+            return .{ .next = toPos(@intCast(commit_logical), cur.physicalPosition()), .rows = rows, .eof = false };
         }
     }
     return .{ .next = cursorPos(cur), .rows = rows, .eof = eof };

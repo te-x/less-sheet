@@ -933,22 +933,6 @@ pub const Cursor = struct {
         };
     }
 
-    /// The physical (compressed) offset that produced `logical` — the `Pos`
-    /// companion for an offset BEHIND the cursor, which `physicalPosition` cannot
-    /// give: it answers for the cursor's OWN position (its gzip arm reads the live
-    /// lane window). A bulk scan that hands back its last fully-consumed row
-    /// boundary rather than where it stopped needs the physical of THAT offset, or
-    /// the published `Pos` describes two different places. No new derivation: the
-    /// gzip arm is the same `physicalFor` head/checkpoint resolver
-    /// `physicalPosition` uses, and the other two are position-linear.
-    pub fn physicalAt(self: *const Cursor, logical: u64) u64 {
-        return switch (self.source.?) {
-            .mmap => |m| m.physical_base +| logical,
-            .http_range => |hr| hr.physical_base +| logical,
-            .gzip => |g| g.physicalFor(logical),
-        };
-    }
-
     pub fn hitPhysicalLimit(self: *const Cursor) bool {
         if (self.physical_limit == null) return false;
         return switch (self.source.?) {
