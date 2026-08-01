@@ -9744,3 +9744,216 @@ test "drift2: a batch boundary between a CR and its LF must not lose the pending
     api.gzForceChunkBytes(gd.doc, 0); // natural spans again for the serve path
     try expectSameRows("drift2/gz", ref.doc, gd.doc, rc.count, &probes);
 }
+
+// ===========================================================================
+// SEQUENTIAL-NETWORK terminator settlement (task #14, round-2 finding 1) — GREEN,
+// and the arm neither drift1 nor drift2 could see.
+// ---------------------------------------------------------------------------
+// A CR on the LAST BYTE of a chunk-bounded span is the only terminator a span
+// cannot settle from its own bytes, and on the SEQUENTIAL fill
+// `net_source.ensureSliceSequentialLocked` waits for the byte AT `internal` and
+// IGNORES `want`. So round 1's `peek(2)` AT the CR came back ONE BYTE SHORT
+// against a perfectly healthy peer — no fault injection, no withholding — the walk
+// read that as a bare CR, and `commitBound` then SECURED the reach past `row_end`
+// instead of refusing it (it secures a reach, it cannot decline one), publishing a
+// between-CR-and-LF frontier: drift2's overcount, deterministically, on plain
+// sequential network CSV. `commitBound` documents the same trap at
+// net_source.zig:985-989 and works around it with a second FAR-BYTE demand.
+// Orchestrator measurements on the two implementation rounds, same construction as
+// below: DELTA=+1 (sequential net 8001 vs local 8000, cell contents disagreeing
+// too) at 9edeeec; DELTA=0 at 5936132.
+//
+// WHY THE SUITE WAS BLIND, and the one thing to preserve here: drift1/drift2 are
+// gzip + `gzForceChunkBytes` fixtures, and fcg1's 256-byte rows end in a LONE LF —
+// a terminator a span settles from its own bytes. The 65-byte CRLF rows below put
+// the CR itself on the span's last byte, on the sequential arm, which is what
+// selects the ignoring-`want` path. Changing either the row width or
+// `honor_ranges` retires the coverage.
+// ===========================================================================
+
+/// `n` rows of exactly 65 bytes ("{d:0>12}," + filler + CRLF), so row 4032's CR
+/// lands on 262143 — the LAST byte of the first 256 KiB span — and its LF on
+/// 262144, the first byte of the next.
+fn genRows65Crlf(gpa: std.mem.Allocator, n: usize) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(gpa);
+    var line: [65]u8 = undefined;
+    for (0..n) |i| {
+        @memset(&line, 'x');
+        _ = std.fmt.bufPrint(line[0..13], "{d:0>12},", .{i}) catch unreachable;
+        line[63] = '\r';
+        line[64] = '\n';
+        try buf.appendSlice(gpa, &line);
+    }
+    return buf.toOwnedSlice(gpa);
+}
+
+test "seqnet1: a CR on the last byte of a span settles from the successor's own offset — a sequential-network document counts the same rows as the streaming lexer" {
+    const gpa = std.testing.allocator;
+    const rows: usize = 8_000;
+    const body = try genRows65Crlf(gpa, rows);
+    defer gpa.free(body);
+
+    // FIXTURE SELF-CHECKS (anti-vacuity): the CR is the LAST byte of the first
+    // chunk-bounded span and its LF is the first byte of the next — the phasing
+    // that distinguishes this from fcg1 (LF at the span end).
+    try std.testing.expectEqual(@as(u8, '\r'), body[net_chunk - 1]);
+    try std.testing.expectEqual(@as(u8, '\n'), body[net_chunk]);
+    const boundary_row: u64 = (net_chunk - 1) / 65; // 4032
+    try std.testing.expectEqual(@as(u64, 4_032), boundary_row);
+    try std.testing.expectEqual(net_chunk - 1, boundary_row * 65 + 63); // its CR, exactly
+    try std.testing.expect(body.len > net_chunk + 128 * 1024); // the scan runs well past the boundary
+
+    // GROUND TRUTH: the same bytes locally through mmap (per-row `boundsAfter`),
+    // cross-checked against the generator's own count.
+    var ref = try openWith(body, fcg_opts);
+    defer ref.deinit();
+    try scanToEnd(ref.doc);
+    const rc = api.ls_row_count_get(ref.doc);
+    try std.testing.expectEqual(true, rc.exact);
+    try std.testing.expectEqual(@as(u64, rows), rc.count);
+
+    // THE SUBJECT: a healthy peer that ignores Range, so the resource is filled
+    // SEQUENTIALLY — the arm whose slice demand honors only the byte at `internal`.
+    var fx: api.NetFixture = .{ .body = body, .honor_ranges = false, .advertise_length = true };
+    const doc = try openFakeToDoneOpts(&fx, &fcg_opts);
+    defer api.ls_close(doc);
+    try std.testing.expectEqual(api.NetRangeMode.sequential_fallback, api.netRangeMode(doc));
+    try scanToEnd(doc);
+    const probes = [_]u64{ boundary_row - 1, boundary_row, boundary_row + 1, boundary_row + 2, rc.count - 1 };
+    try expectSameRows("seqnet1", ref.doc, doc, rc.count, &probes);
+}
+
+// ===========================================================================
+// bytes_scanned MONOTONICITY (api/lesssheet.h: "monotone non-decreasing over the
+// document's lifetime, including across cancelled jobs").
+// ---------------------------------------------------------------------------
+// Today the guarantee is EMERGENT, not enforced: `index.indexPoll` derives
+// bytes_scanned straight from `frontier_pos.physical` and clamps only from ABOVE
+// (`@min(total, …)`), so every publisher is trusted to be monotone on its own —
+// `index.scanChunk`, `search.commitSearch` and `filter.commitFilter` all write
+// `frontier_pos`, and the last two gate on `bytesConsumed`, which is `pos.logical`
+// (csv_reader.zig:242-246), while what is REPORTED is `pos.physical`. For a gzip
+// Source that physical is lane- and op-window-dependent, so a LOGICAL advance can
+// carry a LOWER physical. Round 3 of task #14 was exactly that and removed its
+// cause; the reviewer filed the standing high-water clamp forward because it
+// hardens every writer, not just the one that regressed.
+//
+// This is the lock on the guarantee itself: ONE high-water for a whole document's
+// life, sampled across the publisher mix that can invert it — a local `.csv.gz`
+// where the index worker (forward lane), a trailing SEARCH and a trailing FILTER
+// (replay lanes) all publish the shared frontier, plus window reads behind the
+// frontier on the other replay lane, plus a CANCELLED jump, which the ABI names
+// explicitly; then the same bytes over the network, where the physical is the
+// COMPRESSED offset of a gzip Source composed over a growing spool.
+//
+// HONEST SCOPE — measured, so nobody reads more into a green than it carries.
+// This is a FORWARD-LOOKING regression lock, not a driver for the clamp: it is
+// GREEN at this tip AND at `5936132`, the round-2 tree that still carried the
+// backward tick. Reproducing THAT tick needs the unguarded rewind publish, which
+// needs a scan PARKED on compressed bytes that have not arrived — and that
+// fixture does not fail, it CRASHES: a truncated compressed prefix drives
+// `std.compress.flate` into a ReleaseSafe `integer overflow` panic inside
+// `takeBits` (Decompress.zig:548) during the open head inflate, on BOTH the
+// `withhold` and `drop_after` arms (task #40, the flate guard — reproduction in
+// the planner report). Until #40 lands, that path cannot carry a frozen test.
+// The reviewer's OTHER residual — a replay lane publishing a lower `op_physical`
+// than a forward-lane chunk did — is not constructible through any existing seam
+// either: an inversion needs two publishes whose op-window ENDS invert; forward
+// windows are cut short only at the gzip checkpoint grid (32 MiB LOGICAL,
+// source.zig:19), so no gate-sized fixture can shorten one; replay windows start
+// at the requested position and run the same 256 KiB; and nothing exposes lane
+// assignment (`gzForceChunkBytes` truncates SPANS, not inflate ops). A RED-first
+// lock for the clamp would need a new src/ seam.
+// ===========================================================================
+
+/// One high-water for a document's whole life: the ABI guarantee is per DOCUMENT,
+/// not per operation, so every observation below shares this.
+const MonoWatch = struct {
+    high: u64 = 0,
+    doc: *api.Doc,
+
+    fn sample(self: *MonoWatch, where: []const u8) !void {
+        const s = api.ls_index_poll(self.doc);
+        errdefer std.debug.print("\n[mono1] {s}: bytes_scanned {d} < high-water {d} — ls_index_poll ticked BACKWARD (api/lesssheet.h pins it monotone non-decreasing for the document's lifetime)\n", .{ where, s.bytes_scanned, self.high });
+        try std.testing.expect(s.bytes_scanned >= self.high);
+        self.high = s.bytes_scanned;
+    }
+
+    /// Sample densely for `ms` while the background lane works.
+    fn watch(self: *MonoWatch, ms: i64, where: []const u8) !void {
+        const io = std.testing.io;
+        const t0: std.Io.Clock.Timestamp = .now(io, .awake);
+        while (elapsedMs(t0) < ms) {
+            try self.sample(where);
+            io.sleep(.fromMilliseconds(1), .awake) catch return;
+        }
+        try self.sample(where);
+    }
+};
+
+test "mono1: ls_index_poll().bytes_scanned never ticks backward — across every reachable frontier publisher, replay-lane reads and a cancelled jump" {
+    const gpa = std.testing.allocator;
+    const plain = try genNeedleRows(gpa, 300_000, &.{ 10, 150_000, 299_999 }); // 5.4 MB: past the 4 MiB gz head
+    defer gpa.free(plain);
+    const g = try gz(gpa, plain);
+    defer gpa.free(g);
+
+    // ARM A — a LOCAL `.csv.gz` under AUTO, where THREE publishers write the shared
+    // frontier from cursors on different lanes: `index.scanChunk` (forward lane),
+    // `search.commitSearch` and `filter.commitFilter` (a trailing scan starts BEHIND
+    // the frontier, so `scanCursorAt` hands it a REPLAY lane, and it publishes when
+    // it breaks new ground). Interleaved window reads behind the frontier take the
+    // other replay lane. This is the publisher mix the residual is about.
+    {
+        var od = try openWith(g, .{ .separator = ',', .quote = api.quote_none, .header = api.header_off, .index_mode = api.index_auto });
+        defer od.deinit();
+        var w: MonoWatch = .{ .doc = od.doc };
+        try w.watch(150, "A: background index scan");
+        _ = api.ls_window_set(od.doc, 0, 64); // replay lane, behind the frontier
+        try w.sample("A: after a replay-lane window read");
+        try startSearch(od.doc, textReq("needle")); // trailing scan -> replay lane -> publishes
+        try w.watch(200, "A: search scan publishing the frontier");
+        try setFilter(od.doc, textReq("needle")); // the other trailing publisher
+        try w.watch(200, "A: filter scan publishing the frontier");
+        _ = api.ls_window_set(od.doc, 0, 64);
+        try w.sample("A: after a replay-lane window read");
+        // A CANCELLED job: the ABI names that case explicitly.
+        api.ls_jump_start(od.doc, 250_000);
+        try w.watch(80, "A: mid-jump");
+        api.ls_jump_cancel(od.doc);
+        try w.watch(80, "A: after cancel");
+        _ = try waitFilterDone(od.doc);
+        try w.watch(200, "A: filter complete");
+        // GUARD: the frontier really moved over compressed bytes, in many publishes —
+        // monotone over a frontier that never advanced would be vacuous.
+        try std.testing.expect(w.high > net_chunk);
+    }
+
+    // ARM B — the same bytes over the network (sequential fill, healthy peer served
+    // in FULL): the gzip Source composed over a growing spool, whose physical is the
+    // COMPRESSED offset, driven in stages by demand jumps so the frontier is
+    // published many times from freshly produced op windows.
+    {
+        var fx: api.NetFixture = .{ .body = g, .honor_ranges = false, .advertise_length = true };
+        const doc = try openFakeToDoneOpts(&fx, &fcg_opts);
+        defer api.ls_close(doc);
+        var w: MonoWatch = .{ .doc = doc };
+        try w.sample("B: at open");
+        var target: u64 = 40_000;
+        while (target <= 200_000) : (target += 40_000) {
+            api.ls_jump_start(doc, target);
+            try w.watch(120, "B: demand jump");
+            _ = api.ls_window_set(doc, target / 2, 64); // replay-lane read behind the frontier
+            try w.sample("B: after a replay-lane window read");
+        }
+        api.ls_jump_start(doc, 299_000);
+        try w.watch(60, "B: mid-jump");
+        api.ls_jump_cancel(doc);
+        try w.watch(60, "B: after cancel");
+        try scanToEnd(doc);
+        try w.sample("B: at EOF");
+        try std.testing.expectEqual(true, api.ls_index_poll(doc).complete);
+        try std.testing.expect(w.high > net_chunk);
+    }
+}
