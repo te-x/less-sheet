@@ -9957,3 +9957,314 @@ test "mono1: ls_index_poll().bytes_scanned never ticks backward — across every
         try std.testing.expect(w.high > net_chunk);
     }
 }
+
+// ===========================================================================
+// #40 — the FLATE FEED GUARD (ARCH-security-hardening wave (b), AC-b1 + AC-b2).
+// BOTH RED: they CRASH on this tree, which is the finding.
+// ---------------------------------------------------------------------------
+// Governing functional requirement 2 (ARCH:205): "A truncated / partial compressed
+// stream never drives the inflater into undefined behavior; it resolves to
+// correct-rows-so-far plus a clean 'damaged/truncated' or 'await-more-bytes'
+// outcome."
+//
+// Measured on this tip, both locally and over the network: a compressed stream cut
+// mid-DEFLATE-block drives `std.compress.flate` into a ReleaseSafe PANIC while the
+// open head inflates. Under the shipped mode a panic IS a crash, so these two tests
+// do not merely fail — they abort the run. They are the LAST tests in this file for
+// that reason: everything above still reports before the abort.
+//
+// FROZEN ON BEHAVIOR, NOT ON THE PANIC SITE. The ARCH names `peekBitsEnding`
+// underflow; what reproduces here is an integer-overflow panic in `takeBits`
+// (Decompress.zig:548). Both are std internals that a Zig bump can move, so nothing
+// below asserts a panic site, a std symbol or an error name: the lock is "no crash,
+// and the outcome is one of the classifications the ABI already has".
+//
+// NO NEW TERMINAL CLASSIFICATION IS NEEDED, and none is introduced. Everything
+// below resolves through states that already exist: `ls_open` returning
+// LS_ERROR_IO for an unusable stream (the existing gz vocabulary — gz_ac9 (b)), a
+// document that OPENS and serves correct-rows-so-far (the damaged-EOF salvage —
+// gz_ac9 (c)), and, on the network, the ordinary await-more-bytes stall (the index
+// simply stays incomplete until the bytes arrive — nfd/AC13). `api/lesssheet.h` is
+// untouched by this freeze.
+// ===========================================================================
+
+/// The one outcome rule wave (b) pins. A truncated stream either fails the open
+/// CLEANLY, or produces a document whose served rows are a true prefix of the
+/// undamaged document's — with the LAST row allowed to be a partial tail, since a
+/// cut can land mid-row. `ref_cell` supplies the undamaged text of a given row.
+fn expectTruncationHandled(
+    st: api.Status,
+    doc: ?*api.Doc,
+    ref: *api.Doc,
+    ref_rows: u64,
+    where: []const u8,
+) !void {
+    if (st != .ok) {
+        // A clean terminal classification, not a crash and not a half-open handle.
+        errdefer std.debug.print("\n[flate/{s}] ls_open returned {any} — expected LS_ERROR_IO (the existing damaged-gz classification) or a salvaged document\n", .{ where, st });
+        try std.testing.expectEqual(api.Status.io, st);
+        try std.testing.expectEqual(@as(?*api.Doc, null), doc);
+        return;
+    }
+    const d = doc.?;
+    defer api.ls_close(d);
+    try scanToEnd(d); // must TERMINATE: a truncated tail is an end, not a hang
+    const rc = api.ls_row_count_get(d);
+    errdefer std.debug.print("\n[flate/{s}] salvaged {d} rows (undamaged document has {d})\n", .{ where, rc.count, ref_rows });
+    try std.testing.expect(rc.count <= ref_rows);
+    if (rc.count == 0) return;
+
+    // Correct-rows-so-far: complete rows are byte-identical to the undamaged
+    // document; only the final row may be a partial tail.
+    const last = rc.count - 1;
+    const probe: [4]u64 = .{ 0, rc.count / 2, if (last > 0) last - 1 else 0, last };
+    for (probe, 0..) |row, k| {
+        var expect_buf: [64]u8 = undefined;
+        _ = api.ls_window_set(ref, row, 1);
+        const want = api.ls_cell(ref, row, 0).slice();
+        if (want.len > expect_buf.len) continue;
+        @memcpy(expect_buf[0..want.len], want);
+        _ = api.ls_window_set(d, row, 1);
+        const got = api.ls_cell(d, row, 0).slice();
+        errdefer std.debug.print("\n[flate/{s}] row {d} col 0: salvaged \"{s}\", undamaged \"{s}\"\n", .{ where, row, got, expect_buf[0..want.len] });
+        if (k == 3) {
+            // The final row may be cut mid-row: a PREFIX is correct, garbage is not.
+            try std.testing.expect(std.mem.startsWith(u8, expect_buf[0..want.len], got));
+        } else {
+            try std.testing.expectEqualStrings(expect_buf[0..want.len], got);
+        }
+    }
+}
+
+/// One temp directory reused across a whole sweep: a fresh `std.testing.tmpDir`
+/// per open is most of the per-offset cost, and the sweep opens ~1500 variants.
+const SweepDir = struct {
+    tmp: std.testing.TmpDir,
+    path: [:0]u8,
+
+    fn init(gpa: std.mem.Allocator) !SweepDir {
+        var tmp = std.testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+        var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const n = try tmp.dir.realPath(std.testing.io, &buf);
+        const path = try std.fs.path.joinZ(gpa, &.{ buf[0..n], "sweep.csv.gz" });
+        return .{ .tmp = tmp, .path = path };
+    }
+
+    fn deinit(self: *SweepDir, gpa: std.mem.Allocator) void {
+        gpa.free(self.path);
+        self.tmp.cleanup();
+    }
+
+    fn open(self: *SweepDir, bytes: []const u8, opts: *const api.OpenOptions) !struct { st: api.Status, doc: ?*api.Doc } {
+        try self.tmp.dir.writeFile(std.testing.io, .{
+            .sub_path = "sweep.csv.gz",
+            .data = bytes,
+            .flags = .{ .permissions = .fromMode(0o644) },
+        });
+        var doc: ?*api.Doc = null;
+        const st = api.ls_open(self.path.ptr, opts, &doc);
+        return .{ .st = st, .doc = doc };
+    }
+};
+
+test "flate_b1: a gz stream truncated at any byte offset inside a DEFLATE block is handled without a crash — clean damaged, or correct-rows-so-far (AC-b1)" {
+    const gpa = std.testing.allocator;
+    const opts: api.OpenOptions = .{ .separator = ',', .quote = api.quote_none, .header = api.header_off, .index_mode = api.index_manual };
+    var sweep = try SweepDir.init(gpa);
+    defer sweep.deinit(gpa);
+
+    // FIXTURE A — a SINGLE-BLOCK stream, swept at EVERY byte offset. This is the
+    // criterion's "each byte offset spanning a DEFLATE block": every offset lands
+    // in the gzip header, on the block header bits, or MID-SYMBOL inside the block,
+    // which is exactly what the old regression case never reached (it dropped only
+    // the CRC/ISIZE footer, keeping every deflate byte — gz_ac9 (c)).
+    {
+        const plain = try genFixedRows(gpa, 180);
+        defer gpa.free(plain);
+        const raw = try deflateRaw(gpa, plain);
+        defer gpa.free(raw);
+        var ref = try openWith(plain, opts);
+        defer ref.deinit();
+        try scanToEnd(ref.doc);
+        const ref_rows = api.ls_row_count_get(ref.doc).count;
+        try std.testing.expectEqual(@as(u64, 180), ref_rows);
+        // FIXTURE SELF-CHECK (anti-vacuity): the stream really has deflate payload
+        // to cut INSIDE, well past the 10-byte gzip header.
+        try std.testing.expect(raw.len > 512);
+
+        var cut: usize = 0;
+        while (cut <= raw.len) : (cut += 1) {
+            const g = try gzMember(gpa, plain, .{ .truncate_payload = cut, .omit_footer = true });
+            defer gpa.free(g);
+            const r = try sweep.open(g, &opts);
+            var label: [48]u8 = undefined;
+            try expectTruncationHandled(r.st, r.doc, ref.doc, ref_rows, std.fmt.bufPrint(&label, "b1/A cut={d}", .{cut}) catch "b1/A");
+        }
+    }
+
+    // FIXTURE B — a MULTI-BLOCK stream (a payload far past one deflate block), swept
+    // on a STRIDE plus the whole tail. THE BOUND, stated rather than implied: this
+    // arm samples every 127th offset and then every offset in the last 64 bytes; it
+    // is NOT exhaustive. Exhaustive coverage of the offset x block-structure x
+    // member-layout space is AC-b3's corpus (the (c) campaign), which this cell is
+    // deliberately a prerequisite for (ARCH:548) -- the fast gate carries a
+    // representative sweep, not a campaign.
+    {
+        const plain = try genFixedRows(gpa, 8_000);
+        defer gpa.free(plain);
+        const raw = try deflateRaw(gpa, plain);
+        defer gpa.free(raw);
+        var ref = try openWith(plain, opts);
+        defer ref.deinit();
+        try scanToEnd(ref.doc);
+        const ref_rows = api.ls_row_count_get(ref.doc).count;
+        try std.testing.expectEqual(@as(u64, 8_000), ref_rows);
+        try std.testing.expect(raw.len > 8 * 1024); // several deflate blocks
+
+        var cut: usize = 0;
+        while (cut <= raw.len) : (cut += 127) {
+            const g = try gzMember(gpa, plain, .{ .truncate_payload = cut, .omit_footer = true });
+            defer gpa.free(g);
+            const r = try sweep.open(g, &opts);
+            var label: [48]u8 = undefined;
+            try expectTruncationHandled(r.st, r.doc, ref.doc, ref_rows, std.fmt.bufPrint(&label, "b1/B cut={d}", .{cut}) catch "b1/B");
+        }
+        var tail: usize = raw.len -| 64;
+        while (tail <= raw.len) : (tail += 1) {
+            const g = try gzMember(gpa, plain, .{ .truncate_payload = tail, .omit_footer = true });
+            defer gpa.free(g);
+            const r = try sweep.open(g, &opts);
+            var label: [48]u8 = undefined;
+            try expectTruncationHandled(r.st, r.doc, ref.doc, ref_rows, std.fmt.bufPrint(&label, "b1/B tail={d}", .{tail}) catch "b1/B tail");
+        }
+    }
+}
+
+// AC-b2 is frozen as TWO independent signals, so the implementer can see them fail
+// and pass separately (the drift1/drift2 lesson): `flate_b2a` is the criterion's
+// literal requirement — a fetch stopping on a chunk boundary must not drive the
+// inflater into a panic — and `flate_b2b` is its resolution requirement — the
+// outcome must be a HONEST await-more-bytes or clean-damaged, not a lie. On this
+// tree b2a CRASHES (chunk boundary 2) and b2b fails its very first boundary, so
+// they are RED for two different, measured reasons.
+//
+// THE BOUND, stated rather than implied: both sweep chunk boundaries 1..3 of a
+// ~900 KB compressed body — the fixture whose boundary 2 is the MEASURED crash.
+// Other body shapes, other boundaries, and the full offset space are the (c)
+// campaign's breadth (AC-b3), which this cell is the prerequisite for (ARCH:548).
+
+/// Chunk boundaries these two sweep (see the bound above).
+const flate_b2_boundaries: u64 = 3;
+
+/// The AC-b2 fixture: 3.6 MB of rows whose ~900 KB gzip stream spans several 256 KiB fetch
+/// boundaries inside ONE member, so a fetch that stops on one stops INSIDE a
+/// DEFLATE block — the partial-fetch shape, never a member boundary.
+fn genFlateNetBody(gpa: std.mem.Allocator) ![]u8 {
+    const plain = try genFixedRows(gpa, 200_000);
+    defer gpa.free(plain);
+    return gz(gpa, plain);
+}
+
+test "flate_b2a: a network fetch stopping on a 256 KiB chunk boundary never drives the inflater into a panic (AC-b2)" {
+    const gpa = std.testing.allocator;
+    const g = try genFlateNetBody(gpa);
+    defer gpa.free(g);
+    // FIXTURE SELF-CHECK (anti-vacuity): the compressed stream really spans the
+    // boundaries swept below, so each cut lands mid-block.
+    try std.testing.expect(g.len > flate_b2_boundaries * net_chunk + 4 * 1024);
+
+    var k: u64 = 1;
+    while (k <= flate_b2_boundaries) : (k += 1) {
+        const at = k * net_chunk;
+        // Bytes NOT YET ARRIVED, and bytes that will NEVER arrive: the fake's two
+        // partial-fetch faults. Both must reach a terminal open state, and a demand
+        // against the partial stream must return — never abort the process.
+        var gate: std.atomic.Value(u64) = .init(at);
+        const cases = [_]api.NetFixture{
+            .{ .body = g, .honor_ranges = false, .advertise_length = true, .withhold = &gate },
+            .{ .body = g, .honor_ranges = false, .advertise_length = true, .drop_after = at },
+        };
+        for (cases) |fixture| {
+            var fx = fixture;
+            const job = api.openUrlStartFake(&fx, net_url.ptr, net_url.len, &fcg_opts) orelse return error.NetJobAllocFailed;
+            defer api.ls_net_open_release(job);
+            const st = try pollNetTerminal(job); // TERMINAL, and the process is alive
+            errdefer std.debug.print("\n[flate/b2a boundary {d}] open state={any} err={any}\n", .{ at, st.state, st.err });
+            try std.testing.expect(st.state == .done or st.state == .failed);
+            if (st.state == .failed) {
+                try std.testing.expectEqual(@as(?*api.Doc, null), st.doc);
+                continue;
+            }
+            const doc = st.doc orelse return error.NetOpenNoDoc;
+            defer api.ls_close(doc);
+            api.ls_jump_start(doc, 190_000); // demand across the cut
+            netWait(100);
+            api.ls_jump_cancel(doc);
+            _ = api.ls_window_set(doc, 0, 32); // and a re-lex over what did decode
+            _ = api.ls_index_poll(doc);
+        }
+    }
+}
+
+test "flate_b2b: a fetch stopping on a chunk boundary resolves HONESTLY — await-more-bytes that resumes, or a damaged EOF over the received bytes (AC-b2)" {
+    const gpa = std.testing.allocator;
+    const g = try genFlateNetBody(gpa);
+    defer gpa.free(g);
+    const ref_rows: u64 = 200_000;
+    const target: u64 = 190_000; // a row past every boundary's decoded prefix
+
+    var k: u64 = 1;
+    while (k <= flate_b2_boundaries) : (k += 1) {
+        const at = k * net_chunk;
+        // AWAIT-MORE-BYTES — the gz analog of nfd_ac13. While the rest is withheld
+        // the document must not claim completion; once it arrives the demand must
+        // RESUME and land on the requested row with its true text. A document that
+        // instead declares a truncated count complete+exact has resolved as neither
+        // of the two outcomes the criterion allows — it has silently lost the tail.
+        {
+            var gate: std.atomic.Value(u64) = .init(at);
+            var fx: api.NetFixture = .{ .body = g, .honor_ranges = false, .advertise_length = true, .withhold = &gate };
+            const doc = try openFakeToDoneOpts(&fx, &fcg_opts);
+            defer api.ls_close(doc);
+            api.ls_jump_start(doc, target);
+            netWait(100);
+            errdefer std.debug.print("\n[flate/b2b await boundary {d}] complete={any} rows={d}\n", .{ at, api.ls_index_poll(doc).complete, api.ls_row_count_get(doc).count });
+            try std.testing.expectEqual(false, api.ls_index_poll(doc).complete); // awaiting, not a lie
+            gate.store(g.len, .release);
+            const js = try waitJumpDone(doc);
+            try std.testing.expectEqual(target, js.landed_row); // resumed to the demand
+            _ = api.ls_window_set(doc, target, 4);
+            var b: [8]u8 = undefined;
+            try expectCell(doc, target, 0, fixedCell(&b, target));
+        }
+        // CLEAN-DAMAGED — the gz analog of nfd_ac16. The stream ENDS on the boundary
+        // and nothing more is coming: the document must terminate over the received
+        // bytes (correct-rows-so-far, exact, fewer than the undamaged count), never
+        // await forever for bytes that ended.
+        {
+            var fx: api.NetFixture = .{ .body = g, .honor_ranges = false, .advertise_length = true, .drop_after = at };
+            const job = api.openUrlStartFake(&fx, net_url.ptr, net_url.len, &fcg_opts) orelse return error.NetJobAllocFailed;
+            defer api.ls_net_open_release(job);
+            const st = try pollNetTerminal(job);
+            if (st.state != .done) { // a clean terminal failure is also a resolution
+                try std.testing.expectEqual(api.NetOpenState.failed, st.state);
+                try std.testing.expectEqual(@as(?*api.Doc, null), st.doc);
+                continue;
+            }
+            const doc = st.doc orelse return error.NetOpenNoDoc;
+            defer api.ls_close(doc);
+            try scanToEnd(doc); // must SETTLE
+            const ip = api.ls_index_poll(doc);
+            const rc = api.ls_row_count_get(doc);
+            errdefer std.debug.print("\n[flate/b2b damaged boundary {d}] complete={any} rows={d} exact={any} (undamaged {d})\n", .{ at, ip.complete, rc.count, rc.exact, ref_rows });
+            try std.testing.expectEqual(true, ip.complete); // terminal over the received prefix
+            try std.testing.expectEqual(true, rc.exact);
+            try std.testing.expect(rc.count > 0 and rc.count < ref_rows);
+            const probe = rc.count / 2;
+            _ = api.ls_window_set(doc, probe, 4);
+            var b: [8]u8 = undefined;
+            try expectCell(doc, probe, 0, fixedCell(&b, @intCast(probe))); // correct-rows-so-far
+        }
+    }
+}
