@@ -36,6 +36,151 @@ const PhysicalMark = struct { logical_end: u64, physical_end: u64 };
 const checkpoint_ram_budget: usize = 4 * 1024 * 1024;
 const max_checkpoint_entries: usize = 64 * 1024;
 
+/// The inflater's INPUT reader (security-hardening (b), AC-b1/AC-b2): a
+/// `Reader.fixed` over the compressed mapping in every respect EXCEPT that
+/// running out of bytes is reported as `error.ReadFailed` instead of
+/// `error.EndOfStream`. That single difference is what makes it safe to feed a
+/// TRUNCATED or not-yet-complete stream to `std.compress.flate` at all.
+///
+/// WHY. Zig 0.16.0's `Decompress` is not safe against running out of input
+/// mid-symbol, but the unsoundness is narrow and exactly locatable:
+///   * `decodeSymbol` peeks via `peekBitsShort`, whose ENDING path zero-pads with
+///     no length check, and commits via `tossBitsShort`, whose guard reads
+///     `bufferedLen()*8 + consumed_bits < n` where the available bits are
+///     `bufferedLen()*8 - consumed_bits`. With that sign wrong the toss is
+///     allowed when the bits are not there, and it either tosses past
+///     `input.end` (tripping `Reader.toss`'s `seek <= end` assertion) or leaves
+///     the reader EMPTY with `consumed_bits != 0`;
+///   * the next `peekBitsEnding` then evaluates `0 * 8 - consumed_bits` and
+///     panics with `integer overflow` (Decompress.zig:540; ReleaseSafe reports
+///     :548 because it merges the two overflow traps of the inlined `takeBits`).
+/// A ReleaseSafe panic IS a crash, and every truncated / withheld / dropped
+/// stream reached it.
+///
+/// Everything else is already sound: `takeBits`/`peekBits` check correctly, so
+/// FIXED blocks (`readFixedCode` is pure `takeIntBits`), the extra-bit reads and
+/// every byte-aligned header/footer read cannot cause any of this. Only
+/// `tossBitsShort` — `decodeSymbol` and the dynamic-header codegen decoder — can.
+///
+/// THE CURE. Both `peekBits` and `peekBitsShort` begin with
+/// `d.input.peekInt(u32, .little)` and switch on its error:
+/// `error.ReadFailed => error.ReadFailed`, `error.EndOfStream => <ending path>`.
+/// So ReadFailed SHORT-CIRCUITS before either ending path — `peekBitsEnding`,
+/// `peekBitsShortEnding` and the wrong-signed `tossBitsShort` all become
+/// unreachable. `endingOrRefuse` returns exactly that at the boundary where the
+/// ending paths stop being safe, and plain `EndOfStream` above it, so a truncated
+/// member is still decoded down to its last usable bits (which is what `gz_ac9`,
+/// `gz_ac10` and `flate_b1`'s byte-for-byte sweep measure).
+///
+/// It costs NOTHING on the streaming path: a vtable entry is only ever reached
+/// once the buffered bytes run out, which is precisely the case that used to
+/// crash. And it invents NO input — no padding — so `produce` never has to guess
+/// which of the decoder's output bytes are real.
+const refusing_vtable: Reader.VTable = .{
+    .stream = refuseStream,
+    .discard = refuseDiscard,
+    .readVec = refuseReadVec,
+    .rebase = refuseRebase,
+};
+
+/// The ONE end-of-input answer, and the ONE place the safety rule lives.
+///
+/// `EndOfStream` hands `Decompress` its ending paths; `ReadFailed` locks them out.
+/// Two hazards, and each is refused over exactly the states it can occur in — no
+/// wider, because every bit held back at the end of a truncated member can cost a
+/// whole match's worth of output (up to 258 bytes).
+///
+///  (1) EVERY state: `buffered == 0` with bits already consumed from the (now
+///      absent) current byte. `peekBitsEnding` computes
+///      `buffered * 8 - consumed_bits` in usize and underflows — the
+///      `integer overflow` panic. With `consumed_bits == 0` it evaluates to 0 and
+///      is fine, and that case must stay open: a zero-extra-bit length or
+///      distance code is a `takeBits(0)`, which needs no bits at all.
+///
+///  (2) DYNAMIC-SYMBOL states only: fewer than a full 15-bit code's worth of real
+///      bits left. `tossBitsShort` admits any `n <= 8 + consumed_bits` (its guard
+///      adds where it must subtract), so below that it both decodes symbols out of
+///      `peekBitsShortEnding`'s zero padding and can toss past `input.end`
+///      (tripping `Reader.toss`'s `seek <= end` assertion). It is the ONLY unsound
+///      reader in `Decompress`, and it has just two call sites — `decodeSymbol`
+///      and the code-length loop of a dynamic block header — so `.fixed_block*`
+///      (`readFixedCode` is pure `takeIntBits`), `.stored_block` (byte-oriented),
+///      the protocol header/footer and the extra-bit reads of a match are all
+///      exempt and keep decoding to the last bit.
+///
+/// MEASURED both ways. Applying (2) everywhere truncates `gz_ac10`'s fixed-block
+/// salvage from two rows to one; NOT applying it decoded a bogus match out of the
+/// padding and served 14 bytes of garbage mid-document (`flate_b1` fixture B,
+/// cut 16891: row 3698 came back `"0000307386"` where the document says
+/// `"00003698"`). Scoped as below, both are right: that cut stops at the honest
+/// prefix `"00003"` and `gz_ac10` keeps both rows.
+///
+/// The state test reads `Decompress.state`'s TAG by name. That is a deliberate,
+/// COMPILE-CHECKED coupling to std: if a Zig bump renames or restructures these
+/// states this stops building rather than silently going unsound.
+fn endingOrRefuse(r: *Reader) Reader.Error {
+    const s: *Session = @alignCast(@fieldParentPtr("input", r));
+    const buffered: usize = r.end - r.seek;
+    const consumed_bits: usize = s.dec.consumed_bits;
+    if (buffered == 0 and consumed_bits > 0) return error.ReadFailed; // (1)
+    const max_code_bits: usize = 15; // deflate's longest Huffman code
+    if (tossesShort(s.dec.state) and buffered * 8 < max_code_bits + consumed_bits)
+        return error.ReadFailed; // (2)
+    return error.EndOfStream;
+}
+
+/// Whether `Decompress` in this state can reach `tossBitsShort` (see
+/// `endingOrRefuse` (2)): decoding a dynamic block's symbols, or the code-length
+/// header that builds its tables.
+///
+/// `state` is the RESUMPTION state, and it LAGS: `streamInner` only assigns it
+/// where it returns, so a dynamic block that last stopped mid-match still reads
+/// `.dynamic_block_match` while it decodes its next symbols. That is not an edge
+/// case — it is where the garbage of `flate_b1` fixture B cut 16891 was decoded
+/// (measured). So every state a dynamic block can RESUME from counts, not just
+/// `.dynamic_block`. The fixed-block and stored-block states, the protocol
+/// header/footer and `.end` genuinely cannot reach `tossBitsShort` and stay
+/// exempt.
+fn tossesShort(state: anytype) bool {
+    return switch (std.meta.activeTag(state)) {
+        .block_header, .dynamic_block, .dynamic_block_literal, .dynamic_block_match => true,
+        else => false,
+    };
+}
+
+fn refuseStream(r: *Reader, w: *std.Io.Writer, limit: std.Io.Limit) Reader.StreamError!usize {
+    _ = w;
+    _ = limit;
+    return endingOrRefuse(r);
+}
+
+fn refuseReadVec(r: *Reader, data: [][]u8) Reader.Error!usize {
+    _ = data;
+    return endingOrRefuse(r);
+}
+
+fn refuseDiscard(r: *Reader, limit: std.Io.Limit) Reader.Error!usize {
+    _ = limit;
+    return endingOrRefuse(r);
+}
+
+fn refuseRebase(r: *Reader, capacity: usize) Reader.RebaseError!void {
+    _ = capacity;
+    return endingOrRefuse(r); // the buffer IS the mapping; it never moves
+}
+
+/// `Reader.fixed(mapping)` with `refusing_vtable` (see it for why).
+fn refusingReader(mapping: []const u8) Reader {
+    return .{
+        .vtable = &refusing_vtable,
+        // Const-cast is safe for the same reason `Reader.fixed`'s is: every
+        // vtable entry refuses, so nothing can write through it.
+        .buffer = @constCast(mapping),
+        .end = mapping.len,
+        .seek = 0,
+    };
+}
+
 const Session = struct {
     input: Reader,
     history: [flate.max_window_len]u8,
@@ -46,7 +191,7 @@ const Session = struct {
 
     fn init(self: *Session, mapping: []const u8, physical_end: usize) void {
         @memset(&self.history, 0);
-        self.input = .fixed(mapping);
+        self.input = refusingReader(mapping);
         self.input.end = @min(mapping.len, physical_end);
         self.logical = 0;
         self.member_count = 0;
@@ -129,6 +274,9 @@ pub const Gzip = struct {
     terminal_end: std.atomic.Value(u64) = .init(std.math.maxInt(u64)),
     terminal_kind: std.atomic.Value(u8) = .init(0), // 0 unknown, 1 clean, 2 damaged
     bom_len: u64 = 0,
+    /// The logical offset just past the last ROW TERMINATOR any session has
+    /// produced (monotone). Only a DAMAGED end reads it — see `terminalLogical`.
+    last_row_end: std.atomic.Value(u64) = .init(0),
     shutdown: std.atomic.Value(bool) = .init(false),
     opening: bool = true,
     force_chunk: std.atomic.Value(u64) = .init(0),
@@ -242,7 +390,7 @@ pub const Gzip = struct {
         return s.input.seek;
     }
 
-    fn nextMember(self: *Gzip, s: *Session) bool {
+    fn nextMember(self: *Gzip, s: *Session, fence: usize) bool {
         s.member_count += 1;
         const at = s.input.seek;
         const phys_len = self.physicalLen();
@@ -250,8 +398,8 @@ pub const Gzip = struct {
             s.terminal = .clean;
             return false;
         }
-        if (at + 2 > s.input.end) {
-            s.terminal = if (s.input.end < phys_len) .budget else .damaged;
+        if (at + 2 > fence) {
+            s.terminal = if (fence < phys_len) .budget else .damaged;
             return false;
         }
         if (self.mapping[at] != 0x1f or self.mapping[at + 1] != 0x8b) {
@@ -260,6 +408,86 @@ pub const Gzip = struct {
         }
         s.dec = Decompress.init(&s.input, .gzip, &s.history);
         return true;
+    }
+
+    /// ONE inflate step: exactly one `Decompress` fill. Callers must have drained
+    /// the history first (asserted), which is what makes dropping a step a single
+    /// assignment on the output side.
+    ///
+    /// It never leaves the session both `.inflating` and unadvanced, so
+    /// `produce`'s loop always terminates.
+    fn inflateStep(self: *Gzip, s: *Session, fence: usize, resumable: bool) void {
+        const r = &s.dec.reader;
+        std.debug.assert(r.seek == r.end); // drained: dropping a step == `end = seek`
+        const snap_dec = s.dec;
+        const snap_seek = s.input.seek;
+
+        r.fillMore() catch |err| switch (err) {
+            // `.end` reached: this member decoded through its footer. std reports
+            // that WITHOUT setting `dec.err`, which is what leaves `dec.err` as
+            // the sole "the decoder failed" discriminator below.
+            error.EndOfStream => {},
+            error.ReadFailed => {}, // why is in `s.dec.err`
+        };
+
+        // No output needs vetting here: `endingOrRefuse` never lets the decoder
+        // consume a bit it does not have, so every byte it emitted is backed by
+        // the stream (the alternative — padding, and then guessing which output
+        // bytes were real — is what that rule exists to avoid).
+
+        // The input reader turned the decoder away: it wanted a byte we do not
+        // have, whether that was reported as a refusal or a plain end of stream
+        // (see `endingOrRefuse`). Everything emitted before that came from bytes
+        // it was actually given, so there is nothing else to distrust or trim.
+        const out_of_input = if (s.dec.err) |e|
+            (e == error.ReadFailed or e == error.EndOfStream)
+        else
+            false;
+
+        if (out_of_input and resumable) {
+            // "NOT YET ARRIVED" — the fence is an ARTIFICIAL one: the open head
+            // budget, a Cursor's physical budget, or a network provider's fetched
+            // high-water. std cannot resume a decoder it stopped MID-SYMBOL: it
+            // re-enters at `dec.state` having already tossed that symbol's bits,
+            // decodes a different symbol from the wrong bit offset, and serves
+            // wrong rows (a withheld-tail jump used to land ~145k rows early).
+            // So undo the step WHOLE and park resumably. Nothing is lost — the
+            // same bytes are simply re-decoded once the fence moves — and the
+            // restored snapshot makes that resume byte-exact.
+            const at = r.seek; // post-rebase history coordinates
+            s.dec = snap_dec;
+            s.dec.input = &s.input;
+            s.dec.reader.buffer = &s.history;
+            s.dec.reader.seek = at;
+            s.dec.reader.end = at; // this step's output dropped
+            s.input.seek = snap_seek;
+            s.terminal = .budget;
+            return;
+        }
+        if (s.dec.err != null) {
+            // The step FAILED — out of input at the TRUE end ("NEVER ARRIVING"), or
+            // a structural failure in bytes we do have (InvalidCode, a bad match, a
+            // broken header). Either way this session is finished, and that has to
+            // be decided BEFORE any "it produced bytes, so keep going" shortcut:
+            // `streamFallible` leaves `dec.state` UNMODIFIED on error, so a step
+            // that stopped in `.dynamic_block_literal` / `.dynamic_block_match`
+            // re-emits its SAVED literal or match on every later step while
+            // consuming no input at all. Re-entering it emits one byte per step
+            // forever — MEASURED on `flate_b2b`'s dropped stream: 256 KiB of a
+            // single duplicated byte per produce op, `input.seek` frozen 2 bytes
+            // short of the fence, so the document grew phantom rows past its true
+            // end (4 MiB of head out of a 3.6 MB document) and NEVER became
+            // terminal. Whatever this step did emit was decoded from real bits, so
+            // it is kept; what must not happen is another step.
+            s.terminal = .damaged;
+            return;
+        }
+        if (r.end > r.seek) return; // decoded bytes: progress, and all of them keepable
+        // Zero bytes and no failure: the member is finished (an EMPTY member
+        // produces exactly this on its first step). Where the old feed keyed on
+        // `readSliceShort` returning 0, this keys on the decoder not failing —
+        // `nextMember` still decides clean / next-member / damaged.
+        _ = self.nextMember(s, fence);
     }
 
     /// Produce at most `out.len` bytes.  A physical artificial end is a
@@ -283,34 +511,47 @@ pub const Gzip = struct {
                 }
             }
         }
+        // THE HONEST EDGE: the last byte this session may treat as content —
+        // `input.end` exactly as every other site sets it (the open fence, a
+        // Cursor's physical budget, the provider's fetched high-water, or the
+        // mapping's true end). `resumable` is the whole of "not yet arrived" vs
+        // "never arriving": an edge SHORT of the physical total is one that can
+        // still move, so a stop there parks and waits; an edge AT the total is
+        // the end of the stream, so a stop there is terminal.
+        const fence = s.input.end;
+        // ... and "still coming" needs the edge to be able to MOVE. An artificial
+        // fence below the physical total is resumable only while the provider can
+        // still deliver: once the peer ended the body SHORT of the length it
+        // advertised, the fence is frozen, and parking on it waits forever for
+        // bytes that already stopped arriving — the dropped-stream case, which
+        // used to leave the document permanently incomplete.
+        const resumable = fence < self.physicalLen() and
+            (if (self.provider) |hr| hr.awaitsBytes() else true);
+
         var written: usize = 0;
-        while (written < out.len and s.terminal == .inflating) {
-            const n = s.dec.reader.readSliceShort(out[written..]) catch {
-                // The indirect inflater commits bytes to its history reader
-                // before reporting a footer/structural error. Preserve that
-                // safely decoded prefix instead of losing it with the error.
-                const pending = s.dec.reader.buffer[s.dec.reader.seek..s.dec.reader.end];
-                const take = @min(pending.len, out.len - written);
-                if (take > 0) {
-                    @memcpy(out[written..][0..take], pending[0..take]);
-                    s.dec.reader.seek += take;
-                    s.logical += take;
-                    written += take;
-                }
-                if (s.input.end < self.physicalLen() and s.input.seek >= s.input.end) {
-                    s.terminal = .budget;
-                } else {
-                    s.terminal = .damaged;
-                }
-                break;
-            };
-            if (n > 0) {
-                written += n;
-                s.logical += n;
+        while (written < out.len) {
+            // Drain FIRST, and only ever from the decoder's own history reader:
+            // `readSliceShort` copies bytes into the destination and then DROPS
+            // its count if a later step fails (Reader.zig:688 returns
+            // `error.ReadFailed`, not the partial `i`), which used to leave the
+            // salvage writing the next decoded bytes over the ones already there
+            // — a complete, exact, WRONG document. Nothing here can lose a byte.
+            const avail = s.dec.reader.buffered();
+            if (avail.len > 0) {
+                const take = @min(avail.len, out.len - written);
+                @memcpy(out[written..][0..take], avail[0..take]);
+                // Cheap because it scans BACKWARD: a terminator turns up within one
+                // row's length, so this is O(row), not O(chunk) (see terminalLogical).
+                if (std.mem.lastIndexOfAny(u8, avail[0..take], "\r\n")) |k|
+                    self.noteRowEnd(s.logical + k + 1);
+                s.dec.reader.toss(take);
+                written += take;
+                s.logical += take;
                 if (s == self.forward) self.forward_logical.store(s.logical, .release);
                 continue;
             }
-            if (!self.nextMember(s)) break;
+            if (s.terminal != .inflating) break;
+            self.inflateStep(s, fence, resumable);
         }
         if (s == self.forward) {
             self.forward_logical.store(s.logical, .release);
@@ -371,14 +612,57 @@ pub const Gzip = struct {
         }
     }
 
+    /// Whether the open-time inflate produced a document worth serving.
+    ///
+    /// A DAMAGED stream must additionally carry at least one ROW TERMINATOR.
+    /// "Correct-rows-so-far" means rows: a salvage shorter than one complete row
+    /// is a FRAGMENT of the first row, and serving it presents a truncated cell
+    /// as a whole one — silent wrong data with nothing to warn the caller
+    /// (`flate_b1`: a 31-byte deflate prefix decodes to `"0"`, whose true cell is
+    /// `"00000000"`). CR and LF terminate rows in every dialect and encoding this
+    /// core reads — a UTF-16 document still contains the 0x0A/0x0D byte — so their
+    /// ABSENCE proves no row is complete, whatever the dialect turns out to be.
+    ///
+    /// UNDAMAGED streams are exempt: a file that simply does not end in a newline
+    /// has a genuine, complete last row. So is a stream that only reached the open
+    /// budget (`.inflating`/`.budget`), whose tail is still to come.
     pub fn openUsable(self: *const Gzip) bool {
-        return self.head.items.len > 0 or self.forward.member_count > 0;
+        if (self.head.items.len == 0 and self.forward.member_count == 0) return false;
+        if (self.forward.terminal == .damaged and
+            std.mem.indexOfAny(u8, self.head.items, "\r\n") == null) return false;
+        return true;
+    }
+
+    /// Note that a row terminator ENDED at logical offset `at` (monotone,
+    /// lock-free). Recorded but NOT yet applied to the reported end — see the
+    /// CONFLICT note in `terminalLogical`.
+    fn noteRowEnd(self: *Gzip, at: u64) void {
+        var cur = self.last_row_end.load(.monotonic);
+        while (at > cur) cur = self.last_row_end.cmpxchgWeak(cur, at, .monotonic, .monotonic) orelse return;
     }
 
     pub fn terminalLogical(self: *const Gzip) ?u64 {
         const end = self.terminal_end.load(.acquire);
         return if (end == std.math.maxInt(u64)) null else end -| self.bom_len;
     }
+
+    // COMPLETE-ROWS-ONLY, and why it is NOT applied here — see
+    // .aidev/CHANGE-REQUEST.md (flate_b1_vs_gz_ac10).
+    //
+    // Clamping a DAMAGED end to `last_row_end` (the last row terminator produced)
+    // is the rule `flate_b1` requires: it makes every reported row WHOLE, so a
+    // truncated final cell is never served as a complete value. With it, the whole
+    // ~1500-offset `flate_b1` sweep passes.
+    //
+    // It cannot be applied while `gz_ac10` stands. That fixture's 6-byte deflate
+    // prefix salvages `"a,b\n1"`; clamping drops the partial `"1"`, leaving ONE
+    // row, which its sniffed header then consumes — so `rc.count >= 1` sees 0
+    // (MEASURED: `rows=0`, complete=1, scanned==total). `gz_ac10` therefore needs
+    // the partial tail KEPT and `flate_b1` needs it DROPPED, and the two tails are
+    // structurally identical (a fragment after the last terminator), so no rule
+    // distinguishes them. The clamp is left wired but unused pending adjudication;
+    // `openUsable` still refuses a salvage with NO terminator at all, which is the
+    // part both tests agree on.
 
     fn createSpill(self: *Gzip) void {
         if (self.spill_fd != null or self.spill_fail_after.load(.acquire) == 0) return;
@@ -507,7 +791,13 @@ pub const Gzip = struct {
             self.replay_inflated = 0;
             self.unlock();
         } else {
-            session.init(self.mapping, self.mapping.len);
+            // A NETWORK gzip's honest edge is the provider's FETCHED high-water,
+            // never `mapping.len` — that is the presized spool total, and a
+            // replay started there reads UNFETCHED spool zeros as content
+            // (silent wrong data: the withheld-tail document grew rows past the
+            // true count). Start at 0 exactly like `initProvider`'s forward
+            // session; `produce` raises it from the provider on the first op.
+            session.init(self.mapping, if (self.provider == null) self.mapping.len else 0);
             self.lock();
             self.replay_landed = target >= self.head.items.len;
             self.replay_restored = 0;
@@ -515,7 +805,7 @@ pub const Gzip = struct {
             self.unlock();
         }
         if (self.lane_physical_budget[lane]) |budget|
-            session.input.end = @intCast(@min(@as(u64, self.mapping.len), session.input.seek +| budget));
+            session.input.end = @intCast(@min(@as(u64, session.input.end), session.input.seek +| budget));
         self.op_len[lane] = 0;
         return self.discardTo(session, target, true, lane);
     }
@@ -1100,6 +1390,17 @@ pub fn gzipDeinit(g: *Gzip) void {
 
 /// True iff this Source fetches over the network (http_range, or a gzip composed
 /// over an http_range) — the lazy-frontier gate keys strictly on this (TD1).
+/// security-hardening (b) AC-b2: whether `source` can still receive bytes it does
+/// not have — the ONE "not yet arrived vs never arriving" resolver (see
+/// net_source.HttpRange.awaitsBytes). Local sources own every byte, so false.
+pub fn sourceAwaitsBytes(source: Source) bool {
+    return switch (source) {
+        .mmap => false,
+        .gzip => |g| if (g.provider) |hr| hr.awaitsBytes() else false,
+        .http_range => |hr| hr.awaitsBytes(),
+    };
+}
+
 pub fn sourceIsNetwork(source: Source) bool {
     return switch (source) {
         .mmap => false,

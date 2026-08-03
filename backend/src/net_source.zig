@@ -843,6 +843,24 @@ pub const HttpRange = struct {
         }
     }
 
+    /// security-hardening (b) AC-b2: whether bytes this Source does not have yet
+    /// can STILL ARRIVE — the "NOT YET ARRIVED" vs "NEVER ARRIVING" question,
+    /// asked wherever a stalled frontier must choose between waiting and calling
+    /// an end (see index.zig's jump-stall branch).
+    ///
+    /// SEQUENTIAL fill only, and that asymmetry is deliberate. That arm is one
+    /// forward-draining GET, so a byte below the advertised total that has not
+    /// landed is simply not downloaded YET; only the peer ending the body (`eof`)
+    /// or the document shutting down makes its absence final. The RANDOM arm
+    /// answers false because a hole there is a SHORT or FAILED range — a byte the
+    /// server refused — which AC-e3 already resolves by ending the demand at the
+    /// frontier instead of re-hammering the transport for it.
+    pub fn awaitsBytes(self: *const HttpRange) bool {
+        if (self.range_mode != 2) return false;
+        if (self.shutdown.load(.acquire)) return false;
+        return !self.eof.load(.acquire);
+    }
+
     /// Blocking forward drain to serve `internal` (AC13): waits (releasing the
     /// lock while sleeping, so poll / other lanes never block) until the byte at
     /// `internal` is downloaded, or the stream ends / shuts down. This lets a
@@ -915,9 +933,16 @@ pub const HttpRange = struct {
         while (self.comp_fetched < end) {
             const ci = self.comp_fetched / chunk_bytes;
             if (!self.present[@intCast(ci)]) self.ensureChunkLocked(@intCast(ci));
+            // A chunk that did NOT arrive ends the contiguous prefix. Leaving
+            // `comp_fetched` at it is what makes the next call RETRY it, which is
+            // the whole difference between "not yet arrived" and "never coming".
+            if (!self.present[@intCast(ci)]) break;
             self.comp_fetched = @min(self.total, (ci + 1) * chunk_bytes);
         }
-        return end;
+        // The CONTIGUOUS PRESENT prefix, never the requested `end`: returning
+        // `end` over a hole told the inflater that withheld/short-fetched bytes
+        // were content, and it decoded the spool's zeros into real rows.
+        return @min(end, self.present_prefix.load(.monotonic));
     }
 
     pub fn byteAt(self: *HttpRange, internal: u64) ?u8 {
