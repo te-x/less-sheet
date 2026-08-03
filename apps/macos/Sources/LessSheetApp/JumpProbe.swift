@@ -206,6 +206,9 @@ enum ViewportLandingProbe {
                 + " offset_y=%.1f target_visible=\(visible)\n",
             requestedRow, visibleRows.location, visibleRows.length, offsetY
         ).utf8))
+        // The find step-sequence driver paces its ⌘G on this observed scroll rather
+        // than on how fast the core resolves matches (see FindStepPacer).
+        FindStepPacer.noteLanded(requestedRow)
     }
 }
 
