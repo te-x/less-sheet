@@ -654,23 +654,20 @@ pub const Gzip = struct {
         }
     }
 
-    /// Whether the open-time inflate produced a document worth serving.
+    /// Whether the open-time inflate produced a document worth serving: ANY output,
+    /// or any member seen. Nothing about row completeness is asserted here.
     ///
-    /// A DAMAGED stream must additionally carry at least one ROW TERMINATOR.
-    /// "Correct-rows-so-far" means rows: a salvage shorter than one complete row
-    /// is a FRAGMENT of the first row, and serving it presents a truncated cell
-    /// as a whole one — silent wrong data with nothing to warn the caller
-    /// (`flate_b1`: a 31-byte deflate prefix decodes to `"0"`, whose true cell is
-    /// `"00000000"`). CR and LF terminate rows in every dialect and encoding this
-    /// core reads — a UTF-16 document still contains the 0x0A/0x0D byte — so their
-    /// ABSENCE proves no row is complete, whatever the dialect turns out to be.
-    ///
-    /// UNDAMAGED streams are exempt: a file that simply does not end in a newline
-    /// has a genuine, complete last row. So is a stream that only reached the open
-    /// budget (`.inflating`/`.budget`), whose tail is still to come.
+    /// A stricter rule lived here briefly — a damaged stream also had to carry a
+    /// row terminator, so a salvage shorter than one row could not present a
+    /// truncated cell as a whole one. It was removed as part of the adjudicated
+    /// CHANGE-REQUEST (`review/REVIEW-flate-feed-guard.md`): it answered the
+    /// partial-tail question one salvage-end EARLIER than, and opposite to, the way
+    /// the tail itself is served, and it turned a single-row garbage salvage into a
+    /// clean `LS_ERROR_IO`, making that case unfalsifiable in exactly the region
+    /// where a mid-symbol decode lands. Whole-rows-only is a product question for
+    /// the architect, to be answered ONCE and applied to both ends of a salvage.
     pub fn openUsable(self: *const Gzip) bool {
-        if (self.head.items.len == 0 and self.forward.member_count == 0) return false;
-        return true;
+        return self.head.items.len != 0 or self.forward.member_count != 0;
     }
 
     pub fn terminalLogical(self: *const Gzip) ?u64 {
@@ -1546,9 +1543,24 @@ pub fn cursorAt(source: Source, logical: u64, logical_limit: ?u64, physical_budg
             cur.physical = session.input.seek;
             if (physical_budget) |budget| {
                 cur.saved_input_end = session.input.end;
-                cur.physical_limit = @min(@as(u64, session.input.end), session.input.seek +| budget);
-                session.fence_cap = @intCast(cur.physical_limit.?);
+                // ONE derivation of the cap, ABSOLUTE, matching `beginReplay` and the
+                // field's own doc comment: the lane's budget anchored at the seek it
+                // was leased at. `cur.physical_limit` keeps its own min() meaning (a
+                // fence for bytes present NOW), but must not feed `fence_cap` —
+                // `session.input.end` for a provider is the fetch HIGH-WATER, so that
+                // pinned the cap at however far the download happened to have got at
+                // lease time, and `produce`'s `@min(raised, cap)` then held the fence
+                // there for the life of the lease. Degenerate case: a lane released
+                // after consuming everything fetched sits at `end == seek`, which
+                // pinned the cap at `seek`, so the raise could never satisfy
+                // `new_end > s.input.end` and every budgeted op on that lane served
+                // nothing and re-leased until an unbudgeted op broke the cycle.
+                const cap: u64 = session.input.seek +| budget;
+                session.fence_cap = @intCast(cap);
+                cur.physical_limit = @min(@as(u64, session.input.end), cap);
                 session.input.end = @intCast(cur.physical_limit.?);
+            } else {
+                session.fence_cap = null; // stated, not inferred from the lease order
             }
             g.unlock();
             cur.locked = true;
