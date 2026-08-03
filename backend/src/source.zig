@@ -506,10 +506,23 @@ pub const Gzip = struct {
         if (fence >= self.physicalLen()) return false;
         const hr = self.provider orelse return true;
         if (may_fetch) return hr.awaitsBytes();
-        // NO PERMIT. "Can this fence move?" is then NOT a question about the peer,
-        // because the reason we are sitting at it is that WE declined to move it.
-        // It is a question about whether the designated fetcher has settled the
-        // stream yet, and `terminal_kind` is exactly that fact:
+        // NO PERMIT. "Can this fence move?" is then NOT only a question about the
+        // peer, because the reason we are sitting at it is that WE declined to move
+        // it. It is also a question about whether the designated fetcher has settled
+        // the stream yet, and `terminal_kind` is exactly that fact.
+        //
+        // STRICT RELAXATION, and that shape is the load-bearing part: the answer is
+        // the permitted answer `OR` one more reason to park, so it is `true`
+        // WHEREVER the fetching path would say `true`, and sometimes where it would
+        // say `false`. `resumable` is therefore never LESS true than before this
+        // change, so a permit-less op can only ever turn a `.damaged` this code
+        // already produced into a recoverable `.budget` — it can never create a
+        // `.damaged` that did not occur before. That is what keeps a foreground read
+        // from stranding a session it does not own, INCLUDING lane 0's shared
+        // forward session (`cursorAt` routes a read with `internal >=
+        // forward_logical` there), whose `.damaged` would stop the frontier and
+        // whose `.budget` self-heals in `produce` the moment the fence rises.
+        // The two reasons to park:
         //   * NOT settled -> movable: park `.budget` and wait. Anything else would
         //     let a foreground read call an end that only a fetch could disprove —
         //     on a HEALTHY peer, where every declined read-ahead sits one chunk
@@ -523,7 +536,7 @@ pub const Gzip = struct {
         //     park here would UNDO that step instead, so a behind-frontier re-lex
         //     could not re-serve rows the frontier had already published —
         //     measured: `netgz1`'s `landed - 64` came back as an empty cell.
-        return self.terminal_kind.load(.acquire) == 0;
+        return hr.awaitsBytes() or self.terminal_kind.load(.acquire) == 0;
     }
 
     fn physical(s: *const Session) u64 {
