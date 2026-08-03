@@ -146,14 +146,14 @@ enum FindProbe {
             landings += 1
             log("lesssheet.find.landing n=\(landings) row_0based=\(row) pos=\(display.position ?? 0)"
                 + " total=\(display.total) final=\(display.totalIsFinal) at_ms=\(elapsedMs()) max_gap_ms=\(maxGapMs)")
-            if stepSeqMode { driveSequence(model, isFinal: display.totalIsFinal) }
+            if stepSeqMode { driveSequence(model) }
         }
 
-        // The after-done step of the sequence (issued only once the scan is final),
-        // paced on the previous match's observed scroll like every other step.
+        // The after-done step of the sequence (issued only once the scan is final).
         if stepSeqMode, wantDoneStep, !doneStepIssued, display.totalIsFinal {
             doneStepIssued = true
-            queueStep(seq: 3, kind: "after-done")
+            log("lesssheet.find.step seq=3 kind=after-done at_ms=\(elapsedMs())")
+            model.stepFind(.forward)
         }
 
         if !stepSeqMode { checkTerminal() }
@@ -198,36 +198,20 @@ enum FindProbe {
 
     /// Drive the submit + step-during-scan ×2 + step-after-done ×1 sequence off
     /// the observed landings (each `stepFind` is exactly what ⌘G does).
-    private static func driveSequence(_ model: DocumentModel, isFinal: Bool) {
+    private static func driveSequence(_ model: DocumentModel) {
         switch landings {
         case 1:  // first match (fromTop) landed; the scan is still counting.
-            queueStep(seq: 1, kind: "during-scan")
+            log("lesssheet.find.step seq=1 kind=during-scan at_ms=\(elapsedMs())")
+            model.stepFind(.forward)
         case 2:  // step #1's match landed; still scanning.
-            queueStep(seq: 2, kind: "during-scan")
+            log("lesssheet.find.step seq=2 kind=during-scan at_ms=\(elapsedMs())")
+            model.stepFind(.forward)
         case 3:  // step #2's match landed; hold until the scan completes.
             wantDoneStep = true
             log("lesssheet.find.await_done at_ms=\(elapsedMs())")
-            // The scan can already be final in this very fold, in which case the
-            // block in `logFold` will not get another turn — queue it here.
-            if isFinal {
-                doneStepIssued = true
-                queueStep(seq: 3, kind: "after-done")
-            }
         default: // step #3's (after-done) match landed -> done.
             log("lesssheet.find.seq_complete landings=\(landings) at_ms=\(elapsedMs()) max_gap_ms=\(maxGapMs)")
             finish()
-        }
-    }
-
-    /// Issue the next ⌘G only once the CURRENT match is physically on screen —
-    /// see `FindStepPacer` for why pacing on the observed scroll (rather than on
-    /// how fast the core resolves matches) is what makes this sequence
-    /// deterministic.
-    private static func queueStep(seq: Int, kind: String) {
-        FindStepPacer.queue(afterRow: lastLandedRow.map { Int(min($0, UInt64(Int.max))) }) {
-            guard let model else { return }
-            log("lesssheet.find.step seq=\(seq) kind=\(kind) at_ms=\(elapsedMs())")
-            model.stepFind(.forward)
         }
     }
 
