@@ -10281,3 +10281,139 @@ test "flate_b2b: a fetch stopping on a chunk boundary resolves HONESTLY — awai
         }
     }
 }
+
+// ===========================================================================
+// NETWORK-GZIP MUTEX-HELD WEDGE — the last AC-e1 residual
+// (ARCH-security-hardening :444-449). RED.
+// ---------------------------------------------------------------------------
+// `Gzip.produce` calls `ensureCompressed(s.input.seek + chunk_bytes)`
+// UNCONDITIONALLY on every inflate op (source.zig:550) — a fixed 256 KiB
+// read-ahead, not a demand the row needs. On a network gzip that resolves through
+// `HttpRange.ensureCompressed` (net_source.zig:931), which fetches: a ranged GET on
+// the random arm, a forward drain on the sequential one. So a re-lex on a
+// MUTEX-HELD path — `ls_window_set`, `ls_cell`, `ls_cell_copy` all hold the
+// Document mutex for their whole call — issues network I/O while holding it, and a
+// slow or silent peer wedges the UI thread: every poll, cancel and `ls_close`
+// blocks behind `d.lock()`. This is why the ARCH scopes AC-e1's "bounded by user
+// cancel" to open, close-via-the-worker and plain net CSV, and NOT to network gzip.
+//
+// THE LOCK is fcg3's, one Source over, and for the same reason the reviewer
+// second-keyed it there: assert on the fake transport's REQUEST-ATTEMPT tally that
+// no mutex-held path raises it. Hermetic and deterministic — a doomed or slow GET
+// is invisible to `netFetchCount` (successful round-trips only) and a timing probe
+// would be flaky and, worse, blind whenever the fetch happens to succeed fast.
+//
+// THE DRIVING CONDITION, measured, because it is not obvious: the read-ahead only
+// reaches un-fetched bytes when BOTH hold — (i) the row sits PAST the inflated open
+// head (a read inside `Gzip.head` never runs an inflate op at all), and (ii) its
+// compressed position is within one 256 KiB chunk of the fetched compressed edge,
+// which is exactly where a user scrolling near the frontier sits. At 64 / 2 000 /
+// 50 000 rows behind the frontier this tree issues 5 / 5 / 2 ranged GETs from
+// `ls_window_set` and 4 more from `ls_cell_copy`; at 250 000 rows behind it issues
+// none, which is why that distance is a GUARD below rather than a lock.
+//
+// THE BOUND, stated rather than implied: ONE fixture, the RANDOM-fill (range) arm,
+// three near-frontier distances plus one copy path. Not swept: the full distance
+// space and other body shapes. The SEQUENTIAL-fill arm is deliberately absent, and
+// that is a measured verdict rather than an omission — neither seam that can bound
+// its compressed prefix produces the driving condition. With `withhold` the
+// frontier never advances past the open head at all (the scan spins on the withheld
+// edge: landed row 0 after ~4500 drain attempts), so there is no near-frontier read
+// to make; with `drop_after` the stream's EOF is known, and `drainOneChunkLocked`
+// then returns without touching the transport (measured: the tally holds at 6
+// across all three distances). Its `ensureCompressed` does reach a blocking socket
+// read on the real transport, so the invariant is expected to hold there too — it
+// simply has no hermetic driver today, and should get a second arm if one appears.
+// ===========================================================================
+
+test "netgz1: a mutex-held read on a network .csv.gz issues NO transport request — the compressed read-ahead belongs to the scan, not to the UI thread (AC-e1 residual)" {
+    const gpa = std.testing.allocator;
+    const rows: u64 = 500_000;
+    const plain = try genFixedRows(gpa, @intCast(rows)); // 9 MB -> ~2.3 MB gz
+    defer gpa.free(plain);
+    const g = try gz(gpa, plain);
+    defer gpa.free(g);
+    // The deliverable compressed prefix is BOUNDED: a fetch past it comes back
+    // SHORT, so the demand is observable in the tally without the test depending on
+    // a peer that stalls. In production that same demand is a blocking round-trip.
+    const cut: u64 = 6 * net_chunk;
+    // FIXTURE SELF-CHECKS (anti-vacuity): the body really outlasts the bound, so
+    // there ARE un-fetched compressed bytes for a read-ahead to reach for.
+    try std.testing.expect(g.len > cut + 2 * net_chunk);
+
+    var attempts: std.atomic.Value(u64) = .init(0);
+    var fx: api.NetFixture = .{
+        .body = g,
+        .honor_ranges = true,
+        .advertise_length = true,
+        .short_body_at = cut,
+        .fetch_attempts = &attempts,
+    };
+    const doc = try openFakeToDoneOpts(&fx, &fcg_opts);
+    defer api.ls_close(doc);
+    try std.testing.expectEqual(api.NetRangeMode.random_access, api.netRangeMode(doc));
+    try std.testing.expect(attempts.load(.acquire) > 0); // the tally is WIRED (open fetched)
+
+    // Drive the frontier as far as the delivered prefix allows — on the SCAN
+    // worker's thread, which is the designated fetcher and is allowed to block.
+    api.ls_jump_start(doc, rows - 1);
+    const js = waitJumpDone(doc) catch api.ls_jump_poll(doc);
+    netWait(100);
+    const landed = js.landed_row;
+    // (i) of the driving condition: the rows read below are PAST the inflated open
+    // head, so serving them needs a real inflate op (a read inside the head buffer
+    // never calls `produce` and could not exercise the read-ahead at all).
+    errdefer std.debug.print("\n[netgz1] frontier landed at row {d} (needs to be past the {d}-byte open head)\n", .{ landed, api.open_head_max_bytes });
+    try std.testing.expect(landed * 18 > api.open_head_max_bytes);
+    try std.testing.expect(landed > 100_000);
+
+    // The background lane must be QUIESCENT before measuring, or the scan's own
+    // (legitimate) fetches would be attributed to the mutex-held calls below.
+    const quiet = attempts.load(.acquire);
+    netWait(150);
+    try std.testing.expectEqual(quiet, attempts.load(.acquire));
+
+    // THE LOCK. Every one of these calls holds the Document mutex for its whole
+    // duration; none of them may touch the transport.
+    for ([_]u64{ 64, 2_000, 50_000 }) |back| {
+        const row = landed - back;
+        const before = attempts.load(.acquire);
+        const r = api.ls_window_set(doc, row, 64);
+        const after = attempts.load(.acquire);
+        errdefer std.debug.print("\n[netgz1] ls_window_set({d}, 64) — {d} rows behind the frontier — issued {d} transport request(s) while holding the document mutex ({d} -> {d})\n", .{ row, back, after - before, before, after });
+        try std.testing.expectEqual(before, after);
+        // ... and it must still SERVE those rows correctly: the invariant may not be
+        // met by refusing to materialize (the bytes are behind the frontier, hence
+        // already fetched, so a demand-only inflate has everything it needs).
+        try std.testing.expectEqual(@as(u64, 64), r.row_count);
+        var cb: [8]u8 = undefined;
+        try expectCell(doc, row, 0, fixedCell(&cb, @intCast(row)));
+    }
+    // The lossless copy read is the same mutex-held family (window.zig cellCopy).
+    {
+        const row = landed - 100;
+        const before = attempts.load(.acquire);
+        var buf: [64]u8 = undefined;
+        var out_len: usize = 0;
+        var truncated: bool = false;
+        const cr = api.ls_cell_copy(doc, row, 0, &buf, buf.len, &out_len, &truncated);
+        const after = attempts.load(.acquire);
+        errdefer std.debug.print("\n[netgz1] ls_cell_copy({d}) issued {d} transport request(s) under the mutex ({d} -> {d})\n", .{ row, after - before, before, after });
+        try std.testing.expectEqual(before, after);
+        try std.testing.expectEqual(api.CopyResult.ok, cr);
+        var cb: [8]u8 = undefined;
+        try std.testing.expectEqualStrings(fixedCell(&cb, @intCast(row)), buf[0..out_len]);
+    }
+    // GUARD (green today and must stay green): far behind the frontier the
+    // read-ahead lands inside the fetched prefix, so nothing is demanded there. This
+    // documents where the defect does NOT fire — and would catch a "fix" that
+    // started fetching on reads that previously did not.
+    {
+        const row = landed - 250_000;
+        const before = attempts.load(.acquire);
+        _ = api.ls_window_set(doc, row, 64);
+        try std.testing.expectEqual(before, attempts.load(.acquire));
+        var cb: [8]u8 = undefined;
+        try expectCell(doc, row, 0, fixedCell(&cb, @intCast(row)));
+    }
+}
