@@ -593,18 +593,29 @@ pub fn cellCopy(d: *Document, row: u64, col: u32, buf: ?[*]u8, buf_len: usize, o
     out_truncated.* = false;
     if (d.column_count == 0 or col >= d.column_count) return .no_cell;
 
-    if (d.filter_state != .idle) return cellCopyFiltered(d, row, col, buf, buf_len, out_len, out_truncated);
+    // FILTER DISPATCH UNDER THE LOCK. `filter_state` is mutated by `ls_filter_set`
+    // on another thread, so reading it here unsynchronized was both a data race and
+    // a TOCTOU: a filter landing between the read and the work would serve an
+    // IDENTITY row index as a FILTERED coordinate (or the reverse) — the wrong cell,
+    // reported `.ok`. ONE acquisition now covers the decision AND the work it
+    // selects, which is why the filtered path is `*Locked`.
+    d.lock();
+    if (d.filter_state != .idle) {
+        defer d.unlock();
+        return cellCopyFilteredLocked(d, row, col, buf, buf_len, out_len, out_truncated);
+    }
 
     // BOUNDED RECORD 1 (identity view only — mirrors windowSet's pinned-row-0
     // branch): row 0's true extent runs past the O(head) budget, and
     // therefore past the (far smaller) window scan cap too, so it is served
     // exactly like any other oversized row, from `data_start`, bypassing the
-    // frontier AND the cursor entirely.
+    // frontier AND the cursor entirely. Reads only open-time immutable facts, so
+    // it hands the lock back first (`decodeCellAt` never needed it).
     if (row == 0 and d.record1_capped and !d.has_header and d.row0_pinned_refs.len > 0) {
+        d.unlock();
         return decodeCellAt(d, d.data_start, col, buf, buf_len, out_len, out_truncated);
     }
 
-    d.lock();
     const avail_end = if (d.complete) d.total_rows else d.frontier_rows;
     if (row >= avail_end) {
         const exact = d.complete;
@@ -700,12 +711,12 @@ pub fn cellCopy(d: *Document, row: u64, col: u32, buf: ?[*]u8, buf_len: usize, o
 /// block — decided WITHOUT ever starting a doomed row-walk)
 /// `nav.nthMatchLocationCounted` — O(checkpoints) + a bounded in-block
 /// re-lex, the same machinery `windowSetFiltered` uses — is both the
-/// cursor-OFF reference (AC2) and the re-anchor fallback (FR3). Holds the
-/// mutex for the whole call (bounded either way), mirroring
-/// `windowSetFiltered`.
-fn cellCopyFiltered(d: *Document, row: u64, col: u32, buf: ?[*]u8, buf_len: usize, out_len: *usize, out_truncated: *bool) api.CopyResult {
-    d.lock();
-    defer d.unlock();
+/// cursor-OFF reference (AC2) and the re-anchor fallback (FR3). Runs with the
+/// Document mutex HELD by `cellCopy` for the whole call (bounded either way),
+/// mirroring `windowSetFiltered` — the caller acquires it BEFORE deciding this is
+/// the filtered path, so the decision and the work cannot straddle an
+/// `ls_filter_set`.
+fn cellCopyFilteredLocked(d: *Document, row: u64, col: u32, buf: ?[*]u8, buf_len: usize, out_len: *usize, out_truncated: *bool) api.CopyResult {
     if (row >= d.filter_total) return if (d.filter_state == .done) .no_cell else .pending;
     const fctx = filter.filterCtx(d);
 
