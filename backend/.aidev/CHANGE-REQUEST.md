@@ -5,8 +5,42 @@ recorded in full in `docs/architecture/ARCH-security-hardening.md`, "Amendment �
 with decision records at `review/REVIEW-security-w2b-net.md` and `review/REVIEW-net-close-hang.md`.
 This supersedes the file contents; it does not reopen anything adjudicated there.)
 
-Signed:  [x] implementer   [ ] reviewer
+Signed:  [x] implementer   [x] reviewer
 (both required; the reviewer's signature also certifies the numbers below were independently re-checked)
+
+## ADJUDICATED 2026-08-03 — GRANTED on grounds A, APPLIED. Record: `review/REVIEW-flate-feed-guard.md`
+
+The reviewer re-derived the helper arithmetic by hand and verified the `gz_ac10` half
+mechanically via `open.zig:237-241` (`has_header = !all_numeric` from record 1 only, so it is
+row-count independent). It also refused, on the record, an in-code escape that would have made
+both fixtures green — "clamp unless clamping would leave zero data rows" — as overfitting whose
+only motivation is the two fixtures.
+
+**The remedy applied is NARROWER than either option proposed above, and is four changes, not
+one.** Orchestrator probes (P1-P6) showed this request's "this needs no implementation change
+(attempt 1 stands)" to be measurably FALSE: with the helper fixed, fixture A cut 50 serves row 5
+as `"00000003"` where the document says `"00000005"` — a symbol decoded out of
+`peekBitsShortEnding`'s zero padding, in a single final DYNAMIC block, because `tossesShort`
+omitted `.protocol_header`. So `gz_ac10` collided with SOUNDNESS, not merely with a semantic
+preference about partial tails.
+
+| where | change | whose |
+|---|---|---|
+| frozen `expectTruncationHandled` | `if (k == 3 or row == last)` | planner |
+| frozen `gz_ac10` opts | add `.header = api.header_off` | planner |
+| `src/source.zig` `tossesShort` | default-deny exhaustive switch, no `else` | implementer |
+| `src/source.zig` `openUsable` | drop the damaged ⇒ needs-CR/LF guard | implementer |
+
+All four are required: the two frozen edits accomplish nothing without the two `src/` ones
+(measured — P4 fails at open with `expected .ok, found .io`, P6 fails without `header_off`).
+
+**The clamp stays OUT of this cell** and the alternative above is NOT adopted. Measurement
+replaced the argument: cut 50's garbage cell is in the FINAL row of the salvage, so the clamp
+would have dropped it and PASSED the cut — it would have masked the soundness hole this round
+found. Whole-rows-only is a product question for the architect and the author, to be decided once
+and applied uniformly to BOTH ends of a salvage (the `openUsable` guard was the same question one
+salvage-end earlier), and if adopted it needs an assertion that still catches garbage at the
+truncation point.
 
 ## Grounds (tick at least one)
 - [x] A. Infeasible within the current contract

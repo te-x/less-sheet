@@ -4910,7 +4910,16 @@ test "gz_ac9: recovery matrix — empty/invalid/truncated/footer-mismatch/struct
 
 test "gz_ac10: a salvaged prefix has a deterministic immutable end (exact count, terminal poll, stable)" {
     const gpa = std.testing.allocator;
-    const opts: api.OpenOptions = .{ .separator = ',', .index_mode = api.index_manual };
+    // `header_off` is deliberate, not incidental (adjudicated CHANGE-REQUEST, see
+    // review/REVIEW-flate-feed-guard.md): this test's SUBJECT is that a salvaged
+    // prefix has a deterministic immutable end, and it must not also depend on
+    // header SNIFFING. `buildShape` decides `has_header` from record 1's
+    // numeric-ness alone, before any index exists and without consulting the row
+    // count -- so under a sniffed header a salvage that yields a single `"a,b"`
+    // row has that row consumed AS the header and reports 0 data rows, failing
+    // `count >= 1` for a reason that has nothing to do with this AC. Every
+    // assertion below is unchanged and none is weakened.
+    const opts: api.OpenOptions = .{ .separator = ',', .index_mode = api.index_manual, .header = api.header_off };
     const full = "a,b\n1,2\n3,4\n5,6\n";
     const trunc = try gzMember(gpa, full, .{ .truncate_payload = 6, .omit_footer = true });
     defer gpa.free(trunc);
@@ -10027,7 +10036,11 @@ fn expectTruncationHandled(
         _ = api.ls_window_set(d, row, 1);
         const got = api.ls_cell(d, row, 0).slice();
         errdefer std.debug.print("\n[flate/{s}] row {d} col 0: salvaged \"{s}\", undamaged \"{s}\"\n", .{ where, row, got, expect_buf[0..want.len] });
-        if (k == 3) {
+        // Keyed on the row's IDENTITY, not the probe INDEX: the probe set
+        // collapses for a small salvage (`rc.count / 2 == last` when `rc.count`
+        // is 1 or 2), which put the EXACT check on the very row this rule exempts
+        // (adjudicated CHANGE-REQUEST, see review/REVIEW-flate-feed-guard.md).
+        if (k == 3 or row == last) {
             // The final row may be cut mid-row: a PREFIX is correct, garbage is not.
             try std.testing.expect(std.mem.startsWith(u8, expect_buf[0..want.len], got));
         } else {

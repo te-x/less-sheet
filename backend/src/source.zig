@@ -105,8 +105,9 @@ const refusing_vtable: Reader.VTable = .{
 ///      reader in `Decompress`, and it has just two call sites — `decodeSymbol`
 ///      and the code-length loop of a dynamic block header — so `.fixed_block*`
 ///      (`readFixedCode` is pure `takeIntBits`), `.stored_block` (byte-oriented),
-///      the protocol header/footer and the extra-bit reads of a match are all
-///      exempt and keep decoding to the last bit.
+///      the protocol FOOTER and the extra-bit reads of a match are all exempt and
+///      keep decoding to the last bit. The protocol HEADER state is NOT exempt;
+///      see `tossesShort` for why the stored tag and the code path differ there.
 ///
 /// MEASURED both ways. Applying (2) everywhere truncates `gz_ac10`'s fixed-block
 /// salvage from two rows to one; NOT applying it decoded a bogus match out of the
@@ -130,21 +131,48 @@ fn endingOrRefuse(r: *Reader) Reader.Error {
 }
 
 /// Whether `Decompress` in this state can reach `tossBitsShort` (see
-/// `endingOrRefuse` (2)): decoding a dynamic block's symbols, or the code-length
-/// header that builds its tables.
+/// `endingOrRefuse` (2)). DEFAULT-DENY: the switch below is exhaustive and has NO
+/// `else`, so a Zig bump that ADDS a state breaks this build instead of silently
+/// defaulting it to permissive. An `else => false` form only appears to have that
+/// property — it catches a RENAME but waves through an ADDITION, which is the
+/// likelier churn and the direction that costs correctness.
 ///
-/// `state` is the RESUMPTION state, and it LAGS: `streamInner` only assigns it
-/// where it returns, so a dynamic block that last stopped mid-match still reads
-/// `.dynamic_block_match` while it decodes its next symbols. That is not an edge
-/// case — it is where the garbage of `flate_b1` fixture B cut 16891 was decoded
-/// (measured). So every state a dynamic block can RESUME from counts, not just
-/// `.dynamic_block`. The fixed-block and stored-block states, the protocol
-/// header/footer and `.end` genuinely cannot reach `tossBitsShort` and stay
-/// exempt.
+/// The gate tests the STORED tag, not the code path, and the two differ in two
+/// ways that each cost real correctness:
+///
+///   * `.protocol_header` is NOT exempt, though the header's own byte reads are.
+///     `Decompress.init` stores it, and `Session.init` / `nextMember` call `init`
+///     once per member, so it stays the live tag for the whole of a member's
+///     FIRST block — including the code-length loop of a dynamic header and the
+///     literal/match symbol loop. Exempting it disabled (2) across every
+///     single-block fixture in the suite.
+///   * `.dynamic_block` is never STORED at all: entry into a block is a bare
+///     `continue :sw` that assigns nothing, so the tag lags all the way back to
+///     `init`. It is listed as refusing for exhaustiveness, not because it can be
+///     observed.
+///
+/// The tag LAGS in general: `streamInner` assigns only where it returns, so a
+/// dynamic block that last stopped mid-match still reads `.dynamic_block_match`
+/// while decoding its next symbols. Every state a dynamic block can RESUME from
+/// therefore counts. State the rule as: exempt is the set that can only ever be
+/// stored while a SOUND reader is active; everything else refuses.
+///
+/// MEASURED, both directions. Exempting the stored `.protocol_header` served a
+/// bogus symbol decoded out of `peekBitsShortEnding`'s zero padding — `flate_b1`
+/// fixture A cut 50 returned row 5 as `"00000003"` where the document says
+/// `"00000005"`, in a single final DYNAMIC block — and fixture B cut 16891 served
+/// 14 bytes of garbage the same way (`"0000307386"` for `"00003698"`). Refusing
+/// costs at most one symbol's worth of salvage at the end of a damaged member
+/// (`gz_ac10`'s two bytes); permitting costs a garbage decode or a `Reader.toss`
+/// assert panic. The project bar decides that direction.
 fn tossesShort(state: anytype) bool {
     return switch (std.meta.activeTag(state)) {
-        .block_header, .dynamic_block, .dynamic_block_literal, .dynamic_block_match => true,
-        else => false,
+        // Exempt: reachable only via byte-oriented or `takeIntBits` reads that
+        // cannot under-run -- `readFixedCode`, stored blocks, the protocol footer
+        // bytes, and `.end`.
+        .fixed_block, .fixed_block_literal, .fixed_block_match, .stored_block, .protocol_footer, .end => false,
+        // Everything else can reach `tossBitsShort`.
+        .protocol_header, .block_header, .dynamic_block, .dynamic_block_literal, .dynamic_block_match => true,
     };
 }
 
@@ -628,8 +656,6 @@ pub const Gzip = struct {
     /// budget (`.inflating`/`.budget`), whose tail is still to come.
     pub fn openUsable(self: *const Gzip) bool {
         if (self.head.items.len == 0 and self.forward.member_count == 0) return false;
-        if (self.forward.terminal == .damaged and
-            std.mem.indexOfAny(u8, self.head.items, "\r\n") == null) return false;
         return true;
     }
 
