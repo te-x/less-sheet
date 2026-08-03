@@ -9455,16 +9455,18 @@ test "fcg3: a bare-CR row ending at extent-4 stays withheld, and NO mutex-held p
     netWait(100);
     try std.testing.expectEqual(quiet, attempts.load(.acquire));
 
-    // THE LOCK. `window.windowSetFiltered` holds the document mutex for its whole
-    // call and re-lexes every row it materializes. The window deliberately reaches
-    // PAST the frontier, so an over-committed bare-CR row WOULD be materialized
-    // here — and its terminator peek would issue a ranged GET while the mutex is
-    // held, which is the wedge (on a peer that answers short-then-silent, this
-    // call never returns and `ls_close` then blocks behind it forever).
+    // THE LOCK. `ls_window_set` re-lexes every row it materializes, and the window
+    // deliberately reaches PAST the frontier, so an over-committed bare-CR row WOULD
+    // be materialized here — and its terminator peek would issue a ranged GET on the
+    // CALLER's thread, which is the UI's: on a peer that answers short-then-silent
+    // this call never returns. (This doc comment said "holds the document mutex for
+    // its whole call"; that is only true of the FILTERED path — `window.windowSet`
+    // takes the mutex for a snapshot and dispatches, window.zig:92-117. The tally
+    // invariant is unaffected: no foreground path may fetch. See netgz1's header.)
     const before = attempts.load(.acquire);
     const r = api.ls_window_set(doc, 1_020, 8);
     const after = attempts.load(.acquire);
-    errdefer std.debug.print("\n[fcg3] window rows={d}, transport requests {d} -> {d} (a mutex-held path must issue NONE)\n", .{ r.row_count, before, after });
+    errdefer std.debug.print("\n[fcg3] window rows={d}, transport requests {d} -> {d} (a foreground path must issue NONE)\n", .{ r.row_count, before, after });
     try std.testing.expectEqual(@as(u64, 3), r.row_count); // 1020..1022; the bare-CR row is withheld
     var lb: [12]u8 = undefined;
     try expectCell(doc, 1_022, 0, rowLabel(&lb, 1_022)); // the re-lex really ran
@@ -10283,23 +10285,33 @@ test "flate_b2b: a fetch stopping on a chunk boundary resolves HONESTLY — awai
 }
 
 // ===========================================================================
-// NETWORK-GZIP MUTEX-HELD WEDGE — the last AC-e1 residual
-// (ARCH-security-hardening :444-449). RED.
+// NETWORK-GZIP READS MUST NOT FETCH — the last AC-e1 residual
+// (ARCH-security-hardening :444-449). Landed 181fb96; these two are its locks.
 // ---------------------------------------------------------------------------
-// `Gzip.produce` calls `ensureCompressed(s.input.seek + chunk_bytes)`
+// `Gzip.produce` called `ensureCompressed(s.input.seek + chunk_bytes)`
 // UNCONDITIONALLY on every inflate op (source.zig:550) — a fixed 256 KiB
 // read-ahead, not a demand the row needs. On a network gzip that resolves through
 // `HttpRange.ensureCompressed` (net_source.zig:931), which fetches: a ranged GET on
-// the random arm, a forward drain on the sequential one. So a re-lex on a
-// MUTEX-HELD path — `ls_window_set`, `ls_cell`, `ls_cell_copy` all hold the
-// Document mutex for their whole call — issues network I/O while holding it, and a
-// slow or silent peer wedges the UI thread: every poll, cancel and `ls_close`
-// blocks behind `d.lock()`. This is why the ARCH scopes AC-e1's "bounded by user
-// cancel" to open, close-via-the-worker and plain net CSV, and NOT to network gzip.
+// the random arm, a forward drain on the sequential one. So a re-lex on a FOREGROUND
+// path issued network I/O, and a slow or silent peer stalled the caller — the UI
+// thread. This is why the ARCH scopes AC-e1's "bounded by user cancel" to open,
+// close-via-the-worker and plain net CSV, and NOT to network gzip.
+//
+// TWO DEGREES OF DAMAGE, and the tests are split along them because the earlier
+// premise here was WRONG (reviewer-corrected): `ls_window_set` does NOT hold the
+// Document mutex for its whole call. `window.windowSet` takes it only for a
+// snapshot (window.zig:92-95) and then dispatches (:117), so an IDENTITY-view read
+// that fetches stalls the calling thread only — bad, since that thread is the UI's,
+// but poll/cancel/close still work. The paths that hold the mutex from entry to
+// return are `window.windowSetFiltered` (:232-233 — the one the ARCH names as the
+// ship-blocker), `window.cellCopy` behind `ls_cell_copy`, and `search.navSearch`
+// (:824-825) behind `ls_search_nav`. Those wedge the WHOLE DOCUMENT: every poll,
+// cancel and `ls_close` blocks behind `d.lock()`. netgz1 covers the identity +
+// cell-copy shapes; netgz2 covers the filtered ones.
 //
 // THE LOCK is fcg3's, one Source over, and for the same reason the reviewer
 // second-keyed it there: assert on the fake transport's REQUEST-ATTEMPT tally that
-// no mutex-held path raises it. Hermetic and deterministic — a doomed or slow GET
+// no FOREGROUND path raises it. Hermetic and deterministic — a doomed or slow GET
 // is invisible to `netFetchCount` (successful round-trips only) and a timing probe
 // would be flaky and, worse, blind whenever the fetch happens to succeed fast.
 //
@@ -10326,7 +10338,7 @@ test "flate_b2b: a fetch stopping on a chunk boundary resolves HONESTLY — awai
 // simply has no hermetic driver today, and should get a second arm if one appears.
 // ===========================================================================
 
-test "netgz1: a mutex-held read on a network .csv.gz issues NO transport request — the compressed read-ahead belongs to the scan, not to the UI thread (AC-e1 residual)" {
+test "netgz1: a foreground read on a network .csv.gz issues NO transport request — the compressed read-ahead belongs to the scan, not to the UI thread (AC-e1 residual)" {
     const gpa = std.testing.allocator;
     const rows: u64 = 500_000;
     const plain = try genFixedRows(gpa, @intCast(rows)); // 9 MB -> ~2.3 MB gz
@@ -10373,8 +10385,10 @@ test "netgz1: a mutex-held read on a network .csv.gz issues NO transport request
     netWait(150);
     try std.testing.expectEqual(quiet, attempts.load(.acquire));
 
-    // THE LOCK. Every one of these calls holds the Document mutex for its whole
-    // duration; none of them may touch the transport.
+    // THE LOCK. None of these foreground calls may touch the transport. The three
+    // `ls_window_set` reads below are IDENTITY-view reads, so what they pin is that
+    // the UI thread is not stalled on network I/O; `ls_cell_copy` after them is
+    // mutex-held from entry to return, and netgz2 covers the filtered shapes.
     for ([_]u64{ 64, 2_000, 50_000 }) |back| {
         const row = landed - back;
         const before = attempts.load(.acquire);
@@ -10416,4 +10430,136 @@ test "netgz1: a mutex-held read on a network .csv.gz issues NO transport request
         var cb: [8]u8 = undefined;
         try expectCell(doc, row, 0, fixedCell(&cb, @intCast(row)));
     }
+}
+
+// ---------------------------------------------------------------------------
+// netgz2 — the FILTERED shapes: the paths that hold the mutex entry-to-return.
+// GREEN on this tree because 181fb96 fixed the read-ahead — but NOT vacuous, and
+// measured rather than argued: run against 181fb96^ this arm is RED, reporting
+// FIVE ranged GETs issued by `windowSetFiltered` with the document mutex held. So
+// it would have caught the ship-blocker on the path the ARCH actually names, which
+// is the coverage netgz1 could not give. netgz1's identity reads stall only the
+// calling thread; `window.windowSetFiltered`
+// (window.zig:232-233) and `search.navSearch` (search.zig:824-825) hold the
+// Document mutex from entry to return, so a fetch inside EITHER wedges the whole
+// document — every poll, cancel and `ls_close` blocks behind `d.lock()`. That is
+// the shape the ARCH names as the ship-blocker (:444-449), and until this arm
+// existed nothing exercised it.
+//
+// THE DRIVE SEQUENCE, and it is the part to carry forward — three authors got it
+// wrong before it was written down. A filtered NETWORK view advances ONLY under a
+// filtered jump: `index.zig:149` gates the filter's own background scan on
+// `!doc.net`, while `:138`'s `do_jump` accepts any non-idle `filter_state`. So the
+// order is
+//
+//     ls_filter_set  ->  ls_jump_start  ->  wait for the landing  ->  measure
+//
+// and NOT filter-after-jump: set the filter once the jump has already landed and
+// the view stays empty forever, which reads exactly like "these fixture shapes are
+// incompatible". They are not.
+//
+// TWO FIXTURE NOTES. (1) The predicate must be SELECTIVE or the arm is hollow:
+// `genFixedRows` zero-pads every cell, so `textReq("0")` matches every row and the
+// filtered view degenerates into the identity view (measured: filter total ==
+// scanned rows). `textReq("99")` keeps ~4.7% of them. (2) `ls_search_nav` is a
+// SILENT NO-OP unless a search is active (`search.navSearch` returns immediately on
+// `search_state == .idle`), so the arm starts one and asserts the state before
+// measuring — otherwise it would pin nothing at all.
+//
+// THE BOUND: one fixture, the RANDOM-fill arm, three near-frontier distances plus
+// the nav entry point. The sequential arm has no hermetic driver (see netgz1).
+
+test "netgz2: the mutex-held-throughout paths on a network .csv.gz issue NO transport request — filtered window materialization and filtered nav (AC-e1 residual)" {
+    const gpa = std.testing.allocator;
+    const rows: u64 = 500_000;
+    const plain = try genFixedRows(gpa, @intCast(rows)); // 9 MB -> ~2.3 MB gz
+    defer gpa.free(plain);
+    const g = try gz(gpa, plain);
+    defer gpa.free(g);
+    const cut: u64 = 6 * net_chunk; // bounded deliverable prefix: un-fetched bytes EXIST
+    try std.testing.expect(g.len > cut + 2 * net_chunk);
+
+    var attempts: std.atomic.Value(u64) = .init(0);
+    var fx: api.NetFixture = .{
+        .body = g,
+        .honor_ranges = true,
+        .advertise_length = true,
+        .short_body_at = cut,
+        .fetch_attempts = &attempts,
+    };
+    const doc = try openFakeToDoneOpts(&fx, &fcg_opts);
+    defer api.ls_close(doc);
+    try std.testing.expectEqual(api.NetRangeMode.random_access, api.netRangeMode(doc));
+    try std.testing.expect(attempts.load(.acquire) > 0); // the tally is WIRED
+
+    // THE DRIVE SEQUENCE (see above): filter FIRST, then the jump that drives it.
+    try setFilter(doc, textReq("99"));
+    api.ls_jump_start(doc, rows - 1);
+    _ = waitJumpDone(doc) catch api.ls_jump_poll(doc);
+    netWait(150);
+    const fs = api.ls_filter_poll(doc);
+    errdefer std.debug.print("\n[netgz2] filter state={any} total={d} exact={any}\n", .{ fs.state, fs.total, fs.total_exact });
+    try std.testing.expect(fs.state != .idle); // the filtered path is the one under test
+    // The view is a genuine SUBSET (predicate selectivity) and deep enough for the
+    // three distances below.
+    try std.testing.expect(fs.total > 8_000);
+    try std.testing.expect(fs.total < rows / 2);
+
+    // Quiescence: the scan worker is the legitimate fetcher, so let it finish before
+    // attributing anything to the foreground calls below.
+    var quiet = attempts.load(.acquire);
+    var spins: usize = 0;
+    while (spins < 10) : (spins += 1) {
+        netWait(100);
+        const now = attempts.load(.acquire);
+        if (now == quiet) break;
+        quiet = now;
+    }
+    try std.testing.expectEqual(quiet, attempts.load(.acquire));
+
+    // THE LOCK, part 1 — `windowSetFiltered`, mutex-held entry-to-return, re-lexing
+    // every row it materializes (a bounded in-block re-lex per candidate).
+    for ([_]u64{ 64, 2_000, 8_000 }) |back| {
+        const frow = fs.total - back;
+        const before = attempts.load(.acquire);
+        const r = api.ls_window_set(doc, frow, 64);
+        const after = attempts.load(.acquire);
+        errdefer std.debug.print("\n[netgz2] windowSetFiltered({d}, 64) — {d} filtered rows behind the view's end — issued {d} transport request(s) with the document mutex held ({d} -> {d})\n", .{ frow, back, after - before, before, after });
+        try std.testing.expectEqual(before, after);
+        // ... and it must still SERVE, correctly: the invariant may not be met by
+        // refusing to materialize. Cell 0 of this fixture IS the original row index,
+        // so a served filtered row proves both the mapping (a filtered view only
+        // skips forward) and the predicate (the row really matches).
+        try std.testing.expectEqual(@as(u64, 64), r.row_count);
+        const c0 = api.ls_cell(doc, frow, 0).slice();
+        const c1 = api.ls_cell(doc, frow, 1).slice();
+        errdefer std.debug.print("\n[netgz2] filtered row {d} served cells \"{s}\" / \"{s}\"\n", .{ frow, c0, c1 });
+        try std.testing.expectEqual(@as(usize, 8), c0.len);
+        const orig = std.fmt.parseInt(u64, c0, 10) catch return error.ServedCellNotANumber;
+        try std.testing.expect(orig >= frow);
+        try std.testing.expect(std.mem.indexOf(u8, c0, "99") != null or std.mem.indexOf(u8, c1, "99") != null);
+        // ... and these reads really are PAST the inflated open head, which is what
+        // makes an inflate op (hence the read-ahead) reachable at all.
+        if (back == 64) try std.testing.expect(orig * 18 > api.open_head_max_bytes);
+    }
+
+    // THE LOCK, part 2 — `ls_search_nav` (`search.navSearch`), also mutex-held
+    // entry-to-return. A search must be ACTIVE first or the call is a silent no-op.
+    try startSearch(doc, textReq("99"));
+    var q2 = attempts.load(.acquire);
+    spins = 0;
+    while (spins < 20) : (spins += 1) {
+        netWait(100);
+        const now = attempts.load(.acquire);
+        if (now == q2) break;
+        q2 = now;
+    }
+    try std.testing.expect(api.ls_search_poll(doc).state != .idle); // not a no-op
+    const before = attempts.load(.acquire);
+    api.ls_search_nav(doc, fs.total / 2, .forward);
+    const after = attempts.load(.acquire);
+    const nav = api.ls_search_poll(doc).nav;
+    errdefer std.debug.print("\n[netgz2] ls_search_nav issued {d} transport request(s) under the mutex ({d} -> {d}); nav={any}\n", .{ after - before, before, after, nav });
+    try std.testing.expectEqual(before, after);
+    try std.testing.expect(nav != .none); // the navigation was accepted, not dropped
 }
