@@ -31,6 +31,70 @@ pub const max_lookahead: usize = 4;
 pub const Mmap = struct { bytes: []const u8, physical_base: u64 = 0 };
 pub const SourceKind = enum { mmap, gzip };
 
+// ---------------------------------------------------------------------------
+// THE FETCH PERMIT (security-hardening (e) AC-e1 residual, cell `net_gz_wedge`)
+// ---------------------------------------------------------------------------
+// The last unbounded route in the signed ARCH (ARCH-security-hardening :444-449)
+// is `produce`'s compressed READ-AHEAD: it calls
+// `ensureCompressed(s.input.seek + chunk_bytes)` on EVERY inflate op — a fixed
+// 256 KiB read-ahead, not a demand the row needs — so a network gzip re-lex on
+// the FOREGROUND lane (`ls_window_set` / `ls_cell` / `ls_cell_copy` / nav) issues
+// a ranged GET on the UI thread, however far behind the frontier it sits. A slow
+// or silent peer then wedges the document: every poll, cancel and `ls_close`
+// blocks behind the same lane and the same document mutex.
+//
+// A commit-side bound cannot cover it (see `Source.commitGuarded`): the demand is
+// not a function of where the frontier committed. So the cure is the OTHER half of
+// the same idiom the frontier-commit guard already uses — `commitBound` vs
+// `commitBoundNoFetch`, a path that MAY block vs one that reads only what is
+// present — lifted from "which function did you call" to "who is calling":
+//
+//   THE DESIGNATED FETCHER FETCHES; THE FOREGROUND READ LANE DOES NOT.
+//
+// The permit is AMBIENT (thread-local) rather than a parameter because the
+// discriminator is the CALL STACK, not the data: `cursorAt` / `scanCursorAt` /
+// `sourceCursorAt` and the whole `Reader`/`csv_reader` layer under them are shared
+// verbatim between the scan worker and the window lane (and `sourceCursorAt`'s
+// signature is frozen — contracts/api.zig:687 — so it could not carry a flag
+// anyway). Threading a bool through ~12 cursor construction sites would have to
+// re-decide the same question at each of them; this decides it once, where the
+// thread's ROLE is known.
+//
+// DEFAULT DENY, and that direction is the point: a scope that forgets to opt in
+// declines to fetch, which shows up as a frontier that stops advancing — loud,
+// and covered by existing tests (netgz1 itself asserts `landed > 100_000`).
+// Default-allow would fail the other way: a forgotten mutex-held path wedges the
+// UI silently. Only LOCAL gzip and mmap are unaffected either way (no provider,
+// so no permission question is ever asked).
+//
+// The permit costs ONE thread-local load per NETWORK-gzip inflate op and nothing
+// at all for a local one (`produce` only reads it inside `if (self.provider)`).
+threadlocal var fetch_permit: bool = false;
+
+/// Whether the CURRENT thread is a designated fetcher — the ONE resolver every
+/// blocking-vs-present decision in the gzip feed reads. See the block comment
+/// above `fetch_permit`.
+pub fn fetchPermitted() bool {
+    return fetch_permit;
+}
+
+/// Open a designated-fetcher scope on THIS thread; pass the returned token to
+/// `endFetchPermit`. Nested/re-entrant by construction (it saves and restores
+/// rather than clearing), so a scope inside a scope is harmless.
+///
+/// Thread-local, so it is NOT inherited by a thread or `io.concurrent` task
+/// spawned inside the scope — every fetcher body opens its own (see
+/// `index.workerMain`, `net.runFake`, `net.realWorker`).
+pub fn beginFetchPermit() bool {
+    const prev = fetch_permit;
+    fetch_permit = true;
+    return prev;
+}
+
+pub fn endFetchPermit(prev: bool) void {
+    fetch_permit = prev;
+}
+
 const Terminal = enum { inflating, clean, damaged, budget };
 const PhysicalMark = struct { logical_end: u64, physical_end: u64 };
 const checkpoint_ram_budget: usize = 4 * 1024 * 1024;
@@ -427,9 +491,39 @@ pub const Gzip = struct {
     /// waits forever for bytes that stopped arriving — the dropped-stream case.
     ///
     /// Distinct from `sourceAwaitsBytes` on purpose; see that function.
-    fn fenceCanMove(self: *const Gzip, fence: usize) bool {
+    ///
+    /// `may_fetch` is `produce`'s already-resolved fetch permit (see
+    /// `fetchPermitted`), passed in rather than re-read so ONE thread-local load
+    /// serves the whole inflate op. It matters here because a fence this call
+    /// DECLINED to move is movable BY DEFINITION — the designated fetcher can
+    /// still move it — and answering `false` for it would let a foreground read
+    /// publish `.damaged`, which `produce` stores into `terminal_kind`: the
+    /// DOCUMENT-GLOBAL terminal. A read lane's local decision not to fetch would
+    /// then truncate the whole document (silent wrong data, the exact failure the
+    /// standing bar forbids). Parking `.budget` instead is the honest answer:
+    /// "these bytes are not here yet", which is what `.budget` already means.
+    fn fenceCanMove(self: *const Gzip, fence: usize, may_fetch: bool) bool {
         if (fence >= self.physicalLen()) return false;
-        return if (self.provider) |hr| hr.awaitsBytes() else true;
+        const hr = self.provider orelse return true;
+        if (may_fetch) return hr.awaitsBytes();
+        // NO PERMIT. "Can this fence move?" is then NOT a question about the peer,
+        // because the reason we are sitting at it is that WE declined to move it.
+        // It is a question about whether the designated fetcher has settled the
+        // stream yet, and `terminal_kind` is exactly that fact:
+        //   * NOT settled -> movable: park `.budget` and wait. Anything else would
+        //     let a foreground read call an end that only a fetch could disprove —
+        //     on a HEALTHY peer, where every declined read-ahead sits one chunk
+        //     below a present edge the scan will raise moments later. That is the
+        //     truncated-document / poisoned-lane failure, and it is silent.
+        //   * SETTLED -> this edge IS the end, so classify it exactly as the scan
+        //     did. That matters for correctness, not just tidiness: when the peer
+        //     refused the tail, the scan's LAST inflate step ran out of input
+        //     mid-symbol and `inflateStep` KEPT its output (those bytes came from
+        //     real bits), and the frontier committed rows out of it. A resumable
+        //     park here would UNDO that step instead, so a behind-frontier re-lex
+        //     could not re-serve rows the frontier had already published —
+        //     measured: `netgz1`'s `landed - 64` came back as an empty cell.
+        return self.terminal_kind.load(.acquire) == 0;
     }
 
     fn physical(s: *const Session) u64 {
@@ -536,6 +630,27 @@ pub const Gzip = struct {
         _ = self.nextMember(s, fence);
     }
 
+    /// Whether THIS thread may publish `terminal_kind`/`terminal_end` — the
+    /// DOCUMENT-GLOBAL terminal, which becomes `terminalLogical()` and hence
+    /// `Source.len` / `knownEnd`.
+    ///
+    /// A terminus reached at the stream's PHYSICAL end is fetch-independent, so any
+    /// thread may publish it (and `.clean` is only ever set there — `nextMember`
+    /// requires `at == physicalLen()`, so a clean end is never suppressed). A
+    /// terminus reached at an ARTIFICIAL fence that this thread DECLINED to move is
+    /// not ours to draw: the store would republish an end computed from a replay
+    /// lane's own position, and could only ever move the document's end DOWN — a
+    /// truncation caused by a read. Only the designated fetcher, which did move the
+    /// fence as far as the peer allows, is entitled to that conclusion.
+    ///
+    /// Called ONLY from the two terminal arms below (once or twice in a document's
+    /// life), never per inflate op — which is why the permit is re-read here instead
+    /// of being kept live across `produce`'s hot drain loop.
+    fn mayPublishTerminal(self: *const Gzip, fence: usize) bool {
+        if (fence >= self.physicalLen()) return true;
+        return self.provider == null or fetchPermitted();
+    }
+
     /// Produce at most `out.len` bytes.  A physical artificial end is a
     /// resumable budget stop; a real decoder/end-of-input failure is a stable
     /// damaged end once useful bytes exist.
@@ -546,8 +661,25 @@ pub const Gzip = struct {
         // lift a resumable budget stop when more arrived. The inflater consumes
         // compressed bytes strictly forward; checkpoint replay only reads already-
         // present bytes, so a single forward fetch high-water suffices.
+        // LOCAL gzip: no provider, so no permission question is ever asked and
+        // this stays `true` at zero cost (the thread-local is not even read).
+        var may_fetch = true;
         if (self.provider) |hr| {
-            const fetched = hr.ensureCompressed(s.input.seek + chunk_bytes);
+            // THE FETCH PERMIT (AC-e1 residual). The read-ahead below is a FIXED
+            // 256 KiB look-ahead, not a demand this row needs, so on the
+            // foreground read lane it is pure cost with a peer-shaped tail: one
+            // ranged GET issued from `ls_window_set` / `ls_cell` / `ls_cell_copy`
+            // / nav, on a lane those calls hold, several of them with the document
+            // mutex held for the whole call. Resolve it ONCE per inflate op (also
+            // used by `fenceCanMove` below) and read only what is PRESENT when
+            // this thread is not the designated fetcher: `presentCompressed` is
+            // the same answer over already-fetched bytes, issues no request, and
+            // takes no lock — which matters, because `ensureCompressed` holds the
+            // provider's mutex ACROSS its blocking GET, so even acquiring that
+            // lock here would queue the UI behind a silent peer.
+            may_fetch = fetchPermitted();
+            const want = s.input.seek + chunk_bytes;
+            const fetched = if (may_fetch) hr.ensureCompressed(want) else hr.presentCompressed(want);
             var raised: u64 = @min(fetched, self.mapping.len);
             // Re-apply the lane's physical cap on EVERY raise. Without this a
             // budgeted provider lane reads straight past its budget, and nothing
@@ -572,7 +704,7 @@ pub const Gzip = struct {
         // still move, so a stop there parks and waits; an edge AT the total is
         // the end of the stream, so a stop there is terminal.
         const fence = s.input.end;
-        const resumable = self.fenceCanMove(fence);
+        const resumable = self.fenceCanMove(fence, may_fetch);
 
         var written: usize = 0;
         while (written < out.len) {
@@ -603,11 +735,11 @@ pub const Gzip = struct {
         // shared forward session.  Real EOF is source-global knowledge; only
         // an artificial physical budget stop remains lane-local.
         switch (s.terminal) {
-            .clean => {
+            .clean => if (self.mayPublishTerminal(fence)) {
                 self.terminal_kind.store(1, .release);
                 self.terminal_end.store(s.logical, .release);
             },
-            .damaged => {
+            .damaged => if (self.mayPublishTerminal(fence)) {
                 self.terminal_kind.store(2, .release);
                 self.terminal_end.store(s.logical, .release);
             },

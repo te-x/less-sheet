@@ -27,6 +27,7 @@ const default_gpa = std.heap.smp_allocator;
 const net_source = @import("net_source.zig");
 const open = @import("open.zig");
 const base = @import("base.zig");
+const source_mod = @import("source.zig");
 
 const redirect_cap: u32 = 3;
 
@@ -164,6 +165,15 @@ fn onProgress(ctx: *anyopaque, fetched: u64, total: u64) void {
 
 /// Synchronous fake-transport open from an injected fixture (the gate path).
 fn runFake(job: *NetOpenJob, fx: *const api.NetFixture) void {
+    // OPEN IS A DESIGNATED FETCHER (see `source.fetchPermitted`): the open-time
+    // inflate of the gz head (`Gzip.initProvider` -> `inflateOpenHead`) and the
+    // O(head) open scan must fetch, and AC-e1 already scopes open's latency to
+    // "bounded by user cancel" (`ls_open_url_cancel`). Its own scope, not the
+    // worker's: the permit is thread-local, and this body runs SYNCHRONOUSLY on
+    // the caller's thread (`startJob` calls it inline) while `realWorker` runs on
+    // an executor thread — neither inherits the other's.
+    const permit = source_mod.beginFetchPermit();
+    defer source_mod.endFetchPermit(permit);
     switch (fx.fault) {
         .none => {},
         .connect => return failLocked(job, .unreachable_),
@@ -218,6 +228,10 @@ fn runFake(job: *NetOpenJob, fx: *const api.NetFixture) void {
 /// the probe AND every subsequent ranged fetch (round-2 review finding 5) —
 /// no fresh TCP/TLS handshake per 256 KiB chunk.
 fn realWorker(job: *NetOpenJob) void {
+    // OPEN IS A DESIGNATED FETCHER — see `runFake` for why, and why each open
+    // body opens its own thread-local scope.
+    const permit = source_mod.beginFetchPermit();
+    defer source_mod.endFetchPermit(permit);
     const rt = net_source.RealTransport.init(job.gpa, job.url) catch return failLocked(job, .io);
     const probe = rt.probe();
     if (job.cancel_flag.load(.acquire)) {

@@ -101,6 +101,17 @@ pub fn headScan(doc: *Document) void {
 // ---------------------------------------------------------------------------
 
 pub fn workerMain(doc: *Document) void {
+    // THE DESIGNATED FETCHER (security-hardening (e) AC-e1 residual — see
+    // `source.fetchPermitted`). This one thread owns every scan that advances the
+    // frontier: the AUTO indexer, jumps, search, filter and the column job. It is
+    // the only post-open path allowed to BLOCK on the transport, and it is exactly
+    // the path that already pays for fetches — cancellable, off the document mutex
+    // for the whole of each chunk (`doc.unlock()` before every `scanChunk` /
+    // `searchScanChunk` / `filterScanChunk`), and backed by the `stalled_await`
+    // backoff below. A network-gzip read on any OTHER thread reads only what is
+    // already present.
+    const permit = source_mod.beginFetchPermit();
+    defer source_mod.endFetchPermit(permit);
     var released: u64 = 0; // bytes up to which pages were madvised away
     doc.lock();
     while (true) {

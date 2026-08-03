@@ -951,6 +951,27 @@ pub const HttpRange = struct {
         return @min(end, self.presentExtent());
     }
 
+    /// `ensureCompressed` WITHOUT the demand — the compressed twin of
+    /// `commitBoundNoFetch`, for the FOREGROUND read lane (see
+    /// `source.fetchPermitted`). Same answer, computed over what is present RIGHT
+    /// NOW: it issues no ranged GET, drains no chunk, and takes no lock (both
+    /// arms of `presentExtent` are atomics, and `total` is fixed at init), so a
+    /// slow or silent peer cannot stall the caller for one instruction.
+    ///
+    /// BYTE-IDENTICAL to `ensureCompressed` whenever the requested prefix is
+    /// already present — the normal case for a read BEHIND the frontier, whose
+    /// compressed bytes were fetched to get the frontier there. That equality is
+    /// what leaves every already-green gz path (and netgz1's far-behind GUARD)
+    /// unchanged: only the read-ahead PAST the present edge is declined, and the
+    /// row never needed it.
+    pub fn presentCompressed(self: *const HttpRange, want: u64) u64 {
+        // Mirrors the two arms above exactly: sequential fill's high-water is the
+        // whole answer (`ensureCompressed` returns `seq_hw` uncapped by `want`),
+        // random fill clamps the present prefix to the requested end.
+        if (self.range_mode == 2) return self.presentExtent();
+        return @min(@min(self.total, want), self.presentExtent());
+    }
+
     pub fn byteAt(self: *HttpRange, internal: u64) ?u8 {
         const s = self.ensureSlice(internal, 1);
         if (s.len == 0) return null;
