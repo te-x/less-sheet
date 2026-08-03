@@ -32,7 +32,6 @@ struct JumpControlView: View {
     var body: some View {
         Button {
             model.openJumpField()
-            model.revealOverlay()
             DispatchQueue.main.async { fieldFocused = true }
         } label: {
             // A custom "jump from here to there" glyph (item 4): two stacked

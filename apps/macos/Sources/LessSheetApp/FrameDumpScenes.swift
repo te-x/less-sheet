@@ -285,7 +285,7 @@ extension FrameDump {
         _ model: DocumentModel, expandedPill: PillKind?, jumpFlow: JumpFlow, jumpFieldActive: Bool = false
     ) -> some View {
         let snapshot = DocumentModel.dumpSnapshot(
-            from: model, revealed: true, expandedPill: expandedPill,
+            from: model, expandedPill: expandedPill,
             jumpFlow: jumpFlow, jumpFieldActive: jumpFieldActive
         )
         return ZStack(alignment: .bottomTrailing) {
@@ -301,7 +301,7 @@ extension FrameDump {
     @MainActor
     static func rejectScene(_ model: DocumentModel) -> some View {
         let snapshot = DocumentModel.dumpSnapshot(
-            from: model, revealed: true, expandedPill: nil, jumpFlow: .idle, jumpFieldActive: true
+            from: model, expandedPill: nil, jumpFlow: .idle, jumpFieldActive: true
         )
         return ZStack(alignment: .bottomTrailing) {
             DumpGrid(model: model)
@@ -317,7 +317,7 @@ extension FrameDump {
     /// here (like the glass/Form dump mirrors) purely for verification.
     @MainActor
     static func titleBarScene(_ model: DocumentModel) -> some View {
-        let snapshot = DocumentModel.dumpSnapshot(from: model, revealed: true, expandedPill: nil, jumpFlow: .idle)
+        let snapshot = DocumentModel.dumpSnapshot(from: model, expandedPill: nil, jumpFlow: .idle)
         // Mirror the live chrome (item 1): the grid content is inset by the
         // title-bar height, so at rest the header + row 1 sit fully BELOW the
         // title-bar region (never hidden under it); scrolled content travels
@@ -342,7 +342,7 @@ extension FrameDump {
     @MainActor
     static func findScene(_ model: DocumentModel, findSession: FindSession, fieldActive: Bool) -> some View {
         let snapshot = DocumentModel.dumpSnapshot(
-            from: model, revealed: true, expandedPill: nil, jumpFlow: .idle,
+            from: model, expandedPill: nil, jumpFlow: .idle,
             findSession: findSession, findFieldActive: fieldActive
         )
         if let request = findSession.display.request {
@@ -361,7 +361,7 @@ extension FrameDump {
     /// legible instead of hiding under the buttons.
     @MainActor
     static func overscrollScene(_ model: DocumentModel) -> some View {
-        let snapshot = DocumentModel.dumpSnapshot(from: model, revealed: true, expandedPill: nil, jumpFlow: .idle)
+        let snapshot = DocumentModel.dumpSnapshot(from: model, expandedPill: nil, jumpFlow: .idle)
         return ZStack(alignment: .bottomTrailing) {
             DumpEndGrid(model: model)
             OverlayView(model: snapshot)

@@ -212,15 +212,10 @@ struct ContentView: View {
         // below the region at rest (item 1) — see GridView.contentMargins.
         .ignoresSafeArea(.container, edges: .top)
         .contentShape(Rectangle())
-        .onContinuousHover { phase in
-            if case .active = phase { model.revealOverlay() }
-        }
         .task(id: model.openGeneration) {
             // First data-bearing frame: emit the cold-start marker (guarded to
-            // once per open), briefly reveal the overlay so the controls are
-            // discoverable, then dump the requested frame for verification.
+            // once per open), then dump the requested frame for verification.
             model.markFirstRowsVisible()
-            model.revealOverlay()
             if SettingsRedesignProbe.active {
                 SettingsRedesignProbe.run(model: model)
             } else if JumpProbe.active {

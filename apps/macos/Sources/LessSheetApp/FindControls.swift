@@ -41,7 +41,6 @@ struct FindControlView: View {
     var body: some View {
         Button {
             model.openFindField()
-            model.revealOverlay()
             DispatchQueue.main.async { focus = focusTarget }
         } label: {
             Image(systemName: "magnifyingglass")

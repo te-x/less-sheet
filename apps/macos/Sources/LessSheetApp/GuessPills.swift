@@ -34,7 +34,6 @@ struct HeaderButton: View {
     var body: some View {
         Button {
             model.applyDialectChange(.header(!isOn))
-            model.revealOverlay()
         } label: {
             HeaderGlyph(isOn: isOn)
                 .frame(width: OverlayMetrics.controlSize, height: OverlayMetrics.controlSize)
@@ -108,7 +107,6 @@ struct DialectPopupButton: View {
     var body: some View {
         Button {
             model.toggleExpandedPill(kind)
-            model.revealOverlay()
         } label: {
             Text(glyph)
                 .font(.callout.weight(.semibold))

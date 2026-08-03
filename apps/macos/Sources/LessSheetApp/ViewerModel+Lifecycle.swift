@@ -9,16 +9,6 @@ import Observation
 // Pure code motion out of ViewerModel.swift (no behavior change).
 
 extension DocumentModel {
-    // MARK: - Overlay reveal / fade
-
-    /// Whether the overlay is currently pinned open (interaction in progress):
-    /// a dialect popup is expanded, the jump or find field is active, a scan is
-    /// running, or the Settings window is open.
-    var overlayPinned: Bool {
-        if expandedPill != nil || jumpFieldActive || findFieldActive || settingsOpen { return true }
-        if case .scanning = jumpFlow { return true }
-        return false
-    }
 
     /// The find match-scan is running (progress % showing) — its popup stays
     /// reachable (cancel affordance) independent of the click-away scrim.
@@ -64,34 +54,14 @@ extension DocumentModel {
         jumpFieldActive = false
     }
 
-    func revealOverlay() {
-        overlayRevealed = true
-        scheduleFade()
-    }
-
-    /// Keyboard reveal (⌘J): reveal the overlay and ask the jump field to open.
+    /// Keyboard reveal (⌘J): ask the jump field to open.
     func requestJumpFocus() {
         jumpFocusRequests += 1
-        revealOverlay()
     }
 
-    /// Keyboard reveal (⌘F): reveal the overlay and ask the find field to open.
+    /// Keyboard reveal (⌘F): ask the find field to open.
     func requestFindFocus() {
         findFocusRequests += 1
-        revealOverlay()
-    }
-
-    func scheduleFade() {
-        fadeTask?.cancel()
-        fadeTask = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(2))
-            guard let self, !Task.isCancelled else { return }
-            if self.overlayPinned {
-                self.scheduleFade()          // stay open while interacting
-            } else {
-                self.overlayRevealed = false
-            }
-        }
     }
 
     // MARK: - Timing marker
@@ -116,7 +86,6 @@ extension DocumentModel {
     /// (no core session), so rendering it is side-effect-free.
     static func dumpSnapshot(
         from live: DocumentModel,
-        revealed: Bool,
         expandedPill: PillKind?,
         jumpFlow: JumpFlow,
         jumpFieldActive: Bool = false,
@@ -136,7 +105,6 @@ extension DocumentModel {
         snapshot.indexProgress = live.indexProgress
         snapshot.setVisibility(live.visibility)
         snapshot.phase = .document
-        snapshot.overlayRevealed = revealed
         snapshot.expandedPill = expandedPill
         snapshot.jumpFlow = jumpFlow
         snapshot.jumpFieldActive = jumpFieldActive

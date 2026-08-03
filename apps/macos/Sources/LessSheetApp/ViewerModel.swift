@@ -152,7 +152,6 @@ final class DocumentModel {
     @ObservationIgnored var viewportLandingHandler: ((UInt64) -> Void)?
 
     // Overlay presentation state.
-    var overlayRevealed = false
     var expandedPill: PillKind?
     var jumpFieldActive = false
     var findFieldActive = false
@@ -292,7 +291,6 @@ final class DocumentModel {
     var desiredStart: UInt64 = 0
     var desiredCount = 0
     var pollTask: Task<Void, Never>?
-    var fadeTask: Task<Void, Never>?
     var wrapNavTask: Task<Void, Never>?
     /// Whether a copy build is currently running off-main. Verification
     /// (`SelectCopyProbe`) polls for a SPECIFIC copy's completion without racing
