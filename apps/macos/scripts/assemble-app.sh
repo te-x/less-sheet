@@ -11,7 +11,14 @@ macos_dir="$(cd "$(dirname "$0")/.." && pwd)"   # apps/macos
 cd "$macos_dir"
 
 # 1) Build the statically-linked core (release), then the app (release).
-(cd ../../backend && zig build -Doptimize=ReleaseFast)
+# ReleaseSafe, NOT ReleaseFast: the security ARCH's wave (a) makes ReleaseSafe the
+# SHIPPED mode (the backend gate certifies it and a frozen mode-guard test asserts
+# it), because this app ingests untrusted files and URLs and runtime safety checks
+# are what turn a memory-safety bug into a clean abort instead of an exploitable
+# one. Measured cost, accepted when that wave was signed: ~19% index, ~10%
+# search/filter, ~20% copy; cold-start is ~40x under the 500 ms budget and
+# unaffected. Do not "optimize" this back.
+(cd ../../backend && zig build -Doptimize=ReleaseSafe)
 # SwiftPM doesn't track liblesssheet.a as a build input (it's linked via -L), so a stale link product can keep the previous archive; drop only the link products (not object caches) to force a relink against the fresh core.
 rm -f .build/*/release/LessSheet
 rm -rf .build/*/release/*.xctest
