@@ -1,8 +1,15 @@
 # Task #40 — the flate feed guard (security ARCH wave (b), AC-b1 / AC-b2)
 
-**Status: IN PROGRESS — not converged.** The adjudicated CHANGE-REQUEST is applied and the suite is
-283/283, but reviewer round-1 findings 2 and 4–7 and its `beginReplay` question are still open.
-Branch `feat/kbdnav-a11y`.
+**Status: CONVERGED — reviewer PASS at `f2185f2`** on a fresh orchestrator-run `--require-frozen`
+gate (283/283, csvgen 142/0, `zig fmt`, native ReleaseSafe + both musl crosses). Three review rounds,
+no `[contract]` or `[design]` findings outstanding. Branch `feat/kbdnav-a11y`.
+
+The reviewer verified AC-b1 and AC-b2 as **genuinely met rather than merely green**: the full sweep
+executes (every byte offset of the single-block fixture, strided plus tail cuts of the multi-block
+one) with every complete row byte-identical to the undamaged document; both faults over three chunk
+boundaries reach a terminal open without a panic and resolve honestly, the await arm resuming to the
+demanded row and the dropped arm terminating over received bytes. It checked the `inflateStep`
+snapshot rollback against the installed std rather than taking it on trust.
 
 | | |
 |---|---|
@@ -111,7 +118,74 @@ gz index scan **936.1 → 917.8 ms** median (−1.96%); mmap control 312.85 → 
 identical. The AFTER pair is still owed at convergence, with the exact command and how the ReleaseSafe
 `--lib` is built, so it can be rerun independently.
 
-## Still open (reviewer round-1 findings)
+## Round 2 — two findings, both fixed in `f2185f2`
+
+**R2-2 `[impl]` — `fence_cap` derived two ways, and a budgeted net-gz lane could stall.**
+`beginReplay` anchored it absolutely at `seek +| budget`; `cursorAt` stored
+`cur.physical_limit` = `min(input.end, seek + budget)` instead. For a provider session `input.end`
+is the fetch HIGH-WATER, so once round 3 began *enforcing* the cap in `produce`, a lane's fence was
+pinned at however far the download had reached at lease time. Degenerate case: `Cursor.deinit`
+restores `input.end = @max(saved, seek)`, so a lane released after consuming everything fetched sits
+at `end == seek` → `cap = seek` → `new_end > s.input.end` never satisfied → the fence could not move
+at all, and every budgeted op served nothing and re-leased until an unbudgeted op broke the cycle.
+Both live budgeted sites reach it (`csv_reader.zig:383`, `reader.zig:238`), and `cursorAt` does not
+route through `beginReplay`, so the min()-based value genuinely survived. No wrong data and no crash
+— the fence only under-shoots — but a responsiveness defect in exactly the partial-fetch path this
+cell is about. Fixed to one absolute derivation at both sites, with `cur.physical_limit` keeping its
+own "bytes present now" meaning and an explicit `else fence_cap = null`.
+
+**R2-1 `[impl]`** — `openUsable`'s doc comment still described the removed damaged-stream
+row-terminator guard. On an open-admission predicate in a security cell, a comment asserting a safety
+property the function lacks is worse than none. Rewritten to state the predicate and record why the
+stricter rule was withdrawn.
+
+## Perf, independently rerun by the orchestrator
+
+The reviewer declined to sign the NFR line on the implementer's numbers and set its criterion in
+advance: gz within noise of the reported figures, control flat, row counts identical.
+
+| arm | measurement |
+|---|---|
+| gz scan (bespoke harness, 7 interleaved reps) | **910.24 → 891.01 ms, −2.11%** (implementer: −1.66%) |
+| rows, both arms | 4,712,344 — identical |
+| control, mmap (`less_sheet_bench.py --lib` per arm) | index +0.26%, filter +0.10%, search +0.99%, copy +1.21% |
+| `db01f8e` copy path (`5f1113c` → `f2185f2`) | **copy_rows 458.29 → 455.14 ms, −0.69%**; index +0.43%, search −0.86%, filter +0.14% |
+
+Baselines extracted with `git archive`, every arm built `-Doptimize=ReleaseSafe` explicitly. Fixtures
+differ from the implementer's (158.6 MB plain / 38.1 MB gz vs 168.0 / 44), so only deltas compare —
+direction and magnitude reproduce. **Signed.**
+
+Two measurement gotchas found doing this, both worth remembering:
+- **The repo bench has no gzip fixture**, so `less_sheet_bench.py` covers none of this cell's hot
+  path. Every gz claim needs a bespoke harness until a `.csv.gz` arm lands.
+- **After `gate.sh`, `backend/zig-out/lib/liblesssheet.a` is the x86_64-linux-musl artifact** — the
+  gate's last cross build overwrites it. A bench pointed there fails to link at best and measures the
+  wrong target at worst. Always `zig build -Doptimize=ReleaseSafe` natively first.
+
+## `db01f8e` — reviewed separately, also PASS
+
+The `ls_cell_copy` `filter_state` TOCTOU, deliberately not folded into this cell's verdict. The
+reviewer audited every exit for lock discipline — filtered branch `defer`, pinned-record-1 unlock
+then return, `row >= avail_end` unlock then return, main path unlocking before the lock-free walk and
+relocking only for the cursor commit — exactly one release on every path, no double-unlock, no
+re-entrant acquisition. Fields still read unlocked (`column_count`, `data_start` passed after the
+unlock) are open-time immutable.
+
+## Carried OUT of this cell
+
+1. **Whole-rows-only is an open product question for the architect and the author.** Should a damaged
+   salvage serve its partial final row, or clamp to whole rows? Answer once, apply to BOTH ends of a
+   salvage — `openUsable`'s withdrawn guard and the partial tail were the same question asked twice
+   with opposite answers. If adopted it needs an assertion that still catches garbage at the
+   truncation point, because the clamp would have masked the cut-50 defect outright.
+2. **Add a `.csv.gz` arm to `tools/bench`** (see the gotcha above).
+3. **Two fuzz regression seeds for the (c) campaign:** fixture A cut 50 and fixture B cut 16891. This
+   cell was AC-b3's prerequisite and has paid that debt — the crash class that would have masked
+   campaign findings is gone.
+4. **The macOS component gate is red** (load-sensitive frozen probe test), so the root gate cannot be
+   green and the branch cannot merge on that basis. Unrelated to this cell; filed for the planner.
+
+## Round-1 findings (all closed)
 
 - **2** — rerun the full `flate_b1` sweep on the converged tree; the 4% coverage must become 100%.
 - **4** — remove the parked clamp residue (`Gzip.last_row_end`, `noteRowEnd`, the `COMPLETE-ROWS-ONLY`
