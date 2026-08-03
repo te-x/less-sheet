@@ -21,6 +21,12 @@ const source_mod = @import("source.zig");
 const posix = std.posix;
 const sysio = @import("sysio.zig");
 
+/// The ONE stall backoff: how long any waiter sleeps before re-checking for
+/// bytes that have not arrived. Three consumers, all reading this const — the two
+/// sequential-fill waits below and `index.workerMain`'s jump-stall backoff — so
+/// changing the policy is one line in one place.
+pub const stall_backoff_ms: u64 = 2;
+
 /// Short blocking sleep (portable std.Io sleep) used to back off while a
 /// sequential fill waits for withheld bytes. Never holds a lock.
 fn sleepMs(ms: u64) void {
@@ -716,7 +722,7 @@ pub const HttpRange = struct {
             if (self.fetching) {
                 // Another thread holds the transport: wait mutex-free, re-check.
                 self.unlock();
-                sleepMs(2);
+                sleepMs(stall_backoff_ms);
                 self.lock();
                 continue;
             }
@@ -872,7 +878,7 @@ pub const HttpRange = struct {
             if (!self.drainOneChunkLocked()) {
                 if (self.eof.load(.monotonic) or self.shutdown.load(.acquire)) break;
                 self.unlock();
-                sleepMs(2);
+                sleepMs(stall_backoff_ms);
                 self.lock();
             }
         }
@@ -942,7 +948,7 @@ pub const HttpRange = struct {
         // The CONTIGUOUS PRESENT prefix, never the requested `end`: returning
         // `end` over a hole told the inflater that withheld/short-fetched bytes
         // were content, and it decoded the spool's zeros into real rows.
-        return @min(end, self.present_prefix.load(.monotonic));
+        return @min(end, self.presentExtent());
     }
 
     pub fn byteAt(self: *HttpRange, internal: u64) ?u8 {

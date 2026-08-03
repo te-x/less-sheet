@@ -211,6 +211,13 @@ fn refusingReader(mapping: []const u8) Reader {
 
 const Session = struct {
     input: Reader,
+    /// The ABSOLUTE physical offset a lane budget caps this session's fence at, or
+    /// null for an uncapped session. It lives here, beside the `input.end` it
+    /// bounds, because `produce` re-raises that fence on every provider op and has
+    /// to re-apply the cap each time (see `produce`). A SIZE cannot live here: the
+    /// budget is anchored at the seek the lane was leased at, and `input.seek`
+    /// moves.
+    fence_cap: ?usize,
     history: [flate.max_window_len]u8,
     dec: Decompress,
     logical: u64,
@@ -221,6 +228,7 @@ const Session = struct {
         @memset(&self.history, 0);
         self.input = refusingReader(mapping);
         self.input.end = @min(mapping.len, physical_end);
+        self.fence_cap = null;
         self.logical = 0;
         self.member_count = 0;
         self.terminal = .inflating;
@@ -302,9 +310,6 @@ pub const Gzip = struct {
     terminal_end: std.atomic.Value(u64) = .init(std.math.maxInt(u64)),
     terminal_kind: std.atomic.Value(u8) = .init(0), // 0 unknown, 1 clean, 2 damaged
     bom_len: u64 = 0,
-    /// The logical offset just past the last ROW TERMINATOR any session has
-    /// produced (monotone). Only a DAMAGED end reads it — see `terminalLogical`.
-    last_row_end: std.atomic.Value(u64) = .init(0),
     shutdown: std.atomic.Value(bool) = .init(false),
     opening: bool = true,
     force_chunk: std.atomic.Value(u64) = .init(0),
@@ -412,6 +417,19 @@ pub const Gzip = struct {
     fn physicalLen(self: *const Gzip) u64 {
         if (self.provider) |hr| return hr.physicalTotal() orelse std.math.maxInt(u64);
         return self.mapping.len;
+    }
+
+    /// Whether a stop at `fence` is RESUMABLE — i.e. whether that fence can still
+    /// MOVE. Two ways it can: it is an artificial fence below the physical total
+    /// (the open-head budget or a lane budget, both lifted later), and, for a
+    /// network gzip, the provider can still deliver. Once the peer ends the body
+    /// SHORT of the length it advertised the fence is frozen, and parking on it
+    /// waits forever for bytes that stopped arriving — the dropped-stream case.
+    ///
+    /// Distinct from `sourceAwaitsBytes` on purpose; see that function.
+    fn fenceCanMove(self: *const Gzip, fence: usize) bool {
+        if (fence >= self.physicalLen()) return false;
+        return if (self.provider) |hr| hr.awaitsBytes() else true;
     }
 
     fn physical(s: *const Session) u64 {
@@ -530,7 +548,14 @@ pub const Gzip = struct {
         // present bytes, so a single forward fetch high-water suffices.
         if (self.provider) |hr| {
             const fetched = hr.ensureCompressed(s.input.seek + chunk_bytes);
-            const new_end: usize = @intCast(@min(fetched, self.mapping.len));
+            var raised: u64 = @min(fetched, self.mapping.len);
+            // Re-apply the lane's physical cap on EVERY raise. Without this a
+            // budgeted provider lane reads straight past its budget, and nothing
+            // downstream catches it: `Cursor.hitPhysicalLimit` keys on the session
+            // parking at `.budget`, not on a byte comparison, so an un-capped
+            // fence simply never trips it.
+            if (s.fence_cap) |cap| raised = @min(raised, @as(u64, cap));
+            const new_end: usize = @intCast(raised);
             if (new_end > s.input.end) {
                 s.input.end = new_end;
                 if (s.terminal == .budget) {
@@ -547,14 +572,7 @@ pub const Gzip = struct {
         // still move, so a stop there parks and waits; an edge AT the total is
         // the end of the stream, so a stop there is terminal.
         const fence = s.input.end;
-        // ... and "still coming" needs the edge to be able to MOVE. An artificial
-        // fence below the physical total is resumable only while the provider can
-        // still deliver: once the peer ended the body SHORT of the length it
-        // advertised, the fence is frozen, and parking on it waits forever for
-        // bytes that already stopped arriving — the dropped-stream case, which
-        // used to leave the document permanently incomplete.
-        const resumable = fence < self.physicalLen() and
-            (if (self.provider) |hr| hr.awaitsBytes() else true);
+        const resumable = self.fenceCanMove(fence);
 
         var written: usize = 0;
         while (written < out.len) {
@@ -568,10 +586,6 @@ pub const Gzip = struct {
             if (avail.len > 0) {
                 const take = @min(avail.len, out.len - written);
                 @memcpy(out[written..][0..take], avail[0..take]);
-                // Cheap because it scans BACKWARD: a terminator turns up within one
-                // row's length, so this is O(row), not O(chunk) (see terminalLogical).
-                if (std.mem.lastIndexOfAny(u8, avail[0..take], "\r\n")) |k|
-                    self.noteRowEnd(s.logical + k + 1);
                 s.dec.reader.toss(take);
                 written += take;
                 s.logical += take;
@@ -659,36 +673,10 @@ pub const Gzip = struct {
         return true;
     }
 
-    /// Note that a row terminator ENDED at logical offset `at` (monotone,
-    /// lock-free). Recorded but NOT yet applied to the reported end — see the
-    /// CONFLICT note in `terminalLogical`.
-    fn noteRowEnd(self: *Gzip, at: u64) void {
-        var cur = self.last_row_end.load(.monotonic);
-        while (at > cur) cur = self.last_row_end.cmpxchgWeak(cur, at, .monotonic, .monotonic) orelse return;
-    }
-
     pub fn terminalLogical(self: *const Gzip) ?u64 {
         const end = self.terminal_end.load(.acquire);
         return if (end == std.math.maxInt(u64)) null else end -| self.bom_len;
     }
-
-    // COMPLETE-ROWS-ONLY, and why it is NOT applied here — see
-    // .aidev/CHANGE-REQUEST.md (flate_b1_vs_gz_ac10).
-    //
-    // Clamping a DAMAGED end to `last_row_end` (the last row terminator produced)
-    // is the rule `flate_b1` requires: it makes every reported row WHOLE, so a
-    // truncated final cell is never served as a complete value. With it, the whole
-    // ~1500-offset `flate_b1` sweep passes.
-    //
-    // It cannot be applied while `gz_ac10` stands. That fixture's 6-byte deflate
-    // prefix salvages `"a,b\n1"`; clamping drops the partial `"1"`, leaving ONE
-    // row, which its sniffed header then consumes — so `rc.count >= 1` sees 0
-    // (MEASURED: `rows=0`, complete=1, scanned==total). `gz_ac10` therefore needs
-    // the partial tail KEPT and `flate_b1` needs it DROPPED, and the two tails are
-    // structurally identical (a fragment after the last terminator), so no rule
-    // distinguishes them. The clamp is left wired but unused pending adjudication;
-    // `openUsable` still refuses a salvage with NO terminator at all, which is the
-    // part both tests agree on.
 
     fn createSpill(self: *Gzip) void {
         if (self.spill_fd != null or self.spill_fail_after.load(.acquire) == 0) return;
@@ -830,8 +818,18 @@ pub const Gzip = struct {
             self.replay_inflated = 0;
             self.unlock();
         }
-        if (self.lane_physical_budget[lane]) |budget|
-            session.input.end = @intCast(@min(@as(u64, session.input.end), session.input.seek +| budget));
+        if (self.lane_physical_budget[lane]) |budget| {
+            // Anchor the cap ABSOLUTELY, here, at the seek this replay starts from.
+            // `session.input.end` is 0 for a provider (no bytes fetched into this
+            // session yet), so min-ing the cap into it would store 0 and cap
+            // nothing; `produce` re-applies `fence_cap` every time it raises the
+            // fence from the provider's high-water instead.
+            const cap: u64 = session.input.seek +| budget;
+            session.fence_cap = @intCast(cap);
+            session.input.end = @intCast(@min(@as(u64, session.input.end), cap));
+        } else {
+            session.fence_cap = null; // stated, not inferred from the lease order
+        }
         self.op_len[lane] = 0;
         return self.discardTo(session, target, true, lane);
     }
@@ -995,7 +993,8 @@ pub const Source = union(enum) {
     /// the bound must reserve the FULL width, not width - 1. On a network Source
     /// that read is an
     /// `ensureSlice`, i.e. a BLOCKING FETCH, and on the sequential arm an
-    /// unbounded `sleepMs(2)` spin (`net_source.ensureSliceSequentialLocked`) — so
+    /// unbounded `net_source.stall_backoff_ms` spin
+    /// (`net_source.ensureSliceSequentialLocked`) — so
     /// the whole document wedges: every poll, cancel and close blocks behind it.
     /// Two failure modes, both cured by never committing such a row:
     ///   * the wedge above (AC-e1 named it "One route remains UNBOUNDED");
@@ -1085,7 +1084,13 @@ pub const Cursor = struct {
                 g.lane_physical_budget[self.lane] = null;
                 if (self.physical_limit != null) {
                     const session = g.sessionForLane(self.lane);
-                    session.input.end = self.saved_input_end;
+                    session.fence_cap = null;
+                    // Never restore an end BEHIND the seek: a provider lane was
+                    // leased at end 0 and has consumed bytes since, and
+                    // `input.seek > input.end` makes `Reader.buffered()` a
+                    // reversed slice. `produce` raises it again from the
+                    // provider's high-water on the next op.
+                    session.input.end = @max(self.saved_input_end, session.input.seek);
                     if (session.terminal == .budget) {
                         session.dec.err = null;
                         session.terminal = .inflating;
@@ -1414,11 +1419,15 @@ pub fn gzipDeinit(g: *Gzip) void {
     g.deinit();
 }
 
-/// True iff this Source fetches over the network (http_range, or a gzip composed
-/// over an http_range) — the lazy-frontier gate keys strictly on this (TD1).
-/// security-hardening (b) AC-b2: whether `source` can still receive bytes it does
-/// not have — the ONE "not yet arrived vs never arriving" resolver (see
-/// net_source.HttpRange.awaitsBytes). Local sources own every byte, so false.
+/// security-hardening (b) AC-b2: whether more bytes can still ARRIVE FROM THE
+/// PEER for `source` (see net_source.HttpRange.awaitsBytes). Local sources own
+/// every byte they will ever have, so false.
+///
+/// NOT the same question as `Gzip.fenceCanMove`, and deliberately not shared with
+/// it: a local gzip has no peer to wait for, yet its session fence still moves
+/// when the open-head budget or a lane budget is lifted. This one answers
+/// "should a stalled frontier keep waiting?"; that one answers "is a stop at this
+/// fence resumable?".
 pub fn sourceAwaitsBytes(source: Source) bool {
     return switch (source) {
         .mmap => false,
@@ -1427,6 +1436,8 @@ pub fn sourceAwaitsBytes(source: Source) bool {
     };
 }
 
+/// True iff this Source fetches over the network (http_range, or a gzip composed
+/// over an http_range) — the lazy-frontier gate keys strictly on this (TD1).
 pub fn sourceIsNetwork(source: Source) bool {
     return switch (source) {
         .mmap => false,
@@ -1536,6 +1547,7 @@ pub fn cursorAt(source: Source, logical: u64, logical_limit: ?u64, physical_budg
             if (physical_budget) |budget| {
                 cur.saved_input_end = session.input.end;
                 cur.physical_limit = @min(@as(u64, session.input.end), session.input.seek +| budget);
+                session.fence_cap = @intCast(cur.physical_limit.?);
                 session.input.end = @intCast(cur.physical_limit.?);
             }
             g.unlock();

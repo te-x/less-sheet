@@ -16,6 +16,7 @@ const filter = @import("filter.zig");
 const search = @import("search.zig");
 const column = @import("column.zig");
 const source_mod = @import("source.zig");
+const net_source = @import("net_source.zig");
 const sysio = @import("sysio.zig");
 
 const Document = base.Document;
@@ -382,11 +383,14 @@ pub fn workerMain(doc: *Document) void {
         // scanChunk always starts exactly at the frontier: always the leading
         // edge, so always drained (see base.drainOversized).
         base.drainOversized(doc, true);
+        // ONE definition of "this chunk got nowhere", read by the stall branch below
+        // and by its backoff (they must agree, and used to be spelled out twice).
+        const no_progress = res.end_row == start_row and base.scanStalled(doc, start_pos, res.end_pos);
         if (res.eof) {
             doc.complete = true;
             doc.total_rows = doc.frontier_rows;
         } else if (doc.jump_state == .scanning and !doc.stop_atomic.load(.monotonic) and
-            res.end_row == start_row and base.scanStalled(doc, start_pos, res.end_pos) and
+            no_progress and
             // security-hardening (b) AC-b2: ONLY when the missing bytes are never
             // arriving. A SEQUENTIAL body is still being drained, so a byte that
             // has not landed is late, not absent — ending the jump there reports
@@ -422,8 +426,7 @@ pub fn workerMain(doc: *Document) void {
         // The other half of the stall branch above: a jump left SCANNING because
         // its bytes are still on the wire must back off, or the worker re-enters a
         // zero-progress chunk at 100% CPU.
-        const stalled_await = doc.jump_state == .scanning and res.end_row == start_row and
-            base.scanStalled(doc, start_pos, res.end_pos);
+        const stalled_await = doc.jump_state == .scanning and no_progress;
         if (doc.jump_state == .scanning) updateJump(doc);
         const advanced = doc.reader.physicalBytes(doc.source, doc.frontier_pos);
         doc.unlock();
@@ -434,7 +437,7 @@ pub fn workerMain(doc: *Document) void {
             madviseDontNeed(doc, released, rel_end);
             released = rel_end;
         }
-        if (stalled_await) sysio.sleepMs(2);
+        if (stalled_await) sysio.sleepMs(net_source.stall_backoff_ms);
 
         doc.lock();
     }
