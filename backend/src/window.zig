@@ -71,6 +71,27 @@ fn appendRowMetadata(d: *Document, source_row: u64, pos: Pos, oversized: bool, b
     return true;
 }
 
+/// ARCH-security-hardening (g) AC-g1 — the SOURCE-FAULT GUARD bracket around the
+/// window re-lex. A window re-lexes source bytes BEHIND the frontier, which makes
+/// it the one FOREGROUND (UI-thread) reader that can touch a page whose file no
+/// longer has it. If the guard repaired a fault while `windowSetInner` ran, the
+/// rows it built came from zero-fill: serve NO rows rather than rows whose cells
+/// are empty or invented, and report the terminal truncated/faulted outcome.
+///
+/// The comparison is against a fault count taken around THIS call, not a sticky
+/// "has ever faulted" flag — that is what lets a truncated document keep serving
+/// the rows it CAN still read instead of going permanently blank.
+pub fn windowSet(d: *Document, first_row: u64, row_count: u32) api.RowRange {
+    const faults_before = base.sourceFaultCount(d);
+    const res = windowSetInner(d, first_row, row_count);
+    if (base.sourceFaultCount(d) == faults_before) return res;
+    d.lock();
+    base.reportSourceFaultLocked(d);
+    d.unlock();
+    clearWindow(d, first_row);
+    return .{ .first_row = first_row, .row_count = 0 };
+}
+
 /// See api/lesssheet.h `ls_window_set`. Never advances the frontier; re-lexes
 /// the requested rows (behind the frontier) from the nearest checkpoint into
 /// the owned window buffer. Changed requests evict; identical requests retain
@@ -80,7 +101,7 @@ fn appendRowMetadata(d: *Document, source_row: u64, pos: Pos, oversized: bool, b
 /// the SOURCE bytes scanned per row are ALSO bounded to
 /// `api.window_row_scan_max_bytes`, so this stays O(min(row bytes, cap) x
 /// rows) regardless of row size (see the materialize loop below).
-pub fn windowSet(d: *Document, first_row: u64, row_count: u32) api.RowRange {
+fn windowSetInner(d: *Document, first_row: u64, row_count: u32) api.RowRange {
     // MATERIALIZATION EPOCH bump (thin-frontend-shared-core Phase 1): every
     // ls_window_set invalidates the match-flags borrow (win_gen keys the memo),
     // exactly like it invalidates the ls_cell borrow. Window-lane serialized
@@ -588,6 +609,25 @@ fn advanceCursorForward(d: *Document, from_row: u64, from_pos: Pos, row: u64, ad
 ///     (possibly empty or bounded) cell. ZERO heap allocation on this path
 ///     (`Reader.cell`); the filtered path's use of the shared `nav_scratch`
 ///     re-lex scratch is the one exception, mirroring `windowSetFiltered`.
+/// ARCH-security-hardening (g) AC-g1 — the SOURCE-FAULT GUARD bracket for the
+/// copy cursor, which re-lexes source bytes of its own and so could otherwise put
+/// the guard's zero-fill on the user's CLIPBOARD.
+///
+/// Deliberately NOT wrapped around `cellCopy` itself: the streaming job calls that
+/// once per CELL, and two atomic loads per cell is a measurable tax on a
+/// million-row copy (+3.5% on the 50/500 MB plain-CSV `copy_rows` bench). The
+/// guard's granularity is the OPERATION, so root.zig brackets its two ABI entry
+/// points — `ls_cell_copy` (one cell) and `ls_copy_next` (one bufferful) — with
+/// this instead. Returns true when a fault landed inside the bracket, having
+/// already reported the terminal outcome; the caller then serves nothing.
+pub fn copyFaulted(d: *Document, faults_before: u32) bool {
+    if (base.sourceFaultCount(d) == faults_before) return false;
+    d.lock();
+    base.reportSourceFaultLocked(d);
+    d.unlock();
+    return true;
+}
+
 pub fn cellCopy(d: *Document, row: u64, col: u32, buf: ?[*]u8, buf_len: usize, out_len: *usize, out_truncated: *bool) api.CopyResult {
     out_len.* = 0;
     out_truncated.* = false;

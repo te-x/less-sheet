@@ -117,7 +117,11 @@ fn failLocked(job: *NetOpenJob, err: api.NetStatus) void {
 /// state, so poll never blocks on a slow open.
 fn publish(job: *NetOpenJob, built: ?net_source.BuiltSource, build_err: api.NetStatus) void {
     const b = built orelse return failLocked(job, build_err);
-    const doc = open.buildDocument(job.gpa, b.source, b.mapping, b.file_size, job.opt) orelse return failLocked(job, .io);
+    // No SOURCE-FAULT GUARD slot and no fd: AC-g1 scopes the guard to a LOCAL
+    // file's mapping, and a network document's spool is a file this process
+    // creates, holds open and extends itself — not one another process truncates.
+    const doc = open.buildDocument(job.gpa, b.source, b.mapping, null, null, b.file_size, job.opt) orelse
+        return failLocked(job, .io);
     doc.net_range_mode = b.range_mode;
     if (job.cancel_flag.load(.acquire)) {
         // Cancelled while building: drop the doc, report cancelled.

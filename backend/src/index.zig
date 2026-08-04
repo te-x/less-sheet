@@ -94,6 +94,11 @@ pub fn headScan(doc: *Document) void {
         doc.complete = true;
         doc.total_rows = row;
     }
+    // ARCH-security-hardening (g): the file shrank inside the open window, so the
+    // head this scan just indexed is partly zero-fill. Clamp to the rows still
+    // backed; `openWithAllocator` turns a faulted open into the existing `.io`
+    // status. No lock needed — the worker has not spawned yet.
+    base.reportSourceFaultLocked(doc);
 }
 
 // ---------------------------------------------------------------------------
@@ -169,7 +174,13 @@ pub fn workerMain(doc: *Document) void {
         }
 
         if (do_column) {
+            const faults_before = base.sourceFaultCount(doc);
             column.workerRunLocked(doc);
+            // security-hardening (g): the type sampler re-reads the head, so it can
+            // be the FIRST reader to touch dead bytes. Report the fault; the types
+            // it just inferred from zero-fill are advisory and the document is now
+            // terminal, so the rows they would have described are gone anyway.
+            if (base.sourceFaultCount(doc) != faults_before) base.reportSourceFaultLocked(doc);
             // Every inference chunk hands the control mutex back before the
             // worker arbitrates again, so cancel/poll and newly-arrived
             // jump/Find/filter work take effect at this boundary.
@@ -201,11 +212,19 @@ pub fn workerMain(doc: *Document) void {
             const dir = doc.nav_dir;
             const pctx = doc.w_ctx;
             const fctx = doc.wf_ctx;
+            const faults_before = base.sourceFaultCount(doc);
             doc.unlock();
 
             const outcome = search.resolveFilteredNavOffMain(doc, nav_gen, search_gen, filter_gen, anchor, dir, pctx, fctx);
 
             doc.lock();
+            // security-hardening (g): a nav resolved against the guard's zero-fill
+            // is not a navigation — report the fault and discard the outcome.
+            if (base.sourceFaultCount(doc) != faults_before) {
+                base.reportSourceFaultLocked(doc);
+                search.failSearchLocked(doc);
+                continue; // lock still held
+            }
             if (outcome) |result| {
                 if (doc.nav_pending and doc.search_nav == .searching and
                     doc.nav_gen == nav_gen and doc.search_gen == search_gen and
@@ -240,11 +259,27 @@ pub fn workerMain(doc: *Document) void {
             const gen = doc.filter_gen;
             const start_pos = doc.filter_pos;
             const start_row = doc.filter_rows;
+            const faults_before = base.sourceFaultCount(doc);
             doc.unlock();
 
             const res = filter.filterScanChunk(doc, start_pos, start_row, gen);
 
             doc.lock();
+            // security-hardening (g) AC-g1: the source faulted under this chunk —
+            // discard it (its matches came from zero-fill) and end the filtered
+            // jump at the last match we DO have, mirroring the stalled-network
+            // clamp below.
+            if (base.sourceFaultCount(doc) != faults_before) {
+                base.reportSourceFaultLocked(doc);
+                if (doc.jump_state == .scanning) {
+                    doc.jump_state = .done;
+                    doc.jump_progress = 1.0;
+                    doc.jump_landed = if (doc.filter_total > 0) doc.filter_total - 1 else 0;
+                }
+                filter.finishStalledLocked(doc);
+                column.sourceCompletedLocked(doc);
+                continue; // lock still held
+            }
             if (doc.filter_gen == gen and doc.jump_state == .scanning) {
                 filter.commitFilter(doc, res);
                 filter.resolveFilterJumpLocked(doc);
@@ -290,11 +325,20 @@ pub fn workerMain(doc: *Document) void {
             const gen = doc.filter_gen;
             const start_pos = doc.filter_pos;
             const start_row = doc.filter_rows;
+            const faults_before = base.sourceFaultCount(doc);
             doc.unlock();
 
             const res = filter.filterScanChunk(doc, start_pos, start_row, gen);
 
             doc.lock();
+            // security-hardening (g) AC-g1: source faulted under this chunk —
+            // discard it and freeze the filter at its last consistent state.
+            if (base.sourceFaultCount(doc) != faults_before) {
+                base.reportSourceFaultLocked(doc);
+                filter.finishStalledLocked(doc);
+                column.sourceCompletedLocked(doc);
+                continue; // lock still held
+            }
             if (doc.filter_gen == gen and doc.filter_state == .scanning) {
                 filter.commitFilter(doc, res);
                 column.sourceCompletedLocked(doc);
@@ -342,12 +386,22 @@ pub fn workerMain(doc: *Document) void {
             const gen = doc.search_gen;
             const start_pos = doc.search_pos;
             const start_row = doc.search_rows;
+            const faults_before = base.sourceFaultCount(doc);
             doc.unlock();
 
             // Lex + match a chunk of rows lock-free (worker snapshot only).
             const res = search.searchScanChunk(doc, start_pos, start_row, filtered, gen);
 
             doc.lock();
+            // security-hardening (g) AC-g1: source faulted under this chunk —
+            // discard it (matches against zero-fill are not matches) and freeze
+            // the search where it stood, serving no phantom hits.
+            if (base.sourceFaultCount(doc) != faults_before) {
+                base.reportSourceFaultLocked(doc);
+                search.finishStalledLocked(doc);
+                column.sourceCompletedLocked(doc);
+                continue; // lock still held
+            }
             // Commit only if this is still the same, still-scanning search;
             // otherwise discard (a replace bumped the gen, or a jump/cancel took
             // the slot — counts freeze at the last committed chunk).
@@ -383,11 +437,24 @@ pub fn workerMain(doc: *Document) void {
         // the viewer-ui worker; the sole frontier writer, so lock-free).
         const start_pos = doc.frontier_pos;
         const start_row = doc.frontier_rows;
+        const faults_before = base.sourceFaultCount(doc);
         doc.unlock();
 
         const res = scanChunk(doc, start_pos, start_row);
 
         doc.lock();
+        // ARCH-security-hardening (g) AC-g1: the bytes this chunk lexed stopped
+        // existing while it ran, so what it produced is the guard's zero-fill and
+        // not the file — DISCARD it whole (committing it would fabricate rows out
+        // of zeroes) and report the terminal truncated/faulted outcome instead.
+        // The jump resolves below through `doc.complete`, exactly as it does for a
+        // damaged gzip, so no poller is left hanging.
+        if (base.sourceFaultCount(doc) != faults_before) {
+            base.reportSourceFaultLocked(doc);
+            column.sourceCompletedLocked(doc);
+            if (doc.jump_state == .scanning) updateJump(doc);
+            continue; // lock still held, as the loop top expects
+        }
         doc.frontier_pos = res.end_pos;
         doc.frontier_rows = res.end_row;
         if (res.checkpoint) |cp| doc.checkpoints.append(doc.gpa, cp) catch {};
@@ -555,6 +622,7 @@ fn madviseDontNeed(doc: *Document, start_physical: u64, end_physical: u64) void 
 pub fn rowCount(d: *Document) api.RowCount {
     d.lock();
     defer d.unlock();
+    base.reportSourceFaultLocked(d); // security-hardening (g): report a faulted source
     // While filtered, report the FILTERED match count (see FILTERED VIEWS):
     // identical semantics to the unfiltered count during indexing (a
     // converging lower bound that becomes exact at LS_FILTER_DONE).
@@ -586,6 +654,7 @@ pub fn rowCount(d: *Document) api.RowCount {
 pub fn indexPoll(d: *Document) api.ScanProgress {
     d.lock();
     defer d.unlock();
+    base.reportSourceFaultLocked(d); // security-hardening (g): report a faulted source
     // never-full-download-streaming (TD5): a network document's total comes from
     // the Source (known length, or the received size once EOF firmed it), or the
     // UINT64_MAX sentinel while an unknown-length stream's total is not yet
@@ -684,5 +753,6 @@ pub fn jumpCancel(d: *Document) void {
 pub fn jumpPoll(d: *Document) api.JumpStatus {
     d.lock();
     defer d.unlock();
+    base.reportSourceFaultLocked(d); // security-hardening (g): report a faulted source
     return .{ .state = d.jump_state, .progress = d.jump_progress, .landed_row = d.jump_landed };
 }

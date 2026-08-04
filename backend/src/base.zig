@@ -17,6 +17,9 @@ const column_state = @import("column_state.zig");
 // `startWorker`/`joinWorker`. Not a new module cycle: base -> source_mod ->
 // net_source -> base already exists.
 const net_source = @import("net_source.zig");
+// ARCH-security-hardening (g): the SOURCE-FAULT GUARD over the document's own
+// mmap region. See src/fault_guard.zig for the mechanism.
+const fault_guard = @import("fault_guard.zig");
 
 const posix = std.posix;
 const sysio = @import("sysio.zig");
@@ -150,6 +153,21 @@ pub const Document = struct {
 
     // File mapping (immutable after open). `mapping` is null for an empty file.
     mapping: ?[]align(std.heap.page_size_min) const u8,
+    // ARCH-security-hardening (g) AC-g1/AC-g2 — SOURCE-FAULT GUARD (immutable
+    // after open). `fault_slot` is this mapping's slot in the process-wide
+    // guard registry (src/fault_guard.zig), or null when the mapping is
+    // unguarded: an empty file, a network source, or a full registry.
+    fault_slot: ?u32,
+    // The source fd, held open for the document's lifetime for exactly one
+    // reason: when the guard reports a fault, `fstat` is the only authoritative
+    // answer to "how much of this file is still there", and re-opening the PATH
+    // cannot answer it (the name may since have been given to another inode).
+    // Holding it also pins the inode, so an unlinked file's mapping stays valid.
+    // Null for a network document. Closed by `freeDoc`.
+    fd: ?posix.fd_t,
+    // The fault count already folded into the terminal report (mutex-protected).
+    // See `reportSourceFaultLocked` for why this is remembered rather than a bool.
+    fault_reported: u32 = 0,
     content_len: u64, // == source.len(); cached (see api/lesssheet.h byte-progress fields)
     file_size: u64,
     bom_len: u64,
@@ -773,9 +791,95 @@ pub fn freeDoc(doc: *Document) void {
     if (doc.row0_pinned_buf.len > 0) doc.gpa.free(doc.row0_pinned_buf);
     if (doc.row0_pinned_refs.len > 0) doc.gpa.free(doc.row0_pinned_refs);
     source_mod.sourceDeinit(&doc.source);
+    // Stop guarding BEFORE unmapping: once the range is gone the kernel may hand
+    // it to an unrelated mapping, and a fault there is not ours to adopt.
+    fault_guard.disarm(doc.fault_slot);
     if (doc.mapping) |m| posix.munmap(m);
+    if (doc.fd) |fd| sysio.close(fd);
     // std.Io.Mutex/Condition need no explicit destroy (unlike pthread_*_destroy).
     doc.gpa.destroy(doc);
+}
+
+/// ARCH-security-hardening (g) AC-g1 — SOURCE-FAULT GUARD, caller side.
+///
+/// How many times this document's mapping has faulted (see src/fault_guard.zig).
+/// Every piece of work that reads the mapping is bracketed by two reads of this:
+/// if it MOVED, the bytes that work saw were the guard's zero-fill, not the
+/// file's, and the result must be thrown away rather than committed. One acquire
+/// atomic load per scan chunk / per window call — the guard's whole cost when
+/// nothing faults.
+///
+/// A COUNTER, not a flag, and that distinction is behavioural: a document whose
+/// tail vanished must still serve the rows that ARE still backed, so "did a fault
+/// happen under this operation" has to be answerable separately from "has this
+/// document ever faulted".
+pub fn sourceFaultCount(doc: *const Document) u32 {
+    return fault_guard.faultCount(doc.fault_slot);
+}
+
+/// The BACKSTOP for reporting a fault, as opposed to discarding the work that
+/// faulted. Every scan/window/copy path brackets itself with `sourceFaultCount`
+/// so it can throw its own faulted result away — but a fault can be triggered
+/// first by a reader that has no result worth discarding (the column-type
+/// sampler, a nav resolve), and then no delta check would ever fire again and the
+/// document would be left serving nothing while still claiming it is making
+/// progress. That is precisely the outcome AC-g1 forbids.
+///
+/// So the progress/count queries the frontends poll continuously call this: it
+/// folds in ANY fault, whoever first hit it, exactly once per fault (the count is
+/// remembered in `fault_reported`, so a document that faults again after already
+/// being complete re-clamps rather than being ignored). Mutex held.
+pub fn reportSourceFaultLocked(doc: *Document) void {
+    const n = fault_guard.faultCount(doc.fault_slot);
+    if (n == doc.fault_reported) return;
+    doc.fault_reported = n;
+    goTerminalOnSourceFaultLocked(doc);
+}
+
+/// The source faulted under us: report it through the EXISTING terminal
+/// vocabulary — correct-rows-so-far + `complete` + `exact`, the same shape a
+/// damaged/truncated gzip already uses (see index.zig's `res.eof` commit and
+/// contracts/api.zig's SOURCE-FAULT GUARD note). There is deliberately NO new
+/// C-ABI error code; api/lesssheet.h stays byte-identical.
+///
+/// "Correct rows so far" is taken literally. The faulting ADDRESS cannot define
+/// it — a scan touches whatever offset it happened to reach, not the point where
+/// the file now ends — so the authoritative answer comes from `fstat` on the
+/// retained fd, and the frontier is clamped back to the last checkpoint whose
+/// bytes still exist. A checkpoint `{row: R, pos: P}` means "row R starts at P",
+/// so rows `0..R` are exactly the rows that ended at or before P: keeping the
+/// last checkpoint at or below the file's current size therefore reports only
+/// rows that were lexed from bytes that are STILL there. The clamp errs low (by
+/// up to one checkpoint interval), which is the honest direction — under-report
+/// rows we could still serve, never claim rows we cannot.
+///
+/// If the fd or `fstat` cannot answer, or the file did not actually shrink below
+/// the frontier (a media/IO fault rather than a truncation), the frontier stands
+/// and this degrades to the plain damaged-source shape. Idempotent: a second call
+/// re-derives the same clamp and changes nothing. Mutex held.
+fn goTerminalOnSourceFaultLocked(doc: *Document) void {
+    var keep_rows = doc.frontier_rows;
+    var keep_pos = doc.frontier_pos;
+    if (doc.fd) |fd| {
+        if (sysio.file(fd).stat(sysio.io())) |st| {
+            const now: u64 = st.size;
+            if (doc.reader.physicalBytes(doc.source, doc.frontier_pos) > now) {
+                keep_rows = 0;
+                keep_pos = doc.data_start;
+                for (doc.checkpoints.items) |cp| {
+                    if (cp.row <= keep_rows) continue;
+                    if (doc.reader.physicalBytes(doc.source, cp.pos) <= now) {
+                        keep_rows = cp.row;
+                        keep_pos = cp.pos;
+                    }
+                }
+            }
+        } else |_| {}
+    }
+    doc.frontier_rows = keep_rows;
+    doc.frontier_pos = keep_pos;
+    doc.complete = true;
+    doc.total_rows = keep_rows;
 }
 
 /// security-hardening (e) AC-e3: the ONE stall predicate shared by all three

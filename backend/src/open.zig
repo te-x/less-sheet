@@ -11,8 +11,12 @@ const std = @import("std");
 const api = @import("api");
 
 const posix = std.posix;
+const sysio = @import("sysio.zig");
 
 const base = @import("base.zig");
+// ARCH-security-hardening (g): released here only on the failure path before a
+// Document exists to own the guard slot (afterwards `freeDoc` does it).
+const fault_guard = @import("fault_guard.zig");
 const csv_reader = @import("csv_reader.zig");
 const source_mod = @import("source.zig");
 const index = @import("index.zig");
@@ -26,15 +30,25 @@ const freeDoc = base.freeDoc;
 const encoding_sample_bytes: usize = 256 * 1024;
 
 /// Build a Document from a ready Source. On success returns the doc (worker
-/// spawned); on failure returns null AFTER releasing `source` and `mapping`
-/// (the caller must not touch either again). `mapping`, when non-null, is the
-/// backing mmap the doc owns and munmaps at close (a local file, or a network
-/// download spool). For an http_range Source `mapping` is null — the Source
-/// owns its spool. `file_size` is the physical byte total for progress.
+/// spawned); on failure returns null AFTER releasing `source`, `mapping`,
+/// `fault_slot` and `fd` (the caller must not touch any of them again).
+/// `mapping`, when non-null, is the backing mmap the doc owns and munmaps at
+/// close (a local file, or a network download spool). For an http_range Source
+/// `mapping` is null — the Source owns its spool. `file_size` is the physical
+/// byte total for progress.
+///
+/// `fault_slot` and `fd` are the ARCH-security-hardening (g) SOURCE-FAULT GUARD's
+/// two handles on a LOCAL file: the registry slot guarding `mapping` (armed by
+/// the caller BEFORE any byte was read) and the source fd kept open so a fault
+/// can be sized with `fstat`. Both are null for a network document — the local
+/// mmap is what AC-g1 scopes, and the network spool is a file this process
+/// creates, holds and extends itself rather than one a stranger can truncate.
 pub fn buildDocument(
     gpa: std.mem.Allocator,
     source_in: source_mod.Source,
     mapping: ?[]align(std.heap.page_size_min) const u8,
+    fault_slot: ?u32,
+    fd: ?posix.fd_t,
     file_size: u64,
     opt: api.OpenOptions,
 ) ?*Document {
@@ -51,12 +65,16 @@ pub fn buildDocument(
     const content_len: u64 = if (is_gzip) file_size else source.len();
 
     const doc = gpa.create(Document) catch {
+        fault_guard.disarm(fault_slot);
         if (mapping) |m| posix.munmap(m);
+        if (fd) |h| sysio.close(h);
         return null;
     };
     doc.* = .{
         .gpa = gpa,
         .mapping = mapping,
+        .fault_slot = fault_slot,
+        .fd = fd,
         .source = source,
         .reader = .{ .csv = oh.reader },
         .content_len = content_len,

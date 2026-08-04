@@ -36,6 +36,9 @@ const filter = @import("filter.zig");
 const search = @import("search.zig");
 const index = @import("index.zig");
 const window = @import("window.zig");
+// ARCH-security-hardening (g): the SOURCE-FAULT GUARD, armed over the local
+// file mapping in `openWithAllocator` before its first byte is read.
+const fault_guard = @import("fault_guard.zig");
 const Document = base.Document;
 const CellRef = base.CellRef;
 const asDoc = base.asDoc;
@@ -103,42 +106,81 @@ pub fn openWithAllocator(gpa: std.mem.Allocator, path: [*:0]const u8, options: ?
         error.AccessDenied, error.PermissionDenied => .permission_denied,
         else => .io,
     };
-    defer sysio.close(fd);
+    // The fd is NOT closed here any more: the document keeps it for its whole
+    // life (base.Document.fd) so the source-fault guard can `fstat` the real
+    // current size when the bytes under the mapping vanish. Every failure path
+    // below closes it explicitly (this function returns a status, not an error
+    // union, so there is no `errdefer` to lean on); on success `freeDoc` owns it.
 
     // Portable stat via std.Io.File (0.16.0 removed the std.posix file syscalls;
     // std.c bindings are void on linux-musl). One fstat, same as before.
-    const st = sysio.file(fd).stat(sysio.io()) catch return .io;
-    if (st.kind != .file) return .io; // dirs/devices -> distinct .io
+    const st = sysio.file(fd).stat(sysio.io()) catch {
+        sysio.close(fd);
+        return .io;
+    };
+    if (st.kind != .file) { // dirs/devices -> distinct .io
+        sysio.close(fd);
+        return .io;
+    }
     const file_size: u64 = st.size;
 
     // Map the file head-to-tail (sparse tails cost nothing; pages fault lazily
     // and the indexer madvises them away). Empty files are not mapped.
     var mapping: ?[]align(std.heap.page_size_min) const u8 = null;
+    // ARCH-security-hardening (g): arm the SOURCE-FAULT GUARD over the mapping
+    // BEFORE anything reads a byte of it — the gzip-magic peek immediately below
+    // is already a read, and from here on any page of this file can be gone.
+    var fault_slot: ?u32 = null;
     if (file_size > 0) {
-        const m = posix.mmap(null, file_size, .{ .READ = true }, .{ .TYPE = .PRIVATE }, fd, 0) catch return .io;
+        const m = posix.mmap(null, file_size, .{ .READ = true }, .{ .TYPE = .PRIVATE }, fd, 0) catch {
+            sysio.close(fd);
+            return .io;
+        };
         mapping = m;
+        fault_slot = fault_guard.arm(m);
     }
 
     const raw: []const u8 = if (mapping) |m| m else &.{};
     const kind: source_mod.SourceKind = if (raw.len >= 2 and raw[0] == 0x1f and raw[1] == 0x8b) .gzip else .mmap;
     var source = source_mod.sourceFromMappingAlloc(gpa, raw, kind) catch {
-        if (mapping) |m| posix.munmap(m);
-        return .io;
+        return openFailed(mapping, fault_slot, fd);
     };
     if (!source.gzipUsable()) {
         source_mod.sourceDeinit(&source);
-        if (mapping) |m| posix.munmap(m);
+        return openFailed(mapping, fault_slot, fd);
+    }
+
+    const doc = open.buildDocument(gpa, source, mapping, fault_slot, fd, file_size, opt) orelse return .io;
+
+    // The source faulted while the head was being scanned — the file shrank
+    // inside the fstat->mmap->read window. Report the at-open failure through the
+    // EXISTING `.io` status (no new ABI): a document whose very head is already
+    // unreadable has nothing honest to serve.
+    if (base.sourceFaultCount(doc) != 0) {
+        closeDocument(doc);
         return .io;
     }
 
-    const doc = open.buildDocument(gpa, source, mapping, file_size, opt) orelse return .io;
     out_doc.* = @ptrCast(doc);
     return .ok;
 }
 
-/// See api/lesssheet.h `ls_close`.
-pub export fn ls_close(doc: *api.Doc) callconv(.c) void {
-    const d: *Document = @ptrCast(@alignCast(doc));
+/// Release everything an aborted open acquired before a Document existed to own
+/// it (guard slot first, then the mapping, then the fd — see `freeDoc`).
+fn openFailed(
+    mapping: ?[]align(std.heap.page_size_min) const u8,
+    fault_slot: ?u32,
+    fd: posix.fd_t,
+) api.Status {
+    fault_guard.disarm(fault_slot);
+    if (mapping) |m| posix.munmap(m);
+    sysio.close(fd);
+    return .io;
+}
+
+/// Stop the worker and free the document. Shared by `ls_close` and the at-open
+/// source-fault path above, which must tear down a fully-built document.
+fn closeDocument(d: *Document) void {
     d.lock();
     d.stop = true;
     d.stop_atomic.store(true, .monotonic);
@@ -147,6 +189,11 @@ pub export fn ls_close(doc: *api.Doc) callconv(.c) void {
     d.unlock();
     d.joinWorker();
     freeDoc(d);
+}
+
+/// See api/lesssheet.h `ls_close`.
+pub export fn ls_close(doc: *api.Doc) callconv(.c) void {
+    closeDocument(@ptrCast(@alignCast(doc)));
 }
 
 // ---------------------------------------------------------------------------
@@ -350,7 +397,15 @@ pub fn copyAdvancesReset(doc: *api.Doc) void {
 
 /// See api/lesssheet.h `ls_cell_copy`.
 pub export fn ls_cell_copy(doc: *const api.Doc, row: u64, col: u32, buf: ?[*]u8, buf_len: usize, out_len: *usize, out_truncated: *bool) callconv(.c) api.CopyResult {
-    return window.cellCopy(asDocMut(doc), row, col, buf, buf_len, out_len, out_truncated);
+    const d = asDocMut(doc);
+    // security-hardening (g) AC-g1: never hand the guard's zero-fill to the
+    // clipboard — a fault under this read reports and serves nothing.
+    const faults_before = base.sourceFaultCount(d);
+    const res = window.cellCopy(d, row, col, buf, buf_len, out_len, out_truncated);
+    if (!window.copyFaulted(d, faults_before)) return res;
+    out_len.* = 0;
+    out_truncated.* = false;
+    return .no_cell;
 }
 
 /// See api/lesssheet.h `ls_window_match_flags` (MATCH-FLAGS EXTENSION).
@@ -531,6 +586,19 @@ pub export fn ls_copy_open(doc: *const api.Doc, rect: *const api.CopyRect) callc
 /// borrow). See StreamCopyJob for the framing/boundary/STALLED model.
 pub export fn ls_copy_next(job: *api.CopyJob, buf: ?[*]u8, buf_len: usize) callconv(.c) api.CopyProgress {
     const self: *StreamCopyJob = @ptrCast(@alignCast(job));
+    // security-hardening (g) AC-g1: bracket the whole PULL (many cells) rather
+    // than each cell — see window.copyFaulted. If the source faulted inside the
+    // pull, everything it framed came from the guard's zero-fill, so the job ends
+    // DONE with NOTHING written: the caller never puts NULs on the clipboard.
+    // Rows framed by EARLIER pulls were read from real bytes and still count.
+    const faults_before = base.sourceFaultCount(self.doc);
+    const p = copyNext(self, buf, buf_len);
+    if (!window.copyFaulted(self.doc, faults_before)) return p;
+    self.done = true;
+    return self.progress(.done, 0, 0);
+}
+
+fn copyNext(self: *StreamCopyJob, buf: ?[*]u8, buf_len: usize) api.CopyProgress {
     if (self.done or self.empty_job) {
         self.done = true;
         return self.progress(.done, 0, 0);
