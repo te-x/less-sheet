@@ -24,6 +24,7 @@ No python packages.
 """
 
 import argparse
+import gzip
 import os
 import platform
 import re
@@ -401,10 +402,23 @@ def build_report(info, per_fixture, cold, copy_cap, optimize):
     L.append("  %-22s %s" % ("build:", optimize))
     L.append("  %-22s %s rows" % ("copy cap:", "{:,}".format(copy_cap)))
     L.append("")
+    # A gz fixture's throughput MUST be denominated in UNCOMPRESSED bytes: the
+    # harness divides by the size of the file it opened, which for a .csv.gz is the
+    # compressed size, and that understates the work by the compression ratio. Only
+    # the file-denominated SCANS are rescaled -- copy_rows is TSV-output bytes and is
+    # unaffected by compression, and the latency rows carry no bytes at all.
+    FILE_SCANS = ("index_scan", "search_scan", "filter_scan")
     for fx in per_fixture:
+        is_gz = fx.get("gz", False)
         L.append("-" * 72)
-        L.append("fixture: %s  (%s, %s rows)" % (
-            fx["name"], human_bytes(fx["bytes"]), "{:,}".format(fx.get("rowcount", 0))))
+        if is_gz:
+            L.append("fixture: %s  (%s compressed, %s uncompressed, %s rows)" % (
+                fx["name"], human_bytes(fx["bytes"]), human_bytes(fx["plain_bytes"]),
+                "{:,}".format(fx.get("rowcount", 0))))
+            L.append("         GB/s below = UNCOMPRESSED bytes / time (inflate + lex, the real work)")
+        else:
+            L.append("fixture: %s  (%s, %s rows)" % (
+                fx["name"], human_bytes(fx["bytes"]), "{:,}".format(fx.get("rowcount", 0))))
         L.append("-" * 72)
         header = ("operation", "warm ms", "warm GB/s")
         if cold:
@@ -416,12 +430,20 @@ def build_report(info, per_fixture, cold, copy_cap, optimize):
             w = warm.get(op)
             if not w:
                 continue
+            def rate(r):
+                if not r or r["gbps"] <= 0:
+                    return None
+                if is_gz and op in FILE_SCANS and r["ms"] > 0:
+                    return (fx["plain_bytes"] / 1e9) / (r["ms"] / 1e3)
+                return r["gbps"]
             ms = "%.2f" % w["ms"]
-            gbps = ("%.3f" % w["gbps"]) if w["gbps"] > 0 else "-"
+            wr = rate(w)
+            gbps = ("%.3f" % wr) if wr else "-"
             if cold:
                 c = coldd.get(op)
                 cms = ("%.2f" % c["ms"]) if c else "-"
-                cgbps = ("%.3f" % c["gbps"]) if (c and c["gbps"] > 0) else "-"
+                cr = rate(c)
+                cgbps = ("%.3f" % cr) if cr else "-"
                 table.append((op, ms, gbps, cms, cgbps))
             else:
                 table.append((op, ms, gbps))
@@ -444,6 +466,10 @@ def main():
                          "Scale up on fast/large disks, e.g. 200,2000,8000.")
     ap.add_argument("--repo", default=None, help="path to the less-sheet repo (else auto-located)")
     ap.add_argument("--lib", default=None, help="prebuilt liblesssheet.a (skips zig build)")
+    ap.add_argument("--gz", action=argparse.BooleanOptionalAction, default=True,
+                    help="also benchmark a gzip copy of each fixture (default: yes). The gz path is "
+                         "the whole subject of two hardening cells and had NO bench coverage at all; "
+                         "--no-gz skips it if you only care about the mmap path.")
     ap.add_argument("--optimize", default="ReleaseSafe",
                     choices=["ReleaseSafe", "ReleaseFast", "ReleaseSmall", "Debug"],
                     help="zig optimize mode for the backend (default ReleaseSafe — the SHIPPED mode; "
@@ -530,6 +556,29 @@ def main():
             entry["warm"] = warm
             entry["rowcount"] = warm.get("index_scan", {}).get("rows", 0)
             per_fixture.append(entry)
+
+            if args.gz:
+                gz_name = name + ".gz"
+                gz_path = path + ".gz"
+                print("[gen ] %s (gzip -6 of the above) ..." % gz_name, flush=True)
+                with open(path, "rb") as fin, gzip.open(gz_path, "wb", compresslevel=6) as fout:
+                    shutil.copyfileobj(fin, fout, 8 << 20)
+                fixtures.append(gz_path)
+                gz_entry = {"name": gz_name, "bytes": os.path.getsize(gz_path),
+                            "plain_bytes": actual, "gz": True}
+                if args.cold:
+                    if cold_ok:
+                        ok, note = drop_caches()
+                        if not ok:
+                            print("[cold] drop failed: %s (this fixture's cold ~= warm)" % note)
+                    print("[run ] %s cold pass ..." % gz_name, flush=True)
+                    gz_entry["cold"] = run_harness(harness, gz_path, args.copy_cap)
+                print("[run ] %s warm pass ..." % gz_name, flush=True)
+                run_harness(harness, gz_path, args.copy_cap)
+                gz_warm = run_harness(harness, gz_path, args.copy_cap)
+                gz_entry["warm"] = gz_warm
+                gz_entry["rowcount"] = gz_warm.get("index_scan", {}).get("rows", 0)
+                per_fixture.append(gz_entry)
 
         info = machine_info(cwd)
         report = build_report(info, per_fixture, args.cold, args.copy_cap, opt_label)
