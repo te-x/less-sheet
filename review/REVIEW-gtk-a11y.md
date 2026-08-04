@@ -48,7 +48,32 @@ freed. SSOT respected (one accel table, one control-name source, one `a11y_view_
    `grid_cursor_apply` gates on the raw `extend` flag (main.c:1896). Debatable; **an H-A2 Orca judgment
    call for the author's live pass.**
 
-## Pending: human GNOME/Orca pass (the author, `run_gtk_on`)
+## ACCEPTED WITHOUT AN ORCA PASS (the author, 2026-08-04) — read this before trusting the a11y claims
+
+the author built and ran the app on GNOME (Arch/arch, Ryzen 3600) and reported "gtk looks and feels
+good". He then decided explicitly: **"I don't know how to test Orca accessibility, so let's trust the
+implementation."**
+
+So, stated plainly so nobody later mistakes this for verified:
+
+- **PASSED by human inspection:** H-A5 (no regression), the accent ring / light-dark look from H-A4,
+  and the app building and launching on a real GNOME desktop.
+- **NOT VERIFIED, accepted on the implementation + the gate:** **H-A2** (Orca announcements match
+  FR3, including the `grid_cursor_apply` raw-`extend` judgment call at `main.c:1896`) and the
+  screen-reader half of **H-A4** (every control *named* under Orca). **H-A3** (shortcuts window via
+  `Ctrl+?` / `Ctrl+F1` and the menu) was not separately confirmed either.
+- What *is* machine-verified underneath: the display-free cursor reducer, the announcement and
+  description builders, and the accelerator/name tables are all gate-tested in `lsg_a11y.c` (13/13
+  meson suites). What no gate can check is whether AT-SPI actually surfaces them to a screen reader.
+
+If accessibility is ever claimed publicly, or if a user reports a screen-reader problem, **this is the
+gap to close first** — it needs someone with Orca, not more tests.
+
+One defect was found and fixed during that session: **Shift+wheel did not scroll horizontally**
+(`d8ac6b4`) — the scroll handler never read the modifier, and a mouse wheel reports only a vertical
+delta, so with a plain mouse a wide document could not be panned at all.
+
+## (was) Pending: human GNOME/Orca pass (the author, `run_gtk_on`)
 H-A1 keyboard-only select+copy end to end; H-A2 Orca announcements match FR3 (watch N2); H-A3 shortcuts
 window via Ctrl+? / Ctrl+F1 + menu, complete/correct; H-A4 every control named under Orca + accent ring
 follows live GNOME accent in light/dark; H-A5 no regression. Reassemble/rebuild on GNOME before testing.

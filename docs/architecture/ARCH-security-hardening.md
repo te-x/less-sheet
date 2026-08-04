@@ -59,7 +59,8 @@ change rides on this amendment; `api/lesssheet.h` is byte-identical throughout t
    unreachable without hand-rolling connection/TLS setup — the exact hand-rolling that produced the
    sec_w2b2 finding-1 ReleaseSafe panic on every https open. The inert knob was deleted rather than
    shipped. What bounds a hung host instead: user cancel over cancellable executor tasks — see the
-   re-amended AC-e1, including its one known remaining unbounded route (open ship-blocker).
+   re-amended AC-e1. Its one remaining unbounded route (network gzip) was CLOSED 2026-08-04 by the
+   fetch permit — see AC-e1's own entry; no unbounded route remains.
 2. **(e) `https→http` downgrade — DETECTED AND DISCARDED, not prevented (reviewer's option (a)).**
    std follows the redirect inside `receiveHead` before returning control, so one plaintext request
    — the request line to the redirect target plus our `Range` header; **no credentials, because we
@@ -210,8 +211,8 @@ and departs from the two earlier texts as follows:
 4. *(amended 2026-07-24; re-amended 2026-07-28)* No real-transport deadline fires on its own in v1
    (see AC-e1). A hung or non-responding host is bounded by USER CANCEL over cancellable executor
    tasks: `ls_net_open_release` interrupts a blocked connect/read during open, and `ls_close`
-   cancels the network scan worker's in-flight fetch — with one known unbounded route
-   (`windowSetFiltered`'s Document-mutex-held frontier read) tracked as an open ship-blocker cell.
+   cancels the network scan worker's in-flight fetch. The one known unbounded route
+   (`windowSetFiltered`'s Document-mutex-held frontier read) is CLOSED (2026-08-04, fetch permit).
    A redirect cannot silently downgrade a fetch off TLS and yield document content: the downgrade
    is detected and the response discarded, though one plaintext request is issued before detection
    (AC-e2). Un-fetched bytes are never served as zero-filled document content.
@@ -348,8 +349,8 @@ and departs from the two earlier texts as follows:
    (~30 s) stays **DEFERRED** (no per-read deadline hook). What replaces both: the open job and a
    network document's scan worker are cancellable `io.concurrent` executor tasks, so USER CANCEL
    (`ls_net_open_release` / `ls_close`) interrupts a blocked connect/read — measured on the
-   shipped ReleaseSafe build; one residual unbounded route (`windowSetFiltered`) is an open
-   ship-blocker tracked as its own cell (see AC-e1). Redirect policy: 3-hop cap kept; the
+   shipped ReleaseSafe build; the residual unbounded route (`windowSetFiltered`) is CLOSED
+   (2026-08-04, fetch permit — see AC-e1). Redirect policy: 3-hop cap kept; the
    `https→http` downgrade is **DETECTED AND DISCARDED, not prevented** — std re-sends inside
    `receiveHead` before we can inspect the scheme, so one plaintext request (request line +
    `Range`, no credentials) is issued; the open then fails with `LS_NET_ERROR_INSECURE_REDIRECT`
@@ -402,6 +403,21 @@ one-time campaign). The planner turns these into frozen tests.
 - **AC-c3 [gate]** — The harness + corpus + campaign log are committed as a reproducible dev tool
   (buildable from a documented command). Not gate-blocking (one-time cadence).
 
+**(c) SATISFIED 2026-08-04.** `tools/fuzz/`, one command: `bash tools/fuzz/fuzz.sh [iters]`.
+Campaign: **902,418 runs / 8,081 unique, ReleaseSafe, ZERO crashes / OOMs / hangs**, stopping
+criterion 200,000 iterations per target, log committed under `tools/fuzz/campaign/`. All seven
+AC-c1 hotspots entered and CHECKED (the coverage decoder exits non-zero if any was missed):
+`csv_reader` 559/749, `encoding` 426/475, `source` 325/521, `window` 227/370, `index` 177/316,
+`net_source` 193/364, `search` 118/433. Record: `review/REVIEW-fuzz-campaign.md`.
+
+It found one defect, on its own seed corpus before the campaign ran: **`ls_open` never returned** on
+a UTF-16 stream ending mid code unit over either STREAMING source, reachable from 3 bytes with
+default options — a HANG, which is why no prior gate caught it (nothing times out a synchronous
+C-ABI call), with a silent second face reporting 354,999 rows against a plain file's 355,000. Fixed;
+both reproducers are permanent corpus seeds. Residue recorded in the review: `search` at 27.3% is
+where to point the fuzzer next, and the net arm of that defect is not lockable in-process because
+`openUrlStartFake` runs synchronously.
+
 **(d) gzip-bomb cap — WITHDRAWN (amended 2026-07-24)**
 - **AC-d1 / AC-d2 / AC-d4 — RETIRED.** AC-d3's bench ran and falsified the separation premise (see
   Decision 3); per its own "finalized by bench against real CSV ratios" caveat the mechanism is
@@ -441,12 +457,22 @@ one-time campaign). The planner turns these into frozen tests.
     the peek side (a peek clamp would have traded the hang for silent UTF-16 corruption): a row is
     committed only when `row_end + max_lookahead <= present_extent`, or `row_end` is the source's
     genuine end. Mutex-held re-lex therefore never touches an absent byte.
-  - **STILL UNBOUNDED for network gzip — open, its own cell:** a commit-side bound cannot cover it.
-    `Gzip.produce` calls `ensureCompressed(seek + chunk_bytes)` unconditionally on every inflate op
-    — a fixed read-ahead, not a demand the row needs — so it can require un-fetched chunks however
-    far behind the frontier a mutex-held re-lex sits; `column.zig`'s mutex-held gzip-lane acquire
-    (`waitUncancelable`) is the same family. So **"bounded by user cancel" holds for open, for
-    close-via-the-worker, and for plain net CSV — NOT for network gzip.**
+  - **CLOSED 2026-08-04 (was: STILL UNBOUNDED for network gzip, its own cell).** The defect was as
+    described: `Gzip.produce` called `ensureCompressed(seek + chunk_bytes)` unconditionally on every
+    inflate op — a fixed read-ahead, not a demand the row needs — and that call blocks, so a
+    foreground read could wait on a silent peer however far behind the frontier it sat. Measured
+    before the fix: `ls_window_set` issued 5 ranged GETs 64 rows behind the frontier.
+    A commit-side bound indeed could not cover it; the fix is a **fetch permit** instead
+    (`7fcdd84`, `181fb96`): a thread-local, DEFAULT DENY, held only by the three designated fetcher
+    bodies (`index.workerMain`, `net.runFake`, `net.realWorker`), with `presentCompressed` as the
+    non-fetching twin of `ensureCompressed` for everyone else. A permit-less read parks resumably
+    rather than touching the transport. Locked by frozen `netgz1` (foreground reads) and `netgz2`
+    (the `windowSetFiltered` path this document named as the ship-blocker), both asserting on a
+    fetch-attempt tally; reviewer-PASS, record `review/REVIEW-netgz-mutex-wedge.md`.
+    So **"bounded by user cancel" now holds for open, for close-via-the-worker, for plain net CSV
+    AND for network gzip.** `column.zig`'s mutex-held gzip-lane acquire (`waitUncancelable`) remains
+    a latent lane-starvation hazard rather than a drivable wedge: it acquires with the mutex held, so
+    a network-stalled lane holder is always the mutex holder — which is the route just closed.
   The timeout **taxonomy** (`LS_NET_ERROR_TIMEOUT`) remains contractual and hermetically tested
   via the fake (`NetFault.timeout`); only real-transport enforcement is out of scope for v1. No
   frozen test may assert a real-transport deadline, connect or idle-read; the cancel bounds above
