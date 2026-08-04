@@ -225,6 +225,16 @@ fn storeToStructural(
 /// many SOURCE bytes this call may look at (<= content.len); `capped` in the
 /// result mirrors `recordBounds`: record 1's O(head) bound (requirement 9)
 /// passes a real limit, every other caller passes content.len (unbounded).
+///
+/// `CellRef.truncated` is true iff the field's full transcoded content is
+/// longer than the bytes stored for it: `cap` cut it, or `limit` is an
+/// ARTIFICIAL bound (`limit != content.len` — a caller's head/row scan budget)
+/// reached before the field could be fully decoded. Reaching the TRUE end of
+/// the content (`limit == content.len`) with no more separators is simply a
+/// final record with no terminator: nothing is missing, so the cell is
+/// complete and UNTRUNCATED. Same rule as `lexSelected`, `recordBounds`'s
+/// `capped = limit != content.len`, `csv_reader.decodeColumn`'s `artificial`,
+/// and the streaming lane's `Cursor.atLimit`.
 pub fn lexInto(
     content: []const u8,
     pos: usize,
@@ -240,6 +250,7 @@ pub fn lexInto(
 ) !Bounds {
     var i = pos;
     const cl = content.len;
+    const artificial = limit != cl; // one derivation, both verdicts below
     var produced: u32 = 0;
     while (true) {
         const store = want == null or produced < want.?;
@@ -262,7 +273,7 @@ pub fn lexInto(
             i = sr.pos;
         }
 
-        const was_truncated = truncated or hit_limit;
+        const was_truncated = truncated or (hit_limit and artificial);
         if (store) {
             // UTF-8 pass-through stores raw bytes one at a time (the hot,
             // zero-lookahead path -- see decodeUtf8PassthroughUnit), so a cut
@@ -277,7 +288,7 @@ pub fn lexInto(
 
         if (hit_limit) {
             if (want) |w| while (produced < w) : (produced += 1) try refs.append(gpa, .{ .start = 0, .len = 0 });
-            return .{ .next = limit, .capped = limit != cl };
+            return .{ .next = limit, .capped = artificial };
         }
 
         const u = enc.decodeUnit(content, i, limit, encoding).?; // present: hit_limit was false
@@ -313,6 +324,7 @@ pub fn lexSelected(
     gpa: std.mem.Allocator,
 ) !Bounds {
     var i = pos;
+    const artificial = limit != content.len; // one derivation, as in lexInto
     var produced: u32 = 0;
     var selected_index: usize = 0;
     while (true) {
@@ -336,7 +348,7 @@ pub fn lexSelected(
             i = sr.pos;
         }
 
-        const was_truncated = truncated or (hit_limit and limit != content.len);
+        const was_truncated = truncated or (hit_limit and artificial);
         if (store) {
             if (was_truncated and encoding == api.encoding_utf8)
                 buf.shrinkRetainingCapacity(start + enc.utf8TrimToBoundary(buf.items[start..]));
@@ -346,10 +358,9 @@ pub fn lexSelected(
         produced += 1;
 
         if (hit_limit) {
-            const capped = limit != content.len;
             while (selected_index < selected.len) : (selected_index += 1)
-                try refs.append(gpa, .{ .start = 0, .len = 0, .truncated = capped });
-            return .{ .next = limit, .capped = capped };
+                try refs.append(gpa, .{ .start = 0, .len = 0, .truncated = artificial });
+            return .{ .next = limit, .capped = artificial };
         }
 
         const u = enc.decodeUnit(content, i, limit, encoding).?;

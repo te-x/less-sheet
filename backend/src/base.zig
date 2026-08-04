@@ -51,7 +51,10 @@ pub const net_head_budget: u64 = 256 * 1024;
 
 /// A decoded cell: byte range into an owning buffer (window or header).
 /// `truncated` is set when LS_CELL_MAX_BYTES cut the cell's stored bytes, or
-/// when a bounded record-1 decode stopped mid-field (see `lexInto`).
+/// when a decode bounded by an ARTIFICIAL limit (the record-1 head budget, a
+/// per-row window scan budget) stopped mid-field. Running out of bytes at the
+/// content's TRUE end is not a truncation — a final record with no terminator
+/// is complete (see `lexInto`).
 pub const CellRef = struct { start: usize, len: usize, truncated: bool = false };
 
 /// A sparse row-index entry: data row `row` begins at (opaque) position `pos`.
