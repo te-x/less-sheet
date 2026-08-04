@@ -25,6 +25,13 @@ DEPENDENCY_PATHS=( "meson.build" ".ci/Dockerfile" ".clang-format" )
 # docker/podman is on PATH. `--security-opt label=disable` keeps the bind-mount
 # readable under the podman-machine VM's SELinux. `set -e` is wrapped in a
 # subshell so the gate's own shell is unaffected.
+# CORE BUILD MODE: ReleaseSafe, not ReleaseFast. Wave (a) of the signed security
+# hardening ARCH makes ReleaseSafe the SHIPPED mode -- the backend gate certifies it
+# and a frozen mode-guard test asserts it -- because this app ingests untrusted files
+# and URLs, and the runtime checks are what turn a memory-safety bug into a clean
+# abort instead of an exploitable one. The macOS bundle was flipped in 376abb9; this
+# is the GTK half of the same ARCH item. Measured cost: ~19% index, ~10-19% search,
+# accepted when that wave was signed; cold-start is far under budget and unaffected.
 CONFORMANCE_CMD='( set -e
   CTR="$(command -v docker || command -v podman)"
   case "$(uname -m)" in
@@ -33,7 +40,7 @@ CONFORMANCE_CMD='( set -e
     *) echo "GATE: unsupported host arch $(uname -m)" >&2; exit 1 ;;
   esac
   CORE_OUT="$PWD/.core-linux"; REPO="$(cd ../.. && pwd)"; IMG=less-sheet-gtk-ci:fedora43
-  ( cd ../../backend && zig build -Dtarget="$ZT" -Doptimize=ReleaseFast -p "$CORE_OUT" )
+  ( cd ../../backend && zig build -Dtarget="$ZT" -Doptimize=ReleaseSafe -p "$CORE_OUT" )
   "$CTR" image inspect "$IMG" >/dev/null 2>&1 || "$CTR" build --platform "$PLAT" -t "$IMG" -f .ci/Dockerfile .ci
   "$CTR" run --rm --platform "$PLAT" --security-opt label=disable -v "$REPO":/src -w /src/apps/gtk "$IMG" \
     sh -c "rm -rf build && meson setup build && meson compile -C build" )'
