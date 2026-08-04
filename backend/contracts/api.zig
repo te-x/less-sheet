@@ -48,6 +48,21 @@
 //!     FILTERED VIEWS.
 //!   - The core may own background threads (std.Thread); tests pin
 //!     observable behavior, never scheduling.
+//!   - SOURCE-FAULT GUARD (ARCH-security-hardening (g), Decision 5). Because a
+//!     local file can shrink under our mmap, the core may install exactly ONE
+//!     process-wide signal handler -- SIGBUS -- and it must be REGION-SCOPED (it
+//!     recovers only for faults inside its own mappings), CHAINED (any other
+//!     SIGBUS reaches the handler installed before ours, so the host process's
+//!     crash handling survives) and IDEMPOTENT. SIGSEGV/SIGILL/SIGFPE stay with
+//!     the host; SIGIO/SIGPIPE stay with the network executor (src/net_source.zig
+//!     never deinitializes its Io for exactly that reason) -- opening a LOCAL
+//!     document must change no disposition but SIGBUS. A faulted source is
+//!     reported through the EXISTING terminal vocabulary (correct-rows-so-far,
+//!     complete, exact -- the damaged-gz shape) and, at open, the existing
+//!     `.io` status: there is NO new C-ABI error code and api/lesssheet.h stays
+//!     byte-identical. The recovery MECHANISM is implementer-owned. Frozen by
+//!     the sigbus_* tests, whose banner records the measured platform split
+//!     (macOS does not fault on truncate; Linux does).
 
 const std = @import("std");
 const core = @import("core");

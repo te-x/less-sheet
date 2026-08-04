@@ -147,6 +147,769 @@ test "toolchain baseline" {
     try std.testing.expect(true);
 }
 
+// ===========================================================================
+// SOURCE-FAULT GUARD — SIGBUS / mmap-TOCTOU (ARCH-security-hardening (g):
+// AC-g1, AC-g2, Decision 5 "core-installed scoped, chained sigaction").
+//
+// DECLARED FIRST, BY NECESSITY: `sigbus_g2` below must run before the suite's
+// first `ls_open`. Installing the guard once per process is a perfectly good
+// reading of "installation is idempotent", and such an installer can only be
+// OBSERVED installing while the test's sentinel handler is underneath it — once
+// its handler is up, a sentinel installed later merely overwrites it. The test
+// checks that position mechanically and says so, rather than reporting a
+// phantom missing guard, but it has to be declared here to hold.
+// ---------------------------------------------------------------------------
+// The core mmaps local files, so the bytes under a mapping can vanish: another
+// process truncates the file, a network mount drops, a USB drive is pulled. The
+// core must catch the resulting SIGBUS INSIDE ITS OWN regions, recover, and
+// report a clean truncated/faulted outcome; a SIGBUS anywhere else must reach
+// whatever handler was installed BEFORE ours, because this core ships INTO a
+// host process (the Swift app, the GTK app, this test binary) that owns its own
+// crash handling.
+//
+// WHAT THE PLATFORMS ACTUALLY DO — MEASURED, because the criterion's driving
+// condition is not portable (C probe, 4 shrink methods x pre-touched/cold x
+// with/without madvise(DONTNEED), 2026-08-04):
+//
+//   shrink under a live read-only MAP_PRIVATE mapping
+//     macOS 26 / APFS / aarch64 : NO FAULT, on all 16 arms. ftruncate,
+//       truncate, open(O_TRUNC) and unlink+recreate all leave the mapping
+//       serving the ORIGINAL bytes, whether the pages were faulted in first or
+//       stone cold, with or without an intervening madvise(DONTNEED).
+//     Linux / aarch64 : SIGBUS on all 12 truncate arms (unlink+recreate does
+//       not fault there either — the inode outlives the name).
+//   mmap LONGER than the file (what root.zig:110-118's fstat->mmap window
+//   yields if the file shrinks inside it)
+//     BOTH platforms: SIGBUS, deterministically.
+//
+// So on the GATE HOST (macOS) AC-g1's fault is NOT REACHABLE: a truncated local
+// document keeps serving the snapshot it opened. The two g1 tests are therefore
+// one body with two regimes — on macOS they lock the no-crash / no-garbage /
+// no-hang / snapshot-or-clean-terminal behaviour (green today: a guard against
+// a "fix" that starts aborting, wedging, or serving zero-filled pages), and on
+// LINUX — which this backend ships to (aarch64/x86_64-linux-musl, the GTK
+// frontend) and which the gate only cross-COMPILES — they are the RED lock:
+// today the child dies there. Run them the way ARCH-backend-linux-portability's
+// H1-H3 were run: the same `zig build test` on the ARM board / arch box, or the
+// cross-built test binary inside a Linux container.
+//
+// THE FATAL ARM NEVER TAKES THE SUITE DOWN. Every arm that can fault runs in a
+// FORKED CHILD and the parent turns the child's death into a value —
+// exited(code) / signalled(sig) / timed_out — and asserts on that. A SIGBUS is
+// a FAILING test with a diagnostic naming the stage it died at, never a lost
+// suite. `timed_out` is a first-class outcome, not a nicety: a handler that
+// simply returns re-executes the faulting instruction forever (an infinite
+// fault loop), and a recovery that longjmps out of a mutex-held read deadlocks
+// the next `ls_close` — both must FAIL, not hang the gate.
+//
+// NO NEW ABI. api/lesssheet.h stays byte-identical (its SHA-256 is pinned by
+// the macOS AC23 guard, which catches any byte): the "source truncated/faulted"
+// outcome is reported through the vocabulary the gz truncation path already
+// uses — correct-rows-so-far + terminal + exact (flate_b1 / flate_b2b) — and an
+// at-open failure through the existing LS_ERROR_IO.
+//
+// NOT LOCKED, stated rather than implied: (i) the at-OPEN race itself
+// (root.zig's fstat->mmap window) — winning a nanosecond window from another
+// process is not schedulable, so there is no deterministic driver; (ii) a real
+// unmount / media-removal fault; (iii) the recovery MECHANISM (sigsetjmp +
+// siglongjmp, MAP_FIXED repair, anything else) is deliberately unpinned. Every
+// assertion below is on an outcome.
+// ===========================================================================
+
+const posix = std.posix;
+
+/// libc entry points std 0.16 does not wrap. The tests module links libc.
+extern "c" fn fork() c_int;
+extern "c" fn _exit(code: c_int) noreturn;
+
+/// Exit code a fault-guard child uses for "I completed every stage" ...
+const fg_ok: u8 = 0;
+/// ... and for "I could not even set up" (a broken fixture, never a verdict).
+const fg_setup_failed: u8 = 90;
+
+/// How a forked child ENDED — the value the fatal arm is converted into.
+const ChildEnd = union(enum) {
+    exited: u8,
+    signalled: u32,
+    /// Never terminated within the budget (and was killed): an infinite fault
+    /// loop, or a deadlock on the post-fault path.
+    timed_out: void,
+};
+
+fn classifyChild(status: c_int) ChildEnd {
+    const s: u32 = @bitCast(status);
+    if (std.c.W.IFEXITED(s)) return .{ .exited = std.c.W.EXITSTATUS(s) };
+    if (std.c.W.IFSIGNALED(s)) return .{ .signalled = @intFromEnum(std.c.W.TERMSIG(s)) };
+    return .timed_out;
+}
+
+fn waitChild(pid: c_int, budget_ms: i64) ChildEnd {
+    const io = std.testing.io;
+    const t0: std.Io.Clock.Timestamp = .now(io, .awake);
+    while (elapsedMs(t0) < budget_ms) {
+        var status: c_int = 0;
+        if (std.c.waitpid(pid, &status, std.c.W.NOHANG) == pid) return classifyChild(status);
+        io.sleep(.fromMilliseconds(2), .awake) catch {};
+    }
+    posix.kill(pid, .KILL) catch {};
+    var status: c_int = 0;
+    _ = std.c.waitpid(pid, &status, 0);
+    return .timed_out;
+}
+
+/// What a post-event read handed back. `other` is the one forbidden answer:
+/// bytes that are neither the opened snapshot nor nothing at all — the silent-
+/// wrong-data failure a zero-fill "repair" produces.
+const FaultServed = enum(u32) { nothing = 0, snapshot = 1, empty = 2, other = 3 };
+
+/// The child's report plus the two handshake flags, in a MAP_SHARED anonymous
+/// page so the parent can read it after the child is gone: a child that dies
+/// mid-read still leaves behind the stage it died at.
+const FaultReport = extern struct {
+    /// child -> parent: the document is open and warm.
+    ready: u32 = 0,
+    /// parent -> child: the file has been truncated.
+    go: u32 = 0,
+    /// Last stage ENTERED (`fg_stage_names`), so a death names its own site.
+    stage: u32 = 0,
+    rows_before: u64 = 0,
+    rows_after: u64 = 0,
+    exact_before: u32 = 0,
+    exact_after: u32 = 0,
+    complete_after: u32 = 0,
+    /// `FaultServed` for the post-event read, and for the identical retry.
+    served: u32 = 0,
+    served_retry: u32 = 0,
+    window_rows: u64 = 0,
+    /// Set when the two identical post-event window calls disagreed.
+    window_unstable: u32 = 0,
+    landed: u64 = 0,
+    jump_done: u32 = 0,
+    closed: u32 = 0,
+    /// Dispositions of the signals the core must NOT touch, around the open.
+    other_before: [5]u64 = @splat(0),
+    other_after: [5]u64 = @splat(0),
+};
+
+const fg_stage_names = [_][]const u8{
+    "fork",
+    "open",
+    "warm read (pre-event)",
+    "handshake",
+    "post-event read",
+    "post-event read, identical retry",
+    "poll (row count / index)",
+    "ls_close",
+    "done",
+};
+
+fn stageName(stage: u32) []const u8 {
+    return if (stage < fg_stage_names.len) fg_stage_names[stage] else "?";
+}
+
+/// One MAP_SHARED anonymous page shared with a child.
+const Shared = struct {
+    map: []align(std.heap.page_size_min) u8,
+    r: *FaultReport,
+
+    fn init() !Shared {
+        const m = try posix.mmap(
+            null,
+            std.heap.pageSize(),
+            .{ .READ = true, .WRITE = true },
+            .{ .TYPE = .SHARED, .ANONYMOUS = true },
+            -1,
+            0,
+        );
+        const r: *FaultReport = @ptrCast(m.ptr);
+        r.* = .{};
+        return .{ .map = m, .r = r };
+    }
+
+    fn deinit(self: Shared) void {
+        posix.munmap(self.map);
+    }
+};
+
+fn fgPost(flag: *u32) void {
+    @atomicStore(u32, flag, 1, .release);
+}
+
+/// Wait for a handshake flag. Bounded — a wedged peer must fail, not hang. In
+/// the child this cannot use `std.testing.io`: that executor's worker threads do
+/// not exist after `fork`, so it sleeps on the inline blocking global `Io` (the
+/// same one the core itself uses, src/sysio.zig).
+fn fgAwait(flag: *u32, budget_ms: u64) bool {
+    var slept: u64 = 0;
+    while (slept < budget_ms) : (slept += 1) {
+        if (@atomicLoad(u32, flag, .acquire) != 0) return true;
+        std.Io.Threaded.global_single_threaded.io().sleep(.fromMilliseconds(1), .awake) catch {};
+    }
+    return @atomicLoad(u32, flag, .acquire) != 0;
+}
+
+/// A child that is EXPECTED to die must not spray std's segfault-handler stack
+/// trace over a green gate's log. It deliberately does NOT touch SIGBUS: doing
+/// so would uninstall the very guard under test (and a once-per-process
+/// installer would never re-arm it).
+fn childSilenceStderr() void {
+    const devnull = posix.openatZ(posix.AT.FDCWD, "/dev/null", .{ .ACCMODE = .WRONLY }, 0) catch return;
+    _ = std.c.dup2(devnull, 2);
+}
+
+// --- signal-disposition read-back -------------------------------------------
+
+fn actionOf(sig: posix.SIG) posix.Sigaction {
+    var cur: posix.Sigaction = undefined;
+    posix.sigaction(sig, null, &cur);
+    return cur;
+}
+
+fn handlerAddr(a: posix.Sigaction) usize {
+    return @intFromPtr(a.handler.handler);
+}
+
+fn dispositionOf(sig: posix.SIG) usize {
+    return handlerAddr(actionOf(sig));
+}
+
+/// The signals the core must leave ALONE. SEGV/ILL/FPE belong to the host's
+/// crash reporting; IO/PIPE are already owned — deliberately and permanently —
+/// by the network executor (`std.Io.Threaded.init` installs no-op SIGIO/SIGPIPE
+/// handlers and net_source.zig never deinitializes it, src/net_source.zig:100).
+/// ONE SIGNAL POLICY: opening a LOCAL document changes the disposition of
+/// exactly one signal, SIGBUS, and of nothing else.
+const fg_untouchable = [_]posix.SIG{ .SEGV, .ILL, .FPE, .IO, .PIPE };
+
+fn snapshotUntouchable(out: *[5]u64) void {
+    for (fg_untouchable, 0..) |sig, i| out[i] = dispositionOf(sig);
+}
+
+// ---------------------------------------------------------------------------
+// AC-g2 — installation, the ONE-SIGNAL policy, chaining, idempotence. This is
+// the whole gate-host-observable half of (g), and it is the RED lock: the
+// guard is process-global state, so `sigaction` read-back is direct,
+// mechanism-independent evidence that it exists, and `raise(.BUS)` — a SIGBUS
+// whose address is outside every mapping, let alone every core region — is the
+// non-fatal way to prove it CHAINS rather than swallows. Measured: with a
+// handler installed, `raise` returns and the process lives, so no arm here can
+// crash the suite.
+// ---------------------------------------------------------------------------
+
+var fg_sentinel_hits: std.atomic.Value(u32) = .init(0);
+/// Set only around this test's own `raise` calls. Outside them, a SIGBUS
+/// reaching the sentinel is a GENUINE fault: hand the process back to the
+/// runtime's own handler (restore, then return so the faulting instruction
+/// re-executes and dies properly) so this test can never turn a later crash
+/// into a silent infinite fault loop.
+var fg_expect_raise: std.atomic.Value(bool) = .init(false);
+var fg_runtime_bus: posix.Sigaction = undefined;
+
+fn fgSentinel(_: posix.SIG, _: *const posix.siginfo_t, _: ?*anyopaque) callconv(.c) void {
+    _ = fg_sentinel_hits.fetchAdd(1, .monotonic);
+    if (!fg_expect_raise.load(.monotonic)) posix.sigaction(.BUS, &fg_runtime_bus, null);
+}
+
+fn fgRaiseBus() !void {
+    fg_expect_raise.store(true, .monotonic);
+    defer fg_expect_raise.store(false, .monotonic);
+    try posix.raise(.BUS);
+}
+
+test "sigbus_g2: a local open installs the core's OWN chained SIGBUS handler, touches no other signal, and is idempotent (AC-g2)" {
+    // The runtime's own disposition, obtained by asking std to (re)install the
+    // handler it already installed at startup — `default_enable_segfault_handler
+    // = runtime_safety`, so every ReleaseSafe Zig binary has one. That address is
+    // what "nobody has taken SIGBUS yet" looks like, and it is the safe restore
+    // target the sentinel falls back to.
+    std.debug.attachSegfaultHandler();
+    fg_runtime_bus = actionOf(.BUS);
+    const runtime_addr = handlerAddr(fg_runtime_bus);
+
+    // Deliberately NOT restored at the end: with a once-per-process installer,
+    // putting the runtime handler back would leave every later document — and
+    // every later g1 arm — running unguarded, with no way for the core to
+    // re-arm. The sentinel's non-raise path keeps that safe.
+    const at_entry = dispositionOf(.BUS);
+    {
+        errdefer std.debug.print(
+            "\n[g2] SIGBUS was already owned by {x} (the runtime's handler is {x}) on entry.\n" ++
+                "     This test MUST be declared before the suite's first ls_open: a\n" ++
+                "     once-per-process installer cannot be observed installing once its\n" ++
+                "     handler is already up.\n",
+            .{ at_entry, runtime_addr },
+        );
+        try std.testing.expectEqual(runtime_addr, at_entry);
+    }
+
+    // The sentinel takes SIGBUS FIRST, so it is what the core has to chain to.
+    const sentinel: posix.Sigaction = .{
+        .handler = .{ .sigaction = fgSentinel },
+        .mask = posix.sigemptyset(),
+        .flags = posix.SA.SIGINFO,
+    };
+    posix.sigaction(.BUS, &sentinel, null);
+    const sentinel_addr = dispositionOf(.BUS);
+    try std.testing.expect(sentinel_addr != runtime_addr); // the sentinel really took it
+
+    var untouchable_before: [5]u64 = @splat(0);
+    snapshotUntouchable(&untouchable_before);
+
+    // (1) INSTALLED. A local document is mmap'd and its head is read during
+    //     open, so by the time open returns the guard must be up.
+    var first = try openWith("a,b\n1,2\n3,4\n", manual);
+    var first_live = true;
+    errdefer if (first_live) first.deinit();
+    const after_open = dispositionOf(.BUS);
+    {
+        errdefer std.debug.print(
+            "\n[g2] after a local ls_open the SIGBUS disposition is {x}; expected the CORE's OWN\n" ++
+                "     handler — not the test's sentinel ({x}), not the runtime's ({x}), not DFL/IGN.\n" ++
+                "     ARCH-security-hardening Decision 5: the core installs a scoped, chained\n" ++
+                "     handler at its mmap access sites.\n",
+            .{ after_open, sentinel_addr, runtime_addr },
+        );
+        try std.testing.expect(after_open != sentinel_addr);
+        try std.testing.expect(after_open != runtime_addr);
+        try std.testing.expect(after_open != @intFromPtr(posix.SIG.DFL));
+        try std.testing.expect(after_open != @intFromPtr(posix.SIG.IGN));
+    }
+
+    // (2) ONE-SIGNAL POLICY. Exactly one disposition moved: SEGV/ILL/FPE stay
+    //     with the host's crash reporting, IO/PIPE with the net executor.
+    var untouchable_after: [5]u64 = @splat(0);
+    snapshotUntouchable(&untouchable_after);
+    for (fg_untouchable, 0..) |sig, i| {
+        errdefer std.debug.print(
+            "\n[g2] opening a LOCAL document changed the disposition of {t}: {x} -> {x}.\n" ++
+                "     The core may own SIGBUS and nothing else (one-signal policy).\n",
+            .{ sig, untouchable_before[i], untouchable_after[i] },
+        );
+        try std.testing.expectEqual(untouchable_before[i], untouchable_after[i]);
+    }
+
+    // (3) CHAINED. A SIGBUS from outside every core region reaches the handler
+    //     installed before ours, and the guard survives having chained.
+    fg_sentinel_hits.store(0, .monotonic);
+    try fgRaiseBus();
+    {
+        errdefer std.debug.print(
+            "\n[g2] a SIGBUS raised outside every core mmap region did not reach the previously\n" ++
+                "     installed handler (hits={d}): the core swallowed it. The host frontends' own\n" ++
+                "     crash handling has to survive us (AC-g2, AC-g3).\n",
+            .{fg_sentinel_hits.load(.monotonic)},
+        );
+        try std.testing.expectEqual(@as(u32, 1), fg_sentinel_hits.load(.monotonic));
+    }
+    {
+        errdefer std.debug.print(
+            "\n[g2] the guard disarmed itself after chaining one foreign SIGBUS ({x} -> {x}):\n" ++
+                "     every later document would run unprotected.\n",
+            .{ after_open, dispositionOf(.BUS) },
+        );
+        try std.testing.expectEqual(after_open, dispositionOf(.BUS));
+    }
+
+    // (4) IDEMPOTENT. A second document neither re-layers the handler nor makes
+    //     the chain point at ourselves (which would loop forever).
+    var second = try openWith("x,y\n7,8\n", manual);
+    var second_live = true;
+    errdefer if (second_live) second.deinit();
+    {
+        errdefer std.debug.print(
+            "\n[g2] a second local open changed the SIGBUS disposition ({x} -> {x}):\n" ++
+                "     installation must be idempotent (AC-g2).\n",
+            .{ after_open, dispositionOf(.BUS) },
+        );
+        try std.testing.expectEqual(after_open, dispositionOf(.BUS));
+    }
+    try fgRaiseBus();
+    try std.testing.expectEqual(@as(u32, 2), fg_sentinel_hits.load(.monotonic));
+
+    // (5) The chain outlives the documents. Whether the core keeps its handler
+    //     or restores the previous one on the last close is its own choice —
+    //     what may never happen is a foreign SIGBUS getting lost.
+    second_live = false;
+    second.deinit();
+    first_live = false;
+    first.deinit();
+    try fgRaiseBus();
+    {
+        errdefer std.debug.print(
+            "\n[g2] after every document was closed a foreign SIGBUS no longer reaches the\n" ++
+                "     previously installed handler (hits={d}, disposition {x}).\n",
+            .{ fg_sentinel_hits.load(.monotonic), dispositionOf(.BUS) },
+        );
+        try std.testing.expectEqual(@as(u32, 3), fg_sentinel_hits.load(.monotonic));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AC-g2, the other direction — REGION SCOPE. A guard that recovered from every
+// SIGBUS instead of only its own regions would satisfy every assertion above
+// while making the host's own crashes disappear (or spin forever). So with a
+// core document open, a GENUINE fault at an address the core does not own must
+// still be fatal. Deterministic on both platforms (a mapping longer than its
+// file faults — measured), fork-confined, and it doubles as proof that this
+// harness can see a real fault at all.
+// ---------------------------------------------------------------------------
+
+/// Map `len` bytes of a much shorter file and read the last byte: a genuine
+/// SIGBUS at an address inside a mapping the CORE does not own.
+fn fgFaultOnForeignMapping(path: [:0]const u8, len: usize) void {
+    const fd = posix.openatZ(posix.AT.FDCWD, path.ptr, .{ .ACCMODE = .RDONLY }, 0) catch _exit(fg_setup_failed);
+    const m = posix.mmap(null, len, .{ .READ = true }, .{ .TYPE = .PRIVATE }, fd, 0) catch _exit(fg_setup_failed);
+    const b = m[m.len - 1]; // faults unless something swallows it
+    if (b == 0xff) _exit(fg_setup_failed); // (defeats dead-code elimination)
+}
+
+test "sigbus_g2_scope: with the guard installed, a genuine SIGBUS OUTSIDE every core region stays fatal (GUARD)" {
+    var tiny = try makeFixture("a\n", 0o644);
+    defer tiny.deinit();
+    var doc_fx = try makeFixture("id,v\n1,2\n", 0o644);
+    defer doc_fx.deinit();
+
+    const pid = fork();
+    try std.testing.expect(pid >= 0);
+    if (pid == 0) {
+        childSilenceStderr();
+        var doc: ?*api.Doc = null;
+        if (api.openWithAllocator(std.heap.page_allocator, doc_fx.path.ptr, &manual, &doc) != .ok) _exit(fg_setup_failed);
+        _ = api.ls_window_set(doc.?, 0, 4); // the guard's own regions are live and warm
+        fgFaultOnForeignMapping(tiny.path, 4 * 1024 * 1024);
+        _exit(fg_ok); // reached only if the fault was SWALLOWED
+    }
+    switch (waitChild(pid, 20_000)) {
+        .signalled => {},
+        .exited => |code| {
+            std.debug.print(
+                "\n[g2/scope] a genuine SIGBUS at an address the core does NOT own did not kill the\n" ++
+                    "           child (exit {d}): the guard is not region-scoped — it swallows faults\n" ++
+                    "           that belong to the host process (AC-g2).\n",
+                .{code},
+            );
+            return error.ForeignFaultSwallowed;
+        },
+        .timed_out => {
+            std.debug.print(
+                "\n[g2/scope] the child never terminated: chaining a foreign SIGBUS re-executed the\n" ++
+                    "           faulting instruction forever (an infinite fault loop).\n",
+                .{},
+            );
+            return error.ForeignFaultLooped;
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AC-g1 — a local file truncated under the open mapping. Two drivers, because
+// the fault lands on two different threads and only one of them is the caller's:
+//   * FOREGROUND — a behind-frontier `ls_window_set` re-lexes a row whose bytes
+//     are now past EOF (this is the UI thread).
+//   * SCAN — a deep jump-scan marches the frontier into the truncated tail on
+//     the core's own worker thread (a per-thread recovery site).
+// Split into two tests so the two sites fail, and pass, independently (the
+// drift1/drift2 lesson).
+//
+// The fixture is bigger than LS_OPEN_HEAD_MAX_BYTES so its tail is genuinely
+// unread at open, and the truncation keeps a whole number of `genFixedRows`
+// records, so exactly which rows survive is known rather than assumed.
+// ---------------------------------------------------------------------------
+
+const fg_record_bytes: u64 = 18; // genFixedRows: "{i:0>8},{2i:0>8}\n"
+const fg_rows: usize = 400_000; // 7.2 MB — well past the 4 MiB open head
+const fg_survivors: u64 = 3_640; // rows still backed after the truncation
+const fg_keep_bytes: u64 = fg_survivors * fg_record_bytes; // 65_520
+const fg_probe_row: u64 = 100_000; // indexed at open (byte 1.8 MB), gone after
+const fg_jump_row: u64 = fg_rows - 2;
+
+const fg_opts: api.OpenOptions = .{
+    .separator = ',',
+    .quote = api.quote_none,
+    .header = api.header_off,
+    .index_mode = api.index_manual,
+};
+
+const FaultDriver = enum { foreground_window, scan_jump };
+
+/// Classify a served cell against the row's KNOWN text.
+fn fgClassify(got: []const u8, row: u64) FaultServed {
+    if (got.len == 0) return .empty;
+    var buf: [8]u8 = undefined;
+    if (std.mem.eql(u8, got, fixedCell(&buf, @intCast(row)))) return .snapshot;
+    return .other;
+}
+
+fn fgChild(path: [:0]const u8, r: *FaultReport, driver: FaultDriver) noreturn {
+    childSilenceStderr();
+    r.stage = 1;
+    snapshotUntouchable(&r.other_before);
+    var doc: ?*api.Doc = null;
+    if (api.openWithAllocator(std.heap.page_allocator, path.ptr, &fg_opts, &doc) != .ok) _exit(fg_setup_failed);
+    const d = doc orelse _exit(fg_setup_failed);
+    snapshotUntouchable(&r.other_after);
+    const rc0 = api.ls_row_count_get(d);
+    r.rows_before = rc0.count;
+    r.exact_before = @intFromBool(rc0.exact);
+
+    // Warm a DIFFERENT window than the one probed after the event, so the
+    // post-event read cannot be served out of a cached window.
+    r.stage = 2;
+    _ = api.ls_window_set(d, 0, 8);
+    if (api.ls_cell(d, 0, 0).len == 0) _exit(fg_setup_failed);
+
+    r.stage = 3;
+    fgPost(&r.ready);
+    if (!fgAwait(&r.go, 20_000)) _exit(fg_setup_failed);
+
+    // From here the bytes behind every row >= fg_survivors no longer exist.
+    r.stage = 4;
+    switch (driver) {
+        .foreground_window => {
+            const w = api.ls_window_set(d, fg_probe_row, 8);
+            r.window_rows = w.row_count;
+            r.served = @intFromEnum(fgClassify(api.ls_cell(d, fg_probe_row, 0).slice(), fg_probe_row));
+            r.stage = 5;
+            const w2 = api.ls_window_set(d, fg_probe_row, 8);
+            r.served_retry = @intFromEnum(fgClassify(api.ls_cell(d, fg_probe_row, 0).slice(), fg_probe_row));
+            r.window_unstable = @intFromBool(w2.row_count != w.row_count);
+        },
+        .scan_jump => {
+            api.ls_jump_start(d, fg_jump_row);
+            var spins: u64 = 0;
+            while (spins < 20_000) : (spins += 1) {
+                if (api.ls_jump_poll(d).state == .done) break;
+                std.Io.Threaded.global_single_threaded.io().sleep(.fromMilliseconds(1), .awake) catch {};
+            }
+            const js = api.ls_jump_poll(d);
+            r.jump_done = @intFromBool(js.state == .done);
+            // landed_row is only defined once the jump is done; probe row 0
+            // otherwise, so a stuck scan is reported by `jump_done`, not by a
+            // phantom garbage verdict.
+            const row = if (js.state == .done) js.landed_row else 0;
+            r.landed = row;
+            _ = api.ls_window_set(d, row, 4);
+            r.served = @intFromEnum(fgClassify(api.ls_cell(d, row, 0).slice(), row));
+            r.stage = 5;
+            _ = api.ls_window_set(d, row, 4);
+            r.served_retry = @intFromEnum(fgClassify(api.ls_cell(d, row, 0).slice(), row));
+        },
+    }
+
+    r.stage = 6;
+    const rc1 = api.ls_row_count_get(d);
+    r.rows_after = rc1.count;
+    r.exact_after = @intFromBool(rc1.exact);
+    r.complete_after = @intFromBool(api.ls_index_poll(d).complete);
+
+    r.stage = 7;
+    api.ls_close(d); // must RETURN: a recovery that longjmps out of a held lock wedges here
+    r.closed = 1;
+    r.stage = 8;
+    _exit(fg_ok);
+}
+
+/// One AC-g1 arm: open in a child, truncate from the PARENT — a genuinely
+/// different process from the one holding the mapping — then assert the outcome.
+fn fgTruncationArm(driver: FaultDriver) !void {
+    const gpa = std.testing.allocator;
+    const bytes = try genFixedRows(gpa, fg_rows);
+    defer gpa.free(bytes);
+    try std.testing.expectEqual(fg_rows * fg_record_bytes, bytes.len); // fixture geometry
+    var fx = try makeFixture(bytes, 0o644);
+    defer fx.deinit();
+    const sh = try Shared.init();
+    defer sh.deinit();
+    const r = sh.r;
+
+    const pid = fork();
+    try std.testing.expect(pid >= 0);
+    if (pid == 0) fgChild(fx.path, r, driver);
+
+    if (!fgAwait(&r.ready, 20_000)) {
+        posix.kill(pid, .KILL) catch {};
+        _ = waitChild(pid, 2_000);
+        return error.FaultChildNeverOpened;
+    }
+    {
+        const f = try fx.tmp.dir.openFile(std.testing.io, "fixture.csv", .{ .mode = .write_only });
+        defer f.close(std.testing.io);
+        try f.setLength(std.testing.io, fg_keep_bytes);
+    }
+    fgPost(&r.go);
+
+    const end = waitChild(pid, 30_000);
+    errdefer std.debug.print(
+        "\n[g1/{t}] rows {d}(exact={d}) -> {d}(exact={d}) complete={d} served={d} retry={d}\n" ++
+            "         window_rows={d} unstable={d} landed={d} jump_done={d} closed={d}\n" ++
+            "         last stage entered: {s}\n",
+        .{
+            driver,        r.rows_before,      r.exact_before, r.rows_after,
+            r.exact_after, r.complete_after,   r.served,       r.served_retry,
+            r.window_rows, r.window_unstable,  r.landed,       r.jump_done,
+            r.closed,      stageName(r.stage),
+        },
+    );
+    switch (end) {
+        .exited => |code| {
+            if (code == fg_setup_failed) return error.FaultFixtureSetupFailed;
+            try std.testing.expectEqual(fg_ok, code);
+        },
+        .signalled => |sig| {
+            std.debug.print(
+                "\n[g1/{t}] the process DIED (signal {d}) at: {s}. A local file truncated under our\n" ++
+                    "         mmap must surface a clean truncated/faulted outcome, never a crash\n" ++
+                    "         (AC-g1). (A ReleaseSafe Zig binary turns an uncaught SIGBUS into\n" ++
+                    "         std's segfault handler and then abort, so the signal reported here is\n" ++
+                    "         SIGBUS only when the inherited disposition was SIG_DFL.) On macOS this\n" ++
+                    "         arm is a guard — that platform does not fault; this is the Linux RED.\n",
+                .{ driver, sig, stageName(r.stage) },
+            );
+            return error.SourceFaultCrashedTheProcess;
+        },
+        .timed_out => {
+            std.debug.print(
+                "\n[g1/{t}] the process NEVER TERMINATED at: {s} — either an infinite fault loop (a\n" ++
+                    "         handler that returns without repairing anything) or a deadlock (a\n" ++
+                    "         recovery that longjmped out of a mutex-held read, wedging ls_close).\n",
+                .{ driver, stageName(r.stage) },
+            );
+            return error.SourceFaultNeverTerminated;
+        },
+    }
+
+    // The honest-outcome half, identical on both platforms.
+    try std.testing.expectEqual(@as(u32, 8), r.stage); // every stage completed
+    try std.testing.expectEqual(@as(u32, 1), r.closed); // ls_close returned
+    try std.testing.expect(r.served != @intFromEnum(FaultServed.nothing)); // the driver really ran
+    // Never garbage: the opened snapshot's own text, or nothing at all.
+    try std.testing.expect(r.served != @intFromEnum(FaultServed.other));
+    try std.testing.expect(r.served_retry != @intFromEnum(FaultServed.other));
+    // Idempotent: the identical call twice answers identically (no oscillation).
+    try std.testing.expectEqual(r.served, r.served_retry);
+    try std.testing.expectEqual(@as(u32, 0), r.window_unstable);
+    // Never invents rows the file never had, and never grows past an exact count.
+    try std.testing.expect(r.rows_after <= fg_rows);
+    if (r.exact_before == 1) try std.testing.expect(r.rows_after <= r.rows_before);
+    // REPORTS, not merely survives (the "clean truncated/faulted error" half of
+    // AC-g1): if the read could not hand back the opened snapshot's own text,
+    // the document must have gone TERMINAL about it -- complete, with an exact
+    // count over whatever survived -- never left serving nothing while claiming
+    // it is still making progress. Vacuous where the platform does not fault
+    // (macOS serves the snapshot); on a platform that does, this is what
+    // forbids a page-repair "recovery" that silently serves emptiness forever.
+    if (r.served != @intFromEnum(FaultServed.snapshot)) {
+        errdefer std.debug.print(
+            "\n[g1/{t}] the post-event read did not serve the opened snapshot, yet the document\n" ++
+                "         does not report a terminal, exact state (complete={d} exact={d}): a\n" ++
+                "         truncated/faulted source must be REPORTED, not silently served as\n" ++
+                "         nothing (AC-g1).\n",
+            .{ driver, r.complete_after, r.exact_after },
+        );
+        try std.testing.expectEqual(@as(u32, 1), r.complete_after);
+        try std.testing.expectEqual(@as(u32, 1), r.exact_after);
+    }
+    // A document that LOST rows must be terminal about it, never left claiming
+    // it is still making progress.
+    if (r.rows_after < r.rows_before) try std.testing.expectEqual(@as(u32, 1), r.complete_after);
+    // And a window that cannot serve the row's true text must serve NO rows --
+    // never a row whose cells are empty or invented.
+    if (driver == .foreground_window and r.served != @intFromEnum(FaultServed.snapshot)) {
+        errdefer std.debug.print(
+            "\n[g1/foreground] the window returned {d} row(s) but could not serve row {d}'s own\n" ++
+                "         text (served={d}): a faulted read must return no rows, not rows whose\n" ++
+                "         cells are empty or invented.\n",
+            .{ r.window_rows, fg_probe_row, r.served },
+        );
+        try std.testing.expectEqual(@as(u64, 0), r.window_rows);
+    }
+    // A jump always resolves: `done` at wherever it got to, never stuck.
+    if (driver == .scan_jump) try std.testing.expectEqual(@as(u32, 1), r.jump_done);
+    // Opening a local document touched no signal but SIGBUS in the child either.
+    for (0..fg_untouchable.len) |i| try std.testing.expectEqual(r.other_before[i], r.other_after[i]);
+}
+
+test "sigbus_g1_foreground: a file truncated under the mapping — a behind-frontier window re-lex reports honestly and never crashes (AC-g1)" {
+    try fgTruncationArm(.foreground_window);
+}
+
+test "sigbus_g1_scan: a file truncated under the mapping — a deep jump-scan on the core's worker thread reports honestly and never crashes (AC-g1)" {
+    try fgTruncationArm(.scan_jump);
+}
+
+// ---------------------------------------------------------------------------
+// CONTROLS. The g1 arms are green on the gate host by PLATFORM, not by proof, so
+// the machinery they rest on is checked separately: the harness must be able to
+// see a fatal fault, a clean exit and a hang, and the fixture must really shrink
+// to exactly the extent the assertions assume.
+// ---------------------------------------------------------------------------
+
+test "sigbus_controls: the fault harness sees death / exit / hang, and the truncation fixture really shrinks (GUARD)" {
+    // (a) A GENUINE SIGBUS is reported as `signalled`, so nothing above can pass
+    //     by the harness being blind to a fatal fault.
+    {
+        var tiny = try makeFixture("a\n", 0o644);
+        defer tiny.deinit();
+        const pid = fork();
+        try std.testing.expect(pid >= 0);
+        if (pid == 0) {
+            childSilenceStderr();
+            fgFaultOnForeignMapping(tiny.path, 4 * 1024 * 1024);
+            _exit(fg_ok);
+        }
+        const end = waitChild(pid, 20_000);
+        errdefer std.debug.print("\n[controls] a mapping longer than its file did not fault: {any}\n", .{end});
+        try std.testing.expect(end == .signalled);
+    }
+    // (b) A clean exit code round-trips.
+    {
+        const pid = fork();
+        try std.testing.expect(pid >= 0);
+        if (pid == 0) _exit(7);
+        try std.testing.expectEqual(ChildEnd{ .exited = 7 }, waitChild(pid, 20_000));
+    }
+    // (c) A child that never terminates is reported as `timed_out` and killed —
+    //     what turns an infinite fault loop into a failing test instead of a
+    //     wedged gate.
+    {
+        const pid = fork();
+        try std.testing.expect(pid >= 0);
+        if (pid == 0) {
+            while (true) std.atomic.spinLoopHint();
+        }
+        try std.testing.expectEqual(ChildEnd{ .timed_out = {} }, waitChild(pid, 300));
+    }
+    // (d) The truncation is real, and its extent is exactly what the g1
+    //     assertions assume: a FRESH open of the truncated file sees precisely
+    //     the survivors, and the probed row is genuinely past them.
+    {
+        const gpa = std.testing.allocator;
+        const bytes = try genFixedRows(gpa, fg_rows);
+        defer gpa.free(bytes);
+        var fx = try makeFixture(bytes, 0o644);
+        defer fx.deinit();
+        {
+            const f = try fx.tmp.dir.openFile(std.testing.io, "fixture.csv", .{ .mode = .write_only });
+            defer f.close(std.testing.io);
+            try f.setLength(std.testing.io, fg_keep_bytes);
+        }
+        var doc: ?*api.Doc = null;
+        try std.testing.expectEqual(api.Status.ok, api.ls_open(fx.path.ptr, &fg_opts, &doc));
+        defer api.ls_close(doc.?);
+        try scanToEnd(doc.?);
+        const rc = api.ls_row_count_get(doc.?);
+        errdefer std.debug.print(
+            "\n[controls] the truncated fixture opened with {d} rows, expected {d}\n",
+            .{ rc.count, fg_survivors },
+        );
+        try std.testing.expectEqual(fg_survivors, rc.count);
+        try std.testing.expectEqual(true, rc.exact);
+        try std.testing.expect(fg_probe_row > fg_survivors); // probed bytes are gone
+        try std.testing.expect(fg_rows * fg_record_bytes > api.open_head_max_bytes); // tail unread at open
+        try std.testing.expect(fg_probe_row * fg_record_bytes < api.open_head_max_bytes); // yet indexed at open
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Criterion 1 — forced dialect: every candidate separator, custom bytes,
 // every quote incl. NONE, header on/off; invalid combinations are a distinct
