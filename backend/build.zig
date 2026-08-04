@@ -134,8 +134,56 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+
+    // Stable, per-target install path for the test binary
+    // (ARCH-security-hardening (g), source-fault guard).
+    //
+    // The two locks that PROVE the SIGBUS guard -- `sigbus_g1_foreground` and
+    // `sigbus_g1_scan` -- are only enforceable on Linux: truncating a file under a
+    // live MAP_PRIVATE mapping keeps serving the original bytes on macOS 26/APFS
+    // (measured, 16 arms) while Linux faults on all 12 truncate arms. So the suite
+    // also runs on Linux, in a container, from a binary CROSS-BUILT here.
+    //
+    // That container leg has to NAME the binary. Zig otherwise leaves it at a
+    // content-hashed cache path (.zig-cache/o/<hash>/test) whose hash changes with
+    // every source edit, so the only way to find it was to scrape it out of the
+    // build's FAILURE message -- a gate leg resting on a non-zero exit and an error
+    // format, i.e. one that could one day match nothing and pass silently. Install
+    // it instead, under a predictable basename. The target triple is part of the
+    // name so the native leg and the two cross legs never overwrite each other:
+    //
+    //   zig build test                                 -> zig-out/bin/behavior-tests-aarch64-macos-none
+    //   zig build test -Dtarget=aarch64-linux-musl ... -> zig-out/bin/behavior-tests-aarch64-linux-musl
+    //   zig build test -Dtarget=x86_64-linux-musl ...  -> zig-out/bin/behavior-tests-x86_64-linux-musl
+    //
+    // Attached to the `test` step only, never to `b.getInstallStep()`: a bare
+    // `zig build` (the conformance leg) keeps building just the library, with no
+    // new dependency on the python3 corpus generator.
+    const install_behavior_tests = b.addInstallArtifact(behavior_tests, .{
+        .dest_sub_path = b.fmt("behavior-tests-{s}-{s}-{s}", .{
+            @tagName(target.result.cpu.arch),
+            @tagName(target.result.os.tag),
+            @tagName(target.result.abi),
+        }),
+    });
+
     const run_behavior_tests = b.addRunArtifact(behavior_tests);
     run_behavior_tests.step.dependOn(&gen.step); // corpus must exist before tests run
-    const test_step = b.step("test", "Run behavior tests");
+
+    // A foreign suite can only be PRODUCED here, not executed: skip -- rather than
+    // fail -- the run when the host cannot spawn the target binary, so
+    // `zig build test -Dtarget=*-linux-musl` exits 0 with the ELF installed above
+    // and the container leg does the running. This does NOT weaken the native leg:
+    // for a host target the binary spawns and runs, and a failing test fails the
+    // build exactly as before (verified against the installed 0.16.0 std --
+    // Step.Run reaches this only from the `error.InvalidExe` spawn path, where the
+    // `.bad_os_or_cpu` branch then returns `MakeSkipped` instead of `step.fail`,
+    // and a skipped step is counted apart from failures by the build runner). If a
+    // foreign executor IS configured (rosetta / -fqemu / binfmt_misc), the tests
+    // still actually run.
+    run_behavior_tests.skip_foreign_checks = true;
+
+    const test_step = b.step("test", "Run behavior tests (foreign target: build + install only)");
+    test_step.dependOn(&install_behavior_tests.step);
     test_step.dependOn(&run_behavior_tests.step);
 }
