@@ -10898,3 +10898,349 @@ test "f1_controls: the progress assertion is SATISFIABLE -- mmap on the same byt
         try std.testing.expect(!d.encoding_forced);
     }
 }
+
+// ===========================================================================
+// TRUNCATION HONESTY (eofcap) — `ls_cell_truncated` / `ls_header_cell_truncated`
+// report the LS_CELL_MAX_BYTES DISPLAY CAP, never "the lexer ran out of bytes".
+//
+// api/lesssheet.h pins the meaning exactly: the flag is "whether the cell
+// ls_cell(doc, row, col) serves was cut by the LS_CELL_MAX_BYTES display cap
+// (its full transcoded content is longer than the served bytes)". A COMPLETE
+// final cell of a file that merely does not end in a newline was cut by
+// nothing, so it must report false. Both frontends draw a per-cell truncation
+// indicator from this flag, so a false positive tells the user bytes are
+// missing when none are.
+//
+// THE DEFECT, measured 2026-08-04 over the real C ABI in native ReleaseSafe
+// (`ls_open` -> drain `ls_index_poll` -> `ls_window_set(last,1)` ->
+// `ls_cell_truncated`), same bytes four ways:
+//
+//   a,b\n1,x\n2,y     .csv     (no trailing newline)   last row -> [0 1] WRONG
+//   a,b\n1,x\n2,y     .csv.gz  (identical bytes)       last row -> [0 0] right
+//   a,b\n1,x\n2,y\n   .csv                             last row -> [0 0] right
+//   a,b\n1,x\n2,y\n   .csv.gz                          last row -> [0 0] right
+//
+// So the MMAP arm is the liar and the STREAMING (gzip / http_range) arm is
+// honest — the inverse of the usual direction. Every CSV that does not end in a
+// newline (extremely common) shows a spurious "this cell was cut off" marker on
+// its very last cell.
+//
+// It is ONE conflation at ONE seam. The rule is already written down three
+// times in-tree, correctly:
+//   * src/csv_reader.zig `decodeColumn` (the ls_cell_copy path) computes
+//     `artificial = limit != content.len` and flags `cap_truncated or
+//     (hit_limit and artificial)`, with the rule spelled out in its doc
+//     comment: "Reaching the TRUE end of the content (limit == content.len)
+//     with no more separators is simply a ragged/short row".
+//   * src/lexer.zig `lexSelected`: `truncated or (hit_limit and limit != content.len)`.
+//   * the streaming lane: `truncated or streamAtLimit(&cur)`, whose
+//     `Cursor.atLimit()` already makes the "limit == the source's true end ->
+//     not a cap" distinction — that is exactly what `gz_regression` above
+//     fixed for the ROW-level sibling of this bug (`ls_row_oversized`).
+// `src/lexer.zig` `lexInto` alone still says `truncated or hit_limit`.
+//
+// Consequence worth naming: `ls_cell_truncated` and `ls_cell_copy` CONTRADICT
+// each other on the same cell today. For row 1 / col 1 of "a,b\n1,x\n2,y",
+// ls_cell serves 1 byte and flags it cut, while ls_cell_copy reads the whole
+// cell — 1 byte, out_truncated false. Both answer the same "was it cut"
+// question about the same cell, so the locks below cross-check them.
+//
+// SCOPE. No api/lesssheet.h byte changes: the header's text is already correct
+// and the implementation disagrees with it. No new seam. The expected verdict
+// comes from the FIXTURE (`cell_len > LS_CELL_MAX_BYTES`), so these are
+// ABSOLUTE assertions, not a parity two arms could satisfy by agreeing on the
+// wrong answer; the mmap/gzip parity sweep (eofcap2) is additional, and
+// eofcap_controls records the non-vacuity argument.
+// ===========================================================================
+
+/// Which byte provider serves the fixture: the mmap path (`lexer.lexInto`) or
+/// the streaming inflate lane (`csv_reader.lexStream`) — the same logical
+/// document either way (ARCH-csv-gz equivalence).
+const EofSource = enum { mmap, gzip };
+
+/// Cell lengths bracketing the display cap: well under, one under, exactly the
+/// cap (served whole -> NOT truncated), one over, well over.
+const eofcap_lens = [_]usize{ 1, 10, api.cell_max_bytes - 1, api.cell_max_bytes, api.cell_max_bytes + 1, 5000 };
+
+/// "h1,h2\n" + one data row "v," + `cell_len` bytes of 'Q', terminated by a
+/// newline only when `terminated`. 'Q' on purpose: ls_cell_copy NEUTRALIZES a
+/// leading = @ + - (security-hardening (f), COPY OUTPUT SAFETY), which would
+/// change the copied length and invalidate the cross-check below.
+fn eofDataFixture(gpa: std.mem.Allocator, cell_len: usize, terminated: bool) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(gpa);
+    try buf.appendSlice(gpa, "h1,h2\nv,");
+    try buf.appendNTimes(gpa, 'Q', cell_len);
+    if (terminated) try buf.append(gpa, '\n');
+    return buf.toOwnedSlice(gpa);
+}
+
+/// The same shape for the HEADER record: "h1," + `cell_len` bytes of 'Q'. With
+/// the header forced ON and no data rows, record 1 IS the file's last record —
+/// a headers-only export with no trailing newline, which is how the header path
+/// reaches the identical conflation (`buildShape` materializes the header
+/// through the same `lexInto`).
+fn eofHeaderFixture(gpa: std.mem.Allocator, cell_len: usize, terminated: bool) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(gpa);
+    try buf.appendSlice(gpa, "h1,");
+    try buf.appendNTimes(gpa, 'Q', cell_len);
+    if (terminated) try buf.append(gpa, '\n');
+    return buf.toOwnedSlice(gpa);
+}
+
+/// Open `plain` directly (mmap) or gzipped (the streaming lane) — same bytes,
+/// same options, one variable.
+fn openEof(gpa: std.mem.Allocator, plain: []const u8, src: EofSource, opts: api.OpenOptions) !OpenedDoc {
+    switch (src) {
+        .mmap => return openWith(plain, opts),
+        .gzip => {
+            const g = try gz(gpa, plain);
+            defer gpa.free(g);
+            return openWith(g, opts);
+        },
+    }
+}
+
+fn eofLabel(terminated: bool) []const u8 {
+    return if (terminated) "trailing newline" else "NO trailing newline";
+}
+
+test "eofcap1: ls_cell_truncated is the DISPLAY-CAP verdict — a complete final cell of a file with no trailing newline reports FALSE, an over-cap one still reports TRUE (mmap AND gzip)" {
+    const gpa = std.testing.allocator;
+    const scratch = try gpa.alloc(u8, 1 << 16); // > any swept cell: reads them whole
+    defer gpa.free(scratch);
+
+    for ([_]EofSource{ .mmap, .gzip }) |src| {
+        for ([_]bool{ true, false }) |terminated| {
+            for (eofcap_lens) |len| {
+                const plain = try eofDataFixture(gpa, len, terminated);
+                defer gpa.free(plain);
+                var od = try openEof(gpa, plain, src, .{ .header = api.header_on, .index_mode = api.index_manual });
+                defer od.deinit();
+                try expectDims(od.doc, 1, 2);
+                winAll(od.doc);
+
+                const served = api.ls_cell(od.doc, 0, 1).slice();
+                const flag = api.ls_cell_truncated(od.doc, 0, 1);
+                // The SAME cell read through the FULL-CELL READ, which has no
+                // display cap. It must come back whole; if it does not, the
+                // cross-check's own reference is broken and this fails here
+                // rather than sanctioning a wrong verdict.
+                const full = copyCell(od.doc, 0, 1, scratch);
+
+                errdefer std.debug.print(
+                    "\n[eofcap1] {t} / {s} / cell_len {d}: ls_cell served {d} byte(s), ls_cell_copy read {d} (out_truncated={any}); ls_cell_truncated={any}, api/lesssheet.h says {any}\n",
+                    .{ src, eofLabel(terminated), len, served.len, full.len, full.truncated, flag, len > api.cell_max_bytes },
+                );
+
+                try std.testing.expectEqual(api.CopyResult.ok, full.result);
+                try std.testing.expectEqual(false, full.truncated);
+                try std.testing.expectEqual(len, full.len);
+
+                // THE LOCK, in the header's own words: the flag is true iff the
+                // cell's full content is longer than the bytes ls_cell served —
+                // iff the LS_CELL_MAX_BYTES display cap cut it. Absolute: the
+                // expected value is derived from the fixture.
+                try std.testing.expectEqual(@min(len, api.cell_max_bytes), served.len);
+                try std.testing.expectEqual(len > api.cell_max_bytes, flag);
+                // ... and the two ABI answers about the same cell must agree.
+                try std.testing.expectEqual(full.len > served.len, flag);
+
+                // The cell BEFORE the last one ends at a separator, so it was
+                // never in doubt: it must stay false in every arm (a "fix" that
+                // just flips the flag off wholesale is caught by the over-cap
+                // lengths above, one that flips it on by this).
+                try expectCell(od.doc, 0, 0, "v");
+                try std.testing.expectEqual(false, api.ls_cell_truncated(od.doc, 0, 0));
+            }
+        }
+    }
+}
+
+/// A terminator-less document shape: its LAST record ends at EOF, which is the
+/// trigger condition. Named so a failure names the shape.
+const EofShape = struct { name: []const u8, bytes: []const u8 };
+
+const eofcap_shapes = [_]EofShape{
+    .{ .name = "plain final cell", .bytes = "a,b\n1,x\n2,y" },
+    .{ .name = "RAGGED final row (col 0 is the cell ending at EOF)", .bytes = "a,b,c\n1,2,3\n9" },
+    .{ .name = "headers-only export: record 1 IS the last record", .bytes = "name,age" },
+    .{ .name = "final cell's CLOSING QUOTE is the last byte", .bytes = "a,b\n1,x\n2,\"quoted\"" },
+    .{ .name = "CRLF body, still no final terminator", .bytes = "a,b\r\n1,x\r\n2,y" },
+    .{ .name = "final cell EMPTY and unterminated", .bytes = "a,b\n1,x\n2," },
+    .{ .name = "multi-byte UTF-8 final cell ending at EOF", .bytes = "a,b\n1,x\n2,caf\u{e9}" },
+};
+
+test "eofcap2: mmap/gzip parity — the same terminator-less bytes report the same ls_cell_truncated / ls_header_cell_truncated for every cell, in the identity AND filtered views" {
+    const gpa = std.testing.allocator;
+    const opts: api.OpenOptions = .{ .separator = ',', .index_mode = api.index_manual };
+
+    // A .csv.gz is the SAME DOCUMENT as its .csv (ARCH-csv-gz equivalence), and
+    // here the streaming arm is the one that is already right — so the flag must
+    // not merely be plausible, it must be IDENTICAL across the two providers for
+    // every cell and every header cell. expectGzEquiv (the AC3 workhorse) asserts
+    // exactly that, alongside dialect/dims/text/oversized/source_row; the shapes
+    // it is fed here are the ones whose last record ends at EOF. Relational on
+    // purpose, and NOT sufficient alone — two arms could agree on `true`; eofcap1
+    // pins the absolute value.
+    for (eofcap_shapes) |shape| {
+        const g = try gz(gpa, shape.bytes);
+        defer gpa.free(g);
+        errdefer std.debug.print("\n[eofcap2] terminator-less shape: {s}\n", .{shape.name});
+        try expectGzEquiv(shape.bytes, opts, g);
+    }
+
+    // An over-cap final cell, unterminated: parity must hold where the flag is
+    // genuinely TRUE too.
+    {
+        const plain = try eofDataFixture(gpa, api.cell_max_bytes + 100, false);
+        defer gpa.free(plain);
+        const g = try gz(gpa, plain);
+        defer gpa.free(g);
+        errdefer std.debug.print("\n[eofcap2] terminator-less shape: over-cap final cell\n", .{});
+        try expectGzEquiv(plain, opts, g);
+    }
+
+    // FILTERED VIEWS materialize their rows through a DIFFERENT window call site
+    // than the identity path, so a repair applied at a call site instead of at
+    // the lexer seam would leave this one lying. Measured today: the last
+    // filtered row reports [0 1] over mmap and [0 0] over gzip.
+    {
+        const plain = "a,b\nk1,x\nk2,y"; // both data rows match "k"; no trailing newline
+        const g = try gz(gpa, plain);
+        defer gpa.free(g);
+        var pod = try openWith(plain, manual);
+        defer pod.deinit();
+        var god = try openWith(g, manual);
+        defer god.deinit();
+        for ([_]EofSource{ .mmap, .gzip }, [_]*api.Doc{ pod.doc, god.doc }) |src, doc| {
+            errdefer std.debug.print("\n[eofcap2] filtered view over {t}: last filtered row\n", .{src});
+            try setFilter(doc, textReq("k"));
+            try std.testing.expectEqual(@as(u64, 2), (try waitFilterDone(doc)).total);
+            _ = api.ls_window_set(doc, 0, api.window_max_rows);
+            // Filtered row 1 is the terminator-less final record. Both of its
+            // cells are complete, so the display cap cut neither.
+            try expectCell(doc, 1, 0, "k2");
+            try expectCell(doc, 1, 1, "y");
+            try std.testing.expectEqual(false, api.ls_cell_truncated(doc, 1, 0));
+            try std.testing.expectEqual(false, api.ls_cell_truncated(doc, 1, 1));
+        }
+    }
+}
+
+test "eofcap3: ls_header_cell_truncated shares the verdict — a complete final header cell with no trailing newline reports FALSE, an over-cap one still reports TRUE" {
+    const gpa = std.testing.allocator;
+
+    // MEASURED (2026-08-04, same driver): a headers-only "name,age" with no
+    // trailing newline reports ls_header_cell_truncated = [0 1] over mmap and
+    // [0 0] over gzip — the header path shares the conflation, because
+    // `buildShape` materializes the header record through the same `lexInto`.
+    for ([_]EofSource{ .mmap, .gzip }) |src| {
+        for ([_]bool{ true, false }) |terminated| {
+            for (eofcap_lens) |len| {
+                const plain = try eofHeaderFixture(gpa, len, terminated);
+                defer gpa.free(plain);
+                var od = try openEof(gpa, plain, src, .{ .header = api.header_on, .index_mode = api.index_manual });
+                defer od.deinit();
+                try std.testing.expectEqual(@as(u32, 2), api.ls_column_count(od.doc));
+                try std.testing.expectEqual(true, api.ls_dialect_get(od.doc).header);
+                winAll(od.doc);
+
+                const served = api.ls_header_cell(od.doc, 1).slice();
+                const flag = api.ls_header_cell_truncated(od.doc, 1);
+                errdefer std.debug.print(
+                    "\n[eofcap3] {t} / {s} / header cell_len {d}: ls_header_cell served {d} byte(s); ls_header_cell_truncated={any}, api/lesssheet.h says {any}\n",
+                    .{ src, eofLabel(terminated), len, served.len, flag, len > api.cell_max_bytes },
+                );
+                // Same display-only semantics as ls_cell_truncated
+                // (api/lesssheet.h ls_header_cell / ls_header_cell_truncated).
+                try std.testing.expectEqual(@min(len, api.cell_max_bytes), served.len);
+                try std.testing.expectEqual(len > api.cell_max_bytes, flag);
+                try expectHeaderCell(od.doc, 0, "h1");
+                try std.testing.expectEqual(false, api.ls_header_cell_truncated(od.doc, 0));
+            }
+        }
+    }
+
+    // REACHABILITY: no forcing, no user action. DEFAULT options on a
+    // headers-only file with no trailing newline — the grammar elects record 1
+    // as the header on its own, and both column labels are complete.
+    for ([_]EofSource{ .mmap, .gzip }) |src| {
+        var od = try openEof(gpa, "name,age", src, .{});
+        defer od.deinit();
+        errdefer std.debug.print("\n[eofcap3] DEFAULT options over {t}: \"name,age\" with no trailing newline\n", .{src});
+        try std.testing.expectEqual(true, api.ls_dialect_get(od.doc).header);
+        try expectHeaderCell(od.doc, 0, "name");
+        try expectHeaderCell(od.doc, 1, "age");
+        try std.testing.expectEqual(false, api.ls_header_cell_truncated(od.doc, 0));
+        try std.testing.expectEqual(false, api.ls_header_cell_truncated(od.doc, 1));
+    }
+}
+
+test "eofcap_controls: the honesty assertions are SATISFIABLE and the fixtures are faithful (GUARD)" {
+    const gpa = std.testing.allocator;
+    const scratch = try gpa.alloc(u8, 1 << 16);
+    defer gpa.free(scratch);
+
+    // (a) NON-VACUITY, one variable: the SAME fixture, the SAME assertion, with
+    //     the trailing newline restored. Green today over mmap, so eofcap1's RED
+    //     is caused by the missing terminator, not by the assertion being
+    //     unsatisfiable or the harness being wrong.
+    // (b) NON-VACUITY, the other variable: the SAME terminator-less bytes over
+    //     the gzip provider. Green today, so the RED is the mmap lexer, not the
+    //     fixture shape.
+    for ([_]EofSource{ .mmap, .gzip }) |src| {
+        for ([_]bool{ true, false }) |terminated| {
+            if (src == .mmap and !terminated) continue; // that arm is the DEFECT
+            const plain = try eofDataFixture(gpa, 3, terminated);
+            defer gpa.free(plain);
+            var od = try openEof(gpa, plain, src, .{ .header = api.header_on, .index_mode = api.index_manual });
+            defer od.deinit();
+            winAll(od.doc);
+            errdefer std.debug.print("\n[eofcap_controls] {t} / {s}: control arm is NOT green\n", .{ src, eofLabel(terminated) });
+            try std.testing.expectEqual(false, api.ls_cell_truncated(od.doc, 0, 1));
+        }
+    }
+
+    // (c) The must-stay-TRUE direction is genuinely exercised, so eofcap1 cannot
+    //     be satisfied by a blanket `false`: an over-cap final cell reports true
+    //     on all four provider/terminator combinations, and ls_cell really does
+    //     serve exactly the cap.
+    for ([_]EofSource{ .mmap, .gzip }) |src| {
+        for ([_]bool{ true, false }) |terminated| {
+            const plain = try eofDataFixture(gpa, api.cell_max_bytes + 1, terminated);
+            defer gpa.free(plain);
+            var od = try openEof(gpa, plain, src, .{ .header = api.header_on, .index_mode = api.index_manual });
+            defer od.deinit();
+            winAll(od.doc);
+            errdefer std.debug.print("\n[eofcap_controls] {t} / {s}: an over-cap cell stopped reporting truncated\n", .{ src, eofLabel(terminated) });
+            try std.testing.expectEqual(api.cell_max_bytes, api.ls_cell(od.doc, 0, 1).slice().len);
+            try std.testing.expectEqual(true, api.ls_cell_truncated(od.doc, 0, 1));
+            const full = copyCell(od.doc, 0, 1, scratch);
+            try std.testing.expectEqual(api.cell_max_bytes + 1, full.len);
+        }
+    }
+
+    // (d) FAITHFULNESS: every shape eofcap2 sweeps really is terminator-less
+    //     (its last byte is neither LF nor CR), and eofDataFixture really adds
+    //     the terminator only when asked. A fixture that quietly ended in a
+    //     newline would make the whole lock vacuous.
+    for (eofcap_shapes) |shape| {
+        errdefer std.debug.print("\n[eofcap_controls] shape \"{s}\" is NOT terminator-less\n", .{shape.name});
+        try std.testing.expect(shape.bytes.len > 0);
+        const last = shape.bytes[shape.bytes.len - 1];
+        try std.testing.expect(last != '\n' and last != '\r');
+    }
+    {
+        const unterminated = try eofDataFixture(gpa, 3, false);
+        defer gpa.free(unterminated);
+        const terminated = try eofDataFixture(gpa, 3, true);
+        defer gpa.free(terminated);
+        try std.testing.expectEqualStrings("h1,h2\nv,QQQ", unterminated);
+        try std.testing.expectEqualStrings("h1,h2\nv,QQQ\n", terminated);
+        const hdr = try eofHeaderFixture(gpa, 3, false);
+        defer gpa.free(hdr);
+        try std.testing.expectEqualStrings("h1,QQQ", hdr);
+    }
+}
