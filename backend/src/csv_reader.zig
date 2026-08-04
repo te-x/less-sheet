@@ -122,7 +122,7 @@ pub const SelectedScanner = struct {
                 .quoted => {
                     self.cursor.advance(unit.src_len);
                     if (self.quote) |q| if (enc.unitIsByte(unit, q)) {
-                        if (streamUnit(&self.cursor, self.encoding)) |peek| if (enc.unitIsByte(peek, q)) {
+                        if (peekUnit(&self.cursor, self.encoding)) |peek| if (enc.unitIsByte(peek, q)) {
                             if (self.cursor.logical -| self.source_start +| peek.src_len > row_budget)
                                 return .{ .oversized = cursorPos(&self.cursor) };
                             try self.appendUnit(selected, cap, unit, buf, gpa);
@@ -142,7 +142,7 @@ pub const SelectedScanner = struct {
                 try self.finishField(selected, refs, buf, gpa);
             } else if (enc.unitIsByte(unit, '\r') or enc.unitIsByte(unit, '\n')) {
                 self.cursor.advance(unit.src_len);
-                if (enc.unitIsByte(unit, '\r')) if (streamUnit(&self.cursor, self.encoding)) |next| {
+                if (enc.unitIsByte(unit, '\r')) if (peekUnit(&self.cursor, self.encoding)) |next| {
                     if (enc.unitIsByte(next, '\n')) {
                         if (self.cursor.logical -| self.source_start +| next.src_len > row_budget)
                             return .{ .oversized = cursorPos(&self.cursor) };
@@ -195,6 +195,19 @@ const DirectCursor = struct {
     pub fn atLimit(self: *const DirectCursor) bool {
         if (self.logical_limit) |lim| if (self.logical >= lim) return true;
         return if (self.physical_limit) |lim| self.physical_base +| self.logical >= lim else false;
+    }
+
+    /// mmap's own answer to `source.Cursor.danglingTail` (see it for the rule).
+    /// Every byte is in the mapping, so the only question is which end the residual
+    /// sits below: the MAPPING's end makes it a stub to drop, an artificial cap
+    /// makes it `capped`. `end()` folds both, so compare it against `bytes.len` —
+    /// which is precisely `lexer.recordBounds`'s `limit != content.len`.
+    pub fn danglingTail(self: *const DirectCursor, in_hand: usize) usize {
+        const end_at = self.end();
+        if (end_at != self.bytes.len) return 0;
+        const left = end_at -| self.logical;
+        if (left == 0 or left > in_hand) return 0;
+        return @intCast(left);
     }
 };
 
@@ -330,7 +343,10 @@ pub const CsvReader = struct {
         // a local document never enters the guarded branch at all.
         const guarded = source.commitGuarded();
         while (rows < max_rows) {
-            if (streamUnit(&cur, self.encoding) == null) break;
+            // `streamHasRow`, not "a unit decodes": a dangling half unit at a genuine
+            // end of stream is the document's last row on the mmap side, so counting
+            // it here is what keeps this walk's total equal to the plain file's.
+            if (!streamHasRow(&cur, self.encoding)) break;
             // The row's OWN start, which is where the frontier stays if the row
             // turns out not to be committable (the lex below cannot be un-run).
             const row_start = if (guarded) cursorPos(&cur) else undefined;
@@ -341,7 +357,9 @@ pub const CsvReader = struct {
         }
         // security-hardening (e) AC-e3: as scanUtf8Rows -- an empty stream unit is
         // EOF only at a genuine end-of-source, never a network short-body stall.
-        const eof = streamUnit(&cur, self.encoding) == null and !streamAtLimit(&cur) and cur.spanTerminal();
+        // The row question again, for the same reason it is asked above: a stub the
+        // `max_rows` budget stopped short of is a row still to come, not EOF.
+        const eof = !streamHasRow(&cur, self.encoding) and !streamAtLimit(&cur) and cur.spanTerminal();
         return .{ .next = cursorPos(&cur), .rows = rows, .eof = eof };
     }
 
@@ -480,7 +498,7 @@ fn matchCursor(cur: anytype, sep: u8, quote: ?u8, encoding: u8, primary: base.Ma
                 while (streamUnit(cur, encoding)) |u| {
                     cur.advance(u.src_len);
                     if (enc.unitIsByte(u, q)) {
-                        if (streamUnit(cur, encoding)) |peek| if (enc.unitIsByte(peek, q)) {
+                        if (peekUnit(cur, encoding)) |peek| if (enc.unitIsByte(peek, q)) {
                             if (pfeed) ps.feed(u.out[0..u.out_len]);
                             if (ffeed) fs.?.feed(u.out[0..u.out_len]);
                             cur.advance(peek.src_len);
@@ -752,12 +770,58 @@ fn scanUtf8Rows(cur: *source_mod.Cursor, sep: u8, quote: ?u8, max_rows: u64) rea
     return .{ .next = cursorPos(cur), .rows = rows, .eof = eof };
 }
 
-fn streamUnit(cur: anytype, encoding: u8) ?enc.Unit {
+/// A decode attempt at the cursor: the unit if one is there, and how many bytes
+/// WERE there (what `Cursor.danglingTail` needs to tell a stream that ends
+/// mid-unit from one whose bytes have merely not arrived). The single peek+decode
+/// site for every streaming op; the three wrappers below are the only callers.
+const StreamPeek = struct { unit: ?enc.Unit, in_hand: usize };
+
+inline fn peekStream(cur: anytype, encoding: u8) StreamPeek {
     // The ONE max-width peek in the lexer (a 4-byte UTF-16 surrogate pair). The
     // frontier commit guard sizes itself from the same const — see
     // source.max_lookahead.
     const bytes = cur.peek(source_mod.max_lookahead);
-    return enc.decodeUnit(bytes, 0, bytes.len, encoding);
+    return .{ .unit = enc.decodeUnit(bytes, 0, bytes.len, encoding), .in_hand = bytes.len };
+}
+
+/// One code unit WITHOUT consuming anything — pure lookahead. Use exactly where
+/// the mmap lexer also merely peeks: a CRLF's second half and a doubled quote.
+/// Those must leave a dangling tail ALONE, because `lexer.recordBounds` leaves it
+/// alone too and reports it as the next (degenerate) record — dropping it inside a
+/// lookahead would swallow a row the plain file counts.
+inline fn peekUnit(cur: anytype, encoding: u8) ?enc.Unit {
+    return peekStream(cur, encoding).unit;
+}
+
+/// The decode at a position the caller will PUBLISH (a field/record walk). Same
+/// as `peekUnit`, plus the one thing a streaming cursor must settle that an mmap
+/// slice never has to: a code unit the stream ENDS INSIDE. `Cursor.danglingTail`
+/// decides that, and only that; the stub is dropped, so the cursor lands on the
+/// true end and the caller publishes the end — exactly what
+/// `lexer.recordBounds`/`lexInto` do with `next = limit` for the same bytes, which
+/// is what keeps a .csv.gz's rows and terminus equal to its .csv's. Null still
+/// means "no unit here", so no caller's null path changes except in where the
+/// cursor is left sitting.
+inline fn streamUnit(cur: anytype, encoding: u8) ?enc.Unit {
+    const p = peekStream(cur, encoding);
+    if (p.unit == null) {
+        // Once per op, at the end of the stream — never in the field loop this is
+        // inlined into. Hinted so the tail resolution is laid out off the hot path.
+        @branchHint(.unlikely);
+        cur.advance(cur.danglingTail(p.in_hand));
+    }
+    return p.unit;
+}
+
+/// Is there another ROW at the cursor? A decodable unit — or a dangling tail,
+/// which `recordBounds` ends a record on rather than ignoring, so it is a row on
+/// the mmap side and has to be one here. Asking only the first question is how a
+/// .csv.gz came to report one row FEWER than the identical .csv (the same F1 root
+/// cause, in its silent-wrong-data form). Progress is guaranteed either way: a
+/// unit advances at least one unit, a tail is consumed by the `streamUnit` above.
+fn streamHasRow(cur: anytype, encoding: u8) bool {
+    const p = peekStream(cur, encoding);
+    return p.unit != null or cur.danglingTail(p.in_hand) > 0;
 }
 
 fn streamAtLimit(cur: anytype) bool {
@@ -767,7 +831,7 @@ fn streamAtLimit(cur: anytype) bool {
 fn finishTerminator(cur: anytype, u: enc.Unit, encoding: u8) void {
     cur.advance(u.src_len);
     if (enc.unitIsByte(u, '\r')) {
-        if (streamUnit(cur, encoding)) |nxt| if (enc.unitIsByte(nxt, '\n')) cur.advance(nxt.src_len);
+        if (peekUnit(cur, encoding)) |nxt| if (enc.unitIsByte(nxt, '\n')) cur.advance(nxt.src_len);
     }
 }
 
@@ -785,7 +849,7 @@ fn boundsFromCursor(cur: *source_mod.Cursor, sep: u8, quote: ?u8, encoding: u8) 
                 while (streamUnit(cur, encoding)) |u| {
                     cur.advance(u.src_len);
                     if (!enc.unitIsByte(u, q)) continue;
-                    if (streamUnit(cur, encoding)) |peek| {
+                    if (peekUnit(cur, encoding)) |peek| {
                         if (enc.unitIsByte(peek, q)) {
                             cur.advance(peek.src_len);
                             continue;
@@ -833,7 +897,7 @@ fn lexStream(source: Source, pos: Pos, want: ?u32, cap: ?usize, limit: ?Pos, sep
                 while (streamUnit(&cur, encoding)) |u| {
                     cur.advance(u.src_len);
                     if (enc.unitIsByte(u, q)) {
-                        if (streamUnit(&cur, encoding)) |peek| {
+                        if (peekUnit(&cur, encoding)) |peek| {
                             if (enc.unitIsByte(peek, q)) {
                                 if (store) try appendStreamUnit(buf, gpa, start, u, cap, &truncated);
                                 cur.advance(peek.src_len);
@@ -891,7 +955,7 @@ fn lexStreamSelected(source: Source, pos: Pos, selected: []const u32, cap: usize
                 while (streamUnit(&cur, encoding)) |u| {
                     cur.advance(u.src_len);
                     if (enc.unitIsByte(u, q)) {
-                        if (streamUnit(&cur, encoding)) |peek| {
+                        if (peekUnit(&cur, encoding)) |peek| {
                             if (enc.unitIsByte(peek, q)) {
                                 if (store) try appendStreamUnit(buf, gpa, start, u, cap, &truncated);
                                 cur.advance(peek.src_len);
@@ -953,7 +1017,7 @@ fn cellStream(source: Source, pos: Pos, col: u32, limit: ?Pos, sep: u8, quote: ?
                 while (streamUnit(&cur, encoding)) |u| {
                     cur.advance(u.src_len);
                     if (enc.unitIsByte(u, q)) {
-                        if (streamUnit(&cur, encoding)) |peek| if (enc.unitIsByte(peek, q)) {
+                        if (peekUnit(&cur, encoding)) |peek| if (enc.unitIsByte(peek, q)) {
                             if (store) storeUnit(buf, buf_len, &out_len, &truncated, u);
                             cur.advance(peek.src_len);
                             continue;

@@ -1427,6 +1427,44 @@ pub const Cursor = struct {
         };
     }
 
+    /// mmap PARITY AT AN UNDECODABLE TAIL: how many bytes at the cursor are a code
+    /// unit THE STREAM ENDS INSIDE — a dangling half UTF-16 unit — given that
+    /// `in_hand` bytes here are already available (the count the caller's own `peek`
+    /// just returned, so this never fetches). 0 at every other position, which is
+    /// every well-formed one.
+    ///
+    /// The mmap lexer holds `content.len` up front, so a `decodeUnit` that comes up
+    /// empty there means "the content ends inside this unit", and
+    /// `lexer.recordBounds` DROPS the stub and lands on `limit` — with
+    /// `capped = limit != content.len`, i.e. a true end is not a truncation. A
+    /// streaming Cursor cannot see its end until the provider reaches it, so the
+    /// same verdict has to be asked for at the point the decode came up null.
+    /// Answering it wrong is unbounded rather than merely wrong: a scan step that
+    /// neither advances nor reports `capped` makes every frontier loop re-issue the
+    /// identical call forever (F1 — the `ls_open` hang).
+    ///
+    /// Three things make a decode come up empty, and only the first is a dangling
+    /// tail:
+    ///   * the stream genuinely ENDS mid-unit — `knownEnd` is published and every
+    ///     byte up to it is `in_hand`: those bytes are the stub, and dropping them
+    ///     lands the cursor exactly on the end (what this returns).
+    ///   * an artificial CAP (a per-row/window/scan budget) cuts the unit: `atLimit`
+    ///     answers `capped` and the caller stops without consuming. Only a limit
+    ///     STRICTLY before the true end is such a cap — the same rule `atLimit`
+    ///     applies just above, and `recordBounds`'s `limit != content.len`.
+    ///   * the bytes are merely NOT YET THERE — an unknown-length stream that has
+    ///     not hit EOF, a network range still in flight, a lane parked on a
+    ///     compressed budget: `knownEnd` is null, or it is known but not `in_hand`.
+    ///     That is a retryable STALL; consuming here would fabricate a terminus and
+    ///     silently drop every row behind it.
+    pub fn danglingTail(self: *const Cursor, in_hand: usize) usize {
+        const end = (self.source orelse return 0).knownEnd() orelse return 0;
+        if (self.limit) |lim| if (lim < end) return 0;
+        const left = end -| self.logical;
+        if (left == 0 or left > in_hand) return 0;
+        return @intCast(left);
+    }
+
     /// security-hardening (e) AC-e3: whether an EMPTY span at the current position
     /// is a genuine end-of-source, vs. bytes merely NOT-YET-AVAILABLE. A NETWORK
     /// short/failed range leaves un-fetched bytes BELOW the known end, so an empty
