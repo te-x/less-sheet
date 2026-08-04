@@ -41,7 +41,12 @@
 //   3. findStepSequenceLandsOnEachMarker — LESSSHEET_FIND + LESSSHEET_FIND_STEP_SEQ
 //      equivalence: submit -> first match, step x2 during scan, step x1 after done —
 //      landings exactly on the fixture's 4 marker rows in order, final count exactly 4.
-//      Each landing also carries the same PHYSICAL-VIEWPORT LOCK (target_visible=true).
+//      PHYSICAL-VIEWPORT LOCK, coalescing-aware: every scroll the grid ACTUALLY
+//      performed must have gone to the match the model had JUST resolved and put that
+//      row inside the LIVE visible rect, and the run must END with the final match on
+//      screen. It does NOT assert one scroll per landing — that form is unachievable,
+//      and a product SPEEDUP broke it; see the coalescing HAZARD below before touching
+//      those assertions.
 //   4. layoutFramesArePinnedAtRest — LESSSHEET_LOG_LAYOUT equivalence: at-rest
 //      window-space frames band y[0,54], header y[32,54], row1 y[54,76] (+-1 pt),
 //      scrollview top at 0 — the same numbers the current grid logs; the new grid
@@ -114,6 +119,43 @@
 // arms FindProbe, whose terminal check under LESSSHEET_DUMP_EXIT quits the app the
 // moment the seeded search resolves, killing the landing sequence mid-run. The stall
 // probe's built-in default query ("ZQZmark") is baked into the fixture instead.
+//
+// HAZARD (pinned knowledge): test 3's physical-viewport lock is TIMING-COUPLED, and a
+// product SPEEDUP is what broke it once already. Read this before adding an assertion
+// there.
+//   * LANDING COALESCING IS BY DESIGN. `NativeGrid.applyPendingLanding` consumes a
+//     SINGLE `model.pendingScrollRow` slot, and `scheduleLandingApply` coalesces to ONE
+//     apply per run-loop turn (NativeGrid+Update.swift). Landings resolved inside the
+//     same turn overwrite that slot, so only the LAST of a batch ever emits
+//     `lesssheet.viewport.landed`. That is CORRECT for the product — the user wants the
+//     final target on screen, not three intermediate scrolls — which makes the NUMBER
+//     of physical scrolls in a run a function of CORE SPEED, not of correctness.
+//   * MEASURED (2026-08-04, debug, M-series, this fixture): the step driver issues each
+//     ⌘G straight out of the model's fold handler, so landings arrive at
+//     at_ms = 95 / 98 / 232 / 235 — two batches, so two physical scrolls for four
+//     landings. The SAME binary under full-suite CPU load produced three and four
+//     batches, and WHICH markers scroll moves run to run: {1.4M, 2.8M} idle;
+//     {200k, 2M, 2.8M}, {200k, 1.4M, 2.8M}, and all four loaded.
+//   * WHAT BROKE: this test used to assert target_visible=true for EVERY marker. That
+//     held only while the core was slow enough for the clip view to settle between
+//     matches. The row-count-drift fixes plus two rounds of gz speedups on this branch
+//     closed the gap and the test went RED with NO product defect — all four landings
+//     resolved to the right rows and the viewport converged on the right row. A product
+//     speedup broke a test: that is the hazard class to watch for here.
+//   * DO NOT pace the driver on the observed scroll to buy one scroll per landing:
+//     tried (ce00dd3), REVERTED (85d81c5). It is deterministic in isolation but
+//     stretches the sequence past the LESSSHEET_DUMP_EXIT termination, so under
+//     full-suite load the run ended before landing 4 and two failures became four.
+//   * SO THE LOCK ASSERTS TWO LOAD-INDEPENDENT INVARIANTS instead (see the test): every
+//     scroll that happened went to the match the model had just resolved and put it
+//     inside the live visible rect, and the run ENDS with the final match on screen.
+//     Both hold for 1..4 batches, so no future speedup or slowdown can flip them. The
+//     COUNT of scrolls is deliberately NOT asserted — it is exactly the quantity core
+//     speed controls. Check any new assertion against BOTH extremes: all four landings
+//     in ONE turn, and each landing in its own turn.
+//   * Test 2 (jump) is NOT exposed to this: JumpProbe submits the next jump on a fixed
+//     0.3 s wall-clock delay (JumpProbe.advance) — a gap the core cannot outrun — so
+//     its per-target physical assertions stay achievable.
 //
 // Determinism notes: find-step landings anchor at current.row + 1 (pinned in
 // FindControlling.step), so the marker sequence is viewport-independent; jump targets
@@ -312,6 +354,53 @@ private func logTail(_ log: String, lines n: Int = 30) -> String {
     log.split(separator: "\n", omittingEmptySubsequences: true).suffix(n).joined(separator: "\n")
 }
 
+/// The two probe-log families whose INTERLEAVING is what test 3's physical-viewport
+/// lock reads, in emission order: each match the MODEL resolved
+/// (`lesssheet.find.landing`) and each PHYSICAL scroll of the shipping NSClipView
+/// (`lesssheet.viewport.landed`, emitted only from `NativeGrid.applyPendingLanding`,
+/// after `landOn`).
+///
+/// Order is meaningful and one-directional: the model writes its landing into
+/// `pendingScrollRow` BEFORE FindProbe logs the landing line, and the apply that
+/// consumes that slot always runs on a LATER run-loop turn — so a scroll line always
+/// follows the landing it belongs to, and "the match most recently resolved" is
+/// exactly the last `.landing` seen. Reading the two families as ONE ordered
+/// timeline is what makes the lock independent of how the landings batch (see the
+/// coalescing HAZARD in the file header).
+///
+/// A field that went missing (probe-format drift) becomes row -1 rather than a
+/// dropped event, so drift fails LOUDLY instead of quietly shrinking the timeline.
+private struct LandingTimeline {
+    enum Event {
+        case landing(row: Int)
+        case scrolled(row: Int, targetVisible: Bool?)
+    }
+
+    let events: [Event]
+
+    init(log: String) {
+        events = log.split(separator: "\n", omittingEmptySubsequences: true).compactMap { raw -> Event? in
+            let line = String(raw)
+            if line.hasPrefix("lesssheet.find.landing ") {
+                return .landing(row: intField(line, "row_0based") ?? -1)
+            }
+            if line.hasPrefix("lesssheet.viewport.landed ") {
+                return .scrolled(row: intField(line, "requested_row_0based") ?? -1,
+                                 targetVisible: boolField(line, "target_visible"))
+            }
+            return nil
+        }
+    }
+
+    /// The physical scrolls only, in order.
+    var scrolls: [(row: Int, targetVisible: Bool?)] {
+        events.compactMap { event -> (row: Int, targetVisible: Bool?)? in
+            guard case let .scrolled(row, targetVisible) = event else { return nil }
+            return (row: row, targetVisible: targetVisible)
+        }
+    }
+}
+
 // MARK: - Frozen behavior (serialized: one headless app instance at a time)
 
 @Suite("native-grid probes", .serialized)
@@ -422,7 +511,8 @@ struct NativeGridProbeTests {
 
     // Equivalence pin (ARCH criterion 3, gate-scaled): submit lands the FIRST match,
     // step x2 during the scan and x1 after completion land the next matches in order
-    // — exactly the fixture's four marker rows — and the final count is exactly 4.
+    // — exactly the fixture's four marker rows — and the final count is exactly 4,
+    // with the PHYSICAL-VIEWPORT lock in its coalescing-aware form (see below).
     @Test func findStepSequenceLandsOnEachMarker() throws {
         let fixture = try NativeGridFixture.path()
         let env = [
@@ -437,21 +527,64 @@ struct NativeGridProbeTests {
             if !probeLines(log, prefix: "lesssheet.find.seq_complete ").isEmpty { break }
         }
 
+        // MODEL side: every landing resolves to its marker row, in order. Exact and
+        // load-independent — the model's landings never coalesce (only their SCROLLS
+        // can), so all four are always present.
         for (index, marker) in NativeGridFixture.markerRows.enumerated() {
             let landing = probeLines(log, prefix: "lesssheet.find.landing n=\(index + 1) ").first
             #expect(landing.flatMap { intField($0, "row_0based") } == marker,
                     "find landing \(index + 1) must be 0-based row \(marker):\n\(logTail(log))")
             #expect(landing.flatMap { intField($0, "pos") } == index + 1)
-
-            // Physical-viewport lock (cc-macos defect pass): each find landing must
-            // scroll the shipping NSTableView so the marker row is in the LIVE
-            // visible rect — not merely resolved in the model. See the jump test's
-            // note; the probe emits this only after the real NSClipView is scrolled.
-            let vp = probeLines(log, prefix: "lesssheet.viewport.landed ")
-                .last { intField($0, "requested_row_0based") == marker }
-            #expect(vp.flatMap { boolField($0, "target_visible") } == true,
-                    "find landing \(index + 1) must put marker row \(marker) inside the REAL viewport:\n\(logTail(log))")
         }
+
+        // PHYSICAL-VIEWPORT LOCK (cc-macos defect pass — the author reported "find says it
+        // found it, the grid never moves"). Resolving a match in the MODEL is not
+        // enough: the shipping NSTableView must actually scroll, so the match is inside
+        // the LIVE visible rect. `lesssheet.viewport.landed` is emitted ONLY from
+        // NativeGrid.applyPendingLanding, after the real NSClipView was scrolled, so
+        // target_visible=true here is a true physical-viewport assertion.
+        //
+        // Asserted in its coalescing-aware form: the grid deliberately performs ONE
+        // scroll per run-loop turn, so a landing that shares a turn with the next one
+        // never gets its own scroll, and how the four landings batch depends on core
+        // speed. Read the coalescing HAZARD in the file header — the per-marker form of
+        // this assertion was unachievable and a product speedup broke it.
+        let timeline = LandingTimeline(log: log)
+
+        // (1) EVERY scroll the grid performed went to the match the model had just
+        //     resolved and put that row inside the live visible rect. Holds however the
+        //     landings batch, and covers every scroll in the run — a landing that
+        //     scrolls somewhere else, or scrolls without bringing its match on screen,
+        //     is RED here.
+        var resolvedMatch: Int?
+        for event in timeline.events {
+            switch event {
+            case let .landing(row):
+                resolvedMatch = row
+            case let .scrolled(row, targetVisible):
+                #expect(row == resolvedMatch,
+                        Comment(rawValue: "the grid scrolled to 0-based row \(row), but the match the model had "
+                            + "just resolved was \(resolvedMatch.map(String.init) ?? "none") — a find landing must "
+                            + "scroll to ITS OWN match:\n\(logTail(log))"))
+                #expect(targetVisible == true,
+                        Comment(rawValue: "the find landing on 0-based row \(row) scrolled the grid but left that "
+                            + "row OUTSIDE the real visible rect:\n\(logTail(log))"))
+            }
+        }
+
+        // (2) The sequence ENDS with the final match physically on screen. This is the
+        //     non-vacuity anchor for (1): if the landing bridge stops scrolling
+        //     altogether there is no scroll to check, and if `landOn` stops putting the
+        //     target in view the last scroll reports target_visible=false — both RED.
+        let lastScroll = timeline.scrolls.last
+        let lastScrollText = lastScroll.map {
+            "row \($0.row) target_visible=\($0.targetVisible.map(String.init) ?? "nil")"
+        } ?? "none — the grid never scrolled"
+        #expect(lastScroll?.row == NativeGridFixture.markerRows.last
+                    && lastScroll?.targetVisible == true,
+                Comment(rawValue: "the step sequence must END with the final match (0-based "
+                    + "\(NativeGridFixture.markerRows.last ?? -1)) inside the REAL viewport; the last physical "
+                    + "scroll was \(lastScrollText):\n\(logTail(log))"))
 
         let complete = probeLines(log, prefix: "lesssheet.find.seq_complete ").first
         #expect(complete.flatMap { intField($0, "landings") } == 4,
