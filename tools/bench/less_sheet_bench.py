@@ -13,7 +13,7 @@ test files.
   python3 .../less_sheet_bench.py --repo /path/to/less-sheet       # if auto-locate fails
 
 How it works: the script (1) finds the repo, (2) builds the backend static lib
-with `zig build -Doptimize=ReleaseFast` (or uses --lib), (3) compiles a tiny C
+with `zig build -Doptimize=<--optimize, default ReleaseSafe>` (or uses --lib), (3) compiles a tiny C
 harness that #includes api/lesssheet.h and links the lib (needs `cc`/`clang`),
 (4) generates fixtures in CWD, (5) runs the harness (warm; also cold with --cold),
 (6) reports, (7) cleans up. Build artifacts live in the repo / a temp dir; only
@@ -209,7 +209,7 @@ def find_repo(explicit):
         "Pass --repo <path> or set LESSSHEET_REPO.")
 
 
-def build_lib(repo, prebuilt):
+def build_lib(repo, prebuilt, optimize):
     if prebuilt:
         if not os.path.isfile(prebuilt):
             die("--lib path does not exist: " + prebuilt)
@@ -217,8 +217,8 @@ def build_lib(repo, prebuilt):
     if not shutil.which("zig"):
         die("zig not found on PATH (needed to build the backend). Install zig 0.16.0, "
             "or pass --lib <prebuilt liblesssheet.a>.")
-    print("[build] zig build -Doptimize=ReleaseFast (backend) ...", flush=True)
-    r = run(["zig", "build", "-Doptimize=ReleaseFast"], cwd=os.path.join(repo, "backend"))
+    print("[build] zig build -Doptimize=%s (backend) ..." % optimize, flush=True)
+    r = run(["zig", "build", "-Doptimize=" + optimize], cwd=os.path.join(repo, "backend"))
     if r.returncode != 0:
         die("backend build failed:\n" + r.stderr[-2000:])
     lib = os.path.join(repo, "backend", "zig-out", "lib", "liblesssheet.a")
@@ -389,7 +389,7 @@ def fmt_table(rows):
     return "\n".join(out)
 
 
-def build_report(info, per_fixture, cold, copy_cap):
+def build_report(info, per_fixture, cold, copy_cap, optimize):
     L = []
     L.append("=" * 72)
     L.append("less-sheet backend benchmark")
@@ -398,6 +398,7 @@ def build_report(info, per_fixture, cold, copy_cap):
     for k, v in info.items():
         L.append("  %-22s %s" % (k + ":", v))
     L.append("  %-22s %s" % ("mode:", "COLD (page cache dropped) + warm" if cold else "warm (page cache)"))
+    L.append("  %-22s %s" % ("build:", optimize))
     L.append("  %-22s %s rows" % ("copy cap:", "{:,}".format(copy_cap)))
     L.append("")
     for fx in per_fixture:
@@ -443,6 +444,11 @@ def main():
                          "Scale up on fast/large disks, e.g. 200,2000,8000.")
     ap.add_argument("--repo", default=None, help="path to the less-sheet repo (else auto-located)")
     ap.add_argument("--lib", default=None, help="prebuilt liblesssheet.a (skips zig build)")
+    ap.add_argument("--optimize", default="ReleaseSafe",
+                    choices=["ReleaseSafe", "ReleaseFast", "ReleaseSmall", "Debug"],
+                    help="zig optimize mode for the backend (default ReleaseSafe — the SHIPPED mode; "
+                         "ReleaseFast measures a build we do not ship, roughly 19%% faster on index "
+                         "and 20%% on copy, so label it if you use it)")
     ap.add_argument("--cold", action="store_true", help="also measure cold (drop page cache; needs root)")
     ap.add_argument("--copy-cap", type=int, default=1000000, help="max rows to copy in copy_rows (default 1e6)")
     ap.add_argument("--keep", action="store_true", help="keep the generated fixtures (don't delete)")
@@ -477,13 +483,19 @@ def main():
         except OSError:
             pass
         workdir = None
+        # A prebuilt harness was built elsewhere (the remote runner cross-compiles
+        # it), so --optimize is a LABEL we are told, not something we enforced.
+        opt_label = "%s (prebuilt harness, as reported)" % args.optimize
         print("[info] prebuilt harness: %s" % harness)
         print("[info] disk under test (CWD): %s" % cwd)
     else:
         repo = find_repo(args.repo)
         print("[info] repo:  %s" % repo)
         print("[info] disk under test (CWD): %s" % cwd)
-        lib = build_lib(repo, args.lib)
+        # An unlabelled number is how three storage-tier runs got read as shipped
+        # performance when they were ReleaseFast: never omit the mode.
+        opt_label = "UNKNOWN (prebuilt --lib)" if args.lib else args.optimize
+        lib = build_lib(repo, args.lib, args.optimize)
         workdir = tempfile.mkdtemp(prefix="lsbench-")
         harness = compile_harness(repo, lib, workdir)
 
@@ -520,7 +532,7 @@ def main():
             per_fixture.append(entry)
 
         info = machine_info(cwd)
-        report = build_report(info, per_fixture, args.cold, args.copy_cap)
+        report = build_report(info, per_fixture, args.cold, args.copy_cap, opt_label)
         print("\n" + report)
 
         out = args.out or os.path.join(
