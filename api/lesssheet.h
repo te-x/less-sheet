@@ -951,9 +951,13 @@ typedef enum ls_filter_state {
      * is final (total_exact true), progress is exactly 1.0. */
     LS_FILTER_DONE = 2,
     /* A filter is active but its filter-scan stopped before EOF (a jump-scan
-     * or match-scan took the slot). Counts, progress, and frontier gains are
-     * kept, frozen at their last values; the filter MODE persists (the view is
-     * still filtered). See FILTERED VIEWS for when it resumes. */
+     * or match-scan took the slot -- or, on a NETWORK document, the filtered
+     * jump that was driving the scan landed and nothing else drives it: a net
+     * document gets no background filter scan). Counts, progress, and frontier
+     * gains are kept, frozen at their last values; the filter MODE persists
+     * (the view is still filtered), and total_exact is false -- which is the
+     * flag to render a partial count from, NOT a user cancellation. See
+     * FILTERED VIEWS for when it resumes. */
     LS_FILTER_CANCELLED = 3,
 } ls_filter_state;
 

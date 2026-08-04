@@ -62,6 +62,17 @@ struct AmendmentContractGuardTests {
     // AC23 — the frozen C ABI is byte-identical: no additive block, no edit to any
     // existing symbol/layout/prototype for this UI amendment.
     @Test func frozenCAbiHeaderHasEmptyDiff() {
+        // Baseline re-bumped 2026-08-04 for a COMMENT-ONLY correction: the
+        // LS_FILTER_CANCELLED doc block listed only "a jump-scan or match-scan took
+        // the slot" as the cause, which does not describe what happens on a NETWORK
+        // document -- the filtered jump that was driving the scan lands and nothing
+        // else drives it, because a net document gets no background filter scan. A
+        // frontend author reading only that list would not anticipate the state, and
+        // could render it as a user cancellation instead of a partial count. Wording
+        // endorsed by the reviewer in review/REVIEW-netgz-mutex-wedge.md. ZERO
+        // struct / enum / signature / constant / layout change -- ls_filter_state's
+        // values are untouched -- so the ABI is byte-compatible; only the comment
+        // bytes moved, which this guard deliberately notices.
         // Baseline re-bumped for the ARCH-thin-frontend-shared-core Phase 1
         // amendment: ONE additive appended block (the MATCH-FLAGS EXTENSION —
         // the single new prototype ls_window_match_flags), with struct / enum /
@@ -107,7 +118,7 @@ struct AmendmentContractGuardTests {
         // rebuild (no external ABI consumer). Updated through the change-authority
         // process. See docs/architecture/ARCH-security-hardening.md.
         expectEmptyDiff("api/lesssheet.h",
-                        baseline: "39b998743a82fc6fcedb75607387bffc33e9ca1f15efdefc0d8bddc4d6eb02d1")
+                        baseline: "b949b3dc8166c977c40ce451a37436ae057bf3e6b392f19704abf2c1c5c54805")
     }
 
     // AC23 — the public Swift search/layout contracts are byte-identical:
