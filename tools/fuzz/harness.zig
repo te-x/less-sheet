@@ -550,7 +550,7 @@ fn gzMember(plain: []const u8, shape: gzbuild.Shape) ?[]u8 {
 // `csv` target only while this is true — where all five encodings are drawn and
 // measured to terminate. Revert by setting this to `false`, which is the intended
 // first step of triage once the fix lands.
-const quarantine_utf16_streaming = true;
+const quarantine_utf16_streaming = false; // LIFTED: F1 fixed (streaming end-of-stream verdict)
 
 fn quarantine(opts: api.OpenOptions) api.OpenOptions {
     if (!quarantine_utf16_streaming) return opts;

@@ -1,0 +1,82 @@
+=== less-sheet fuzz campaign (security-hardening wave (c)) ===
+date        : 2026-08-04T15:59:13Z
+host        : MAC-mac Darwin arm64
+zig         : 0.16.0
+repo tip    : 80e1052 (feat/kbdnav-a11y)
+tree        : DIRTY
+iterations  : 200 per fuzz target
+mode        : ReleaseSafe (the shipped mode — a safety panic counts as a crash)
+log         : $HOME/Documents/projects/less-sheet/tools/fuzz/campaign/campaign-MAC-mac-20260804-175913.log
+
+--- quarantines in force ---
+553:const quarantine_utf16_streaming = false; // LIFTED: F1 fixed (streaming end-of-stream verdict)
+
+--- corpus ---
+  csv.pack                1535750 bytes
+  gz_raw.pack              315812 bytes
+  gz_trunc.pack            130819 bytes
+  net.pack                 409205 bytes
+
+--- seed replay (deterministic, every committed entry once) ---
+replay exit status: 0
+
+--- campaign ---
+======= FUZZING REPORT =======
+Step: run test lsfuzz
+Fuzz test: "harness.test.fuzz csv: ls_open + window/cell/search/filter/copy over a fuzzed local CSV" (7cf0c562a16d1d19)
+Runs: 84934 -> 87585
+Unique runs: 2251 -> 2275
+Coverage: 4726/22258 -> 4786/22258 (21.50%)
+------------------------------
+Values are accumulated across multiple runs when preserving the cache.
+==============================
+campaign exit status: 0
+
+--- coverage report ---
+instrumented binary : .zig-cache/o/92742e53e64ba04299698291c98dd13e/lsfuzz
+coverage map        : .zig-cache/v/191d6da162c5f07c
+
+======= COVERAGE REPORT =======
+binary      : .zig-cache/o/92742e53e64ba04299698291c98dd13e/lsfuzz
+coverage    : .zig-cache/v/191d6da162c5f07c
+runs        : 87585
+unique runs : 2275
+PCs covered : 4786/22258 (21.50%)
+unresolved  : 314 PCs (no debug line info)
+
+-- required hotspot modules (AC-c1) --
+  csv_reader   ENTERED      505/749 PCs in 1 file(s)
+  source       ENTERED      310/521 PCs in 1 file(s)
+  net_source   ENTERED      181/364 PCs in 1 file(s)
+  window       ENTERED      203/370 PCs in 1 file(s)
+  index        ENTERED      148/316 PCs in 1 file(s)
+  search       ENTERED      118/433 PCs in 1 file(s)
+  encoding     ENTERED      420/475 PCs in 1 file(s)
+
+-- per-file coverage (project files only) --
+  base.zig                         67/90      74.44%
+  column.zig                      408/879     46.42%
+  column_state.zig                 16/60      26.67%
+  csv_reader.zig                  505/749     67.42%
+  encoding.zig                    420/475     88.42%
+  filter.zig                       79/168     47.02%
+  gzbuild.zig                      36/54      66.67%
+  harness.zig                      59/96      61.46%
+  index.zig                       148/316     46.84%
+  lexer.zig                       153/166     92.17%
+  matcher.zig                     170/382     44.50%
+  nav.zig                          50/132     37.88%
+  net.zig                          77/114     67.54%
+  net_source.zig                  181/364     49.73%
+  open.zig                         33/46      71.74%
+  reader.zig                       18/18     100.00%
+  root.zig                        172/229     75.11%
+  search.zig                      118/433     27.25%
+  sniff.zig                        51/54      94.44%
+  source.zig                      310/521     59.50%
+  sysio.zig                         1/4       25.00%
+  window.zig                      203/370     54.86%
+==============================
+
+--- triage (AC-c2) ---
+no crashing input saved
