@@ -10458,13 +10458,49 @@ test "netgz1: a foreground read on a network .csv.gz issues NO transport request
 // the view stays empty forever, which reads exactly like "these fixture shapes are
 // incompatible". They are not.
 //
-// TWO FIXTURE NOTES. (1) The predicate must be SELECTIVE or the arm is hollow:
-// `genFixedRows` zero-pads every cell, so `textReq("0")` matches every row and the
-// filtered view degenerates into the identity view (measured: filter total ==
-// scanned rows). `textReq("99")` keeps ~4.7% of them. (2) `ls_search_nav` is a
-// SILENT NO-OP unless a search is active (`search.navSearch` returns immediately on
-// `search_state == .idle`), so the arm starts one and asserts the state before
-// measuring — otherwise it would pin nothing at all.
+// THREE MORE FIXTURE TRAPS — the drive sequence above was the first of the four,
+// and every one of them is something an author on this path got wrong.
+//
+// (1) The predicate must be SELECTIVE or the arm is hollow: `genFixedRows`
+// zero-pads every cell, so `textReq("0")` matches EVERY row and the filtered view
+// degenerates into the identity view — an expensive re-run of netgz1.
+// `textReq("99")` keeps ~4.7%: the filter reports `total = 16161, exact = true`
+// against a 343 313-row frontier, roughly 2x headroom over the `> 8_000` floor
+// below.
+//
+//     THE SELECTIVITY GUARD IS THE PER-ROW CELL ASSERTION IN THE LOOP, not the
+//     count bound above it. `fs.total < rows / 2` is 250 000, and a measured
+//     match-all run produced 200 704 — it would have PASSED the very degeneration
+//     it looks like it guards. (Another produced 343 314, which the bound does
+//     catch; that the answer depends on how far the scan got is exactly why the
+//     bound cannot be the guard.) What catches it is
+//     `indexOf(c0, "99") or indexOf(c1, "99")`: under match-all the filtered
+//     mapping is the identity, so filtered row 200 640 serves "00200640", which
+//     contains no "99", and the arm goes RED. That assertion is LOAD-BEARING, not
+//     decorative — weaken it and this arm can silently become an identity-view
+//     re-run of netgz1.
+//
+// (2) To COMPLETE a filtered view on a network document, the jump target must lie
+// PAST THE END of the view. `filter.resolveFilterJumpLocked` (:255-269) ends the
+// jump the moment the target row is LOCATED among the counted matches, which leaves
+// the filter parked at `LS_FILTER_CANCELLED` — "stopped before EOF", mode persists,
+// resumes on a later jump, exactly the state's documented meaning. Only a target it
+// never locates makes the scan run to EOF and firm `total_exact`. `netgz2` reaches
+// `.done` because `rows - 1` is unreachable in a ~16 k-row view; a REACHABLE
+// mid-view target parks it instead (measured: target 200 000 -> `.cancelled`,
+// total = 200 704).
+//
+// PREDICATE SELECTIVITY HAS NO BEARING ON WHICH OF THOSE HAPPENS, and the tempting
+// inference "a completing filter proves the predicate is selective" is FALSE — two
+// variables differed between those runs and this is the other one. Measured
+// directly: the match-all predicate with the unreachable `rows - 1` target ALSO
+// reaches `.done` (total = 343 314). Selectivity is enforced by (1)'s cell
+// assertion, nothing else.
+//
+// (3) `ls_search_nav` is a SILENT NO-OP unless a search is active
+// (`search.navSearch` returns immediately on `search_state == .idle`), so the arm
+// starts one and asserts the state before measuring — otherwise it would pin
+// nothing at all.
 //
 // THE BOUND: one fixture, the RANDOM-fill arm, three near-frontier distances plus
 // the nav entry point. The sequential arm has no hermetic driver (see netgz1).
