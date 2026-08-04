@@ -276,10 +276,34 @@ def main():
                   % (label, outp, peak / 1e6, peak / outp))
         valid = [p for (_, _, _, p) in peaks if p]
         if valid:
-            flat = max(valid) / min(valid) < 1.5
-            check("peak RSS flat (max/min < 1.5x across 1MB..100MB)", flat,
-                  "max=%d min=%d ratio=%.3f" % (max(valid), min(valid),
-                                                max(valid) / min(valid)))
+            # The property is that memory is BOUNDED as output grows -- not that it is
+            # identical. A bare `max/min < 1.5` measured the wrong thing and flaked:
+            # peak RSS at the small end is ~28.4 MB of fixed interpreter/runtime
+            # overhead and is rock steady, while the INTERMEDIATE sizes swing ~13% run
+            # to run on allocator/GC timing (measured over repeated runs: 8MB came in
+            # at 32.2, 32.4 and 36.4 MB). So the ratio tracked allocator noise, and a
+            # 1.5 bound left only ~12% headroom over an observed 1.28-1.34 -- it was
+            # seen failing at 1.533 and passing on re-run. A gate that cries wolf
+            # teaches people to re-run instead of look.
+            #
+            # Stated against the growth it is actually about: output grows ~100x across
+            # this sweep while peak RSS grows ~1.33x, a ~75x separation. Requiring
+            # sublinear growth by a wide margin keeps every bit of the teeth (buffering
+            # would track output, i.e. ~100x) while sitting far outside the noise.
+            out_growth = peaks[-1][2] / max(peaks[0][2], 1)
+            rss_growth = max(valid) / min(valid)
+            check("peak RSS growth is sublinear in output (%.0fx output -> %.2fx RSS, "
+                  "%.0fx separation)" % (out_growth, rss_growth, out_growth / rss_growth),
+                  rss_growth < 2.0,
+                  "max=%d min=%d ratio=%.3f (bound 2.0)" % (max(valid), min(valid), rss_growth))
+            # Independent absolute ceiling, so widening the ratio above cannot quietly
+            # cost coverage: every peak stays far under the 100 MB top output, which a
+            # buffering implementation could not do.
+            ceiling = 64 << 20
+            check("peak RSS under the absolute ceiling (%d MB) at every size"
+                  % (ceiling >> 20),
+                  max(valid) < ceiling,
+                  "max=%d ceiling=%d" % (max(valid), ceiling))
             # peak must be far below the 100 MB output => not buffering the file
             biggest = peaks[-1]
             check("peak RSS << 100MB output (constant memory)",
