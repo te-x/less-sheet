@@ -46,7 +46,18 @@ empty-extent → nil no-op; dead code fully removed. Cold-open budget passed all
 - **H4** — downward reveals land the active row's bottom at the literal viewport bottom edge (byte-exact per
   G5); confirm it reads well against the floating-controls overlay strip.
 
-## Pending: human macOS GUI pass (the author, reassembled `.app`)
+## PASSED: human macOS GUI pass (the author, 2026-08-04) — "H1, 2, 3 and 4 all feel good"
+
+the author ran H1–H4 against `/Applications/less-sheet.app` reassembled 2026-08-03 21:39 — the first
+bundle built on the **ReleaseSafe** core (`376abb9`), so the pass also covers the shipped-mode flip.
+He separately confirmed the week's `.csv.gz` correctness work live: "csv.gz seems all correctly
+handled" — i.e. the silent row-count drift (#14), the flate feed guard (#40) and the network-gzip
+wedge are validated by hand as well as by the frozen locks. **#38 is closed.** The GTK/Orca pass
+(#37, H-A1–H-A5) is still outstanding.
+
+The original items, retained for the record:
+
+## (was) Pending: human macOS GUI pass (the author, reassembled `.app`)
 H1 keyboard-only select+copy (seed, move, auto-scroll, ←/→ visible columns, Cmd+C single cell) + physical-key
 mapping; H2 accent outline light/dark + live accent; H3 Esc precedence + no focus hijack while typing; H4 no
 regression + native auto-scroll feel. The implementer already reassembled `less-sheet.app` on fresh bits.
