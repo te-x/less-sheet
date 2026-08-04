@@ -10599,3 +10599,302 @@ test "netgz2: the mutex-held-throughout paths on a network .csv.gz issue NO tran
     try std.testing.expectEqual(before, after);
     try std.testing.expect(nav != .none); // the navigation was accepted, not dropped
 }
+
+// ===========================================================================
+// FUZZ FINDING F1 (tools/fuzz/findings/README.md + F1-gz-utf16-hang/):
+// `ls_open` NEVER RETURNS when the decoded stream is UTF-16 ending on an ODD
+// byte -- a dangling half code unit at end of stream -- AND the source is a
+// STREAMING one (confirmed by the harness on the local gzip Source AND on the
+// network Source). Reachable from THREE bytes with DEFAULT options (`FF FE 41`),
+// because `encoding = auto` selects UTF-16 straight off the BOM. Both frontends
+// call `ls_open`, so an unkillable open on untrusted input is a frozen window
+// with no way out -- a ship-blocker against "everything either WORKS or FAILS
+// GRACEFULLY".
+//
+// WHY THE LOCK IS ONE LEVEL BELOW `ls_open`
+// The obvious test -- open the fixture, assert it returns -- is UNUSABLE: on the
+// broken tree it HANGS rather than fails, wedging this whole suite and the gate
+// with it, and a synchronous C-ABI call cannot be timed out in-process. Measured
+// first-hand before writing these tests (native ReleaseSafe, the standalone
+// driver `F1-gz-utf16-hang/repro.zig`, 12 s deadline, BOTH index modes):
+//
+//     B-bom-le-odd-1byte.csv.gz   (FF FE 41)                *** NO RETURN ***
+//     C-bom-le-odd-9bytes.csv.gz  (FF FE + a,b\nx,y\n + A)   *** NO RETURN ***
+//     D-control-bom-le-even.csv.gz(FF FE + id,name\n1,a\n)   RETURNED
+//
+// So the lock is placed on the ROW-SCAN op the hanging loop calls. Every frontier
+// scan in the core -- `index.headScan` (the one `ls_open` runs), `index.scanChunk`,
+// and the jump/window/nav skip loops -- is the SAME loop:
+//
+//     while (!reader.atEnd(source, pos)) {
+//         const b = reader.boundsAfter(source, pos, lim);
+//         if (b.capped) break;        // limit/budget reached -> stop
+//         pos = b.next;               // ... otherwise ADVANCE
+//     }
+//
+// It terminates if and only if every call ADVANCES (`next > pos`), or reports
+// `capped`, or lands on `atEnd`. Diagnosed non-progress, measured at that seam:
+// with a UTF-16 encoding and ONE byte left, `csv_reader.boundsFromCursor`'s
+// `streamUnit` gets a 1-byte peek, `encoding.decodeUnit` cannot form a code unit
+// and returns null, and the streaming arm returns `next == pos` with
+// `capped = false` -- while the mmap arm (`lexer.recordBounds`) returns
+// `next = limit`, i.e. it RESOLVES the end and advances past the undecodable
+// tail. That difference is the whole finding, and it is what these tests pin.
+//
+// Driving `boundsAfter` ONE CALL AT A TIME under a hard STEP BUDGET turns the
+// hang into a failing assertion: each individual call returns promptly; it is
+// only the caller's re-issue that is infinite.
+//
+// COVERAGE, STATED PLAINLY. These lock the LOCAL GZIP arm, on BOTH of its byte
+// providers (the resident open head and the streaming inflate lane past it). The
+// NETWORK arm is NOT lockable here: the only way into an http_range Source is
+// `openUrlStartFake`, which runs the whole fake open SYNCHRONOUSLY on the calling
+// thread (src/net.zig `startJob` -> `runFake`), so a network repro would hang this
+// binary exactly like `ls_open` does. Both arms execute the SAME
+// `csv_reader.boundsFromCursor` over the same `Cursor` API -- only the byte
+// provider differs -- so one fix closes both; the network arm's regression check
+// is `net.pack` entry 40 in the fuzz corpus, which goes RED the moment
+// `quarantine_utf16_streaming` is lifted (finding steps 2-4).
+// ===========================================================================
+
+/// A UTF-16 stream that ends on an odd byte, with the BOM `encoding = auto`
+/// resolves from and the `bom_len` it strips (what `open` does before any scan).
+const F1Case = struct {
+    name: []const u8,
+    /// The DECODED stream: the bytes a plain `.csv` holds, and the bytes the
+    /// `.csv.gz` member inflates to.
+    plain: []const u8,
+    bom_len: u64,
+    encoding: u8,
+};
+
+/// The finding's own seeds (`F1-gz-utf16-hang/`), as decoded streams. Each is
+/// ODD-length after its BOM, so its last byte can never complete a UTF-16 code
+/// unit. `B` is the 3-byte minimal reproducer; `BE` is the big-endian twin (the
+/// other BOM auto-detection keys on).
+const f1_odd_cases = [_]F1Case{
+    .{
+        .name = "B: BOM-LE + one dangling byte (3 bytes -- the minimal reproducer)",
+        .plain = &[_]u8{ 0xFF, 0xFE, 0x41 },
+        .bom_len = 2,
+        .encoding = api.encoding_utf16le,
+    },
+    .{
+        .name = "C: BOM-LE + 8 bytes + one dangling byte (11 bytes)",
+        .plain = &([_]u8{ 0xFF, 0xFE } ++ "a,b\nx,y\n".* ++ [_]u8{0x41}),
+        .bom_len = 2,
+        .encoding = api.encoding_utf16le,
+    },
+    .{
+        .name = "BE: BOM-BE + one dangling byte (3 bytes)",
+        .plain = &[_]u8{ 0xFE, 0xFF, 0x41 },
+        .bom_len = 2,
+        .encoding = api.encoding_utf16be,
+    },
+};
+
+/// The EVEN-length control (`D-control-bom-le-even.csv.gz`): the same source
+/// kind, the same encoding, the same code path -- every byte completes a code
+/// unit. It opens cleanly today and must keep doing so.
+const f1_even_control = F1Case{
+    .name = "D: BOM-LE + 12 bytes, EVEN (control)",
+    .plain = &([_]u8{ 0xFF, 0xFE } ++ "id,name\n1,a\n".*),
+    .bom_len = 2,
+    .encoding = api.encoding_utf16le,
+};
+
+/// A UTF-16LE stream whose undecodable TAIL is served by the gzip Source's
+/// STREAMING INFLATE lane instead of its resident open head: the head inflate
+/// stops at `api.open_head_max_bytes` (src/source.zig's `open_bytes` IS that
+/// constant), so a logical stream longer than it cannot have a head-resident
+/// tail. Deliberately ONE row (no terminator anywhere) so the walk below costs
+/// two steps rather than 350k.
+fn f1BigPayload(gpa: std.mem.Allocator) ![]u8 {
+    const units: u64 = (api.open_head_max_bytes / 2) + 128 * 1024; // whole code units, > head
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(gpa);
+    try buf.ensureTotalCapacity(gpa, @intCast(units * 2 + 3));
+    buf.appendSliceAssumeCapacity(&.{ 0xFF, 0xFE }); // the BOM auto-detection keys on
+    var i: u64 = 0;
+    while (i < units) : (i += 1) buf.appendSliceAssumeCapacity(&.{ 'a', 0x00 });
+    buf.appendAssumeCapacity(0x41); // the dangling half code unit
+    return buf.toOwnedSlice(gpa);
+}
+
+const F1Kind = enum { plain, gzipped };
+
+/// How the frontier loop ENDED. The first two terminate; the last two do not.
+const F1Stop = enum {
+    /// The loop condition ended it: `atEnd(pos)`. The clean termination.
+    at_end,
+    /// `boundsAfter` reported the limit, so the caller breaks. Also terminating.
+    capped,
+    /// No advance, not capped, and `next` is not the end: the caller re-issues
+    /// the identical call forever. THE DEFECT -- this is the `ls_open` hang.
+    no_progress,
+    /// Still advancing when the step budget ran out. Never an expected outcome
+    /// for these fixtures (1-2 rows); it would mean the fixture is not what the
+    /// test thinks it is, so it is asserted against rather than ignored.
+    step_budget,
+};
+
+const F1Walk = struct {
+    stop: F1Stop,
+    /// Logical byte the walk ended at (measured through the seam, never by
+    /// reaching into the opaque `Pos`).
+    at: u64,
+    rows: u64,
+    steps: u64,
+};
+
+/// Run the core's own frontier-scan loop (see the banner) over `bytes` served
+/// through the mmap or gzip byte provider, with a hard step budget, and report
+/// how it ended. Mirrors `index.headScan`'s body exactly, including that a
+/// `capped` step breaks BEFORE counting a row.
+fn f1Walk(bytes: []const u8, kind: F1Kind, bom_len: u64, encoding: u8, max_steps: u64) F1Walk {
+    var source = switch (kind) {
+        .plain => api.sourceFromMapping(bytes, .mmap),
+        .gzipped => api.sourceFromMapping(bytes, .gzip),
+    };
+    defer {
+        api.sourceShutdown(&source);
+        api.sourceDeinit(&source);
+    }
+    api.sourceRebaseBom(&source, bom_len); // exactly what `open` does post-resolution
+    const rdr = api.csvReaderSeam(api.default_separator, api.default_quote, encoding);
+    var pos = rdr.start(source);
+    var rows: u64 = 0;
+    var steps: u64 = 0;
+    while (steps < max_steps) : (steps += 1) {
+        if (rdr.atEnd(source, pos))
+            return .{ .stop = .at_end, .at = api.posLogicalBytes(source, pos), .rows = rows, .steps = steps };
+        const b = rdr.boundsAfter(source, pos, null);
+        if (b.capped)
+            return .{ .stop = .capped, .at = api.posLogicalBytes(source, pos), .rows = rows, .steps = steps };
+        if (api.posLogicalBytes(source, b.next) <= api.posLogicalBytes(source, pos) and !rdr.atEnd(source, b.next))
+            return .{ .stop = .no_progress, .at = api.posLogicalBytes(source, pos), .rows = rows, .steps = steps };
+        rows += 1;
+        pos = b.next;
+    }
+    return .{ .stop = .step_budget, .at = api.posLogicalBytes(source, pos), .rows = rows, .steps = steps };
+}
+
+fn f1Report(label: []const u8, kind: []const u8, w: F1Walk) void {
+    std.debug.print(
+        "\n[F1] {s} / {s}: stop={t} at logical {d} after {d} step(s), {d} row(s)\n",
+        .{ label, kind, w.stop, w.at, w.steps, w.rows },
+    );
+}
+
+const f1_steps: u64 = 64; // fixtures are 1-2 rows; 64 is slack, not a budget
+
+test "f1_progress: a streaming row scan ADVANCES or STOPS, never neither -- UTF-16 ending on an odd byte over a gzip Source (resident head AND streaming inflate lane)" {
+    const gpa = std.testing.allocator;
+
+    // --- arm 1: the finding's seeds, whose whole stream is head-resident -------
+    for (f1_odd_cases) |c| {
+        const g = try gz(gpa, c.plain);
+        defer gpa.free(g);
+        const w = f1Walk(g, .gzipped, c.bom_len, c.encoding, f1_steps);
+        errdefer f1Report(c.name, "gzip Source", w);
+        errdefer std.debug.print(
+            "     -> boundsAfter returned next == pos with capped = false and atEnd(next) = false, so every frontier loop re-issues that identical call FOREVER: that is the ls_open hang (the same bytes as a plain .csv advance to the end -- see f1_controls)\n",
+            .{},
+        );
+        try std.testing.expect(w.stop != .no_progress);
+        try std.testing.expect(w.stop != .step_budget);
+    }
+
+    // --- arm 2: the SAME defect where the tail comes off the streaming lane ----
+    // Guards a fix that resolves end-of-stream only for the resident head.
+    const big = try f1BigPayload(gpa);
+    defer gpa.free(big);
+    try std.testing.expect(big.len - 2 > api.open_head_max_bytes); // tail CANNOT be head-resident
+    const g = try gz(gpa, big);
+    defer gpa.free(g);
+    const w = f1Walk(g, .gzipped, 2, api.encoding_utf16le, f1_steps);
+    errdefer f1Report("BIG: UTF-16LE stream longer than the open head, odd tail", "gzip Source", w);
+    try std.testing.expect(w.stop != .no_progress);
+    try std.testing.expect(w.stop != .step_budget);
+}
+
+test "f1_parity: the same UTF-16 odd-tail bytes present the SAME rows and the SAME terminus over a gzip Source as over a plain mmap Source" {
+    const gpa = std.testing.allocator;
+
+    // A .csv.gz is the SAME DOCUMENT as its .csv -- that is what transparent gzip
+    // means (ARCH-csv-gz equivalence), and it is why the finding uses the plain
+    // open as its control. So the row scan must not merely terminate: it must
+    // terminate at the same place, having reported the same rows, as the identical
+    // bytes served through mmap. That also rules OUT the degenerate repair of
+    // answering `capped` at the dangling byte, which would terminate the loop but
+    // leave the document permanently INCOMPLETE (a spinner that never resolves)
+    // and would count a different number of rows than the plain file.
+    //
+    // Relational on purpose: it compares gzip against whatever mmap does, and
+    // separately requires the mmap reference to be a genuine `atEnd` -- so it
+    // cannot be satisfied by both sides degenerating together.
+    for (f1_odd_cases) |c| {
+        const g = try gz(gpa, c.plain);
+        defer gpa.free(g);
+        const gw = f1Walk(g, .gzipped, c.bom_len, c.encoding, f1_steps);
+        const mw = f1Walk(c.plain, .plain, c.bom_len, c.encoding, f1_steps);
+        errdefer f1Report(c.name, "gzip Source", gw);
+        errdefer f1Report(c.name, "mmap Source (the reference)", mw);
+        try std.testing.expectEqual(F1Stop.at_end, mw.stop); // reference is non-degenerate
+        try std.testing.expectEqual(F1Stop.at_end, gw.stop);
+        try std.testing.expectEqual(mw.at, gw.at);
+        try std.testing.expectEqual(mw.rows, gw.rows);
+    }
+
+    const big = try f1BigPayload(gpa);
+    defer gpa.free(big);
+    try std.testing.expect(big.len - 2 > api.open_head_max_bytes);
+    const g = try gz(gpa, big);
+    defer gpa.free(g);
+    const gw = f1Walk(g, .gzipped, 2, api.encoding_utf16le, f1_steps);
+    const mw = f1Walk(big, .plain, 2, api.encoding_utf16le, f1_steps);
+    errdefer f1Report("BIG: UTF-16LE stream longer than the open head, odd tail", "gzip Source", gw);
+    errdefer f1Report("BIG: UTF-16LE stream longer than the open head, odd tail", "mmap Source (the reference)", mw);
+    try std.testing.expectEqual(F1Stop.at_end, mw.stop);
+    try std.testing.expectEqual(F1Stop.at_end, gw.stop);
+    try std.testing.expectEqual(mw.at, gw.at);
+    try std.testing.expectEqual(mw.rows, gw.rows);
+}
+
+test "f1_controls: the progress assertion is SATISFIABLE -- mmap on the same bytes, gzip on an even-length stream -- and encoding=auto really picks UTF-16 for these bytes (GUARD)" {
+    const gpa = std.testing.allocator;
+
+    // (a) NON-VACUITY, one variable: the SAME bytes, the SAME reader, the SAME
+    //     assertion -- served through mmap instead. Green today, so `f1_progress`
+    //     is not asserting something no source can satisfy; the STREAMING source
+    //     is the whole difference.
+    for (f1_odd_cases) |c| {
+        const w = f1Walk(c.plain, .plain, c.bom_len, c.encoding, f1_steps);
+        errdefer f1Report(c.name, "mmap Source", w);
+        try std.testing.expectEqual(F1Stop.at_end, w.stop);
+    }
+
+    // (b) NON-VACUITY, the other variable: the SAME gzip Source and the SAME
+    //     UTF-16 path over an EVEN-length stream. Green today, so `f1_progress`'s
+    //     RED is caused by the odd trailing byte, not by the gzip harness.
+    {
+        const g = try gz(gpa, f1_even_control.plain);
+        defer gpa.free(g);
+        const w = f1Walk(g, .gzipped, f1_even_control.bom_len, f1_even_control.encoding, f1_steps);
+        errdefer f1Report(f1_even_control.name, "gzip Source", w);
+        try std.testing.expectEqual(F1Stop.at_end, w.stop);
+    }
+
+    // (c) REACHABILITY: the encoding the locks force is the one DEFAULT options
+    //     resolve for exactly these bytes -- no dialect override, no user action,
+    //     three bytes. Asserted over the PUBLIC ABI on the plain .csv, because
+    //     the .csv.gz open is precisely what does not return.
+    for (f1_odd_cases) |c| {
+        var od = try openWith(c.plain, .{}); // DEFAULT options: encoding = auto
+        defer od.deinit();
+        const d = api.ls_dialect_get(od.doc);
+        errdefer std.debug.print("\n[F1] {s}: auto-detection resolved encoding={d} (forced={any}), expected {d}\n", .{ c.name, d.encoding, d.encoding_forced, c.encoding });
+        try std.testing.expectEqual(c.encoding, d.encoding);
+        try std.testing.expect(!d.encoding_forced);
+    }
+}

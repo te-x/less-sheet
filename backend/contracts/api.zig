@@ -1549,3 +1549,89 @@ comptime {
     if (@TypeOf(core.copyCapCellsForTest) != fn (*Doc, u64) void)
         @compileError("signature drift: copyCapCellsForTest");
 }
+
+// ===========================================================================
+// FUZZ FINDING F1 -- the ROW-SCAN PROGRESS seam (tools/fuzz/findings/README.md,
+// F1-gz-utf16-hang/). Zig-only, ADDITIVE, no C symbol: api/lesssheet.h stays
+// BYTE-IDENTICAL and every layout above is untouched.
+//
+// F1 is a NON-TERMINATION: `ls_open` never returns when the decoded stream is
+// UTF-16 ending on an ODD byte (a dangling half code unit at end of stream) and
+// the source is a STREAMING one. A test that calls `ls_open` and asserts it
+// returns cannot lock that -- on the broken tree it HANGS instead of failing, and
+// a synchronous C-ABI call has no in-process timeout. So the lock is placed ONE
+// LEVEL BELOW the C ABI, on the Source/Reader seam op the hanging loop calls:
+// every frontier scan in the core (index.headScan at open, index.scanChunk, the
+// jump/window/nav skip loops) is the same loop over `Reader.boundsAfter`, and it
+// terminates if and only if each call ADVANCES, or reports `capped`, or lands on
+// `atEnd`. Driving that op ONE CALL AT A TIME under a step budget turns the hang
+// into a failing assertion. This block spells the seam pieces a frozen test needs
+// for that; the DEFINITIONS all stay implementer-owned in src/ (csv-gz Decision
+// 1-C), and the capabilities themselves are already pinned above.
+// ===========================================================================
+
+/// The Reader SEAM type (src/reader.zig `Reader`), NAMED here without importing
+/// src/: `core.readerMatchRow`'s first parameter IS that type (seam capability
+/// (6), pinned above). The contract does not DEFINE it -- it only spells it, so a
+/// frozen test can hold a Reader value and call the ops the core's own scan loops
+/// are built out of. The comptime block below pins that the reflection really
+/// landed on the Reader union and that those ops still have the shape the F1
+/// tests drive.
+pub const ReaderSeam = @typeInfo(@TypeOf(core.readerMatchRow)).@"fn".params[0].type.?;
+
+/// The CSV Reader seam value for a RESOLVED dialect -- separator, optional quote
+/// (null == quoting off), and a resolved `encoding_*` -- i.e. exactly what `open`
+/// hands every scan after sniffing + encoding resolution. This is the ONE place
+/// outside src/ that constructs one, so implementer-side field drift fails HERE,
+/// as a contract compile error, instead of silently rewriting a frozen test.
+pub fn csvReaderSeam(sep: u8, quote: ?u8, encoding: u8) ReaderSeam {
+    return .{ .csv = .{ .sep = sep, .quote = quote, .encoding = encoding } };
+}
+
+/// Seam capability (1): build a Source over an in-memory mapping with the mmap
+/// (plain) or gzip (streaming) byte provider. A frozen test drives the SAME seam
+/// the C ABI drives, without opening a document -- the only way to assert a
+/// non-termination invariant in-process at all.
+pub const sourceFromMapping = core.sourceFromMapping;
+/// Seam capability (5): rebase the Source past the ONE leading BOM, as `open`
+/// does once `encoding` is resolved.
+pub const sourceRebaseBom = core.sourceRebaseBom;
+/// Seam capability (4): measure an OPAQUE `Pos` in logical bytes. A test compares
+/// positions through this, never by reaching into the handle.
+pub const posLogicalBytes = core.posLogicalBytes;
+/// Seam capability (7): explicit shutdown + deinit (a gzip Source owns an inflate
+/// lane and heap state; the mapping itself stays the caller's).
+pub const sourceShutdown = core.sourceShutdown;
+pub const sourceDeinit = core.sourceDeinit;
+
+comptime {
+    // The reflection must really have landed on the Reader union ...
+    if (@typeInfo(ReaderSeam) != .@"union")
+        @compileError("F1 seam drift: core.readerMatchRow's first parameter is no longer the Reader union");
+    if (!@hasField(ReaderSeam, "csv"))
+        @compileError("F1 seam drift: Reader has no `csv` variant");
+    // ... and the three ops every frontier scan loop is built out of must still
+    // have the shape the F1 progress/parity locks drive.
+    if (@TypeOf(ReaderSeam.start) != fn (ReaderSeam, core.Source) core.Pos)
+        @compileError("F1 seam drift: Reader.start must be fn(Reader, Source) Pos");
+    if (@TypeOf(ReaderSeam.atEnd) != fn (ReaderSeam, core.Source, core.Pos) bool)
+        @compileError("F1 seam drift: Reader.atEnd must be fn(Reader, Source, Pos) bool");
+    const bounds = @typeInfo(@TypeOf(ReaderSeam.boundsAfter)).@"fn";
+    if (bounds.params.len != 4 or
+        bounds.params[1].type != core.Source or
+        bounds.params[2].type != core.Pos or
+        bounds.params[3].type != ?core.Pos)
+        @compileError("F1 seam drift: Reader.boundsAfter must be fn(Reader, Source, Pos, ?Pos)");
+    const bounds_result = bounds.return_type.?;
+    if (!@hasField(bounds_result, "next") or !@hasField(bounds_result, "capped"))
+        @compileError("F1 seam drift: boundsAfter's result must carry `next` + `capped`");
+    // Construction / measurement / lifecycle signatures the F1 tests bind to.
+    if (@TypeOf(core.sourceFromMapping) != fn ([]const u8, core.SourceKind) core.Source)
+        @compileError("F1 seam drift: sourceFromMapping must be fn([]const u8, SourceKind) Source");
+    if (@TypeOf(core.sourceRebaseBom) != fn (*core.Source, u64) void)
+        @compileError("F1 seam drift: sourceRebaseBom must be fn(*Source, u64) void");
+    if (@TypeOf(core.sourceShutdown) != fn (*core.Source) void)
+        @compileError("F1 seam drift: sourceShutdown must be fn(*Source) void");
+    if (@TypeOf(core.sourceDeinit) != fn (*core.Source) void)
+        @compileError("F1 seam drift: sourceDeinit must be fn(*Source) void");
+}
