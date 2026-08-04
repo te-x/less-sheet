@@ -1604,10 +1604,25 @@ action_open_url (GtkButton *button, gpointer data)
 static gboolean
 on_scroll (GtkEventControllerScroll *ctrl, double dx, double dy, gpointer data)
 {
-  (void)ctrl;
   App *app = data;
   if (app->doc == NULL)
     return GDK_EVENT_PROPAGATE;
+
+  /* Shift+wheel scrolls HORIZONTALLY — the GNOME/GTK convention, and the only
+   * way to pan a wide document with a plain mouse. A wheel reports dy ONLY
+   * (dx arrives from trackpads and tilt wheels, hence BOTH_AXES), so without
+   * consulting the modifier the Shift was simply ignored and Shift+wheel
+   * scrolled vertically like a bare wheel. Redirect dy INTO dx rather than
+   * adding a second write path, so the step sizes below stay the one place
+   * either axis is tuned. Guarded on `dx == 0.0` so a trackpad already
+   * reporting a real horizontal delta is left alone. */
+  GdkModifierType state = gtk_event_controller_get_current_event_state (
+      GTK_EVENT_CONTROLLER (ctrl));
+  if ((state & GDK_SHIFT_MASK) != 0 && dy != 0.0 && dx == 0.0)
+    {
+      dx = dy;
+      dy = 0.0;
+    }
 
   if (dy != 0.0)
     gtk_adjustment_set_value (app->vadj, gtk_adjustment_get_value (app->vadj)
