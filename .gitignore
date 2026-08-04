@@ -11,3 +11,8 @@ xcuserdata/
 # Generated icon artifacts (source of truth: branding/icon.svg)
 branding/generated/
 __pycache__/
+
+# Benchmark reports: less_sheet_bench.py writes bench-<host>-<ts>.txt into the
+# directory under test, so they land wherever a run happens. Results worth keeping
+# get summarised into review/ or the ARCH, not committed raw.
+bench-*.txt
