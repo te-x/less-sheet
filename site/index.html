@@ -101,7 +101,7 @@
 
   /* ---- figures: plain borders, quiet captions, nothing floating ---- */
   figure { margin: 0; }
-  .shot { display: block; width: 100%; height: auto; border: 1px solid var(--line); }
+  .shot { display: block; width: 100%; height: auto; }
   figcaption { font: 12.5px/1.5 var(--sans); color: var(--dim); padding-top: 9px; }
   .rail { display: flex; gap: 22px; overflow-x: auto; scroll-snap-type: x mandatory; padding-bottom: 4px; }
   .rail figure { flex: 0 0 min(540px, 84%); scroll-snap-align: start; }
@@ -224,7 +224,7 @@
           <source media="(prefers-color-scheme: dark)"
                   srcset="assets/shots/shot-hero-macos-dark.avif">
           <img class="shot" src="assets/shots/shot-hero-macos-light.avif"
-               width="1920" height="1240" alt="less-sheet showing a large CSV">
+               width="1600" height="1055" alt="less-sheet showing a large CSV">
         </picture>
         <figcaption>the window is the data</figcaption>
       </figure>
@@ -284,7 +284,7 @@
           <source media="(prefers-color-scheme: dark)"
                   srcset="assets/shots/shot-jump-macos-dark.avif">
           <img class="shot" src="assets/shots/shot-jump-macos-light.avif"
-               width="1800" height="1200" alt="Jump-to-row control"
+               width="1600" height="1055" alt="Jump-to-row control"
                loading="lazy" decoding="async">
         </picture>
         <figcaption>jump to any row, at any file size</figcaption>
@@ -313,7 +313,7 @@
           <source media="(prefers-color-scheme: dark)"
                   srcset="assets/shots/shot-dialect-macos-dark.avif">
           <img class="shot" src="assets/shots/shot-dialect-macos-light.avif"
-               width="1800" height="1200" alt="Separator and quote controls over the grid"
+               width="1600" height="1055" alt="Separator and quote controls over the grid"
                loading="lazy" decoding="async">
         </picture>
         <figcaption>separator guessed from the file — one click to override</figcaption>
@@ -342,7 +342,7 @@
             <source media="(prefers-color-scheme: dark)"
                     srcset="assets/shots/shot-search-macos-dark.avif">
             <img class="shot" src="assets/shots/shot-search-macos-light.avif"
-                 width="1800" height="1200" alt="Text search with live match count"
+                 width="1600" height="1055" alt="Text search with live match count"
                  loading="lazy" decoding="async">
           </picture>
           <figcaption>live match count, every visible match highlighted</figcaption>
@@ -352,7 +352,7 @@
             <source media="(prefers-color-scheme: dark)"
                     srcset="assets/shots/shot-filter-macos-dark.avif">
             <img class="shot" src="assets/shots/shot-filter-macos-light.avif"
-                 width="1800" height="1200" alt="Typed column predicate"
+                 width="1600" height="1055" alt="Typed column predicate"
                  loading="lazy" decoding="async">
           </picture>
           <figcaption>typed column predicates</figcaption>

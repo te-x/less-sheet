@@ -1,113 +1,96 @@
 #!/usr/bin/env python3
 """Deterministic screenshot capture for the less-sheet frontpage.
 
-Produces the shot set `docs/architecture/ARCH-frontpage.md` §3.3 specifies, by
-driving the app's OWN off-screen renderer rather than any screen-capture API.
+Two capture modes, and the difference is the whole history of this tool:
 
-WHY THERE IS NO SCREEN RECORDING PERMISSION HERE. `screencapture` is *screen*
-recording and needs a TCC grant, which would put a system dialog in front of
-whoever runs this. The app already renders itself: `FrameDump`
-(apps/macos/Sources/LessSheetApp/FrameDump.swift) draws a scene OFF-SCREEN with
-`ImageRenderer` when `LESSSHEET_DUMP_FRAME=<path>` is set, logs
-`lesssheet.frame_dumped=<path>`, and needs no permission of any kind. So this
-tool is fully unattended.
+  window (default)  Photographs the REAL window with `screencapture -l`:
+      traffic lights, transparent title bar, rounded corners, shadow, and the
+      macOS 26 glass/scroll-edge materials. This is what ships. It requires the
+      one-time Screen Recording permission for the app running this tool —
+      checked with a preflight that NEVER pops the system dialog; if the grant
+      is missing the tool prints the exact click and stops.
 
-WHY THE DIMENSIONS ARE IDENTICAL BY CONSTRUCTION, WHICH IS THE POINT. §3.3
-requires all variants of a shot to share exact pixel dimensions so the page's
-platform toggle causes no layout shift; hand-matching that across a shot set
-silently drifts. `FrameDump` renders a FIXED 900x600 layout at a FIXED
-`renderer.scale = 2` => 1800x1200 px, independent of the display it runs on.
-The post-check below still verifies it rather than trusting it, because a
-requirement that is only satisfied by construction is one refactor away from
-being satisfied by nothing.
+  flat              The app's own off-screen content render (`FrameDump`,
+      LESSSHEET_DUMP_FRAME). No permission needed, fully headless — and
+      REJECTED by the author for the page ("no window borders, traffic lights,
+      the transparent/glass effects are gone"). Kept because it needs no
+      display and no grant: useful for layout smoke tests, never for shipping.
 
-WHAT THIS TOOL CANNOT DO, stated here rather than discovered later:
-  * The `filter` shot has NO scene. FrameDump exposes grid / overlay / titlebar
-    / overscroll / separator / quote / pills / jump / progress / settings /
-    configure / reject and a find family (find, findtext, findwhere,
-    findcounts, findnomatches, findwrapped, highlights) — nothing renders a
-    FILTERED view with original row numbers kept. `findwhere` shows the typed
-    predicate UI, which is the closest honest substitute, and is used here with
-    that substitution named in the manifest. A real filter scene is a small
-    addition to FrameDump and belongs to whoever next touches that file.
-  * These are CONTENT renders, not window grabs: no window shadow, no rounded
-    corners, no vibrancy / Liquid Glass behind the floating controls. That is a
-    real fidelity trade for a permission-free, deterministic pipeline, and it is
-    the author's call whether the page wants app-window chrome around them.
-  * The hero "money shot" is a composition judgement. A script cannot make it.
+Determinism, both modes: a fixed deterministic fixture, app state driven
+through the SAME probe entry points the verification suite uses (a real find,
+a real jump, a real filter — no synthetic input events), theme pinned
+per-process (LESSSHEET_CAPTURE_APPEARANCE / LESSSHEET_DUMP_APPEARANCE; the
+system setting is never touched), and in window mode a fixed content size
+(LESSSHEET_CAPTURE_SIZE) so the autosaved window frame cannot leak geometry
+between runs. A post-check asserts all variants of each shot are
+pixel-identical — that requirement is the reason this tool exists.
 
-AVIF comes from macOS's own `sips`, which lists `public.avif` as Writable — no
-Homebrew encoder needed (`avifenc`, `magick` and `convert` are all absent here).
-It matters: a render is ~280 KB as PNG against §3.3's 150 KB-per-shot budget, and
-~65 KB as AVIF. PNG alone would have blown the page-weight budget by ~2x, so the
-conversion is part of the tool rather than a follow-up someone forgets.
-
-THE HERO HAS A DIFFERENT ASPECT RATIO ON PURPOSE. It is paged to row 1,048,576 —
-which is EXACTLY Excel's row ceiling, so the shot shows the viewer sitting at the
-row where Excel stops. That widens the row-number gutter and the layout with it
-(1920x1240 vs 1800x1200 elsewhere). §3.3 requires identical dimensions ACROSS
-VARIANTS OF ONE SHOT (so the platform toggle cannot shift layout) and one aspect
-ratio across THE RAIL; the hero is band B1's own imagery, not part of the rail,
-so its ratio is free. Both properties are checked below rather than assumed.
+Honest residuals the tool prints at the end: the hero composition is a human
+judgement, every output needs the author's review before it ships (ARCH AC-13),
+and the Linux arm is deliberately absent rather than stubbed.
 
 Usage:
-    python3 tools/shots/capture_shots [--out DIR] [--app PATH] [--shots a,b]
+    python3 tools/shots/capture_shots [--mode window|flat] [--out DIR]
+        [--app PATH] [--shots a,b] [--self-test-dimensions]
 """
 
 import argparse
 import os
+import re
+import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
 
-# Platform is a page-level axis (ARCH §7.4 keeps a macOS/Linux toggle); this tool
-# covers macOS. The Linux arm is the same driver with a GTK state mechanism and a
-# different renderer, and is deliberately absent rather than stubbed: the author's
-# Linux host was unreachable, and an unexercised path claims coverage it lacks.
 PLATFORM = "macos"
 THEMES = ("light", "dark")
-
-# A ROW NUMBER BEYOND EXCEL'S CEILING WOULD BE THE BEST POSSIBLE HERO, AND THIS
-# TOOL CANNOT PRODUCE ONE. Recording the two failed attempts because the next
-# person will have the same idea:
-#
-#   1. `LESSSHEET_DUMP_FIRSTROW=1048576` against a 2,000-row fixture. The gutter
-#      widened (silently changing the hero's dimensions to 1920x1240) but the
-#      content clamped to row 1. The shot showed rows 1-26 while this file's own
-#      comment claimed it sat at Excel's ceiling.
-#   2. The same, against a 1,100,000-row fixture. STILL rows 1-26. FrameDump
-#      fires just after first paint, when only the head of the file is indexed,
-#      so `dumpMaterialize(startRow:)` has nothing to page to and clamps.
-#
-# Both were caught by CONVERTING THE AVIF AND LOOKING AT IT — every automated
-# check passed both times, because dimension identity and aspect ratio are blind
-# to which rows are on screen. A green post-check says nothing about content.
-#
-# Getting it would need FrameDump to wait for the index to reach the target row
-# (or drive a jump first) before rendering — real work in apps/macos, not a knob.
-# Until then the hero shows the top of a large file, and no claim is made about
-# row numbers. Dropping the paging also removes the aspect-ratio exception it
-# caused, so every shot is now 1800x1200 and the rail is uniform by default.
 FIXTURE_ROWS = 2000
 
-# shot -> (FrameDump scene, extra env, substitution note or None)
+# Window-mode content size in points (Retina renders at 2x). Fixed so every
+# variant of every shot shares one geometry; the window's autosaved frame is
+# overridden for the capture process only (CaptureProbe), never persisted.
+WINDOW_SIZE = "1240x780"
+
+# shot -> (state env, settle regex, note-or-None)
+#
+# State env drives the app's real probe entry points; the settle regex is the
+# app's OWN stdout/stderr marker that the state has finished landing — never a
+# bare sleep, so a half-painted or mid-scan window cannot be captured. Every
+# shot also implicitly waits for `lesssheet.capture_window=<id>` (the window id
+# `screencapture -l` takes, printed by CaptureProbe after first paint).
 SHOTS = {
-    "hero":    ("grid",      {},
-                "the hero shows the TOP of the file: FrameDump cannot page to a "
-                "high row number (see the note above the fixture constants), so "
-                "no claim about row numbers can rest on this shot"),
-    "jump":    ("jump",      {}, None),
-    "dialect": ("separator", {}, None),
-    "search":  ("findcounts", {}, None),
-    "filter":  ("findwhere", {},
-                "SUBSTITUTION: no filtered-view scene exists in FrameDump; "
-                "`findwhere` shows the typed predicate instead of a filtered "
-                "view with original row numbers kept"),
+    "hero": ({}, r"first_rows_visible_ms", None),
+    "jump": ({"LESSSHEET_JUMP": "1500"}, r"lesssheet\.jump\.", None),
+    "dialect": ({"LESSSHEET_CAPTURE_REVEAL": "separator"}, r"first_rows_visible_ms",
+                None),
+    "search": ({"LESSSHEET_FIND": "Lisbon"}, r"lesssheet\.find\.count_final", None),
+    # `.done` is the probe's FINAL marker. The first run keyed on any
+    # filterrepaint line and captured mid-rematerialize: a dark window with a
+    # perfect popover, a correct "Filtered - 400 of 2.0K rows" pill, correct
+    # filtered gutter numbers - and NO CELL TEXT. Only looking at the image
+    # caught it; the light variant of the same run happened to win the race.
+    "filter": ({"LESSSHEET_FILTER_REPAINT": "Lisbon"}, r"lesssheet\.filterrepaint\.done",
+               None),
 }
+
+# Flat mode renders FrameDump scenes instead (kept for headless smoke tests).
+FLAT_SCENES = {
+    "hero": ("grid", {}),
+    "jump": ("jump", {}),
+    "dialect": ("separator", {}),
+    "search": ("findcounts", {}),
+    "filter": ("findwhere", {}),
+}
+
+SETTLE_SECONDS = 1.2       # after the state marker: animations/glass settle
+LAUNCH_DEADLINE = 40       # per variant, before the launch is declared failed
+PER_SHOT_BUDGET_KB = 150   # ARCH-frontpage §3.3
+
 
 def die(msg):
     sys.stderr.write("error: %s\n" % msg)
@@ -115,7 +98,6 @@ def die(msg):
 
 
 def find_app(explicit):
-    """The app BINARY (FrameDump runs inside the app, so we need the executable)."""
     if explicit:
         return explicit
     cands = [
@@ -126,21 +108,12 @@ def find_app(explicit):
     for c in cands:
         if os.path.isfile(c) and os.access(c, os.X_OK):
             return c
-    die("no app binary found. Build it (apps/macos/scripts/assemble-app.sh) or "
-        "pass --app. Looked in:\n  " + "\n  ".join(cands))
+    die("no app binary found. Build it (cd apps/macos && swift build -c release) "
+        "or pass --app. Looked in:\n  " + "\n  ".join(cands))
 
 
 def write_fixture(path, rows=FIXTURE_ROWS):
-    """A deterministic fixture — same bytes every run, so shots are comparable.
-
-    ARCH §7.7 names a csvgen-produced catalog file. This writes its own so the
-    tool has no build-order dependency; swapping in `tools/csvgen` is a drop-in
-    change if the richer corpus is wanted.
-
-    Nine columns, not six: a 900 pt grid left three columns of dead space with
-    six, and a hero shot with an empty right third undersells a viewer whose
-    whole point is dense tabular data.
-    """
+    """Deterministic fixture — same bytes every run, so shots are comparable."""
     if os.path.isfile(path) and os.path.getsize(path) > 0:
         return path
     cities = ("Lisbon", "Berlin", "Porto", "Munich", "Faro")
@@ -150,21 +123,15 @@ def write_fixture(path, rows=FIXTURE_ROWS):
         fh.write("order_id,order_date,city,region,qty,unit_price,sku,status,notes\n")
         for i in range(rows):
             fh.write("%d,2026-%02d-%02d,%s,%s,%d,%.2f,%s,%s,%s\n" % (
-                100000 + i,
-                1 + (i % 12), 1 + (i % 28),
-                cities[i % len(cities)],
-                regions[i % len(regions)],
-                1 + (i % 9),
-                4.5 + (i % 37) * 0.25,
-                "SKU-%05d" % (i * 7 % 99991),
-                states[i % len(states)],
-                "batch %d" % (i // 250),
-            ))
+                100000 + i, 1 + (i % 12), 1 + (i % 28),
+                cities[i % len(cities)], regions[i % len(regions)],
+                1 + (i % 9), 4.5 + (i % 37) * 0.25,
+                "SKU-%05d" % (i * 7 % 99991), states[i % len(states)],
+                "batch %d" % (i // 250)))
     return path
 
 
 def png_size(path):
-    """(width, height) from the IHDR chunk — no image library needed."""
     with open(path, "rb") as fh:
         head = fh.read(24)
     if head[:8] != b"\x89PNG\r\n\x1a\n":
@@ -172,33 +139,25 @@ def png_size(path):
     return struct.unpack(">II", head[16:24])
 
 
-# The rail shares one aspect ratio (§3.3); the hero is band B1's own imagery and
-# not part of the rail, so it may differ.
-#
-# OBSERVED, CAUSE NOT ESTABLISHED: the bare `grid` scene renders 1920x1240 while
-# every wrapped scene (jump / separator / findcounts / findwhere) renders
-# 1800x1200, even though FrameDump passes the SAME `gridSize` (900x600) to
-# `render` for all of them and the difference survives removing the row-paging
-# and changing the column count. I guessed the cause three times — row paging,
-# then column count, then scene padding — and was wrong each time, so this states
-# the measurement and stops there rather than shipping a fourth guess as fact.
-# It does not affect the page: the hero sits alone in its band.
-RAIL_EXEMPT = ("hero",)
-PER_SHOT_BUDGET_KB = 150
+AVIF_QUALITY = "70"    # sips formatOptions; measured on first-generation sources
+# Captures are 2704 px wide (1240 pt content + shadow at 2x) but display at
+# ~600 CSS px, so 1600 px keeps >2.5x oversampling for retina while roughly
+# halving the encoded bytes. Applied to the PNG before AVIF encoding; the
+# dimension post-check runs on the resized output, so identity still holds.
+RESIZE_MAX_PX = "1600"
 
 
 def to_avif(png):
-    """PNG -> AVIF via macOS `sips`. Returns (path, kb) or (None, reason).
-
-    §3.3 names `.avif` and sets a 150 KB per-shot budget; a render is ~280 KB as
-    PNG and ~65 KB as AVIF, so this is what keeps the page inside its budget.
-    Absolute paths only: `sips` reports a relative path it cannot resolve as
-    "not a valid file - skipping" and still exits 0, which is a silent no-op.
-    """
+    """PNG -> AVIF via macOS `sips` (no third-party encoder). Absolute paths
+    only: sips reports a path it cannot resolve as "not a valid file" and
+    still exits 0 — a silent no-op this tool refuses to inherit."""
     avif = os.path.splitext(os.path.abspath(png))[0] + ".avif"
     if os.path.exists(avif):
         os.remove(avif)
+    subprocess.run(["sips", "-Z", RESIZE_MAX_PX, os.path.abspath(png)],
+                   capture_output=True, text=True)
     proc = subprocess.run(["sips", "-s", "format", "avif",
+                           "-s", "formatOptions", AVIF_QUALITY,
                            os.path.abspath(png), "--out", avif],
                           capture_output=True, text=True)
     if not os.path.isfile(avif):
@@ -207,35 +166,115 @@ def to_avif(png):
     return avif, os.path.getsize(avif) / 1024.0
 
 
-def capture(app, fixture, shot, theme, out_dir, hero_fixture=None):
-    scene, extra, _ = SHOTS[shot]
-    if shot == "hero" and hero_fixture:
-        fixture = hero_fixture
+# ---------------------------------------------------------------------------
+# Window mode
+# ---------------------------------------------------------------------------
+
+def tcc_granted():
+    """Compile-and-run the query-only preflight. Never pops the dialog."""
+    if not shutil.which("swiftc"):
+        die("swiftc not found — needed once to build the TCC preflight helper "
+            "(xcode-select --install)")
+    d = tempfile.mkdtemp(prefix="lsshots-")
+    helper = os.path.join(d, "tccpreflight")
+    src = os.path.join(HERE, "tccpreflight.swift")
+    r = subprocess.run(["swiftc", "-O", src, "-o", helper],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        die("could not build the TCC preflight helper:\n" + r.stderr)
+    return subprocess.run([helper]).returncode == 0
+
+
+GRANT_INSTRUCTIONS = """\
+Screen Recording permission is NOT granted to the app running this tool, and
+this tool never pops the permission dialog itself.
+
+One-time grant (the author):
+  1. System Settings -> Privacy & Security -> Screen Recording
+  2. Enable it for the application this tool runs inside
+     (Terminal / iTerm2 / the IDE hosting the shell)
+  3. macOS will ask to quit & reopen that application - do it
+  4. Re-run:  python3 tools/shots/capture_shots
+
+Nothing was captured. No dialog was triggered.\
+"""
+
+
+def capture_window(app, fixture, shot, theme, out_dir):
+    state_env, settle_re, _ = SHOTS[shot]
+    out_png = os.path.join(out_dir, "shot-%s-%s-%s.png" % (shot, PLATFORM, theme))
+    env = dict(os.environ)
+    env.update(state_env)
+    env.update({
+        "LESSSHEET_CAPTURE_SIZE": WINDOW_SIZE,
+        "LESSSHEET_CAPTURE_APPEARANCE": theme,
+        # NO LESSSHEET_DUMP_EXIT: the window must stay alive to be photographed.
+    })
+    if os.path.exists(out_png):
+        os.remove(out_png)
+
+    t0 = time.time()
+    proc = subprocess.Popen([app, fixture], env=env,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, bufsize=1)
+    win_id, settled, tail = None, False, []
+    try:
+        deadline = t0 + LAUNCH_DEADLINE
+        for line in proc.stdout:
+            tail = (tail + [line.rstrip()])[-6:]
+            m = re.search(r"lesssheet\.capture_window=(-?\d+)", line)
+            if m:
+                win_id = int(m.group(1))
+            if re.search(settle_re, line):
+                settled = True
+            if win_id is not None and settled:
+                break
+            if time.time() > deadline:
+                break
+        if win_id is None or win_id < 0 or not settled:
+            return out_png, False, time.time() - t0, tail + [
+                "no capture_window/settle marker (win_id=%r settled=%r)"
+                % (win_id, settled)]
+        time.sleep(SETTLE_SECONDS)
+        # -x: no sound. Window capture includes chrome, corners and shadow.
+        shot_r = subprocess.run(["screencapture", "-x", "-l", str(win_id), out_png],
+                                capture_output=True, text=True)
+        ok = shot_r.returncode == 0 and os.path.isfile(out_png) \
+            and os.path.getsize(out_png) > 0
+        if not ok:
+            tail.append("screencapture rc=%d %s"
+                        % (shot_r.returncode, (shot_r.stderr or "").strip()))
+        return out_png, ok, time.time() - t0, tail
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+def capture_flat(app, fixture, shot, theme, out_dir):
+    scene, extra = FLAT_SCENES[shot]
     out = os.path.join(out_dir, "shot-%s-%s-%s.png" % (shot, PLATFORM, theme))
     env = dict(os.environ)
-    env.update({
-        "LESSSHEET_DUMP_FRAME": out,
-        "LESSSHEET_DUMP_SCENE": scene,
-        "LESSSHEET_DUMP_APPEARANCE": theme,
-        # Quit once the frame is written: this is a capture run, not a session.
-        "LESSSHEET_DUMP_EXIT": "1",
-    })
+    env.update({"LESSSHEET_DUMP_FRAME": out, "LESSSHEET_DUMP_SCENE": scene,
+                "LESSSHEET_DUMP_APPEARANCE": theme, "LESSSHEET_DUMP_EXIT": "1"})
     env.update(extra)
     if os.path.exists(out):
         os.remove(out)
-
     t0 = time.time()
     proc = subprocess.run([app, fixture], env=env, capture_output=True,
                           text=True, timeout=120)
     blob = (proc.stdout or "") + (proc.stderr or "")
-    # Gate on the app's OWN marker, never on a sleep: "the file appeared" can be
-    # a half-written frame, whereas frame_dumped is logged after the write.
     ok = ("lesssheet.frame_dumped=" in blob) and os.path.isfile(out)
-    return out, ok, time.time() - t0, blob
+    return out, ok, time.time() - t0, blob.strip().splitlines()[-3:]
 
+
+# ---------------------------------------------------------------------------
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--mode", choices=("window", "flat"), default="window")
     ap.add_argument("--out", default=os.path.join(REPO, "site", "assets", "shots"))
     ap.add_argument("--app", default=None)
     ap.add_argument("--shots", default=",".join(SHOTS))
@@ -251,38 +290,46 @@ def main():
         if s not in SHOTS:
             die("unknown shot %r (known: %s)" % (s, ", ".join(SHOTS)))
 
+    if args.mode == "window" and not tcc_granted():
+        print(GRANT_INSTRUCTIONS)
+        sys.exit(2)
+
     app = find_app(args.app)
     os.makedirs(args.out, exist_ok=True)
     fixture = write_fixture(os.path.join(args.out, ".fixture-2000.csv"))
-    hero_fixture = None
 
-    print("capture_shots")
+    print("capture_shots (%s mode)" % args.mode)
     print("  app     %s" % app)
     print("  fixture %s (%d rows, deterministic)" % (fixture, FIXTURE_ROWS))
     print("  out     %s" % args.out)
-    print("  renders OFF-SCREEN via FrameDump — no screen-recording permission\n")
+    if args.mode == "window":
+        print("  window  %s pt content, real chrome via screencapture -l" % WINDOW_SIZE)
+        print("  note    windows will appear on screen while this runs\n")
+    else:
+        print("  renders OFF-SCREEN via FrameDump — layout smoke test only,\n"
+              "          NOT the shipping look (no chrome, no glass)\n")
 
+    cap = capture_window if args.mode == "window" else capture_flat
     produced, failed = {}, []
     for shot in wanted:
         for theme in THEMES:
-            path, ok, secs, blob = capture(app, fixture, shot, theme, args.out,
-                                           hero_fixture)
-            if ok:
-                sz = png_size(path)
-                avif, kb = to_avif(path)
-                if avif is None:
-                    failed.append((shot, theme, ["AVIF conversion failed: %s" % kb]))
-                    print("  %-8s %-5s  rendered, AVIF FAILED: %s" % (shot, theme, kb))
-                    continue
-                os.remove(path)          # the PNG is an intermediate, not an artifact
-                produced.setdefault(shot, {})[theme] = (avif, sz, kb)
-                over = " OVER BUDGET" if kb > PER_SHOT_BUDGET_KB else ""
-                print("  %-8s %-5s  %s  %s  %5.0f KB%s  %.1fs"
-                      % (shot, theme, os.path.basename(avif),
-                         "%dx%d" % sz if sz else "?", kb, over, secs))
-            else:
-                failed.append((shot, theme, blob.strip().splitlines()[-3:]))
+            path, ok, secs, tail = cap(app, fixture, shot, theme, args.out)
+            if not ok:
+                failed.append((shot, theme, tail))
                 print("  %-8s %-5s  FAILED (%.1fs)" % (shot, theme, secs))
+                continue
+            avif, kb = to_avif(path)   # resizes the PNG in place first
+            sz = png_size(path)        # so the recorded size is what ships
+            if avif is None:
+                failed.append((shot, theme, ["AVIF conversion failed: %s" % kb]))
+                print("  %-8s %-5s  rendered, AVIF FAILED: %s" % (shot, theme, kb))
+                continue
+            os.remove(path)
+            produced.setdefault(shot, {})[theme] = (avif, sz, kb)
+            over = "  OVER BUDGET" if kb > PER_SHOT_BUDGET_KB else ""
+            print("  %-8s %-5s  %s  %s  %5.0f KB%s  %.1fs"
+                  % (shot, theme, os.path.basename(avif),
+                     "%dx%d" % sz if sz else "?", kb, over, secs))
 
     print("\n-- dimension post-check (the reason this tool exists) --")
     bad = 0
@@ -297,41 +344,27 @@ def main():
             print("  %-8s MISMATCH  %s   <- the platform toggle WOULD shift layout"
                   % (shot, sizes))
 
-    # The other half of §3.3, which the first version of this tool did not check:
-    # one aspect ratio across the rail. Per-shot identity says nothing about it.
-    print("\n-- rail aspect-ratio check (%s exempt: own band) --"
-          % ", ".join(RAIL_EXEMPT))
     ratios = {}
     for shot, variants in sorted(produced.items()):
-        if shot in RAIL_EXEMPT:
-            continue
         for _t, (_p, s, _k) in variants.items():
             if s:
                 ratios.setdefault(round(s[0] / s[1], 4), []).append(shot)
-    if len(ratios) <= 1:
-        print("  OK   rail shares one aspect ratio: %s"
-              % (list(ratios)[0] if ratios else "n/a"))
-    else:
+    if len(ratios) > 1:
+        # Window mode should give ONE geometry everywhere (same window size);
+        # a split here means a shot changed the window — say so, loudly.
         bad += 1
-        print("  MISMATCH  %s" % {r: sorted(set(v)) for r, v in ratios.items()})
-    for shot in RAIL_EXEMPT:
-        if shot in produced:
-            _p, s, _k = next(iter(produced[shot].values()))
-            print("  note %s is %dx%d (ratio %.4f) — the bare `grid` scene renders "
-                  "larger than the wrapped scenes; cause not established, and it "
-                  "does not matter because the hero sits alone in its band"
-                  % (shot, s[0], s[1], s[0] / s[1]))
+        print("  aspect MISMATCH across shots: %s"
+              % {r: sorted(set(v)) for r, v in ratios.items()})
 
     total_kb = sum(k for v in produced.values() for (_p, _s, k) in v.values())
-    print("\n  total %d file(s), %.0f KB (one theme's worth is what a visitor "
-          "loads: %.0f KB)" % (sum(len(v) for v in produced.values()), total_kb,
-                               total_kb / max(1, len(THEMES))))
+    print("\n  total %d file(s), %.0f KB (a visitor loads one theme: ~%.0f KB)"
+          % (sum(len(v) for v in produced.values()), total_kb,
+             total_kb / max(1, len(THEMES))))
 
     print("\n-- what still needs a human --")
     print("  * the hero composition is a judgement a script cannot make")
     print("  * review every output before it ships (ARCH AC-13)")
-    print("  * these are CONTENT renders: no window shadow/rounded corners/vibrancy")
-    for shot, (_s, _e, note) in SHOTS.items():
+    for shot, (_e, _r, note) in SHOTS.items():
         if note and shot in produced:
             print("  * %s: %s" % (shot, note))
     print("  * Linux variants are NOT produced by this tool (macOS only)")
@@ -348,31 +381,25 @@ def main():
 
 
 def self_test():
-    """Prove the dimension check has teeth, per the coordinator's requirement.
-
-    A post-check that has never rejected anything is indistinguishable from one
-    that cannot.
-    """
-    import tempfile
+    """A post-check that has never rejected anything is indistinguishable from
+    one that cannot; prove it can."""
     d = tempfile.mkdtemp()
 
     def fake_png(path, w, h):
-        ihdr = struct.pack(">II", w, h)
         with open(path, "wb") as fh:
-            fh.write(b"\x89PNG\r\n\x1a\n" + b"\x00" * 8 + ihdr)
+            fh.write(b"\x89PNG\r\n\x1a\n" + b"\x00" * 8 + struct.pack(">II", w, h))
 
-    a = os.path.join(d, "a.png")
-    b = os.path.join(d, "b.png")
-    fake_png(a, 1800, 1200)
-    fake_png(b, 1800, 1199)
-    sa, sb = png_size(a), png_size(b)
-    print("self-test: %s vs %s -> %s"
-          % (sa, sb, "DETECTED (correct)" if sa != sb else "MISSED (broken)"))
-    same = os.path.join(d, "c.png")
-    fake_png(same, 1800, 1200)
-    print("self-test: identical pair -> %s"
-          % ("accepted (correct)" if png_size(a) == png_size(same) else "false alarm"))
-    sys.exit(0 if sa != sb and png_size(a) == png_size(same) else 1)
+    a, b, c = (os.path.join(d, n) for n in ("a.png", "b.png", "c.png"))
+    fake_png(a, 2480, 1560)
+    fake_png(b, 2480, 1559)
+    fake_png(c, 2480, 1560)
+    mismatch = png_size(a) != png_size(b)
+    match = png_size(a) == png_size(c)
+    print("self-test: mismatched pair -> %s"
+          % ("DETECTED (correct)" if mismatch else "MISSED (broken)"))
+    print("self-test: identical pair  -> %s"
+          % ("accepted (correct)" if match else "false alarm"))
+    sys.exit(0 if mismatch and match else 1)
 
 
 if __name__ == "__main__":
