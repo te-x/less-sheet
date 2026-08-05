@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>less-sheet — open huge spreadsheets instantly</title>
-<meta name="description" content="A native, read-only viewer for spreadsheet-sized data. It reads CSV — plain, gzipped, or streamed from a URL — and nothing else, which is why it opens 2 GB as fast as 500 MB.">
+<meta name="description" content="A native, read-only viewer for spreadsheet-sized data. It reads CSV — plain, gzipped, or streamed from a URL — and nothing else, which is why it opens 10 GB as fast as 10 MB.">
 <link rel="icon" href="assets/logo.svg">
 <style>
   /* -------------------------------------------------------------------------
@@ -185,6 +185,7 @@
     <img src="assets/logo.svg" alt=""><span class="name">less-sheet</span>
     <nav>
       <a href="#speed">speed</a>
+      <a href="#bench">benchmarks</a>
       <a href="#compare">vs. excel</a>
       <a href="#download">download</a>
     </nav>
@@ -200,13 +201,13 @@
       <p class="lede">less-sheet is a native, read-only viewer for
         spreadsheet-sized data. It reads <b>CSV — plain, gzipped, or streamed
         straight from a URL — and nothing else</b>, which is exactly why it opens
-        two gigabytes as fast as five hundred megabytes.</p>
+        ten gigabytes as fast as ten megabytes.</p>
 
       <div class="ledger">
-        <div class="row"><span class="size">500 MB</span><span class="time">~100 ms</span></div>
-        <div class="row"><span class="size">2 GB</span><span class="time">~103 ms</span></div>
-        <div class="note">cold open to first rows on screen · four times the
-          data, the same wait · measured on a 7200 rpm spinning disk<br>
+        <div class="row"><span class="size">10 MB</span><span class="time">~200 ms</span></div>
+        <div class="row"><span class="size">10 GB</span><span class="time">~200 ms</span></div>
+        <div class="note">launch to first rows on screen, GUI included — a
+          thousand times the data, the same wait<br>
           <span class="draft">DRAFT NUMBERS — NOT YET RE-MEASURED</span></div>
       </div>
 
@@ -225,7 +226,7 @@
           <img class="shot" src="assets/shots/shot-hero-macos-light.avif"
                width="1920" height="1240" alt="less-sheet showing a large CSV">
         </picture>
-        <figcaption>the window is the data — theme follows your system</figcaption>
+        <figcaption>the window is the data</figcaption>
       </figure>
       <figure class="only-linux">
         <div class="pending">linux screenshots not captured yet<br>— placeholder, not a broken image —</div>
@@ -236,18 +237,44 @@
 </section>
 
 <!-- 02 ──────────────────────────────────────────────────────────────────── -->
-<section class="band">
+<section class="band" id="bench">
   <div class="col">
     <div class="prose">
       <div class="rn">02</div>
+      <h2>Benchmarks.</h2>
+      <p>Every time on this page is <b>launch to first rows on screen</b> —
+        application start, file open, and the GUI actually drawing, because the
+        backend alone is irrelevant to you.</p>
+      <p>Cold cache, from a standing start, on ordinary hardware. The point is
+        not any single number: it’s that the numbers barely move across six
+        orders of magnitude of file size.</p>
+    </div>
+    <div class="figs cmp-wrap">
+      <table class="cmp">
+        <thead><tr><th>file size</th><th>NVMe</th><th>7200 rpm hard disk</th></tr></thead>
+        <tbody>
+          <tr><td>10 KB</td><td>—</td><td>—</td></tr>
+          <tr><td>10 MB</td><td>—</td><td>—</td></tr>
+          <tr><td>10 GB</td><td>—</td><td>—</td></tr>
+        </tbody>
+      </table>
+      <p class="reqs" style="margin-top:14px">cold open · launch → rows on screen ·
+        median of repeated runs · hardware named here when measured<br>
+        <span class="draft">MEASUREMENTS PENDING — STRUCTURE ONLY, NOTHING SHIPS LIKE THIS</span></p>
+    </div>
+  </div>
+</section>
+
+<!-- 03 ──────────────────────────────────────────────────────────────────── -->
+<section class="band">
+  <div class="col">
+    <div class="prose">
+      <div class="rn">03</div>
       <h2>It never loads the file.</h2>
       <p>less-sheet does for tabular data what <code>less</code> does for text:
         it maps the file and parses only the rows in view. Opening costs
-        milliseconds at any size, and memory stays flat while you scroll
-        through gigabytes.</p>
-      <p>Jump to row 100,000,000 and it lands there without reading what came
-        before. Anything that isn’t instant shows progress and can be
-        cancelled; nothing ever blocks the window.</p>
+        milliseconds at any size, and memory stays flat while you scroll —
+        or jump — through gigabytes.</p>
       <p>Point it at an HTTP(S) URL and it behaves the same way — only the
         bytes you actually look at are ever fetched.</p>
     </div>
@@ -271,7 +298,7 @@
 <section class="band">
   <div class="col">
     <div class="prose">
-      <div class="rn">03</div>
+      <div class="rn">04</div>
       <h2>Change how it’s parsed without reopening it.</h2>
       <p>Separator, quote character, header row and text encoding are detected
         from the file itself. You open the file and read it — there is no
@@ -300,8 +327,8 @@
 <section class="band">
   <div class="col">
     <div class="prose">
-      <div class="rn">04</div>
-      <h2>Search a file you can’t open anywhere else.</h2>
+      <div class="rn">05</div>
+      <h2>Search the whole file, not the loaded part.</h2>
       <p>Incremental search with live match counts. Typed column predicates —
         <code>qty ≤ 2</code> — and filtered views that keep the original row
         numbers, so you always know where you are in the real file.</p>
@@ -340,7 +367,7 @@
 <section class="band" id="compare">
   <div class="col">
     <div class="prose">
-      <div class="rn">05</div>
+      <div class="rn">06</div>
       <h2>Why a spreadsheet struggles here.</h2>
       <p>Excel and LibreOffice are built to edit and compute, and that design
         has costs a viewer doesn’t pay.</p>
@@ -379,7 +406,7 @@
 <section class="band" id="download">
   <div class="col">
     <div class="prose">
-      <div class="rn">06</div>
+      <div class="rn">07</div>
       <h2>Download.</h2>
       <p>Free. No account, no telemetry. Checksums are published beside every
         build.</p>
