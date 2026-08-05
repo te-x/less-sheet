@@ -44,6 +44,12 @@ Scope: a full redesign of `site/index.html` and its screenshot assets, per the a
   Parquet (prioritised but not built), or accessibility (the GTK screen-reader pass is recorded
   as unverified). The page itself is still *built* accessibly (alt text, focus, contrast) — we
   simply claim nothing about the app.
+- **Never publish this workspace.** Hosting (§9.1) forces a public repo, and the code is closed:
+  the public repo carries ONLY the site, the release assets, and the issue tracker — never
+  source. This workspace has **no git remote today, and no role may add one or push it anywhere
+  public** — a leaked push is irreversible (GitHub retains forks and caches) and is the
+  highest-consequence action this feature could trigger. Creating the public repo, enabling
+  Pages, and pushing are the author's actions alone.
 
 ---
 
@@ -56,7 +62,8 @@ Scope: a full redesign of `site/index.html` and its screenshot assets, per the a
 | Screenshot set (§3.3: 5 shots × 2 platforms × 2 themes = 20 files) | Deterministic capture tool (§7.7); residual manual steps: one-time macOS Screen Recording grant, hero composition choice, review of outputs (the author) | Not started |
 | Benchmark figures re-measured on the shipped ReleaseSafe build | Queued measurement task; needs a quiet machine | Queued |
 | Download artifacts | Built & launch-verified 2026-07-30: `less-sheet-0.1-macos-arm64.dmg` 3.34 MB (macOS 26.0+, arm64); `less-sheet-0.1-linux-aarch64.tar.gz` 0.65 MB (glibc ≥ 2.34, GTK4 ≥ 4.20, libadwaita ≥ 1.8); `SHA256SUMS` + `manifest.json`. The zip is a build byproduct, never offered. Linux x86_64 blocked on a core link fix (`__zig_probe_stack`), planner pass in flight | Exist; unhosted |
-| Hosting for the page + artifacts | No decision, no task yet | Open (§9.1) |
+| Hosting | **Decided 2026-07-30: GitHub Releases (artifacts + `SHA256SUMS`) + GitHub Pages (page)**, from a public site-only repo (§9.1). Repo creation, Pages enablement, and pushes are the author's actions alone | Repo not yet created |
+| Release tag / version | Single-sourcing task in flight (macOS `Info.plist` says 0.1, `apps/gtk/meson.build` says 0.0.0); the tag drives every download URL, so page links derive from the one version — never hand-typed | In flight |
 | Ticket-tracker URL (GitHub, issues-only) | Not created; no git remote exists today | Planned, not live |
 
 **Outputs:**
@@ -180,8 +187,9 @@ and benchmarks follow as supporting depth.
   to the majority-arch visitor. One short clause naming Flatpak as the planned channel for
   wider distro reach is permitted (the author's committed channel decision) — the page's only
   forward-looking distribution statement, distinct from the format-promise ban.
-- **Footer.** Tagline; platform line (macOS 26+ Apple silicon · Linux — exact Linux wording
-  pending the artifact task, §10); tracker/contact per §7.
+- **Footer.** Tagline; platform line mirroring the download band's labels — "macOS 26.0+
+  (Apple silicon) · Linux aarch64 (GNOME 49-generation)", gaining x86_64 if that artifact ships
+  (§3.2 B7 two-state rule); tracker/contact per §6 and §9 (OQ 2–3).
 
 ### 3.3 Screenshot inventory — 5 distinct shots (hard cap 6)
 
@@ -250,6 +258,14 @@ user-visible behavior change. No backend or `api/` involvement. Data flow is one
 measured figures + artifact URLs (inputs, §2) are baked into the static file; the page computes
 nothing at runtime beyond CSS state (theme media queries, one radio group).
 
+**Publishing split (hosting decided, §9.1):** this workspace stays the sole authoring ground —
+`site/index.html`, the AVIF set, the capture tool, and fixtures live and evolve here. The public
+site-only repo is a **publish target, never an editing surface**: a prepared one-command step
+copies `site/` into it **byte-identical** (a copy, not a re-export — so the human-reviewed
+capture outputs of AC-13 are exactly the bytes that ship). Binaries and `SHA256SUMS` go to
+GitHub Releases, not the Pages tree. Nothing else of the workspace ever crosses over (§1
+non-goals).
+
 ---
 
 ## 6. External interfaces
@@ -265,8 +281,13 @@ nothing at runtime beyond CSS state (theme media queries, one radio group).
   the tracker exists**; the page must be complete and honest without it (the footer line is
   omitted, not stubbed). Because filing a GitHub issue requires a GitHub account, I recommend a
   plain `mailto:` contact alongside it — the analyst audience in the brief won't all have
-  accounts. The *principle* is a recommendation; the *address* is the author's call (§10).
-- **Hosting/DNS**: out of scope for the page design; open (§10).
+  accounts. The *principle* is a recommendation; the *address* is the author's call (§9, OQ 2).
+- **Hosting**: **GitHub Releases + GitHub Pages** (the author, 2026-07-30). Release assets get
+  stable direct-download URLs — `https://github.com/<owner>/<repo>/releases/download/<tag>/<file>`,
+  no interstitial, no JavaScript — exactly what §9.1 required; `SHA256SUMS` uploads alongside as
+  a release asset, so B7's integrity link is a plain href. The page is served by Pages from the
+  public site-only repo (§5 publishing split). The `<tag>` is the single-sourced version (§2):
+  every baked URL derives from it, never hand-typed.
 
 ---
 
@@ -429,13 +450,16 @@ Each verifiable on the built page with grep, a browser, and devtools — no judg
 
 ## 9. Open Questions
 
-1. **Hosting and deploy** — the site has never been deployed; no domain, host, or mechanism is
-   chosen, and the now-built artifacts live nowhere. **This is the last blocker to
-   publication.** What the page needs from it: stable HTTPS direct-download URLs (no
-   interstitial pages) for the `.dmg`, the tarball(s), and `SHA256SUMS`, fixed enough to bake
-   into a static file. Clarification for AC-8: the zero-third-party budget governs page
-   *resources*; download links are user-initiated navigations and may live on a different
-   origin (e.g. a release host).
+1. **Hosting and deploy** — **resolved (the author, 2026-07-30): GitHub Releases + GitHub Pages.**
+   Releases provides stable, interstitial-free direct-download URLs and hosts `SHA256SUMS` as an
+   asset; Pages serves the page from a public **site-only** repo — closed source stands, see the
+   §1 non-goal barring any public remote on this workspace. AC-8 clarification stands: download
+   links are user-initiated navigations; the release origin does not count against the
+   zero-third-party *resource* budget. **What publication still needs, in order:** (a) the author
+   creates the public repo and enables Pages — his actions alone; (b) the release is uploaded
+   under the single-sourced version tag (§2); (c) the baked `<owner>/<repo>/<tag>` URLs are
+   substituted and resolve; (d) the capture set is produced and human-reviewed (AC-13); (e) the
+   re-measured figures land (OQ 6). Then AC-10 gates the deploy.
 2. **Contact fallback address** — I recommend a `mailto:` beside the tracker link for
    non-GitHub-account visitors; *which* address (and its spam exposure) is the author's call.
 3. **Tracker URL** — the issues-only GitHub repo does not exist; name/org TBD; footer line omitted
