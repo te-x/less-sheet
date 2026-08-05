@@ -53,6 +53,56 @@ pub fn build(b: *std.Build) void {
         .root_module = api_mod,
     });
 
+    // Bundle Zig's compiler-rt into the archive ON x86 ONLY.
+    //
+    // Not a new dependency: compiler-rt is Zig's own runtime-support code (as libgcc
+    // is gcc's), it ships inside the pinned toolchain, and this is a build setting on
+    // our own static library. The approved stack is unchanged; no third party is added.
+    //
+    // WHY. On x86 the compiler emits calls to `__zig_probe_stack` for large stack
+    // frames. `std.Build`'s default for this field is `null` = "let the compiler
+    // decide", which bundles compiler-rt only for an exe or a dynamic library
+    // (Step/Compile.zig) -- so our STATIC library referenced that symbol without
+    // defining it. Measured with `nm` on the installed liblesssheet.a:
+    //
+    //   x86_64-linux-gnu / -musl   1 undefined, 0 defined
+    //   aarch64-linux-gnu / -musl  0 undefined, 0 defined  (that arch emits no probes)
+    //   aarch64-macos              0 undefined, 0 defined
+    //
+    // It stayed hidden because every previously verified Linux link was performed BY
+    // ZIG (lld), which supplies compiler-rt for the final executable itself. The GTK
+    // frontend instead links this archive with gcc/ld.bfd against glibc, and nothing
+    // there provides a Zig-specific symbol -- so x86_64 Linux, the majority desktop
+    // architecture, could not be linked at all. Verified in a fedora:43 amd64
+    // container with gcc 15.3.1 / GNU ld 2.45.1: before, four `undefined reference to
+    // '__zig_probe_stack'` errors and no binary; after, the link succeeds and runs.
+    // Fixing it in the archive fixes every consumer and every linker at once, instead
+    // of pushing a `-fcompiler-rt`-shaped workaround into each frontend's build.
+    //
+    // WHY x86 ONLY, and not simply always. compiler-rt arrives as ONE archive member,
+    // so a linker that needs any symbol from it pulls all ~1.1 MiB in; `--gc-sections`
+    // recovers only ~180 KiB of that (measured). aarch64 already resolves the two
+    // builtins it actually uses (`__divti3`, `__udivti3`) from libgcc, so bundling
+    // there is pure cost: it grew the linked aarch64 binary 8322896 -> 9437272 bytes
+    // (+13.4%) while ALSO silently displacing libgcc's division routines with Zig's
+    // weak ones -- an unforced change to the aarch64 path that was verified on real
+    // hardware (ARCH-backend-linux-portability, commit e3d9b6e). Scoping the setting
+    // to the architecture that has the defect keeps every non-x86 artifact
+    // byte-for-byte identical to that proven one: the field stays `null` there, so no
+    // flag is added to the command line at all (deliberately not `= false`, which
+    // would pass `-fno-compiler-rt` and perturb a working build for no reason).
+    //
+    // `isX86()` covers x86_64 plus 32-bit x86, i.e. wherever the stack-probe call is
+    // emitted -- including a future x86_64 Windows or Intel-macOS target. Should some
+    // other architecture ever need a Zig runtime symbol, it fails the way this did:
+    // a loud undefined-reference at frontend link time, never silent misbehavior.
+    //
+    // Safe on the targets it does apply to: every externally visible symbol in
+    // compiler_rt.o is a WEAK definition (measured: 461 weak, 0 strong globals), so
+    // its `memcpy`/`memset`/`memmove`/`memcmp` and math builtins cannot collide with
+    // glibc, musl, libgcc or libSystem -- their strong definitions still win.
+    if (target.result.cpu.arch.isX86()) lib.bundle_compiler_rt = true;
+
     // Archive production is PER-TARGET (ARCH-backend-linux-portability §build.zig).
     //
     // On a macOS TARGET the installed archive is linked by SwiftPM/ld64, which
