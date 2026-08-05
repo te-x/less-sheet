@@ -111,6 +111,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if !window.setFrameUsingName("LessSheetMain") {
             window.center()
         }
+        // Screenshot-capture affordance: deterministic size/appearance when the
+        // LESSSHEET_CAPTURE_* env vars are set; inert otherwise (CaptureProbe).
+        CaptureProbe.configure(window: window)
         // Traffic lights always visible (no fade).
         for type in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
             window.standardWindowButton(type)?.alphaValue = 1

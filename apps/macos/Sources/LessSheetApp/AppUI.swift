@@ -216,6 +216,11 @@ struct ContentView: View {
             // First data-bearing frame: emit the cold-start marker (guarded to
             // once per open), then dump the requested frame for verification.
             model.markFirstRowsVisible()
+            // Screenshot capture (CaptureProbe): announce the window id and
+            // apply any requested pill reveal ALONGSIDE the probe chain below —
+            // a state probe like LESSSHEET_FIND still runs and leaves its
+            // popup open for the shot. Inert without LESSSHEET_CAPTURE_*.
+            CaptureProbe.announce(model: model)
             if SettingsRedesignProbe.active {
                 SettingsRedesignProbe.run(model: model)
             } else if JumpProbe.active {
