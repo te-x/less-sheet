@@ -11,7 +11,8 @@
      Set like the thing it views: hairline rules for rows, one vertical rule
      between the prose column and the figure column, row numbers in the gutter,
      a ledger for the proof, figures with plain borders. Serif for reading,
-     monospace for data. No gradients, no cards, no glow, nothing rounded.
+     the system sans for small functional text (the author: no monospace).
+     No gradients, no cards, no glow, nothing rounded.
 
      Zero build step, zero third-party requests, zero webfonts, and no
      JavaScript for any content, the theme, or the platform toggle
@@ -23,7 +24,7 @@
     --ink: #1c1b18;
     --dim: #6b6960;
     --line: #dedcd3;
-    --mono: ui-monospace, "SF Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Cantarell, "Helvetica Neue", Arial, sans-serif;
     --serif: Charter, "Bitstream Charter", "Source Serif 4", Georgia, "Liberation Serif", serif;
   }
   @media (prefers-color-scheme: dark) {
@@ -41,15 +42,15 @@
   .col { max-width: 1100px; margin: 0 auto; padding: 0 24px; }
   a { color: inherit; text-decoration-thickness: 1px; text-underline-offset: 2px; }
   a:hover { color: var(--dim); }
-  code { font: 0.85em var(--mono); }
+  code { font-family: inherit; font-style: italic; }
 
   /* ---- masthead: the header row ---- */
   header.site { border-bottom: 1px solid var(--line); }
   header.site .col { display: flex; align-items: center; gap: 10px; height: 58px; }
   header.site img { width: 21px; height: 21px; }
-  header.site .name { font: 600 15px var(--mono); letter-spacing: -.01em; }
+  header.site .name { font: 700 17px var(--serif); letter-spacing: -.01em; }
   header.site nav { margin-left: auto; display: flex; gap: 22px; }
-  header.site nav a { font: 13px var(--mono); color: var(--dim); text-decoration: none; }
+  header.site nav a { font: 13px var(--sans); color: var(--dim); text-decoration: none; }
   header.site nav a:hover { color: var(--ink); text-decoration: underline; }
 
   /* ---- bands: each one a row of the table ---- */
@@ -67,7 +68,7 @@
   }
 
   /* Row number in the gutter — the app numbers its rows; so does its page. */
-  .rn { font: 11px var(--mono); color: var(--dim); letter-spacing: .08em; margin-bottom: 16px; }
+  .rn { font: 11px var(--sans); color: var(--dim); letter-spacing: .08em; margin-bottom: 16px; }
 
   h1 {
     font: 700 clamp(33px, 4.6vw, 44px)/1.12 var(--serif);
@@ -86,33 +87,33 @@
     display: flex; align-items: baseline; justify-content: space-between;
     border-bottom: 1px solid var(--line); padding: 10px 2px;
   }
-  .ledger .size { font: 15px var(--mono); color: var(--dim); }
-  .ledger .time { font: 600 30px/1 var(--mono); letter-spacing: -.02em; font-variant-numeric: tabular-nums; }
-  .ledger .note { font: 12.5px/1.6 var(--mono); color: var(--dim); padding: 10px 2px 0; }
+  .ledger .size { font: 15px var(--sans); color: var(--dim); }
+  .ledger .time { font: 700 30px/1 var(--serif); letter-spacing: -.01em; font-variant-numeric: tabular-nums; }
+  .ledger .note { font: 12.5px/1.6 var(--sans); color: var(--dim); padding: 10px 2px 0; }
 
   .draft {
-    display: inline-block; font: 600 10.5px/1 var(--mono); letter-spacing: .07em;
+    display: inline-block; font: 600 10.5px/1 var(--sans); letter-spacing: .07em;
     color: #7a4b00; background: #f6e8c8; border: 1px solid #dcc386; padding: 4px 6px;
   }
   @media (prefers-color-scheme: dark) {
     .draft { color: #e8b05e; background: #2b2113; border-color: #574220; }
   }
 
-  /* ---- figures: plain borders, mono captions, nothing floating ---- */
+  /* ---- figures: plain borders, quiet captions, nothing floating ---- */
   figure { margin: 0; }
   .shot { display: block; width: 100%; height: auto; border: 1px solid var(--line); }
-  figcaption { font: 12.5px/1.5 var(--mono); color: var(--dim); padding-top: 9px; }
+  figcaption { font: 12.5px/1.5 var(--sans); color: var(--dim); padding-top: 9px; }
   .rail { display: flex; gap: 22px; overflow-x: auto; scroll-snap-type: x mandatory; padding-bottom: 4px; }
   .rail figure { flex: 0 0 min(540px, 84%); scroll-snap-align: start; }
   .pending {
     aspect-ratio: 3 / 2; display: grid; place-content: center; text-align: center;
     border: 1px dashed var(--line); color: var(--dim);
-    font: 12.5px/1.7 var(--mono); padding: 20px;
+    font: 12.5px/1.7 var(--sans); padding: 20px;
   }
 
   /* ---- platform toggle: two radios, no JavaScript ---- */
   .plat-in { position: absolute; opacity: 0; pointer-events: none; }
-  .seg { display: flex; gap: 18px; margin-bottom: 14px; font: 13px var(--mono); }
+  .seg { display: flex; gap: 18px; margin-bottom: 14px; font: 13px var(--sans); }
   .seg label { color: var(--dim); cursor: pointer; padding-bottom: 3px; }
   #plat-mac:checked   ~ div .seg label[for="plat-mac"],
   #plat-linux:checked ~ div .seg label[for="plat-linux"] {
@@ -128,12 +129,12 @@
 
   /* ---- buttons: a rectangle with a border, like a key on a keyboard ---- */
   .btn {
-    display: inline-block; font: 600 13px var(--mono); letter-spacing: .02em;
+    display: inline-block; font: 600 13px var(--sans); letter-spacing: .02em;
     color: var(--ink); background: none; border: 1px solid var(--ink);
     padding: 11px 20px; text-decoration: none;
   }
   .btn:hover { background: var(--ink); color: var(--paper); }
-  .reqs { font: 12.5px/1.7 var(--mono); color: var(--dim); margin: 12px 0 0; }
+  .reqs { font: 12.5px/1.7 var(--sans); color: var(--dim); margin: 12px 0 0; }
   .reqs b { color: var(--ink); font-weight: 600; }
 
   /* The Gatekeeper note: a footnote with a rule, not an alert card. */
@@ -142,33 +143,33 @@
     font-size: 14.5px; line-height: 1.55; color: var(--dim);
   }
   .fn b { color: var(--ink); font-weight: 600; }
-  .fn .path { font: 0.88em var(--mono); color: var(--ink); }
+  .fn .path { color: var(--ink); font-weight: 600; }
 
   /* ---- the comparison, set as the table it is ---- */
   .cmp-wrap { overflow-x: auto; }
   .cmp { width: 100%; border-collapse: collapse; }
   .cmp th, .cmp td { text-align: left; padding: 12px 14px 12px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
-  .cmp thead th { font: 600 11px var(--mono); letter-spacing: .09em; text-transform: uppercase; color: var(--dim); }
+  .cmp thead th { font: 600 11px var(--sans); letter-spacing: .09em; text-transform: uppercase; color: var(--dim); }
   .cmp td { font-size: 15.5px; }
-  .cmp td:first-child { font: 12.5px var(--mono); color: var(--dim); width: 9em; padding-top: 15px; }
+  .cmp td:first-child { font: 12.5px var(--sans); color: var(--dim); width: 9em; padding-top: 15px; }
 
   /* ---- download ---- */
   .dl { display: grid; grid-template-columns: 1fr 1fr; gap: 0; }
   .dl > div { padding: 0 28px; }
   .dl > div:first-child { padding-left: 0; }
   .dl > div + div { border-left: 1px solid var(--line); }
-  .dl h3 { font: 600 13px var(--mono); letter-spacing: .06em; text-transform: uppercase; margin: 0 0 14px; color: var(--dim); }
+  .dl h3 { font: 600 13px var(--sans); letter-spacing: .06em; text-transform: uppercase; margin: 0 0 14px; color: var(--dim); }
   @media (max-width: 700px) {
     .dl { grid-template-columns: 1fr; }
     .dl > div { padding: 0 0 26px; }
     .dl > div + div { border-left: 0; border-top: 1px solid var(--line); padding-top: 26px; }
   }
-  .reads { font: 12.5px var(--mono); color: var(--dim); margin-top: 26px; }
+  .reads { font: 12.5px var(--sans); color: var(--dim); margin-top: 26px; }
   .reads b { color: var(--ink); }
 
   footer { padding: 30px 0 60px; }
   footer .col { display: flex; gap: 14px; flex-wrap: wrap; justify-content: space-between; }
-  footer span { font: 13px/1.6 var(--mono); color: var(--dim); }
+  footer span { font: 13px/1.6 var(--sans); color: var(--dim); }
 </style>
 </head>
 <body>
