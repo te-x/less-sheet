@@ -39,6 +39,7 @@ import argparse
 import hashlib
 import json
 import os
+import platform
 import plistlib
 import re
 import shutil
@@ -63,6 +64,12 @@ RUNTIME_IMAGE = "registry.fedoraproject.org/fedora:43"
 
 ARCH_ZIG = {"aarch64": "aarch64-linux-gnu", "x86_64": "x86_64-linux-gnu"}
 ARCH_PLATFORM = {"aarch64": "linux/arm64", "x86_64": "linux/amd64"}
+
+# `platform.machine()` spells the same CPU differently per OS ("arm64" on macOS,
+# "aarch64" on Linux; "AMD64" on Windows). Normalise to the keys above so the
+# native-vs-emulated test is a comparison and not a guess.
+HOST_ARCH_ALIASES = {"arm64": "aarch64", "aarch64": "aarch64",
+                     "x86_64": "x86_64", "amd64": "x86_64", "AMD64": "x86_64"}
 
 # The GTK app id the code already uses (data/dev.lesssheet.Gtk.svg + main.c's
 # gtk_window_set_icon_name). docs/RELEASE.md flags the final Flatpak app-id as
@@ -533,32 +540,55 @@ def build_linux(repo, out, version, arches, do_verify, notes):
             shutil.copy(core_a, os.path.join(stage, ".core-linux", "lib"))
 
             # Pre-flight: the core archive must not leave compiler-rt helpers
-            # undefined, or the meson link fails with a wall of linker output that
+            # UNRESOLVED, or the meson link fails with a wall of linker output that
             # looks like a frontend bug when it is really a core build-config issue.
             #
             # Concretely: on x86_64 the Zig backend emits calls to
-            # `__zig_probe_stack` (stack probing) but the installed static archive
-            # does not define it, because backend/build.zig does not set
-            # `bundle_compiler_rt` for non-macOS targets. aarch64 never hit this —
-            # it emits no stack probes, so the symbol is neither referenced nor
-            # needed. The verified Linux path in ARCH-backend-linux-portability was
-            # musl + lld, which does not expose this; we link glibc with gcc/ld.bfd.
-            # Fix (needs a backend CHANGE-REQUEST — build.zig is a frozen
-            # DEPENDENCY_PATH): bundle compiler-rt into the static library.
-            missing = run([ctr, "run", "--rm", "--platform", ARCH_PLATFORM[arch],
-                           "--security-opt", "label=disable", "-v", stage + ":/b:ro",
-                           image, "sh", "-c",
-                           "nm --undefined-only /b/.core-linux/lib/liblesssheet.a "
-                           "2>/dev/null | grep -o '__[a-z_]*probe_stack' | sort -u"]).stdout.split()
+            # `__zig_probe_stack` (stack probing). Until `1071708` the static
+            # archive referenced it without defining it, so the GTK app could not be
+            # linked with gcc/ld.bfd and x86_64 could not ship at all. aarch64 never
+            # hit this — it emits no stack probes, so the symbol is neither
+            # referenced nor needed. The Linux path verified in
+            # ARCH-backend-linux-portability was musl + lld, which does not expose
+            # it; we link glibc with gcc/ld.bfd. Fixed by `bundle_compiler_rt` for
+            # x86 targets in backend/build.zig.
+            #
+            # UNDEFINED IS NOT THE TEST — DEFINED IS. The first version of this
+            # check ran `nm --undefined-only | grep probe_stack` and skipped on any
+            # hit, which reported x86_64 as still broken AFTER the fix landed and
+            # would have kept it unbuildable indefinitely. An archive legitimately
+            # carries BOTH an undefined reference (from the object that calls the
+            # helper) and a weak definition (from the bundled `compiler_rt.o`) —
+            # `nm` shows `U __zig_probe_stack` and `W __zig_probe_stack` side by
+            # side, and the linker resolves them happily. So a symbol only counts as
+            # missing when it is referenced AND defined NOWHERE in the archive:
+            # compute the set difference rather than testing one half of it.
+            probes = run([ctr, "run", "--rm", "--platform", ARCH_PLATFORM[arch],
+                          "--security-opt", "label=disable", "-v", stage + ":/b:ro",
+                          image, "sh", "-c",
+                          "A=/b/.core-linux/lib/liblesssheet.a; echo __UNDEF__; "
+                          "nm --undefined-only \"$A\" 2>/dev/null "
+                          "| grep -o '__[a-z_]*probe_stack' | sort -u; echo __DEF__; "
+                          "nm --defined-only \"$A\" 2>/dev/null "
+                          "| grep -o '__[a-z_]*probe_stack' | sort -u"]).stdout
+            undef, defined, bucket = set(), set(), None
+            for tok in probes.split():
+                if tok == "__UNDEF__":
+                    bucket = undef
+                elif tok == "__DEF__":
+                    bucket = defined
+                elif bucket is not None:
+                    bucket.add(tok)
+            missing = sorted(undef - defined)
             if missing:
                 notes.append(
-                    "Linux %s SKIPPED: the cross-built core archive leaves %s undefined, so the "
-                    "GTK app cannot be linked with gcc/ld.bfd. aarch64 is unaffected (no stack "
-                    "probes emitted). Fix = bundle compiler-rt into the static library in "
-                    "backend/build.zig, which is a frozen DEPENDENCY_PATH and needs a "
-                    "CHANGE-REQUEST; verified that building with -fcompiler-rt defines the symbol."
+                    "Linux %s SKIPPED: the cross-built core archive references %s with no "
+                    "definition anywhere in the archive, so the GTK app cannot be linked with "
+                    "gcc/ld.bfd. aarch64 is unaffected (no stack probes emitted). This is what "
+                    "`bundle_compiler_rt` in backend/build.zig exists to prevent — if it is "
+                    "firing, that setting has regressed for this target."
                     % (arch, ", ".join(missing)))
-                print("[linux] %s: SKIPPED - core archive leaves %s undefined (see notes)"
+                print("[linux] %s: SKIPPED - %s referenced but never defined (see notes)"
                       % (arch, ", ".join(missing)), flush=True)
                 continue
 
@@ -641,7 +671,21 @@ def build_linux(repo, out, version, arches, do_verify, notes):
                     "known_bad": "Debian 13 trixie (GTK 4.18)",
                 },
                 "signing": {"state": "n/a on Linux"},
-                "verified_by_running": ran,
+                # A TIMING FROM AN EMULATED CONTAINER IS NOT A PERFORMANCE NUMBER.
+                # Building x86_64 on an ARM host runs every instruction through
+                # QEMU, which inflated a measured cold start to ~1.9 s against
+                # ~0.12 s for the native aarch64 artifact — a ~16x gap that says
+                # nothing about x86_64 hardware and would badly misinform anyone
+                # who found it later. `verified_by_running` exists to prove the
+                # artifact EXECUTES on a machine that never built it, not to
+                # measure speed, so the emulated case says so in the same string
+                # rather than leaving a bare number to be misread. Real x86_64
+                # figures need real x86_64 hardware.
+                "verified_by_running": (
+                    ran if HOST_ARCH_ALIASES.get(platform.machine(), platform.machine()) == arch
+                    else ran + " -- EMULATED (%s host via QEMU): proves it RUNS, "
+                                "NOT a performance measurement"
+                                % platform.machine()),
             })
             # Bank each artifact as soon as it is verified. The x86_64 leg can take
             # hours when it has to run under emulation, and an abort part-way must
