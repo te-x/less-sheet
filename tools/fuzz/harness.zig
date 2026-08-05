@@ -1181,3 +1181,143 @@ test "the committed corpus is non-empty for every target" {
     try std.testing.expect(seeds.gz_trunc.len >= 8);
     try std.testing.expect(seeds.net.len >= 8);
 }
+
+// ---------------------------------------------------------------------------
+// mmap-vs-gzip PARITY over an OVER-SPAN cell — the lock for csv_reader's UTF-8
+// byte-wise fast path.
+//
+// WHY IT IS HERE AND NOT IN THE FROZEN SUITE. `matchCursor`'s UTF-8 arm walks
+// whole fields through `lexer.findStructural` over `Cursor.span()`. When a field
+// is longer than one span it takes a MULTI-SPAN loop: feed this span, advance,
+// fetch the next. Nothing in the frozen suite enters that loop — it needs a field
+// longer than `source.chunk_bytes` (256 KiB) sitting beyond the 4 MiB gzip head
+// (`api.open_head_max_bytes`), because inside the head `span()` returns the whole
+// remainder and always contains a terminator. Measured, not assumed: with the
+// suite's fixtures, mutating `rel orelse bytes.len` to `rel orelse 0` — an
+// infinite loop on any over-span field — left all 297 tests PASSING.
+//
+// The property is mmap-vs-gzip parity: the SAME bytes through both Sources must
+// agree on the row count, on every cell, and on every search/filter total. The
+// mmap side is the reference (it is the byte-wise path that was already correct),
+// so this pins the streaming side against it without needing a third oracle.
+//
+// Needles sit at SEVERAL DEPTHS inside the over-span cell, which is what makes it
+// sensitive: a defect that feeds only the final span of a multi-span field still
+// finds a needle placed at the cell's end, and one placed only mid-cell misses a
+// short-feed at the end. Both are planted defects that escaped earlier versions
+// of this fixture.
+const span_cell_needles = [_][]const u8{ "NEEDLEMID1", "NEEDLEMID2", "NEEDLEEND", "shortrow" };
+
+/// A document whose middle row carries a >256 KiB cell, placed past the 4 MiB
+/// gzip head, with needles at several depths inside it.
+fn buildOverSpanCell() []u8 {
+    var n: usize = 0;
+    const hdr = "id,payload,tail\n";
+    @memcpy(synth_buf[n..][0..hdr.len], hdr);
+    n += hdr.len;
+    // Past the 4 MiB head, with margin.
+    const filler = "0,abcdefghijabcdefghijabcdefghijabcdefghijabcdefghij,z\n";
+    const head_target: usize = 5 * 1024 * 1024;
+    while (n + filler.len <= head_target) {
+        @memcpy(synth_buf[n..][0..filler.len], filler);
+        n += filler.len;
+    }
+    // The over-span cell: >256 KiB with needles at ~300 KiB, ~700 KiB and the end.
+    const open_field = "1,";
+    @memcpy(synth_buf[n..][0..open_field.len], open_field);
+    n += open_field.len;
+    const chunks = [_]struct { fill: usize, needle: []const u8 }{
+        .{ .fill = 300 * 1024, .needle = span_cell_needles[0] },
+        .{ .fill = 400 * 1024, .needle = span_cell_needles[1] },
+        .{ .fill = 300 * 1024, .needle = span_cell_needles[2] },
+    };
+    for (chunks) |c| {
+        @memset(synth_buf[n..][0..c.fill], 'x');
+        n += c.fill;
+        @memcpy(synth_buf[n..][0..c.needle.len], c.needle);
+        n += c.needle.len;
+    }
+    const close_field = ",b\n2,,c\n3,shortrow,e\n"; // empty cell after a huge one, then a short row
+    @memcpy(synth_buf[n..][0..close_field.len], close_field);
+    n += close_field.len;
+    return synth_buf[0..n];
+}
+
+fn parityOpen(path: [*:0]const u8) ?*api.Doc {
+    var doc: ?*api.Doc = null;
+    const opts: api.OpenOptions = .{};
+    if (api.ls_open(path, &opts, &doc) != .ok) return null;
+    return doc;
+}
+
+test "parity: an over-span cell reads identically through mmap and gzip" {
+    const plain = buildOverSpanCell();
+    const gz = gzMember(plain, .{}) orelse return error.SkipZigTest;
+
+    const sb_plain = try Sandbox.init("parity.csv");
+    try sb_plain.placeExact(plain);
+    const sb_gz = try Sandbox.init("parity.csv.gz");
+    try sb_gz.placeExact(gz);
+
+    const m = parityOpen(sb_plain.path.ptr) orelse return error.SkipZigTest;
+    defer api.ls_close(m);
+    const g = parityOpen(sb_gz.path.ptr) orelse return error.SkipZigTest;
+    defer api.ls_close(g);
+
+    _ = api.ls_window_set(m, 0, 8);
+    _ = api.ls_window_set(g, 0, 8);
+    settleScans(m, 20_000);
+    settleScans(g, 20_000);
+    var spins: u32 = 0;
+    while (spins < 20_000) : (spins += 1) {
+        if (api.ls_index_poll(m).complete and api.ls_index_poll(g).complete) break;
+        std.testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+    }
+
+    try std.testing.expectEqual(api.ls_column_count(m), api.ls_column_count(g));
+    const rows_m = api.ls_row_count_get(m);
+    const rows_g = api.ls_row_count_get(g);
+    try std.testing.expectEqual(rows_m.count, rows_g.count);
+
+    // Every cell of the rows that carry the over-span field and its neighbours.
+    const cols = api.ls_column_count(m);
+    var r: u64 = if (rows_m.count > 4) rows_m.count - 4 else 0;
+    while (r < rows_m.count) : (r += 1) {
+        _ = api.ls_window_set(m, r, 1);
+        _ = api.ls_window_set(g, r, 1);
+        var c: u32 = 0;
+        while (c < cols) : (c += 1) {
+            const cm = api.ls_cell(m, r, c);
+            const cg = api.ls_cell(g, r, c);
+            try std.testing.expectEqual(cm.len, cg.len);
+            if (cm.len != 0) {
+                try std.testing.expectEqualSlices(u8, cm.ptr[0..cm.len], cg.ptr[0..cg.len]);
+            }
+        }
+    }
+
+    // Search and filter totals for a needle at every depth of the over-span cell.
+    for (span_cell_needles) |needle| {
+        const req: api.SearchRequest = .{
+            .kind = .text,
+            .op = .eq,
+            .value_ptr = needle.ptr,
+            .value_len = needle.len,
+            .case_sensitive = true,
+        };
+
+        try std.testing.expect(api.ls_search_start(m, &req));
+        try std.testing.expect(api.ls_search_start(g, &req));
+        settleScans(m, 20_000);
+        settleScans(g, 20_000);
+        try std.testing.expectEqual(api.ls_search_poll(m).total, api.ls_search_poll(g).total);
+
+        try std.testing.expect(api.ls_filter_set(m, &req));
+        try std.testing.expect(api.ls_filter_set(g, &req));
+        settleScans(m, 20_000);
+        settleScans(g, 20_000);
+        try std.testing.expectEqual(api.ls_filter_poll(m).total, api.ls_filter_poll(g).total);
+        api.ls_filter_clear(m);
+        api.ls_filter_clear(g);
+    }
+}

@@ -234,11 +234,110 @@ Re-run this list after touching `findStructural`. It reaches the function throug
 a second dev-tool re-export, `lexer_internals`, for the same module reason as
 `matcher_internals` above.
 
+### The two ARMS of the structural scan
+
+`csv_reader.matchCursor` now picks between two implementations by encoding:
+byte-wise `lexer.findStructural` for UTF-8, unit-wise `enc.unitIsStructural` +
+`decodeUnit` otherwise. Two more tests pin that split from both sides:
+
+* **`arms agree on UTF-8`** — the byte-wise and unit-wise scans must return the
+  identical offset over random inputs that include bytes `>= 0x80`. This is the
+  equivalence the fast path rests on, and it holds only because `decodeUnit`'s
+  UTF-8 arm is `decodeUtf8PassthroughUnit`: always one raw byte in, the same raw
+  byte out, never validated, never null.
+* **`the UTF-8 gate is load-bearing`** — a GUARD test asserting the hazard is
+  REAL, so nobody deletes the `encoding == api.encoding_utf8` condition as dead
+  weight. It shows byte-wise scanning gives the WRONG answer for UTF-16LE/BE
+  (U+2C00 encodes as `00 2C`; a byte scan sees a `,` that is not a separator) and
+  that under Latin-1/Windows-1252 one source byte can decode to two output bytes,
+  so feeding raw source bytes would hand the matcher un-transcoded data. It also
+  pins the UTF-8 property positively for all 256 byte values.
+
+Both reach `encoding.zig` through a third dev-tool re-export,
+`encoding_internals`.
+
+## mmap-vs-gzip parity over an OVER-SPAN cell (`harness.zig`)
+
+**This exists because of a measured coverage gap, not a hypothesis.** The UTF-8
+fast path walks whole fields through `findStructural` over `Cursor.span()`. When a
+field is longer than one span it takes a **multi-span loop**: feed this span,
+advance, fetch the next. Nothing in the frozen 297-test suite enters that loop.
+Reaching it needs a field longer than `source.chunk_bytes` (**256 KiB**) that also
+sits beyond the **4 MiB** gzip head (`api.open_head_max_bytes`) — inside the head,
+`span()` returns the whole remainder and so always contains a terminator.
+
+How the gap was established: mutating `rel orelse bytes.len` to `rel orelse 0` —
+an **infinite loop** on any over-span field — left **all 297 tests passing**.
+
+The lock is a parity property: the same bytes through both Sources must agree on
+the row count, on every cell, and on every search/filter total, with the mmap side
+as the reference (it is the byte-wise path that was already correct). Multi-MB
+cells in a `.csv.gz` are a supported input, so this is a real shape, not a
+contrived one.
+
+**Needle placement is what makes it sensitive**, and it took two iterations to get
+right. Needles sit at several DEPTHS inside the over-span cell (~300 KiB, ~700 KiB,
+and at the very end). With a needle only at the cell's END, a defect that feeds
+just the final span of a multi-span field still finds it and escapes; with one only
+mid-cell, a short-feed at the end escapes. Both actually did escape earlier
+versions of this fixture.
+
+**Verified sensitive** — all four caught:
+
+| planted defect | how it surfaces |
+|---|---|
+| `rel orelse 0` (no progress on a terminator-free span) | hangs — infinite loop on any over-span field |
+| `cur.advance(run + 1)` (steps over the terminator) | search total diverges from mmap |
+| feed only the span that contains the terminator | the mid-cell needles go missing on the gz side |
+| feed `run - 1` bytes | the needle at the cell's end goes missing |
+
+One branch of the fast path is deliberately **not** covered: the fallback for
+`span()` returning empty after `streamUnit` proved a byte is present. Mutating it
+to `ended = true` changes nothing measurable, because no configuration I could
+construct makes `span()` under-deliver — `span()` calls `byteAtLane` first, which
+refills. It is kept as insurance rather than removed, since the failure it guards
+against would be silent truncation, and it is deliberately NOT an assert: that
+would trade silent truncation for a ReleaseSafe panic, which counts as a crash
+under this project's bar, and `std.debug.assert` appears only three times in all of
+`backend/src`. Honest record: it is unreachable-in-practice code and no test
+exercises it.
+
+### Why a non-empty BENIGN mutation set is expected here
+
+Not every mutation of this loop is a defect, and that is a property of the design
+rather than a weakness in the lock: **the fast path is structurally
+self-correcting**, because the top-of-loop `streamUnit` + `unitIsStructural` pair
+re-derives the field-ending decision every iteration. Three mutation classes are
+provably benign:
+
+1. **Delete `if (rel != null) break;`** — the advance leaves the cursor ON the
+   structural byte, so the next iteration's `streamUnit` returns it and the
+   top-of-loop check breaks. Identical end state, one extra iteration.
+2. **Shorten `run` to anything in `[1, run]`** — provided the same bytes are fed
+   AND advanced, since `StreamCell.feed` is split-invariant (the property
+   `matcher_diff.zig` pins). Feeding and advancing DIFFERENT amounts is not in this
+   class and is caught.
+3. **Delete the top-of-loop structural check** — the cursor then sits on a
+   structural byte, so `findStructural` returns 0, `run` is 0, the feed is empty (a
+   no-op in every `feed` arm), `advance(0)` moves nothing, and `rel != null`
+   breaks. Same end state. (Benign given that the `span()`-empty fallback above is
+   unreachable; that fallback would otherwise feed the separator byte itself.)
+
+Two mutations tried during this cell landed in that set and were correctly
+dismissed — **"never break on the found terminator"** is class 1, and **"drop the
+structural check at the cursor"** is class 3. Recorded by name so the
+"5 of 6 survived the frozen suite" figure is auditable rather than a matter of
+judgement.
+
+The genuine defect surface is therefore exactly: **feed fewer bytes than you
+advance, drop or duplicate a span, over-advance past the terminator, or fail to
+progress** — which is precisely the four the table above catches.
+
 ## Files
 
 | file | role |
 |---|---|
-| `harness.zig` | the four fuzz targets + the shared `exercise()` drive sequence |
+| `harness.zig` | the four fuzz targets + the shared `exercise()` drive sequence + the mmap-vs-gzip **over-span-cell parity** lock (see above) |
 | `matcher_diff.zig` | the matcher **differential oracle** — a VALUE check, see below |
 | `lexer_diff.zig` | the structural-scan **differential oracle** — `findStructural` vs the `std.mem.findAny` it replaced |
 | `gzbuild.zig` | gzip/deflate construction, shared by the harness and the generator so a baked-in cut offset means the same stream in both |

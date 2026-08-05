@@ -192,6 +192,17 @@ const DirectCursor = struct {
     pub fn advance(self: *DirectCursor, n: usize) void {
         self.logical += n;
     }
+
+    /// mmap's answer to `source.Cursor.span`: every remaining in-bounds byte, in
+    /// one piece. Present so the UTF-8 byte-wise arm of `matchCursor` compiles
+    /// for both cursor types; a `DirectCursor` never actually reaches that arm
+    /// (mmap + UTF-8 is routed to `matchMmapUtf8`), and it would be correct if
+    /// it did, since this is the same slice that function walks.
+    pub fn span(self: *DirectCursor) []const u8 {
+        const end_at = self.end();
+        if (self.logical >= end_at) return &.{};
+        return self.bytes[@intCast(self.logical)..@intCast(end_at)];
+    }
     pub fn atLimit(self: *const DirectCursor) bool {
         if (self.logical_limit) |lim| if (self.logical >= lim) return true;
         return if (self.physical_limit) |lim| self.physical_base +| self.logical >= lim else false;
@@ -538,12 +549,95 @@ fn matchCursor(cur: anytype, sep: u8, quote: ?u8, encoding: u8, primary: base.Ma
             }
         };
         if (!ended) {
-            while (streamUnit(cur, encoding)) |u| {
-                if (enc.unitIsByte(u, sep) or enc.unitIsByte(u, '\r') or enc.unitIsByte(u, '\n')) break;
-                if (pfeed) ps.feed(u.out[0..u.out_len]);
-                if (ffeed) fs.?.feed(u.out[0..u.out_len]);
-                cur.advance(u.src_len);
-            } else ended = true;
+            if (encoding == api.encoding_utf8) {
+                // UTF-8 BYTE-WISE FAST PATH. This is the gzip / http_range match
+                // scan (mmap + UTF-8 never gets here -- `matchStream` routes it to
+                // `matchMmapUtf8`), and unit-at-a-time was costing ~87% of the wait
+                // on a local .csv.gz: a call to decode each byte, three compares,
+                // one `advance` per byte, and -- worst -- a ONE-BYTE `feed`, which
+                // is below the matcher's vector prefilter threshold, so every byte
+                // took the scalar KMP step. Running whole fields through
+                // `findStructural` and feeding them in one call fixes all four.
+                //
+                // SCOPE, because the headline numbers are easy to over-read: this
+                // replaces the UNQUOTED field scan only. The QUOTED arm above is
+                // untouched and still walks unit-at-a-time with ONE-BYTE feeds --
+                // the very cost singled out as worst here. Measured: a local
+                // .csv.gz with every field quoted gets NOTHING from this cell
+                // (1.00x), and in fact runs ~1.5-1.8% SLOWER on a full-column text
+                // scan (reproducible in min and median, `index_scan` control flat,
+                // bands non-overlapping). Mechanism UNVERIFIED; the one hypothesis
+                // tested -- the per-field `encoding` branch -- was DISPROVEN by
+                // hoisting it out of the loop, which changed nothing (1.016x vs
+                // 1.015x). Most likely this function's body roughly doubling
+                // changes inlining/code layout for the quoted arm, but that is not
+                // established and must not compress into "code layout caused it".
+                // The trade is deliberate: quote-heavy gz pays ~1.8% so unquoted
+                // gz gains 3.9-4.2x. Bulk-feeding quoted bodies is the uncosted
+                // follow-on (see review/, closed-out backlog).
+                //
+                // WHY IT IS EXACTLY EQUIVALENT, not merely similar: for UTF-8
+                // `decodeUnit` is `decodeUtf8PassthroughUnit` -- ALWAYS one raw
+                // source byte in and the same raw byte out, never null, never
+                // validated (encoding.zig). So the unit loop this replaces already
+                // WAS a byte loop: `src_len == 1`, `out_len == 1`,
+                // `out[0] == the byte`, and `unitIsStructural` reduces to
+                // `b == sep or b == '\r' or b == '\n'` -- precisely
+                // `findStructural`'s needle set. Feeding a run instead of N
+                // singletons hands the matcher the same byte sequence, and
+                // `StreamCell.feed` is split-invariant by construction (the
+                // property `tools/fuzz/matcher_diff.zig` exists to pin).
+                //
+                // `streamUnit` REMAINS THE AUTHORITY for both decisions that can
+                // end a field -- is there a unit here at all (EOF / budget), and is
+                // it structural -- so this arm cannot disagree with the unit arm
+                // about where a row ends or whether one ended. `span()` is used
+                // only to bulk up the run BETWEEN those decisions, and if it ever
+                // under-delivers (it is a no-demand view of what happens to be
+                // resident) the one-byte step below still makes progress. That is
+                // deliberate: nothing here depends on `span()`-empty meaning EOF.
+                while (true) {
+                    const u = streamUnit(cur, encoding) orelse {
+                        ended = true;
+                        break;
+                    };
+                    if (enc.unitIsStructural(u, sep)) break;
+                    // `u` is a VALUE (its `out` is an inline array), so it stays
+                    // valid across the `span()` below even though that call can
+                    // inflate and re-fill the lane buffer.
+                    const bytes = cur.span();
+                    if (bytes.len == 0) {
+                        // `span()` cannot serve the byte `streamUnit` just proved
+                        // is there. Take it one byte at a time rather than treating
+                        // this as end-of-field.
+                        if (pfeed) ps.feed(u.out[0..u.out_len]);
+                        if (ffeed) fs.?.feed(u.out[0..u.out_len]);
+                        cur.advance(u.src_len);
+                        continue;
+                    }
+                    // `bytes[0]` is known NON-structural (checked just above), so
+                    // `rel != 0` and the run is at least one byte: progress is
+                    // guaranteed and this loop cannot spin.
+                    const rel = lexer.findStructural(bytes, sep);
+                    const run = rel orelse bytes.len;
+                    if (pfeed) ps.feed(bytes[0..run]);
+                    if (ffeed) fs.?.feed(bytes[0..run]);
+                    // `bytes` IS DEAD FROM HERE -- advancing a gzip cursor can
+                    // re-fill or reallocate the lane buffer it points into, the
+                    // same rule `scanUtf8Rows` follows after a peek (see
+                    // review/REVIEW-row-count-drift.md). Nothing below reads it;
+                    // only `rel`, an integer, survives the advance.
+                    cur.advance(run);
+                    if (rel != null) break;
+                }
+            } else {
+                while (streamUnit(cur, encoding)) |u| {
+                    if (enc.unitIsStructural(u, sep)) break;
+                    if (pfeed) ps.feed(u.out[0..u.out_len]);
+                    if (ffeed) fs.?.feed(u.out[0..u.out_len]);
+                    cur.advance(u.src_len);
+                } else ended = true;
+            }
         }
         if (pfeed and primary_col == null and ps.matches()) primary_col = col;
         if (ffeed and fs.?.matches()) filter_ok = true;
@@ -938,7 +1032,7 @@ fn lexStream(source: Source, pos: Pos, want: ?u32, cap: ?usize, limit: ?Pos, sep
         };
         if (!ended) {
             while (streamUnit(&cur, encoding)) |u| {
-                if (enc.unitIsByte(u, sep) or enc.unitIsByte(u, '\r') or enc.unitIsByte(u, '\n')) break;
+                if (enc.unitIsStructural(u, sep)) break;
                 if (store) try appendStreamUnit(buf, gpa, start, u, cap, &truncated);
                 cur.advance(u.src_len);
             } else ended = true;
@@ -996,7 +1090,7 @@ fn lexStreamSelected(source: Source, pos: Pos, selected: []const u32, cap: usize
         };
         if (!ended) {
             while (streamUnit(&cur, encoding)) |u| {
-                if (enc.unitIsByte(u, sep) or enc.unitIsByte(u, '\r') or enc.unitIsByte(u, '\n')) break;
+                if (enc.unitIsStructural(u, sep)) break;
                 if (store) try appendStreamUnit(buf, gpa, start, u, cap, &truncated);
                 cur.advance(u.src_len);
             } else ended = true;
@@ -1056,7 +1150,7 @@ fn cellStream(source: Source, pos: Pos, col: u32, limit: ?Pos, sep: u8, quote: ?
         };
         if (!ended) {
             while (streamUnit(&cur, encoding)) |u| {
-                if (enc.unitIsByte(u, sep) or enc.unitIsByte(u, '\r') or enc.unitIsByte(u, '\n')) break;
+                if (enc.unitIsStructural(u, sep)) break;
                 if (store) storeUnit(buf, buf_len, &out_len, &truncated, u);
                 cur.advance(u.src_len);
             } else ended = true;
@@ -1212,7 +1306,7 @@ fn decodeColumn(
                     hit_limit = true;
                     break;
                 };
-                if (enc.unitIsByte(u, sep) or enc.unitIsByte(u, '\n') or enc.unitIsByte(u, '\r')) break;
+                if (enc.unitIsStructural(u, sep)) break;
                 if (store) storeUnit(buf, buf_len, &out_len, &cap_truncated, u);
                 i += u.src_len;
             }

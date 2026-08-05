@@ -39,6 +39,34 @@
 
 const std = @import("std");
 const lexer = @import("core").lexer_internals;
+const enc = @import("core").encoding_internals;
+
+// The five encodings `resolveEncoding` can produce (contracts/api.zig). Named
+// here rather than imported so the oracle keeps working if the `api` module is
+// not wired into it.
+const utf8: u8 = 0;
+const utf16le: u8 = 1;
+const utf16be: u8 = 2;
+const latin1: u8 = 3;
+const windows1252: u8 = 4;
+
+/// The UNIT-WISE structural scan, written the way every non-UTF-8 lexer arm
+/// writes it: decode a unit, test it with `unitIsStructural`, advance by
+/// `src_len`. Returns the SOURCE offset of the first structural unit.
+///
+/// This is the second of the two arms. `csv_reader.matchCursor` now picks the
+/// byte-wise `findStructural` when the encoding is UTF-8 and this shape
+/// otherwise, so "the two arms agree on UTF-8" is the load-bearing claim and
+/// "they do NOT agree on the multi-byte encodings" is why the gate must stay.
+fn refUnitScan(content: []const u8, sep: u8, encoding: u8) ?usize {
+    var i: usize = 0;
+    while (i < content.len) {
+        const u = enc.decodeUnit(content, i, content.len, encoding) orelse return null;
+        if (enc.unitIsStructural(u, sep)) return i;
+        i += u.src_len;
+    }
+    return null;
+}
 
 /// The implementation under test must agree with the one it replaced.
 fn expectAgree(hay: []const u8, sep: u8) !void {
@@ -171,6 +199,122 @@ test "findStructural: pseudorandom sweep, fixed seeds" {
                 }
             }
             try expectAgree(hay, sep);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The two ARMS of csv_reader.matchCursor's structural scan.
+// ---------------------------------------------------------------------------
+
+test "arms agree on UTF-8: byte-wise findStructural == unit-wise scan" {
+    const gpa = std.testing.allocator;
+    const max_len = block * 3 + 5;
+    const buf = try gpa.alloc(u8, max_len);
+    defer gpa.free(buf);
+
+    // Includes bytes >= 0x80: under UTF-8 pass-through these are ordinary
+    // non-structural singletons, which is exactly why the byte-wise scan is
+    // allowed to treat them as filler. A validating decoder would not be.
+    for ([_]u8{ ',', ';', '\t', 0x7F }) |sep| {
+        var prng: std.Random.DefaultPrng = .init(0xC0FFEE + @as(u64, sep));
+        const rnd = prng.random();
+        var case: usize = 0;
+        while (case < 30_000) : (case += 1) {
+            const len = rnd.uintAtMost(usize, max_len);
+            const hay = buf[0..len];
+            for (hay) |*b| {
+                b.* = switch (rnd.uintLessThan(u8, 6)) {
+                    0 => sep,
+                    1 => '\r',
+                    2 => '\n',
+                    3 => rnd.intRangeAtMost(u8, 0x80, 0xFF), // invalid/continuation
+                    else => rnd.intRangeAtMost(u8, 'a', 'z'),
+                };
+            }
+            const byte_wise = lexer.findStructural(hay, sep);
+            const unit_wise = refUnitScan(hay, sep, utf8);
+            if (byte_wise == null and unit_wise == null) continue;
+            if (byte_wise == null or unit_wise == null or byte_wise.? != unit_wise.?) {
+                std.debug.print(
+                    "UTF-8 ARMS DISAGREE: sep={d} byte_wise={?d} unit_wise={?d}\nhay={x}\n",
+                    .{ sep, byte_wise, unit_wise, hay },
+                );
+                return error.Utf8ArmsDisagree;
+            }
+        }
+    }
+}
+
+test "the UTF-8 gate is load-bearing: byte-wise is WRONG for the other four encodings" {
+    // GUARD / honesty assertion, in the style of the suite's `*_controls` tests:
+    // it asserts the HAZARD IS REAL. If any of these ever stopped differing, the
+    // `encoding == api.encoding_utf8` gate in `matchCursor` would look redundant
+    // and someone would delete it.
+
+    // UTF-16LE: U+2C00 encodes as bytes { 0x00, 0x2C }. The unit is ONE
+    // character and is NOT a separator, but a byte scan sees 0x2C (',') at
+    // offset 1 and would cut the field there.
+    {
+        const bytes = [_]u8{ 0x00, 0x2C, 'A', 0x00 };
+        try std.testing.expectEqual(@as(?usize, 1), lexer.findStructural(&bytes, ','));
+        try std.testing.expectEqual(@as(?usize, null), refUnitScan(&bytes, ',', utf16le));
+    }
+    // UTF-16BE: the same trap with the bytes the other way round.
+    {
+        const bytes = [_]u8{ 0x2C, 0x00, 0x00, 'A' };
+        try std.testing.expectEqual(@as(?usize, 0), lexer.findStructural(&bytes, ','));
+        try std.testing.expectEqual(@as(?usize, null), refUnitScan(&bytes, ',', utf16be));
+    }
+    // Latin-1 / Windows-1252: a source byte >= 0x80 decodes to TWO output bytes,
+    // so source offsets and output offsets diverge. The byte-wise scan reports a
+    // SOURCE offset that the unit-wise scan reaches at a different index once a
+    // high byte precedes the separator -- here they happen to agree on the
+    // offset, so the real divergence to pin is that feeding raw SOURCE bytes
+    // would hand the matcher un-transcoded bytes. Assert the decode differs.
+    for ([_]u8{ latin1, windows1252 }) |e| {
+        const high = [_]u8{0xE9}; // Latin-1 'é' -> 2 UTF-8 output bytes
+        const u = enc.decodeUnit(&high, 0, high.len, e).?;
+        try std.testing.expectEqual(@as(usize, 1), u.src_len);
+        try std.testing.expect(u.out_len == 2); // src != out: byte-wise feeding would corrupt
+        try std.testing.expect(!enc.unitIsStructural(u, ','));
+    }
+    // THIRD REASON THE GATE MUST STAY, and the one least likely to be
+    // rediscovered: the END-OF-STREAM verdict is encoding-asymmetric.
+    //
+    // `Cursor.danglingTail` is encoding-AGNOSTIC -- it is NOT the case that "it
+    // returns 0 for UTF-8" by its own logic. The chain is:
+    //   * UTF-8: a null unit can only mean `peek` returned ZERO bytes (every byte
+    //     decodes, so nothing else yields null). So `in_hand == 0`, and
+    //     `danglingTail`'s `left > in_hand` test makes it 0. Nothing is stranded,
+    //     which is why the byte-wise arm may treat "no unit" as plain exhaustion.
+    //   * UTF-16: a unit can be null with `in_hand == 1` -- a lone trailing byte,
+    //     half a code unit -- and `danglingTail` is then genuinely NONZERO, a
+    //     residue `streamUnit` must advance over for the stream's last row to be
+    //     counted like the mmap side's.
+    // A byte-wise arm applied to UTF-16 would silently drop that residue. This is
+    // the same end-of-stream class as finding F1 in findings/README.md.
+    {
+        // UTF-16LE with an odd trailing byte: the decoder cannot complete a unit.
+        const odd = [_]u8{ 'A', 0x00, 0x42 };
+        try std.testing.expectEqual(@as(?usize, null), refUnitScan(&odd, ',', utf16le));
+        try std.testing.expect(enc.decodeUnit(&odd, 2, odd.len, utf16le) == null);
+        // UTF-8 has no such state: every offset in range decodes.
+        var i: usize = 0;
+        while (i < odd.len) : (i += 1) {
+            try std.testing.expect(enc.decodeUnit(&odd, i, odd.len, utf8) != null);
+        }
+    }
+    // And the property the fast path DOES rest on: under UTF-8 every byte is a
+    // singleton whose output is itself, for all 256 values.
+    {
+        var b: u16 = 0;
+        while (b <= 0xFF) : (b += 1) {
+            const one = [_]u8{@intCast(b)};
+            const u = enc.decodeUnit(&one, 0, 1, utf8).?;
+            try std.testing.expectEqual(@as(usize, 1), u.src_len);
+            try std.testing.expectEqual(@as(u8, 1), u.out_len);
+            try std.testing.expectEqual(@as(u8, @intCast(b)), u.out[0]);
         }
     }
 }

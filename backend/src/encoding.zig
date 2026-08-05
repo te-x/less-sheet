@@ -131,6 +131,28 @@ pub inline fn unitIsByte(u: Unit, b: u8) bool {
     return u.out_len == 1 and u.out[0] == b;
 }
 
+/// True iff `u` ENDS A FIELD under dialect `sep` — the separator, CR or LF.
+///
+/// ONE HOME for the UNIT-WISE structural test, which was re-expressed at seven
+/// call sites: `lexer.scanToStructural`, the non-UTF-8 arm of
+/// `lexer.storeToStructural`, and the five `csv_reader` cursor loops
+/// (`matchCursor`, `lexStream`, `lexStreamSelected`, `cellStream`,
+/// `decodeColumn`). All seven were the same SET of three bytes — only the
+/// `'\n'`/`'\r'` order differed between them, which an OR cannot notice — so
+/// this unifies them without flattening any real difference.
+///
+/// Note it tests the DECODED OUTPUT (`unitIsByte`), not source bytes, which is
+/// why this cannot be replaced by a byte scan for every encoding: under Latin-1
+/// or Windows-1252 one source byte can decode to two output bytes, and under
+/// UTF-16 a unit is 2 or 4 source bytes. `lexer.findStructural` is the byte-wise
+/// counterpart and is sound ONLY for UTF-8, where `decodeUnit` is a pass-through
+/// (one raw byte in, the same raw byte out). Those two are the only definitions
+/// of "structural" in the codebase and they must agree on UTF-8;
+/// `tools/fuzz/lexer_diff.zig` pins exactly that, across all encodings.
+pub inline fn unitIsStructural(u: Unit, sep: u8) bool {
+    return unitIsByte(u, sep) or unitIsByte(u, '\r') or unitIsByte(u, '\n');
+}
+
 fn replacementUnit(src_len: usize) Unit {
     var u: Unit = .{ .src_len = src_len };
     @memcpy(u.out[0..3], &std.unicode.replacement_character_utf8);

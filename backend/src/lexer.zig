@@ -104,7 +104,7 @@ fn scanToStructural(content: []const u8, start: usize, sep: u8, limit: usize, en
     var i = start;
     while (true) {
         const u = enc.decodeUnit(content, i, limit, encoding) orelse return .{ .pos = i, .hit_limit = true };
-        if (enc.unitIsByte(u, sep) or enc.unitIsByte(u, '\n') or enc.unitIsByte(u, '\r')) return .{ .pos = i, .hit_limit = false };
+        if (enc.unitIsStructural(u, sep)) return .{ .pos = i, .hit_limit = false };
         i += u.src_len;
     }
 }
@@ -291,7 +291,7 @@ fn storeToStructural(
     var i = start_at;
     while (true) {
         const u = enc.decodeUnit(content, i, limit, encoding) orelse return .{ .pos = limit, .hit_limit = true };
-        if (enc.unitIsByte(u, sep) or enc.unitIsByte(u, '\n') or enc.unitIsByte(u, '\r')) return .{ .pos = i, .hit_limit = false };
+        if (enc.unitIsStructural(u, sep)) return .{ .pos = i, .hit_limit = false };
         if (store) try storeCapped(buf, gpa, start, u, cap, truncated);
         i += u.src_len;
     }

@@ -734,6 +734,15 @@ pub const matcher_internals = matcher;
 /// C ABI.
 pub const lexer_internals = @import("lexer.zig");
 
+/// DEV-TOOL re-export, same rationale again. The structural-scan oracle needs
+/// BOTH definitions of "structural" to compare them: the byte-wise
+/// `lexer.findStructural` above and the unit-wise `encoding.unitIsStructural` /
+/// `encoding.decodeUnit` that every non-UTF-8 lexer arm uses. The UTF-8
+/// byte-wise fast path in `csv_reader.matchCursor` is sound ONLY because those
+/// two agree for UTF-8, and it would be WRONG for UTF-16 / Latin-1 /
+/// Windows-1252; the oracle pins both halves of that statement.
+pub const encoding_internals = @import("encoding.zig");
+
 // Seam CAPABILITY re-exports (pinned by contracts/api.zig comptime block).
 pub const Source = source_seam.Source;
 pub const Pos = reader_seam.Pos;

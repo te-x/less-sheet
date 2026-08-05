@@ -1286,6 +1286,14 @@ pub const Cursor = struct {
         return s[0..@min(s.len, @as(usize, @intCast(avail)))];
     }
 
+    /// HARD CONSTRAINT, not a perf note — "NO FULL DOWNLOAD, EVER" (PROJECT.md).
+    /// Every span is bounded to the next `chunk_bytes` boundary below, so one span
+    /// costs AT MOST one fresh range fetch. `csv_reader.matchCursor`'s UTF-8
+    /// byte-wise arm consumes spans in a loop, and a caller that loops over a
+    /// primitive which fetched to the end of the document would silently convert a
+    /// match scan into a full download. It cannot: the loop advances one bounded
+    /// chunk per iteration, so a network match scan stays incremental and
+    /// O(bytes actually scanned), exactly as the unit-at-a-time walk it replaced.
     fn spanHttp(self: *Cursor) []const u8 {
         const hr = self.source.?.http_range;
         var cap: ?u64 = self.limit;
@@ -1500,6 +1508,21 @@ pub const Cursor = struct {
         };
     }
 
+    /// The contiguous bytes available AT the cursor, or empty.
+    ///
+    /// CONTRACT NOW RELIED ON BY A CALLER: the returned slice begins at EXACTLY
+    /// the cursor's current logical position — never earlier, never skipping
+    /// forward. All four arms satisfy it (each indexes from `self.logical`, or
+    /// from `internal` = `logical + bom_len` into head/lane/http windows), and it
+    /// used to be merely true rather than depended upon. `csv_reader.matchCursor`'s
+    /// UTF-8 byte-wise arm now feeds `span()[0..run]` to the matcher and then
+    /// `advance(run)`, so a span starting anywhere else would feed the wrong bytes
+    /// AND mis-place the row boundary. The over-span-cell parity lock in
+    /// `tools/fuzz/harness.zig` fails if this is violated (a shifted span shows up
+    /// as a cell mismatch against the mmap reference).
+    ///
+    /// NO DEMAND, and callers must not read emptiness as end-of-source: this is a
+    /// view of what happens to be resident. `spanTerminal` is the EOF question.
     pub fn span(self: *Cursor) []const u8 {
         if (self.source.? == .http_range) return self.spanHttp();
         if (self.limit) |lim| if (self.logical >= lim) return &.{};
