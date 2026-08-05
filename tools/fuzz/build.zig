@@ -107,6 +107,26 @@ pub fn build(b: *std.Build) void {
     // Part of `test` too: the oracle is cheap and a mismatch is a real defect.
     test_step.dependOn(&run_diff.step);
 
+    // --- the structural-scan differential oracle ---------------------------
+    // Same kind of VALUE oracle, for the other silent-failure surface: the
+    // vectorized `lexer.findStructural` against the `std.mem.findAny` it
+    // replaced (see lexer_diff.zig). Reached through the `lexer_internals`
+    // re-export for the same module reason as `matcher_internals`.
+    const lexdiff = b.addTest(.{
+        .name = "lslexdiff",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("lexer_diff.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{.{ .name = "core", .module = core_mod }},
+        }),
+    });
+    const run_lexdiff = b.addRunArtifact(lexdiff);
+    run_lexdiff.has_side_effects = true;
+    diff_step.dependOn(&run_lexdiff.step);
+    test_step.dependOn(&run_lexdiff.step);
+
     // --- the coverage report tool ------------------------------------------
     const covreport = b.addExecutable(.{
         .name = "covreport",

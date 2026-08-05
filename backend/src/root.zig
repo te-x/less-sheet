@@ -723,6 +723,17 @@ const reader_seam = @import("reader.zig");
 /// compiler rejects outright. One re-export is the whole cost.
 pub const matcher_internals = matcher;
 
+/// DEV-TOOL re-export, same rationale as `matcher_internals` directly above.
+/// `tools/fuzz/lexer_diff.zig` pins `lexer.findStructural` — the vectorized
+/// scan shared by the two BYTE-WISE UTF-8 structural scans (the `.mmap`
+/// match-scan row loop and the unquoted-field store; NOT the unit-wise or
+/// cursor/streaming scans — see the map on `findStructural` itself) — against
+/// the scalar `std.mem.findAny` it replaced. A false NEGATIVE there would run a
+/// field past its real end and silently mis-lex the row, which no
+/// crash-oriented fuzz target could notice, and it is not reachable through the
+/// C ABI.
+pub const lexer_internals = @import("lexer.zig");
+
 // Seam CAPABILITY re-exports (pinned by contracts/api.zig comptime block).
 pub const Source = source_seam.Source;
 pub const Pos = reader_seam.Pos;

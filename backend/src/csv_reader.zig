@@ -414,10 +414,27 @@ fn matchMmapUtf8(m: source_mod.Mmap, pos: Pos, sep: u8, quote: ?u8, primary: bas
     var primary_col: ?u32 = null;
     var filter_ok = filter_ctx == null;
     while (true) : (col += 1) {
+        // Built EAGERLY on purpose. Deferring construction to the cells that
+        // are actually fed was measured and REJECTED: it needs `ps` to become
+        // an optional (`undefined` would be UB the moment a future read escaped
+        // its guard), and the resulting unwrap check on every `feed` cost
+        // +10% on a full-column text scan to save ~2% on a predicate scan.
+        // Constructing a `StreamCell` is a struct literal the optimizer already
+        // sinks; the checks needed to skip it are dearer than the literal.
         var ps = matcher.StreamCell.init(primary, col);
         var fs = if (filter_ctx) |fc| matcher.StreamCell.init(fc, col) else null;
-        const pfeed = wantsCell(primary, col);
-        const ffeed = if (filter_ctx) |fc| wantsCell(fc, col) else false;
+        // ONCE A VERDICT IS SETTLED, STOP FEEDING FOR IT. `primary_col` is
+        // assigned only under `primary_col == null` and `filter_ok` only ever
+        // moves false->true, so every cell fed after the respective verdict
+        // lands has its result DISCARDED by the very tests below -- this makes
+        // that explicit instead of computing it and throwing it away.
+        // Nothing else in this loop reads `ps`/`fs`, and neither `i` nor `col`
+        // depends on either flag, so the row walk is bit-identical.
+        // The post-EOL `missing` loops already carry the `primary_col == null`
+        // half of this; their filter half is unguarded and harmless there,
+        // since it can only re-set `filter_ok` from true to true.
+        const pfeed = wantsCell(primary, col) and primary_col == null;
+        const ffeed = if (filter_ctx) |fc| wantsCell(fc, col) and !filter_ok else false;
 
         if (quote) |q| if (i < end and m.bytes[i] == q) {
             i += 1;
@@ -443,7 +460,7 @@ fn matchMmapUtf8(m: source_mod.Mmap, pos: Pos, sep: u8, quote: ?u8, primary: bas
         };
 
         if (i < end) {
-            const rel = std.mem.findAny(u8, m.bytes[i..end], &.{ sep, '\r', '\n' });
+            const rel = lexer.findStructural(m.bytes[i..end], sep);
             const structural = i + (rel orelse end - i);
             if (pfeed) ps.feed(m.bytes[i..structural]);
             if (ffeed) fs.?.feed(m.bytes[i..structural]);
@@ -489,8 +506,17 @@ fn matchCursor(cur: anytype, sep: u8, quote: ?u8, encoding: u8, primary: base.Ma
     while (true) : (col += 1) {
         var ps = matcher.StreamCell.init(primary, col);
         var fs = if (filter_ctx) |fc| matcher.StreamCell.init(fc, col) else null;
-        const pfeed = wantsCell(primary, col);
-        const ffeed = if (filter_ctx) |fc| wantsCell(fc, col) else false;
+        // Settled verdicts stop being fed, exactly as in `matchMmapUtf8` above
+        // and for the same reason: `ps`/`fs` are read nowhere else, and cursor
+        // advance is independent of both flags.
+        // NOTE for anyone measuring: this is the ONLY half of the structural-scan
+        // cell that reaches `.gzip` / `.http_range`. `lexer.findStructural` is
+        // byte-wise and `.mmap`-only, so a local `.csv.gz` or a network document
+        // gains nothing from the vector scan and everything it gains comes from
+        // here — measured 0.829x on a 2000-column local `.csv.gz` whose match is
+        // in the FIRST column, and 1.000x when the match is in the last.
+        const pfeed = wantsCell(primary, col) and primary_col == null;
+        const ffeed = if (filter_ctx) |fc| wantsCell(fc, col) and !filter_ok else false;
         var ended = false;
         if (quote) |q| if (streamUnit(cur, encoding)) |first| {
             if (enc.unitIsByte(first, q)) {

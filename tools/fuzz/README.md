@@ -183,12 +183,64 @@ re-export `matcher_internals` in `backend/src/root.zig`. A module rooted at
 under `src/` would then belong to two modules at once (`api` already pulls
 `src/root.zig` in as `core`), which the compiler rejects.
 
+## The structural-scan differential oracle (`lexer_diff.zig`, same `zig build diff`)
+
+`lexer.findStructural` answers "where does this CSV field end" for the two
+**byte-wise** UTF-8 structural scans, and only those two: the match-scan row loop
+in `csv_reader.matchMmapUtf8` and the unquoted-field arm of
+`lexer.storeToStructural`. It replaced `std.mem.findAny` (in 0.16 a nested
+scalar loop) with a `@Vector(N, u8)` block scan: three splat compares OR-ed
+together, `std.simd.firstTrue`, then a scalar tail.
+
+**Scope, stated because it is easy to over-read.** This is not every UTF-8
+structural scan. The unit-wise `lexer.scanToStructural` (via `recordBounds` and
+`sniff.countFields`), the quote-stateful `csv_reader.scanUtf8Rows`, and the
+entire cursor/streaming family (`matchCursor`, `lexStream`, `lexStreamSelected`,
+`cellStream`, `decodeColumn`) all bypass it. Source dispatch is uniform —
+`.mmap => <content lexer.*>` versus `.gzip, .http_range => <cursor *Stream>` —
+so `findStructural` is reachable for **`.mmap` sources only**. A local `.csv.gz`
+or a network document does not reach it on any path. Any speedup attributed to
+this helper therefore describes **local uncompressed UTF-8 files**.
+
+That change fails **silently**, which is why it gets a value oracle rather than a
+crash target. A missed lane is a false negative, so the field runs past its real
+end, swallows its separator and mis-lexes the row; a wrong lane index reports a
+structural byte where there is none, and every offset this scan returns is one a
+caller may publish as a **row start** (`review/REVIEW-row-count-drift.md` — "a
+terminator is consumed whole, or not at all" rests on the offset being exact).
+No crash either way.
+
+The property is total equivalence with the implementation it replaced, plus an
+independent self-check that the returned offset really is the *first* structural
+byte. Inputs target the block/tail seam, where vector scans actually break:
+every length from 0 to four blocks + 3, a needle at **every** offset for each of
+the three needle bytes, every two-needle pair (so the lowest lane must win),
+dialects where `sep` **aliases** CR or LF (two of the three compares become
+identical), all-needle runs, and a pseudorandom sweep over both dense-needle
+(short fields) and sparse-needle (multi-MB cell) shapes.
+
+**Verified sensitive, not just green** — all five caught, each within the first
+seed:
+
+| planted defect | what it would break in production |
+|---|---|
+| drop the CR splat compare | a CR-terminated row's field never ends: rows merge |
+| `firstTrue` → `lastTrue` | a later needle in the block wins: field end reported too late |
+| `i += structural_vec_len + 1` | one byte per block never examined: intermittent missed delimiters |
+| scalar tail deleted | any needle in the final partial block is missed |
+| `return i` instead of `i + firstTrue(m)` | offsets snap to a block boundary: cell contents and row starts both wrong |
+
+Re-run this list after touching `findStructural`. It reaches the function through
+a second dev-tool re-export, `lexer_internals`, for the same module reason as
+`matcher_internals` above.
+
 ## Files
 
 | file | role |
 |---|---|
 | `harness.zig` | the four fuzz targets + the shared `exercise()` drive sequence |
 | `matcher_diff.zig` | the matcher **differential oracle** — a VALUE check, see below |
+| `lexer_diff.zig` | the structural-scan **differential oracle** — `findStructural` vs the `std.mem.findAny` it replaced |
 | `gzbuild.zig` | gzip/deflate construction, shared by the harness and the generator so a baked-in cut offset means the same stream in both |
 | `seeds.zig` | comptime loader for the four `.pack` corpus files |
 | `seeds/*.pack` | **the committed corpus** (466 entries) |

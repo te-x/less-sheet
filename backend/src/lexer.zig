@@ -12,6 +12,89 @@ const CellRef = base.CellRef;
 
 pub const Bounds = struct { next: usize, capped: bool };
 
+/// Vector width for `findStructural`, 0 on a target without SIMD — the block
+/// loop is then comptime-dead and the scan is purely the scalar tail loop.
+/// `std.simd.suggestVectorLength` is how std sizes its own `findScalarPos`
+/// blocks, so this follows the platform std already picked.
+const structural_vec_len: usize = std.simd.suggestVectorLength(u8) orelse 0;
+
+/// THE structural-byte scan: the offset within `hay` of the first byte that can
+/// end a CSV field — `sep`, CR or LF — or null if `hay` contains none.
+///
+/// ONE SOURCE FOR THE BYTE-WISE SCAN — and ONLY the byte-wise scan. Both of the
+/// codebase's byte-at-a-slice UTF-8 structural scans call this, and they are the
+/// only two callers:
+///   * `storeToStructural` below (the unquoted-field store, UTF-8 arm), and
+///   * the match-scan row loop in `csv_reader.matchMmapUtf8`.
+/// Both previously called `std.mem.findAny(u8, …, &.{ sep, '\r', '\n' })` —
+/// which in Zig 0.16 resolves to `findAnyPos` (`std/mem.zig`), a plain nested
+/// scalar loop: three compares plus a bounds check for every byte of the file.
+/// That it is NOT vectorized is easy to miss because `findScalarPos` — one
+/// needle, used by the quoted-field arm — sits 80 lines above it in the same
+/// file and IS vectorized, which is why only the three-needle scan was slow.
+/// (The two call sites also passed the needles in different ORDERS,
+/// `{sep,'\r','\n'}` vs `{sep,'\n','\r'}`; immaterial, because `findAnyPos`
+/// iterates positions outer and values inner so order cannot move the returned
+/// index — but one helper now makes that unable to drift at all.)
+///
+/// WHAT DOES **NOT** ROUTE THROUGH HERE — a map, so the next reader does not
+/// mistake this for "all UTF-8 structural scanning". Editing this function does
+/// not touch any of them:
+///   * `csv_reader.scanUtf8Rows` — the row-count walk; byte-at-a-time because it
+///     is quote-stateful and owns the terminator invariant;
+///   * `scanToStructural` below, reached from `recordBounds` and
+///     `sniff.countFields` — unit-wise, runs for ALL encodings including UTF-8;
+///   * `csv_reader.matchCursor` — the match scan for `.gzip` / `.http_range`;
+///   * the streaming decode family — `lexStream`, `lexStreamSelected`,
+///     `cellStream`, `decodeColumn`.
+/// The last two matter most: source dispatch is uniform (`.mmap => <content
+/// lexer.*>` vs `.gzip, .http_range => <cursor *Stream>`), and the cursor family
+/// never calls this. So this helper is reachable for **`.mmap` sources only** —
+/// a local `.csv.gz` or a network document gains nothing from it, on bounds,
+/// materialize, selected, cell and match alike.
+///
+/// This is ONLY a faster way to compute the same offset. It decides nothing
+/// about terminators: CR, LF and CRLF are still classified by the caller, so
+/// the "a terminator is consumed whole, or not at all" invariant is untouched.
+/// `sep` is a runtime dialect value, so the three needles are splatted at run
+/// time — no comptime specialization is needed or wanted. A dialect whose `sep`
+/// IS CR or LF is safe for free: the splat then merely equals `vcr`/`vlf` and
+/// the OR of the three masks describes the same set of bytes.
+///
+/// BUFFER SAFETY: reads only bytes inside `hay` (never one past it, not even
+/// speculatively — the block loop's `hay.len - i >= structural_vec_len` is
+/// exactly the condition for the `hay[i..][0..N]` load) and returns only an
+/// offset into `hay`. It holds no state across calls and keeps no pointer.
+/// No CURRENT caller is a streaming one (see the map above — the cursor family
+/// does not use this), so that is a property held in advance rather than one
+/// being relied on today: should a re-filling caller ever route here, a peek
+/// invalidating the slice `hay` pointed into cannot catch anything in here out.
+pub fn findStructural(hay: []const u8, sep: u8) ?usize {
+    var i: usize = 0;
+    // Runs shorter than one block — every field of a typical narrow CSV — go
+    // straight to the scalar loop so they never pay even the splat setup, the
+    // same short-run bail `matcher.feedText` makes before its anchor prefilter.
+    if (comptime structural_vec_len > 0) if (hay.len >= structural_vec_len) {
+        const V = @Vector(structural_vec_len, u8);
+        const vsep: V = @splat(sep);
+        const vcr: V = @splat('\r');
+        const vlf: V = @splat('\n');
+        while (hay.len - i >= structural_vec_len) : (i += structural_vec_len) {
+            const v: V = hay[i..][0..structural_vec_len].*;
+            const m = (v == vsep) | (v == vcr) | (v == vlf);
+            // firstTrue on the OR of the three masks — the LOWEST set lane, so
+            // the result is the first structural byte regardless of which of
+            // the three it is, matching `findAny`'s left-to-right semantics.
+            if (@reduce(.Or, m)) return i + std.simd.firstTrue(m).?;
+        }
+    };
+    while (i < hay.len) : (i += 1) {
+        const c = hay[i];
+        if (c == sep or c == '\r' or c == '\n') return i;
+    }
+    return null;
+}
+
 /// Advance from `i` (decoding units of `encoding`) until a sep/CR/LF unit
 /// (not consumed) or `limit` (ran out, `hit_limit`). Shared by the unquoted
 /// scan and the post-closing-quote trailing-junk scan (both stop the same way).
@@ -189,7 +272,7 @@ fn storeToStructural(
 ) !Scan {
     if (encoding == api.encoding_utf8) {
         const tail = content[start_at..limit];
-        const rel = std.mem.findAny(u8, tail, &.{ sep, '\n', '\r' });
+        const rel = findStructural(tail, sep);
         const end = start_at + (rel orelse tail.len);
         if (store and !truncated.*) {
             const bytes = content[start_at..end];
