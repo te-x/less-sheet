@@ -14,7 +14,8 @@
  * GtkAdjustment + GtkScrollbar, materializing ONLY the visible window (+
  * scroll buffer) via lsg_document_set_window — never O(file).
  *
- * The GNOME toolchain (GTK 4.16+/libadwaita 1.6+, decision 7) is required;
+ * The GNOME toolchain (GTK 4.20+/libadwaita 1.8+, decision 7 as raised by
+ * ARCH-gtk-a11y decision 1 for AdwShortcutsDialog) is required;
  * this binary is compiled by the gate but run by the author on a real GNOME
  * desktop.
  */
@@ -37,6 +38,18 @@
 
 #include <string.h>
 
+/* Reverse-DNS application id — the single source of truth for it in this file.
+ * It is simultaneously the AdwApplication id, the window/about icon NAME, and
+ * (with dots as slashes) the GResource path the embedded logo is laid out
+ * under, so all three can never drift apart. The matching literals in
+ * data/lesssheet.gresource.xml are the one place that must be renamed in step
+ * with these, because a .gresource.xml cannot read a #define; that file spells
+ * the coupling out. A published app id is effectively permanent. */
+#define LSG_APP_ID "com.lesssheet.LessSheet"
+/* Root of the embedded hicolor-laid-out icon resource: LSG_APP_ID with '.'
+ * -> '/', i.e. the gresource prefix minus its `/scalable/apps` leaf. (Also
+ * GApplication's own default resource-base-path convention for the id.) */
+#define LSG_ICON_RESOURCE_PATH "/com/lesssheet/LessSheet/icons"
 /* Row buffer beyond the viewport (the scroll buffer), each side. */
 #define GRID_OVERSCAN 4
 /* Poll cadence for the frontier / network drive. */
@@ -5076,10 +5089,11 @@ action_about (GSimpleAction *a, GVariant *p, gpointer data)
   AdwDialog *about = ADW_DIALOG (adw_about_dialog_new ());
   adw_about_dialog_set_application_name (ADW_ABOUT_DIALOG (about),
                                          "less-sheet");
-  adw_about_dialog_set_application_icon (ADW_ABOUT_DIALOG (about),
-                                         "dev.lesssheet.Gtk");
+  adw_about_dialog_set_application_icon (ADW_ABOUT_DIALOG (about), LSG_APP_ID);
   adw_about_dialog_set_developer_name (ADW_ABOUT_DIALOG (about), "less-sheet");
-  adw_about_dialog_set_version (ADW_ABOUT_DIALOG (about), "0.0.0");
+  /* LSG_VERSION is meson.project_version(), i.e. the root VERSION file: the
+   * displayed version is never hand-typed here. */
+  adw_about_dialog_set_version (ADW_ABOUT_DIALOG (about), LSG_VERSION);
   adw_about_dialog_set_comments (ADW_ABOUT_DIALOG (about),
                                  "A fast viewer for large delimited files.");
   adw_about_dialog_set_license_type (ADW_ABOUT_DIALOG (about),
@@ -6344,8 +6358,8 @@ ensure_window (App *app, GtkApplication *gtk_app)
   GdkDisplay *display = gdk_display_get_default ();
   if (display != NULL)
     gtk_icon_theme_add_resource_path (gtk_icon_theme_get_for_display (display),
-                                      "/dev/lesssheet/Gtk/icons");
-  gtk_window_set_icon_name (app->window, "dev.lesssheet.Gtk");
+                                      LSG_ICON_RESOURCE_PATH);
+  gtk_window_set_icon_name (app->window, LSG_APP_ID);
 
   /* Header bar: Open + Open URL on the left, filename title in the center.
    * The title is a CUSTOM widget (not an AdwWindowTitle) so the filtered
@@ -6666,7 +6680,7 @@ main (int argc, char *argv[])
   app.gutter_font_desc = pango_font_description_from_string ("Sans 10");
 
   g_autoptr (AdwApplication) application
-      = adw_application_new ("dev.lesssheet.Gtk", G_APPLICATION_HANDLES_OPEN);
+      = adw_application_new (LSG_APP_ID, G_APPLICATION_HANDLES_OPEN);
   g_signal_connect (application, "activate", G_CALLBACK (on_activate), &app);
   g_signal_connect (application, "open", G_CALLBACK (on_open), &app);
   register_app_shortcuts (&app, G_APPLICATION (application));

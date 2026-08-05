@@ -1,19 +1,34 @@
 /*
- * lsg_dialect.c — RED SEED for the dialect compose/validate view-model
- * (lsg_dialect.h). Compiles against the frozen header (so the CONFORMANCE gate
- * passes) but deliberately does NOT implement the behavior: the compose funnel
- * always REJECTS, the header shift is always 0, the custom-byte parse always
- * fails, and the encoding picker always reports Automatic. The value builders
- * and the candidate/option DATA are real (tests need them to construct inputs
- * and to assert the frozen lists), so tests/test_dialect.c is RED strictly on
- * the unimplemented LOGIC (compose / validate / carry-forward / header-shift /
- * custom-byte / picker selection), turning GREEN as the implementer fills it
- * in. Pure + display-free: no core, no widgets.
+ * lsg_dialect.c — the dialect compose/validate view-model (lsg_dialect.h):
+ * "the user overrode one dialect parameter; what ls_open_options does the
+ * re-open get?". Fully implemented and shipped; tests/test_dialect.c pins
+ * every rule below.
+ *
+ * What lives here:
+ *   - change builders: one per overridable parameter (separator, quote,
+ *     quote-disabled, header, encoding).
+ *   - compose (F1 + F2): CARRY-FORWARD — every parameter starts from its
+ *     effective FORCED value, or LS_SNIFF / LS_ENCODING_AUTO so the re-open
+ *     re-sniffs it. The change is then applied as ITS parameter's forced
+ *     value and VALIDATED: byte domain, plus a separator/quote collision
+ *     judged against the CARRIED FORCED byte only (equalling a merely
+ *     sniffed byte is fine, the re-open re-sniffs around it). A rejection
+ *     returns accepted = FALSE and no options.
+ *   - custom-byte parse: exactly one byte in 0x01..0x7F, CR / LF excluded.
+ *   - header shift (F5): the row re-anchor when the header toggles — -1
+ *     turning it on, +1 turning it off, 0 when unchanged.
+ *   - candidates + picker: the frozen separator / quote / encoding option
+ *     lists, the picker's selection (the forced encoding, else Automatic)
+ *     and the concrete detected encoding.
+ *
+ * Pure + display-free: no core calls, no widgets, no allocation. Compiles
+ * against the frozen header, so a signature drift fails the CONFORMANCE
+ * build.
  */
 #include <lsg_dialect.h>
 
 /* ------------------------------------------------------------------------- */
-/* Value builders (real — tests construct changes with these)                */
+/* Value builders — tests construct changes with these                       */
 /* ------------------------------------------------------------------------- */
 
 LsgDialectChange
@@ -169,7 +184,7 @@ lsg_dialect_header_shift (gboolean old_header, gboolean new_header)
 }
 
 /* ------------------------------------------------------------------------- */
-/* Candidate lists + encoding picker (DATA real; SELECTION seeded wrong)     */
+/* Candidate lists + encoding picker                                        */
 /* ------------------------------------------------------------------------- */
 
 const guint8 *

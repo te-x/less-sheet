@@ -1,5 +1,10 @@
+# VERSION is a SYMLINK to the workspace-root ../../VERSION -- the single place a
+# human edits the product version (docs/RELEASE.md section 1). Same idiom as
+# include/lesssheet.h symlinking the root api/ header: a pointer, never a copy.
+# meson.project_version() is the ONE resolver every consumer here reads (the
+# about dialog gets it as -DLSG_VERSION below); nothing re-types the number.
 project('less-sheet-gtk', 'c',
-  version : '0.0.0',
+  version : files('VERSION'),
   meson_version : '>= 1.0',
   default_options : ['c_std=c11', 'warning_level=2', 'werror=true'],
 )
@@ -59,7 +64,7 @@ lsgkit = static_library('lsgkit',
   install : false,
 )
 
-# App logo: the branding icon (data/dev.lesssheet.Gtk.svg, copied from
+# App logo: the branding icon (data/com.lesssheet.LessSheet.svg, copied from
 # branding/icon.svg) is compiled into the binary as a GResource, laid out like a
 # hicolor icon theme, so the running app shows it WITHOUT installation (the GUI
 # run helper launches ./build/less-sheet-gtk directly; it never `meson install`s).
@@ -77,6 +82,8 @@ app_resources = gnome.compile_resources(
 executable('less-sheet-gtk',
   'src/main.c',
   app_resources,
+  # The About dialog's version: taken from the ONE resolver, never re-typed.
+  c_args : ['-DLSG_VERSION="' + meson.project_version() + '"'],
   dependencies : [gtk_dep, adw_dep, glib_dep, core_dep],
   link_with : lsgkit,
   include_directories : core_inc,

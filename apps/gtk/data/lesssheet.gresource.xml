@@ -4,9 +4,21 @@
   as a GResource compiled into the binary, laid out like a hicolor icon theme so
   gtk_icon_theme_add_resource_path() finds it by name — WITHOUT installation
   (the run helper launches ./build/less-sheet-gtk directly, never `meson install`).
+
+  THREE STRINGS MUST AGREE or the window icon silently disappears (no build
+  error, because GTK just falls back to no icon):
+
+    prefix     = <LSG_ICON_RESOURCE_PATH>/scalable/apps   (src/main.c)
+    file       = <LSG_APP_ID>.svg                         (data/, this file)
+    icon-name  = <LSG_APP_ID>                             (src/main.c)
+
+  `scalable/apps` is not decoration: gtk_icon_theme_add_resource_path() treats
+  the path as a hicolor icon theme and only looks inside the directories hicolor
+  defines. src/main.c holds the C side as two #defines derived from the app id;
+  a rename must change them here too — a .gresource.xml cannot read a #define.
 -->
 <gresources>
-  <gresource prefix="/dev/lesssheet/Gtk/icons/scalable/apps">
-    <file preprocess="xml-stripblanks">dev.lesssheet.Gtk.svg</file>
+  <gresource prefix="/com/lesssheet/LessSheet/icons/scalable/apps">
+    <file preprocess="xml-stripblanks">com.lesssheet.LessSheet.svg</file>
   </gresource>
 </gresources>

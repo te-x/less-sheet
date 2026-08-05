@@ -8,7 +8,11 @@
 > - **The assembled `.app` was unsealed and macOS refused to launch it** — the user-visible symptom was *"damaged and can't be opened … move it to the Trash"*, which hit the author's own installed app. Cause: `assemble-app.sh` wrapped a linker-ad-hoc-signed executable in a bundle without ever sealing the bundle, so the signature claimed sealed resources that did not exist. `assemble-app.sh` now ad-hoc-seals the bundle as its last step and verifies with `codesign --verify --strict`. See §3a.
 > - **`LSMinimumSystemVersion` claimed 15.0 while the binary requires macOS 26.0** (`Package.swift` targets `.macOS("26.0")` for Liquid Glass). A macOS 15 user would have been offered the app and then got a dyld failure instead of a clean "requires macOS 26" message. Corrected to 26.0.
 >
-> Still open: macOS ships **ad-hoc signed, not notarized** (no Apple Developer account — §3a is now measured, not predicted). The version is not single-sourced (macOS `CFBundleShortVersionString = 0.1`, GTK `meson project version = 0.0.0` — reconcile before v1, §1). The GTK app-id in the code is **`dev.lesssheet.Gtk`**, not the `com.lesssheet.LessSheet` this doc proposes in §4b — reconcile before any Flathub submission, because a published app-id is effectively permanent. EULA not yet written (§6).
+> Settled since (2026-08-05):
+> - **The version is single-sourced** to `VERSION` at the workspace root (§1). The GTK build reads it; the macOS bundle and `tools/release/make_release` still hold their own copies and are the last two consumers to convert — §1 specifies exactly how.
+> - **The GTK app-id is `com.lesssheet.LessSheet`** (the author's decision), matching what §4b proposes. It was `dev.lesssheet.Gtk`; the id, the embedded icon's filename, the GResource path and the `icon-name` lookup were renamed together and the icon was re-verified as resolving.
+>
+> Still open: macOS ships **ad-hoc signed, not notarized** (no Apple Developer account — §3a is now measured, not predicted). EULA not yet written (§6).
 
 ---
 
@@ -30,11 +34,46 @@
 
 ---
 
-## 1. Versioning (do this first — it's currently inconsistent)
+## 1. Versioning
 
-- Adopt **semver** `MAJOR.MINOR.PATCH`; v1 = `1.0.0` (or `0.1.0` for a beta — your call).
-- **Single-source it.** Today the version lives in two places that disagree: `apps/macos/Bundle/Info.plist` (`CFBundleShortVersionString`, `CFBundleVersion`) and `apps/gtk/meson.build` (`version:`). Pick one source of truth (e.g. a `VERSION` file at repo root read by both builds, or keep the two but bump them together via a release script) and reconcile them before tagging.
-- Each release is a git tag `vX.Y.Z` on the release commit.
+**The version has exactly one home: `VERSION` at the workspace root.** One line, **semver**
+`MAJOR.MINOR.PATCH`, currently `0.1.0` (the semver spelling of the `0.1` the macOS bundle
+already claimed; change it to `1.0.0` when v1 ships — it is a one-line edit, which is the point).
+Bumping a release means editing that one file and nothing else.
+
+Every consumer *reads* it; none re-types it:
+
+| Consumer | How it reads `VERSION` | State |
+|---|---|---|
+| GTK build (`apps/gtk/meson.build`) | `project(version : files('VERSION'))`, where `apps/gtk/VERSION` is a **symlink** to the root file — the same pointer-never-a-copy idiom as `apps/gtk/include/lesssheet.h` → `api/lesssheet.h`. `meson.project_version()` is then the single resolver inside that build. | **Done** |
+| GTK About dialog | `meson.build` passes the resolved version to `main.c` as `-DLSG_VERSION`; nothing is typed in C. | **Done** |
+| macOS bundle (`apps/macos/Bundle/Info.plist`) | Still a hand-typed `CFBundleShortVersionString`. | **To do** — below |
+| `tools/release/make_release` | Still reconciles the plist against `meson.build` and warns when they disagree (`resolve_version`). | **To do** — below |
+| Git tag / download URLs | The release tag is `v$(cat VERSION)`; every GitHub Releases URL on the landing page derives from that tag (`ARCH-frontpage` §6) — never hand-typed. | Applies at publish |
+
+Each release is a git tag `vX.Y.Z` on the release commit, where `X.Y.Z` is `VERSION`'s content.
+
+### 1a. The two remaining consumers (specified, not yet done)
+
+Both live outside `apps/gtk` and are deliberately left to a separate pass; until they land,
+`make_release` will keep printing its "version is not single-sourced" warning, which is **true**
+(the plist still says `0.1`, the root file says `0.1.0`) and should stay until it isn't.
+
+1. **macOS bundle.** Put a placeholder in `Info.plist` — `CFBundleShortVersionString` =
+   `__LESSSHEET_VERSION__` — and have `apps/macos/scripts/assemble-app.sh` substitute
+   `$(cat "$REPO/VERSION")` into the copy it lays into the bundle (it already copies the plist, so
+   this is one `sed` on the copy; the in-repo file must keep the placeholder or the number is
+   duplicated again). Leave `CFBundleVersion` (the build counter, `1`) alone — it is a different
+   fact from the marketing version. Note `apps/macos` is its own aidev component with its own
+   frozen paths: route this through that component's planner.
+2. **`make_release`.** Replace `resolve_version()`'s two-place reconciliation with a read of the
+   root `VERSION` (still honouring `--version` as an override), and delete the disagreement
+   warning along with it — there is nothing left to disagree. It should fail loudly if `VERSION`
+   is missing or is not `MAJOR.MINOR.PATCH`, rather than defaulting to `0.0.0`.
+
+Renaming the artifacts is a consequence worth expecting: the built files become
+`less-sheet-0.1.0-…` rather than the `less-sheet-0.1-…` recorded in `ARCH-frontpage` §2. Nothing
+is published yet, so no URL breaks.
 
 ---
 
@@ -75,7 +114,7 @@ bash apps/macos/scripts/assemble-app.sh
 # → apps/macos/.build/<triple>/release/less-sheet.app
 #   (rebuilds the ReleaseSafe core, force-relinks it — avoids the stale-.a hazard — and lays out the bundle)
 ```
-Bundle facts: `CFBundleIdentifier = com.lesssheet.app`, `CFBundleName = less-sheet`, executable `LessSheet`, `LSMinimumSystemVersion = 15.0` (macOS 15 Sequoia).
+Bundle facts: `CFBundleIdentifier = com.lesssheet.app`, `CFBundleName = less-sheet`, executable `LessSheet`, `LSMinimumSystemVersion = 26.0` (macOS 26 — corrected from 15.0 on 2026-08-05, see the note at the top of this doc).
 
 ### 2c. GTK/Linux
 `make_release --platform linux` handles this: it cross-builds the core with Zig (native, no
@@ -177,8 +216,24 @@ xcrun stapler staple "$APP"
 ### 4a. LGPL note (why Flatpak)
 GTK4/libadwaita/GLib are LGPL and **dynamically linked** (`dependency()` in `meson.build`). Flatpak provides them from the `org.gnome.Platform` runtime (dynamic, swappable) — which inherently satisfies LGPL's relink requirement, so a **closed-source app is compliant** as long as we ship the notices (`THIRD-PARTY-NOTICES.md`) and don't statically bundle GTK. (AppImage would bundle GTK and make LGPL compliance manual — that's why Flatpak is chosen.)
 
-### 4b. Confirm the app-id first
-Flatpak needs a reverse-DNS app-id that matches the `GApplication`/`AdwApplication` id and a `.desktop` file — e.g. **`com.lesssheet.LessSheet`** (align with the macOS `com.lesssheet.app`). Confirm/set it consistently in: the GTK `application_new(...)` id, a `com.lesssheet.LessSheet.desktop`, a `com.lesssheet.LessSheet.metainfo.xml` (AppStream — required by Flathub), and the manifest below.
+### 4b. The app-id (settled 2026-08-05)
+The app-id is **`com.lesssheet.LessSheet`** (the author's decision; aligns with the macOS
+`com.lesssheet.app`). Flatpak requires that the `GApplication`/`AdwApplication` id, the `.desktop`
+file name and the AppStream metainfo file name all agree with it.
+
+Already consistent in the GTK component: `adw_application_new(LSG_APP_ID, …)`, the window and
+About `icon-name`, the embedded icon `data/com.lesssheet.LessSheet.svg`, and the GResource path
+`/com/lesssheet/LessSheet/icons/scalable/apps`. `main.c` holds the id as a single `#define
+LSG_APP_ID` (plus `LSG_ICON_RESOURCE_PATH`, the same string with `.` → `/`), so these cannot drift
+apart; `data/lesssheet.gresource.xml` is the one place that must be renamed in step, because XML
+cannot read a `#define`, and it says so in a comment. **Watch out:** an id/icon-name/resource-path
+mismatch produces no build error at all — the window icon just silently disappears.
+
+Still to create (§6): `com.lesssheet.LessSheet.desktop` and
+`com.lesssheet.LessSheet.metainfo.xml`. `make_release` already generates a `.desktop` for the
+Linux tarball, but from its own `GTK_APP_ID` constant, which still reads `dev.lesssheet.Gtk` —
+**it must be updated to `com.lesssheet.LessSheet` before any Linux artifact ships**, or the
+installed desktop entry points `Icon=` at a name the app no longer provides.
 
 ### 4c. Flatpak build (local)
 A manifest `com.lesssheet.LessSheet.yaml` roughly:
@@ -201,7 +256,7 @@ flatpak build-bundle repo less-sheet.flatpak com.lesssheet.LessSheet       # sel
 
 ## 5. Shipping updates
 
-1. Land the change; **bump the version** (§1) on a release commit; tag `vX.Y.Z`.
+1. Land the change; **bump the version** by editing the root `VERSION` file (§1) on a release commit; tag `v$(cat VERSION)`.
 2. Rebuild artifacts (§2) from the tag.
 3. **macOS:** re-sign → re-notarize → re-staple → new DMG (§3b); update the download link + checksum on `site/`.
 4. **Flatpak:**
@@ -221,8 +276,10 @@ flatpak build-bundle repo less-sheet.flatpak com.lesssheet.LessSheet       # sel
 ---
 
 ## Appendix — current gaps / TODO before a real launch
-- [ ] Reconcile + single-source the version (§1).
-- [ ] Confirm/set the reverse-DNS app-id consistently (§4b).
+- [x] Single-source the version — root `VERSION`, read by the GTK build (§1).
+- [ ] Convert the last two version consumers: the macOS `Info.plist` and `make_release` (§1a).
+- [x] Confirm/set the reverse-DNS app-id: `com.lesssheet.LessSheet` (§4b).
+- [ ] Update `make_release`'s `GTK_APP_ID` to the new id before any Linux artifact ships (§4b).
 - [ ] Security hardening #41 landed (publish the hardened build).
 - [ ] macOS: Apple Developer account → switch from unsigned (§3a) to signed+notarized (§3b).
 - [ ] Write the EULA/LICENSE (§6) + legal review.
