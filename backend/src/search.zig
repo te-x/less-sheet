@@ -46,12 +46,9 @@ pub fn docCtx(doc: *Document) MatchCtx {
         .kind = doc.search_kind,
         .op = doc.search_op,
         .column = doc.search_column,
-        .fold = doc.search_fold,
-        .value = doc.search_value,
-        .value_dec = doc.search_value_dec,
+        .q = &doc.search_query,
         .scope_mask = doc.scope_mask,
         .column_count = doc.column_count,
-        .failure = doc.search_failure,
     };
 }
 
@@ -61,22 +58,21 @@ pub fn docCtx(doc: *Document) MatchCtx {
 /// Returns false on OOM — a TRUNCATED query/scope copy must never be matched
 /// against (an empty query would match every cell); the caller fails the search.
 pub fn refreshWorkerCtx(doc: *Document) bool {
-    doc.w_value.clearRetainingCapacity();
-    doc.w_value.appendSlice(doc.gpa, doc.search_value) catch return false;
     doc.w_mask.clearRetainingCapacity();
     doc.w_mask.appendSlice(doc.gpa, doc.scope_mask) catch return false;
-    doc.w_failure.clearRetainingCapacity();
-    doc.w_failure.appendSlice(doc.gpa, doc.search_failure) catch return false;
+    // Build the new copy BEFORE dropping the old one: on OOM the worker keeps
+    // matching against the previous (complete) snapshot and the caller fails
+    // the search, rather than being left with a half-built query.
+    const q = doc.search_query.clone(doc.gpa) catch return false;
+    doc.w_query.deinit(doc.gpa);
+    doc.w_query = q;
     doc.w_ctx = .{
         .kind = doc.search_kind,
         .op = doc.search_op,
         .column = doc.search_column,
-        .fold = doc.search_fold,
-        .value = doc.w_value.items,
-        .value_dec = matcher.parseDecimal(doc.w_value.items),
+        .q = &doc.w_query,
         .scope_mask = doc.w_mask.items,
         .column_count = doc.column_count,
-        .failure = doc.w_failure.items,
     };
     return true;
 }
@@ -716,18 +712,12 @@ pub fn startSearch(d: *Document, request: *const api.SearchRequest) bool {
         if (op_i >= 2 and !matcher.parseDecimal(value).valid) return false; // ordering value must parse
     }
 
-    // Allocate owned copies up front so an OOM rejects cleanly (no state change).
-    const value_copy = d.gpa.dupe(u8, value) catch return false;
-    var failure: []usize = &.{};
-    if (kind_i == 0) failure = matcher.buildFailure(d.gpa, value_copy, fold) catch {
-        d.gpa.free(value_copy);
-        return false;
-    };
+    // Derive the query up front so an OOM rejects cleanly (no state change).
+    var query = matcher.Query.init(d.gpa, value, fold, req.kind) catch return false;
     var mask: []bool = &.{};
     if (kind_i == 0 and req.scope_ptr != null) {
         mask = d.gpa.alloc(bool, d.column_count) catch {
-            d.gpa.free(value_copy);
-            if (failure.len > 0) d.gpa.free(failure);
+            query.deinit(d.gpa);
             return false;
         };
         @memset(mask, false);
@@ -738,17 +728,13 @@ pub fn startSearch(d: *Document, request: *const api.SearchRequest) bool {
 
     d.lock();
     // Replace any previous search ENTIRELY.
-    if (d.search_value.len > 0) d.gpa.free(d.search_value);
     if (d.scope_mask.len > 0) d.gpa.free(d.scope_mask);
-    if (d.search_failure.len > 0) d.gpa.free(d.search_failure);
-    d.search_value = value_copy;
+    d.search_query.deinit(d.gpa);
+    d.search_query = query;
     d.scope_mask = mask;
-    d.search_failure = failure;
     d.search_kind = req.kind;
     d.search_op = req.op;
     d.search_column = req.column;
-    d.search_fold = fold;
-    d.search_value_dec = if (kind_i == 1 and @intFromEnum(req.op) >= 2) matcher.parseDecimal(value_copy) else .{};
     d.search_gen +%= 1;
 
     // Take the scan slot: cancel a scanning jump (DONE persists; gains kept).

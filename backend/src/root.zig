@@ -712,6 +712,17 @@ pub fn copyCapCellsForTest(doc: *api.Doc, cells: u64) void {
 const source_seam = @import("source.zig");
 const reader_seam = @import("reader.zig");
 
+/// DEV-TOOL re-export — not the C ABI, not part of the frozen contract, and
+/// referenced by nothing that ships. `tools/fuzz/matcher_diff.zig` is a
+/// differential oracle over `matcher.StreamCell` / `matcher.cellMatches` /
+/// `matcher.Query`: three implementations of one verdict that must never drift
+/// (see the comments at `matcher.cellMatches` and `window.matchFlags`). None of
+/// them is reachable through the C ABI, and the oracle cannot root a module of
+/// its own at src/matcher.zig either — every src file would then belong to two
+/// modules at once (the `api` module pulls this file in as `core`), which the
+/// compiler rejects outright. One re-export is the whole cost.
+pub const matcher_internals = matcher;
+
 // Seam CAPABILITY re-exports (pinned by contracts/api.zig comptime block).
 pub const Source = source_seam.Source;
 pub const Pos = reader_seam.Pos;

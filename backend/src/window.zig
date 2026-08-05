@@ -383,7 +383,8 @@ pub fn cell(d: *const Document, row: u64, col: u32) api.Str {
 /// same bytes are returned with no further work. The returned pointer stays
 /// valid until the next windowSet (which bumps win_gen) / ls_close (freeDoc).
 /// The whole read is done under `d.lock()` so the request buffers docCtx
-/// borrows (search_value / scope_mask / failure) can't be freed by a concurrent
+/// borrows (`search_query` — the query and its derived artifacts — plus
+/// `scope_mask`) can't be freed by a concurrent
 /// ls_search_start mid-compute; win_buf/win_refs are window-lane state the
 /// caller already serializes with this call.
 pub fn matchFlags(d: *Document, first_col: u32, col_count: u32) api.Str {

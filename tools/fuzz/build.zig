@@ -81,6 +81,32 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_harness.step);
     b.default_step.dependOn(&run_harness.step);
 
+    // --- the matcher differential oracle -----------------------------------
+    // A VALUE oracle, unlike the four crash-oriented targets above: it pins that
+    // the streaming matcher, the whole-cell matcher and a naive reference agree
+    // on every verdict (see matcher_diff.zig). It needs matcher.zig's internals
+    // (StreamCell / cellMatches / Query), which the C ABI does not expose, so
+    // it reaches them through the ONE dev-tool re-export in src/root.zig
+    // (`matcher_internals`) — a module rooted at src/matcher.zig is impossible
+    // here, because every src file would then belong to two modules at once
+    // (`api` already pulls src/root.zig in as `core`).
+    const diff = b.addTest(.{
+        .name = "lsdiff",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("matcher_diff.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{.{ .name = "core", .module = core_mod }},
+        }),
+    });
+    const run_diff = b.addRunArtifact(diff);
+    run_diff.has_side_effects = true;
+    const diff_step = b.step("diff", "Run the matcher differential oracle (deterministic sweep; add --fuzz to explore)");
+    diff_step.dependOn(&run_diff.step);
+    // Part of `test` too: the oracle is cheap and a mismatch is a real defect.
+    test_step.dependOn(&run_diff.step);
+
     // --- the coverage report tool ------------------------------------------
     const covreport = b.addExecutable(.{
         .name = "covreport",

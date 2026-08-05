@@ -27,12 +27,9 @@ pub fn filterCtx(doc: *Document) MatchCtx {
         .kind = doc.filter_kind,
         .op = doc.filter_op,
         .column = doc.filter_column,
-        .fold = doc.filter_fold,
-        .value = doc.filter_value,
-        .value_dec = doc.filter_value_dec,
+        .q = &doc.filter_query,
         .scope_mask = doc.filter_scope_mask,
         .column_count = doc.column_count,
-        .failure = doc.filter_failure,
     };
 }
 
@@ -48,22 +45,19 @@ pub fn activeFilterCtxOrNull(doc: *Document) ?MatchCtx {
 /// lock-free filter predicate both the filter-scan and a concurrent
 /// (filtered) search chunk compose against.
 pub fn refreshFilterWorkerCtx(doc: *Document) bool {
-    doc.wf_value.clearRetainingCapacity();
-    doc.wf_value.appendSlice(doc.gpa, doc.filter_value) catch return false;
     doc.wf_mask.clearRetainingCapacity();
     doc.wf_mask.appendSlice(doc.gpa, doc.filter_scope_mask) catch return false;
-    doc.wf_failure.clearRetainingCapacity();
-    doc.wf_failure.appendSlice(doc.gpa, doc.filter_failure) catch return false;
+    // Build before dropping the old copy — see search.refreshWorkerCtx.
+    const q = doc.filter_query.clone(doc.gpa) catch return false;
+    doc.wf_query.deinit(doc.gpa);
+    doc.wf_query = q;
     doc.wf_ctx = .{
         .kind = doc.filter_kind,
         .op = doc.filter_op,
         .column = doc.filter_column,
-        .fold = doc.filter_fold,
-        .value = doc.wf_value.items,
-        .value_dec = matcher.parseDecimal(doc.wf_value.items),
+        .q = &doc.wf_query,
         .scope_mask = doc.wf_mask.items,
         .column_count = doc.column_count,
-        .failure = doc.wf_failure.items,
     };
     return true;
 }
@@ -356,18 +350,12 @@ pub fn setFilter(d: *Document, request: *const api.SearchRequest) bool {
         if (op_i >= 2 and !matcher.parseDecimal(value).valid) return false; // ordering value must parse
     }
 
-    // Allocate owned copies up front so an OOM rejects cleanly (no state change).
-    const value_copy = d.gpa.dupe(u8, value) catch return false;
-    var failure: []usize = &.{};
-    if (kind_i == 0) failure = matcher.buildFailure(d.gpa, value_copy, fold) catch {
-        d.gpa.free(value_copy);
-        return false;
-    };
+    // Derive the query up front so an OOM rejects cleanly (no state change).
+    var query = matcher.Query.init(d.gpa, value, fold, req.kind) catch return false;
     var mask: []bool = &.{};
     if (kind_i == 0 and req.scope_ptr != null) {
         mask = d.gpa.alloc(bool, d.column_count) catch {
-            d.gpa.free(value_copy);
-            if (failure.len > 0) d.gpa.free(failure);
+            query.deinit(d.gpa);
             return false;
         };
         @memset(mask, false);
@@ -378,17 +366,13 @@ pub fn setFilter(d: *Document, request: *const api.SearchRequest) bool {
 
     d.lock();
     // Replace any previous filter ENTIRELY.
-    if (d.filter_value.len > 0) d.gpa.free(d.filter_value);
     if (d.filter_scope_mask.len > 0) d.gpa.free(d.filter_scope_mask);
-    if (d.filter_failure.len > 0) d.gpa.free(d.filter_failure);
-    d.filter_value = value_copy;
+    d.filter_query.deinit(d.gpa);
+    d.filter_query = query;
     d.filter_scope_mask = mask;
-    d.filter_failure = failure;
     d.filter_kind = req.kind;
     d.filter_op = req.op;
     d.filter_column = req.column;
-    d.filter_fold = fold;
-    d.filter_value_dec = if (kind_i == 1 and @intFromEnum(req.op) >= 2) matcher.parseDecimal(value_copy) else .{};
     d.filter_gen +%= 1;
 
     // Takes the scan slot: a scanning jump is cancelled (LS_JUMP_IDLE, gains

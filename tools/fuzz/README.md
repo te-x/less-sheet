@@ -116,11 +116,79 @@ streaming source), it is reachable with default options, and it **blocks the AC-
 campaign** until fixed. A quarantine keeps the harness runnable meanwhile; `fuzz.sh`
 prints every quarantine in force at the top of each campaign log.
 
+## The matcher differential oracle (`zig build diff`)
+
+```sh
+zig build diff             # deterministic sweep: 5 fixed seeds x 4000 cases
+zig build diff --fuzz      # the same checks, coverage-guided (Smith-driven)
+zig build test             # runs the corpus replay AND this oracle
+```
+
+The four targets above are crash oracles: they assert nothing about returned
+values, because "the process survives" is the property a fuzzer can check
+cheaply. `matcher_diff.zig` is the opposite and exists for one reason: the
+scan-side matcher (`matcher.StreamCell`) carries the throughput work — an early
+verdict exit, a pre-folded query, and a **vectorized anchor prefilter** that
+skips positions the scalar KMP would have rejected. A false negative there drops
+matches *silently*: no panic, no leak, just a wrong count. Nothing else in this
+directory could see it.
+
+So it checks three implementations of ONE verdict against each other, per case:
+
+| implementation | who uses it in production |
+|---|---|
+| a naive brute-force compare written in the oracle | nothing — it is the reference |
+| `matcher.cellMatches` (whole cell) | `ls_window_match_flags`, nav re-lex, filtered-window predicate |
+| `matcher.StreamCell` (streaming) | the full-file search / filter / count scan |
+
+`cellMatches` and `StreamCell` are deliberately two implementations (see the
+comment at `matcher.cellMatches`) so a row match and a cell highlight can never
+disagree — for the ordering predicates they are genuinely different algorithms
+(exact-decimal parse-and-compare vs an incremental digit FSM), and the oracle is
+what pins them together.
+
+Two generation details do the real work, and both are load-bearing:
+
+* **queries drawn as substrings of the cell** (half the cases, with random case
+  flips) — a random query almost never matches, so a false negative would hide
+  behind a random "no" forever;
+* **every awkward feed split** — one call, 1/2/4-byte units (the decode-per-unit
+  streaming cursor path), and cuts at 15/16/17/31/32/33/63/64/65… because the
+  prefilter only claims positions with a full block plus lookahead left and hands
+  the tail back to the scalar KMP, which is the only path allowed to end
+  mid-match.
+
+**Verified sensitive, not just green.** Green is not evidence on its own, so the
+oracle is kept honest by planting known defects and confirming each is caught.
+All five below were re-run against the current tree; each fails within the first
+seed, most via a split-feed check:
+
+| planted defect | what it would break in production |
+|---|---|
+| `i += anchor_vec_len + 1` in the prefilter | vector skip steps over one candidate position per block |
+| `feedTextScalar` reads `q.value` instead of `q.folded` | case-insensitive search misses matches |
+| `Query.clone` derives no failure table | every worker snapshot (so every full-file scan) loses the KMP table — panics in ReleaseSafe |
+| prefilter guard `if (k == 0)` → `if (true)` | skipping while a match is in progress, i.e. discarding KMP state |
+| `anchor1_upper = a1` (drops the uppercase twin) | folded second-byte anchor stops matching uppercase input |
+
+The last two pin the exact two conditions the optimization rests on: that the
+prefilter runs **only** at cursor 0, and that a folded anchor compare needs
+**both** case twins. Re-run this list after touching `feedText`, `Query.init` or
+`Query.clone`; a mutation that is no longer caught means the oracle stopped
+covering the thing it exists for.
+
+It reaches `StreamCell` / `cellMatches` / `Query` through the single dev-tool
+re-export `matcher_internals` in `backend/src/root.zig`. A module rooted at
+`src/matcher.zig` would be the obvious alternative and does not work: every file
+under `src/` would then belong to two modules at once (`api` already pulls
+`src/root.zig` in as `core`), which the compiler rejects.
+
 ## Files
 
 | file | role |
 |---|---|
 | `harness.zig` | the four fuzz targets + the shared `exercise()` drive sequence |
+| `matcher_diff.zig` | the matcher **differential oracle** — a VALUE check, see below |
 | `gzbuild.zig` | gzip/deflate construction, shared by the harness and the generator so a baked-in cut offset means the same stream in both |
 | `seeds.zig` | comptime loader for the four `.pack` corpus files |
 | `seeds/*.pack` | **the committed corpus** (466 entries) |

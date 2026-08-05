@@ -13,6 +13,11 @@ const api = @import("api");
 const reader_mod = @import("reader.zig");
 const source_mod = @import("source.zig");
 const column_state = @import("column_state.zig");
+// For `MatchCtx.q` / the Document's request fields: matcher.Query owns every
+// artifact derived from an active query. matcher.zig imports base.zig back for
+// CellRef/Decimal/MatchCtx — a file cycle, not a layout cycle (`q` is a
+// pointer, and Query's layout needs only Decimal).
+const matcher = @import("matcher.zig");
 // Only for `netIo()` (the one process-global network executor) in
 // `startWorker`/`joinWorker`. Not a new module cycle: base -> source_mod ->
 // net_source -> base already exists.
@@ -74,16 +79,23 @@ pub const OversizedMatch = struct { row: u64, matched: bool };
 
 /// A resolved request, evaluated against a decoded record. Built from the
 /// document under the lock (nav) or from the worker's lock-free snapshot (scan).
+///
+/// Everything DERIVED from the query (folded query, KMP table, parsed Decimal,
+/// the fold flag itself) lives behind `q` — one struct, built once when the
+/// request is accepted (see matcher.Query). `q` is a pointer, not an embedded
+/// value, for two reasons: the scan copies a MatchCtx into a StreamCell per
+/// column per row, and a copied `Query` would carry a `value_dec` borrowing
+/// somebody else's bytes.
 pub const MatchCtx = struct {
     kind: api.SearchKind = .text,
     op: api.SearchOp = .eq,
     column: u32 = 0,
-    fold: bool = false, // fold ASCII case for TEXT substring + predicate EQ/NE (== !case_sensitive)
-    value: []const u8 = &.{},
-    value_dec: Decimal = .{}, // pre-parsed value (ordering predicates)
+    /// The derived query artifacts. Borrowed — its lifetime is the document
+    /// request buffers' (mutex-held reads) or the worker snapshot's (lock-free
+    /// scan), exactly as the query slices it replaced.
+    q: *const matcher.Query = &matcher.Query.empty,
     scope_mask: []const bool = &.{}, // empty == all columns; else len == column_count
     column_count: u32 = 0,
-    failure: []const usize = &.{}, // TEXT KMP prefix table, one entry/query byte
 };
 
 // ---------------------------------------------------------------------------
@@ -268,10 +280,9 @@ pub const Document = struct {
     search_kind: api.SearchKind,
     search_op: api.SearchOp,
     search_column: u32,
-    search_value: []u8, // owned query / comparison bytes
-    search_value_dec: Decimal, // pre-parsed value (ordering predicates)
-    search_fold: bool, // fold ASCII case (== !request.case_sensitive): TEXT substring + predicate EQ/NE
-    search_failure: []usize,
+    /// The query and everything derived from it (owned; built once by
+    /// ls_search_start — see matcher.Query).
+    search_query: matcher.Query,
     scope_mask: []bool, // owned; empty == all columns (NULL scope); else len == column_count
     // Per-index-block match counters (owned): block b == rows
     // [b*checkpoint_interval, (b+1)*checkpoint_interval); O(checkpoints) always.
@@ -280,9 +291,10 @@ pub const Document = struct {
     // during a chunk). Refreshed under the lock when search_gen changes.
     search_scratch: std.ArrayList(u8),
     search_refs: std.ArrayList(CellRef),
-    w_value: std.ArrayList(u8),
+    /// The worker's own copy of the active query, so ls_search_start can
+    /// replace/free the document's while a chunk is matching lock-free.
+    w_query: matcher.Query,
     w_mask: std.ArrayList(bool),
-    w_failure: std.ArrayList(usize),
     w_ctx: MatchCtx,
     w_gen: u64,
     // Nav-resolution scratch (only touched while holding the mutex).
@@ -309,10 +321,9 @@ pub const Document = struct {
     filter_kind: api.SearchKind,
     filter_op: api.SearchOp,
     filter_column: u32,
-    filter_value: []u8,
-    filter_value_dec: Decimal,
-    filter_fold: bool, // fold ASCII case (== !request.case_sensitive): TEXT substring + predicate EQ/NE
-    filter_failure: []usize,
+    /// The filter query and everything derived from it (owned; built once by
+    /// ls_filter_set — see matcher.Query).
+    filter_query: matcher.Query,
     filter_scope_mask: []bool,
     // Per-index-block filter-match counters (owned): O(checkpoints) always,
     // aligned 1:1 with `checkpoints`, exactly like the search job's block_counts.
@@ -340,9 +351,9 @@ pub const Document = struct {
     // filtered (see searchRowMatch).
     filter_scratch: std.ArrayList(u8),
     filter_refs: std.ArrayList(CellRef),
-    wf_value: std.ArrayList(u8),
+    /// The worker's own copy of the active filter query (see `w_query`).
+    wf_query: matcher.Query,
     wf_mask: std.ArrayList(bool),
-    wf_failure: std.ArrayList(usize),
     wf_ctx: MatchCtx,
     wf_gen: u64,
 
@@ -761,9 +772,8 @@ pub fn freeDoc(doc: *Document) void {
     doc.block_counts.deinit(doc.gpa);
     doc.search_scratch.deinit(doc.gpa);
     doc.search_refs.deinit(doc.gpa);
-    doc.w_value.deinit(doc.gpa);
+    doc.w_query.deinit(doc.gpa);
     doc.w_mask.deinit(doc.gpa);
-    doc.w_failure.deinit(doc.gpa);
     doc.nav_scratch.deinit(doc.gpa);
     doc.nav_refs.deinit(doc.gpa);
     doc.filter_block_counts.deinit(doc.gpa);
@@ -771,21 +781,18 @@ pub fn freeDoc(doc: *Document) void {
     doc.filter_oversized_matches.deinit(doc.gpa);
     doc.filter_scratch.deinit(doc.gpa);
     doc.filter_refs.deinit(doc.gpa);
-    doc.wf_value.deinit(doc.gpa);
+    doc.wf_query.deinit(doc.gpa);
     doc.wf_mask.deinit(doc.gpa);
-    doc.wf_failure.deinit(doc.gpa);
     doc.column_store.deinit(doc.gpa);
     doc.column_buf.deinit(doc.gpa);
     doc.column_refs.deinit(doc.gpa);
     doc.column_worker_ids.deinit(doc.gpa);
     doc.column_changed_ids.deinit(doc.gpa);
     doc.column_window_events.deinit(doc.gpa);
-    if (doc.search_value.len > 0) doc.gpa.free(doc.search_value);
+    doc.search_query.deinit(doc.gpa);
     if (doc.scope_mask.len > 0) doc.gpa.free(doc.scope_mask);
-    if (doc.search_failure.len > 0) doc.gpa.free(doc.search_failure);
-    if (doc.filter_value.len > 0) doc.gpa.free(doc.filter_value);
+    doc.filter_query.deinit(doc.gpa);
     if (doc.filter_scope_mask.len > 0) doc.gpa.free(doc.filter_scope_mask);
-    if (doc.filter_failure.len > 0) doc.gpa.free(doc.filter_failure);
     if (doc.header_buf.len > 0) doc.gpa.free(doc.header_buf);
     if (doc.header_refs.len > 0) doc.gpa.free(doc.header_refs);
     if (doc.row0_pinned_buf.len > 0) doc.gpa.free(doc.row0_pinned_buf);
