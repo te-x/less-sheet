@@ -10,7 +10,11 @@ one-time pre-launch cadence, so nothing here runs in `.aidev/gate.sh`.
 ```sh
 bash tools/fuzz/fuzz.sh                   # 20k iterations per target (smoke)
 bash tools/fuzz/fuzz.sh 5000000 --fresh   # a real campaign, from the seeds only
+bash tools/fuzz/fuzz.sh --minutes 30      # wall-clock budget (see AC-c2 below)
 ```
+
+Comparing two harness versions? Use `--minutes`. An iteration is not a constant
+amount of work — see *"An iteration is not a unit of work"* below.
 
 Triage levers (both used to pin finding F1, and both worth knowing before a long run):
 
@@ -201,14 +205,46 @@ copy it out before continuing.
 
 ## Stopping criterion (AC-c2)
 
-AC-c2 wants a *recorded* criterion. The two supported shapes:
+AC-c2 wants a *recorded* criterion. The three supported shapes:
 
 * **Iteration-boxed** — `fuzz.sh <N>` runs N iterations *per target* (Zig's
   `--fuzz=N` limit is per fuzz test, counted in mutation cycles). The log records
   N, the wall time, and the final coverage.
+* **Wall-clock-boxed** — `fuzz.sh --minutes M` lifts the iteration cap and stops
+  the campaign after M minutes. A process-group watchdog does the stopping, and a
+  flag file makes a budget expiry distinguishable from a finding in both
+  directions; the coverage map is mmap'd and updated live, so it survives.
 * **Coverage plateau** — run repeatedly *without* `--fresh` (Zig accumulates both
   corpus and coverage across runs) until `PCs covered` stops moving between logs.
   Each log carries the number, so the plateau is evidenced by the log sequence.
+
+### An iteration is not a unit of work — do not compare N across versions
+
+The csv target draws **synthesized document shapes** (see `oneCsv`), and they
+differ in cost by two orders of magnitude:
+
+| shape | document | share of draws | share of csv seeds | cost |
+|---|---|---|---|---|
+| ordinary | ≤1 MiB, the `rep` amplifier | 55/64 | 202/219 | ~1-5 ms |
+| `many_rows` | >2048 rows, ~166 KiB | 8/64 | 15/219 | ~5 ms |
+| `deep` | >8 MiB, forces the off-main filtered nav | 1/64 | 2/219 | **~82 ms** |
+
+So "200,000 iterations per target" means different work for different harness
+versions, and two campaign logs are **only** comparable by iteration count if they
+ran the same harness. `fuzz.sh` prints a `budget:` line naming the unit and the
+shape table for exactly this reason. **Use `--minutes` when comparing versions.**
+
+Measured example (M-series mac, 10 minutes each, same machine and build config):
+the pre-shapes harness managed 741,398 runs and the current one 365,724 — half the
+iterations for the same wall clock, because a filtered second search pass is real
+work. Coverage went *up* (5030 → 5566 PCs) on half the iterations.
+
+The shape sentinels are **non-zero on purpose**. 93 of the 219 committed csv
+entries carry `w0 == 0` exactly (the generator zeroes the knob words), so a
+`shape == 0` selector does not mean "1 in 64" — it means "the default for 43% of
+the corpus". Choosing `0` for the >8 MiB shape once turned a 20k-iteration smoke
+run into an 18-minute one. Whatever an absent or zeroed draw decays to is part of
+the design, not an accident — the same reason `csv_bytes` covers all of 0..255.
 
 Note `--fuzz=N` is headless and single-instance; bare `--fuzz` (no limit) instead
 runs forever across all cores with a web UI, and the two cannot be combined.
@@ -228,3 +264,38 @@ claim `net_source.zig`, which is exactly the distinction AC-c1 enumerates both
 for. `covreport` exits 2 if any required module was never entered.
 
 `--all` also lists std/compiler-rt files; the default shows project files only.
+
+### Aiming: `--cold <module>`
+
+A per-file percentage says a module is weakly covered; it does not say *which*
+code was never entered, which is the only thing that tells you what to change in a
+target. `--cold` resolves each PC to its line, attributes it to the enclosing `fn`
+by parsing the module's own source, and prints per-function seen/total plus the
+cold line ranges:
+
+```sh
+./zig-out/bin/covreport <binary> <coverage-map> --cold search,window
+```
+
+```
+-- cold regions: search.zig  118/433 PCs seen --
+  function                           lines  seen/total     cold
+  resolveNavLockedFiltered            436-495      0/31        31   NEVER ENTERED
+  filteredNavFitsBudget               359-396      0/29        29   NEVER ENTERED
+  ...
+```
+
+That output is what turned "`search` is at 27%" into "the entire filtered
+coordinate half is unreachable because `exercise` cancelled its search *before*
+setting the filter" — a one-line ordering bug in the harness worth 210 PCs. It is
+report-only and never changes the exit status, so the AC-c1 gate property is
+unaffected.
+
+Two practical notes:
+
+* Pass the **fuzz-mode** binary (`.zig-cache/o/<hash>/lsfuzz`, rebuilt by
+  `--fuzz`), not the plain test binary. With the wrong one almost nothing resolves
+  and every module reads as near-zero — a mismatch that looks like a coverage
+  collapse rather than an error. `fuzz.sh` picks it via a timestamp marker.
+* `covreport` writes to **stderr** (`std.debug.print`). Capture with `2>&1`, not
+  `2>/dev/null`.
