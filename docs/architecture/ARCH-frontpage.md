@@ -55,7 +55,8 @@ Scope: a full redesign of `site/index.html` and its screenshot assets, per the a
 |---|---|---|
 | Screenshot set (§3.3: 5 shots × 2 platforms × 2 themes = 20 files) | Deterministic capture tool (§7.7); residual manual steps: one-time macOS Screen Recording grant, hero composition choice, review of outputs (the author) | Not started |
 | Benchmark figures re-measured on the shipped ReleaseSafe build | Queued measurement task; needs a quiet machine | Queued |
-| Download artifacts + their shapes per platform | Separate task, in flight | Undecided (§7) |
+| Download artifacts | Built & launch-verified 2026-07-30: `less-sheet-0.1-macos-arm64.dmg` 3.34 MB (macOS 26.0+, arm64); `less-sheet-0.1-linux-aarch64.tar.gz` 0.65 MB (glibc ≥ 2.34, GTK4 ≥ 4.20, libadwaita ≥ 1.8); `SHA256SUMS` + `manifest.json`. The zip is a build byproduct, never offered. Linux x86_64 blocked on a core link fix (`__zig_probe_stack`), planner pass in flight | Exist; unhosted |
+| Hosting for the page + artifacts | No decision, no task yet | Open (§9.1) |
 | Ticket-tracker URL (GitHub, issues-only) | Not created; no git remote exists today | Planned, not live |
 
 **Outputs:**
@@ -65,9 +66,11 @@ Scope: a full redesign of `site/index.html` and its screenshot assets, per the a
 - `tools/` gains the capture tool (§7.7) — the one artifact outside `site/`.
 
 **Ordering (hard dependency):** the frontpage ships together with, or after, the download
-binaries — never before. AC-10 implies it, but it is a dependency in its own right: the artifact
-shapes are still undecided ("I don't know yet"), so publication is blocked on that task, not
-merely on pasting links into a finished page.
+binaries — never before. The binaries now exist and are launch-verified (2026-07-30), so the
+remaining blocker is **hosting**: the artifacts live nowhere a link can point yet (§9.1). The
+verification timings (197 ms to first rows from the unpacked `.dmg`; 120.3 ms cold start in a
+clean container) are input evidence that the artifacts work — not page copy; published figures
+still come exclusively from the bench task (AC-10).
 
 ---
 
@@ -147,10 +150,36 @@ and benchmarks follow as supporting depth.
   state or imply gz opens like plain CSV.** All figures are absolute measurements on the shipped
   build; **no self-relative multipliers** ("1.9× faster than before" is changelog material, not
   landing-page material). Methodology line kept (median, cold, machine, footprint).
-- **B7 Download + formats.** The flexible artifact block (§7). Beside the artifact links, in the
-  same visual group: **"Reads: CSV · CSV.GZ · http(s) URLs"** — the constraint restated at the
-  point of commitment. Formats pills stay: CSV (on), CSV.GZ (on), "more formats coming" (generic
-  — no format named).
+- **B7 Download + formats.** Settled 2026-07-30: **one link per platform** — the `.dmg` for
+  macOS, the `.tar.gz` for Linux; the zip byproduct is never offered. Each link sits with its
+  requirements line in the same visual group — macOS: "macOS 26.0 or later · Apple silicon ·
+  3.3 MB"; Linux: arch label per the two-state rule below, "glibc 2.34+ · GTK 4.20 /
+  libadwaita 1.8 (GNOME 49-generation: Fedora 43+, current Arch) · 0.7 MB". A `SHA256SUMS`
+  link accompanies the artifacts. Beside the links, in the same visual group: **"Reads: CSV ·
+  CSV.GZ · http(s) URLs"** — the constraint restated at the point of commitment. Formats pills
+  stay: CSV (on), CSV.GZ (on), "more formats coming" (generic — no format named).
+
+  **First launch on macOS — a designed element, not a footnote.** The `.dmg` is ad-hoc signed,
+  not notarized, so Gatekeeper blocks the first open of a downloaded copy. Directly beneath the
+  macOS link, visible without any interaction (no accordion, tooltip, or hover reveal), two or
+  three lines in the plain-technical register: the why (the app is signed but not notarized
+  through Apple's paid developer program — it is a free app), then the exact path — open the
+  app once, then **System Settings → Privacy & Security → "Open Anyway"** — stated as a
+  property of how macOS treats unnotarized downloads, not an apology. A visitor who hits the
+  block with no explanation concludes the app is unsafe; a visitor told before downloading
+  reads it as a distribution fact. The page must never contain the old right-click /
+  control-click → Open instruction: Apple removed it in macOS 15 and the floor here is 26, so
+  that copy would be wrong (AC-14). The `SHA256SUMS` link doubles as the integrity affordance
+  for the visitor this note makes cautious.
+
+  **Linux reach, honestly — two shippable states.** (a) If the x86_64 tarball lands before
+  publication (the `__zig_probe_stack` fix is in flight): two artifact links under the Linux
+  label — x86_64 and aarch64 — sharing one requirements line. (b) If not: the label reads
+  "Linux · aarch64" and the band states plainly that x86_64 is not yet available — explicit
+  absence, never silence, because a silently aarch64-only link reads as broken Linux support
+  to the majority-arch visitor. One short clause naming Flatpak as the planned channel for
+  wider distro reach is permitted (the author's committed channel decision) — the page's only
+  forward-looking distribution statement, distinct from the format-promise ban.
 - **Footer.** Tagline; platform line (macOS 26+ Apple silicon · Linux — exact Linux wording
   pending the artifact task, §10); tracker/contact per §7.
 
@@ -225,11 +254,12 @@ nothing at runtime beyond CSS state (theme media queries, one radio group).
 
 ## 6. External interfaces
 
-- **Download artifacts** (undecided, separate task): B7 is designed as a flexible list —
-  `platform/arch label → artifact link (+ size, format)` — that renders correctly with anywhere
-  from one artifact to a small matrix (macOS arm64; Linux x86_64/aarch64). It must not assume
-  "one big button" or a picker widget. Placeholder rows exist only in the draft; publication
-  requires real URLs (AC-10).
+- **Download artifacts** (settled 2026-07-30): one link per platform — the `.dmg` (macOS 26.0+,
+  Apple silicon) and the `.tar.gz` (Linux) — plus `SHA256SUMS`. The zip byproduct is never
+  offered. B7 stays flexible on exactly one axis: one or two Linux arch links per the two-state
+  rule (§3.2 B7). Placeholder URLs exist only in the draft; publication requires hosted URLs
+  (AC-10, §9.1). The GTK app id (`com.lesssheet.LessSheet`; rename from `dev.lesssheet.Gtk` is a
+  separate task) is not referenced anywhere on the page — not a page dependency.
 - **Ticket tracker** (planned, not live): closed source, GitHub presence for issues only — a
   normal arrangement. The footer carries "Report a bug / request a feature → tracker" **only once
   the tracker exists**; the page must be complete and honest without it (the footer line is
@@ -385,21 +415,38 @@ Each verifiable on the built page with grep, a browser, and devtools — no judg
     — one command per platform, committed fixture, fixed window geometry; the tool's post-check
     passes (all four variants of each shot pixel-identical in dimensions); the 20 outputs get a
     recorded human review before publication.
+14. **Gatekeeper element**: the download band renders the macOS first-launch explanation in the
+    same visual group as the macOS link, visible without any interaction; its text contains
+    "Privacy & Security" and "Open Anyway"; case-insensitive grep of the deployed HTML for
+    `right-click`, `right click`, `control-click`, and `ctrl-click` yields zero hits.
+15. **Reach honesty**: every download link is adjacent to its requirements line (macOS: contains
+    "26.0" and "Apple silicon"; Linux: contains the GTK/libadwaita floor or its distro
+    translation); arch labels match the artifacts actually offered; if no x86_64 Linux artifact
+    is offered, the band contains an explicit statement that x86_64 is not yet available;
+    case-insensitive grep for `.zip` yields zero hits.
 
 ---
 
 ## 9. Open Questions
 
 1. **Hosting and deploy** — the site has never been deployed; no domain, host, or mechanism is
-   chosen. Out of this feature's scope but blocks real publication.
+   chosen, and the now-built artifacts live nowhere. **This is the last blocker to
+   publication.** What the page needs from it: stable HTTPS direct-download URLs (no
+   interstitial pages) for the `.dmg`, the tarball(s), and `SHA256SUMS`, fixed enough to bake
+   into a static file. Clarification for AC-8: the zero-third-party budget governs page
+   *resources*; download links are user-initiated navigations and may live on a different
+   origin (e.g. a release host).
 2. **Contact fallback address** — I recommend a `mailto:` beside the tracker link for
    non-GitHub-account visitors; *which* address (and its spam exposure) is the author's call.
 3. **Tracker URL** — the issues-only GitHub repo does not exist; name/org TBD; footer line omitted
    until live.
-4. **Artifact list** — shapes per platform undecided (separate task); B7 flexes by design;
-   final labels/sizes land with the artifacts.
-5. **Footer Linux wording** — exact claim (distro-neutral? glibc? x86_64/aarch64?) depends on
-   what the artifact task actually produces.
+4. **Artifact list** — **resolved 2026-07-30**: one link per platform (`.dmg` / `.tar.gz`,
+   `SHA256SUMS` alongside; the zip byproduct never offered). Only the Linux arch count stays
+   two-state until publication (§3.2 B7).
+5. **Footer Linux wording** — **resolved**: the footer platform line mirrors the download
+   band's labels — "macOS 26.0+ (Apple silicon) · Linux aarch64 (GNOME 49-generation)" —
+   gaining x86_64 if that artifact ships (§3.2 B7 two-state rule).
 6. **Published figures** — all numbers await the re-measurement task on the shipped build; the
    hero proof pair (the 3-tier flat-cost result) must be re-verified on that build before it is
-   the signature.
+   the signature. The artifact-verification timings (197 ms / 120.3 ms, §2) are evidence the
+   binaries work, not page figures.
