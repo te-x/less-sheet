@@ -74,7 +74,22 @@ HOST_ARCH_ALIASES = {"arm64": "aarch64", "aarch64": "aarch64",
 # The GTK app id the code already uses (data/dev.lesssheet.Gtk.svg + main.c's
 # gtk_window_set_icon_name). docs/RELEASE.md flags the final Flatpak app-id as
 # still-to-confirm, so this follows the code rather than inventing a new one.
-GTK_APP_ID = "dev.lesssheet.Gtk"
+# The GTK app id, read from the app's OWN single definition rather than copied.
+# A copy here shipped the wrong value: after the rename to com.lesssheet.LessSheet
+# (`5ac88d7`) this constant still said `dev.lesssheet.Gtk`, which would have put
+# `Icon=dev.lesssheet.Gtk` in the installed .desktop file — pointing at an icon
+# name the app no longer provides, so the launcher entry would render iconless on
+# every Linux install. Nothing caught it: the app builds, the tarball builds, and
+# desktop-file-validate checks SYNTAX, not whether the icon resolves.
+def _gtk_app_id(gtk):
+    """The single definition is `#define LSG_APP_ID "…"` in <gtk>/src/main.c."""
+    src = os.path.join(gtk, "src", "main.c")
+    with open(src) as fh:
+        m = re.search(r'#define\s+LSG_APP_ID\s+"([^"]+)"', fh.read())
+    if not m:
+        die("cannot find `#define LSG_APP_ID` in %s — the release packaging reads "
+            "the app id from the app itself and will not guess it" % src)
+    return m.group(1)
 
 DESKTOP_ENTRY = """[Desktop Entry]
 Type=Application
@@ -203,30 +218,41 @@ def check_zig():
 
 
 def resolve_version(repo, override):
-    """Read the two places the version lives and complain if they disagree.
+    """Read the ONE place the version lives, and report anything still lagging.
 
-    docs/RELEASE.md section 1 records that the version is NOT yet single-sourced.
-    Choosing the scheme is the author's call, so this reports the split instead of
-    silently inventing a value.
+    `<repo>/VERSION` is the single home (`5ac88d7`); `apps/gtk/VERSION` is a
+    symlink to it and meson's `project(version : files('VERSION'))` makes
+    `meson.project_version()` the single resolver, reaching main.c as
+    -DLSG_VERSION. This function does NOT re-derive a version from a consumer —
+    that is what it used to do, reading the macOS plist and gtk's meson.build and
+    reporting a disagreement it could not fix.
+
+    It still checks the macOS plist, but only to report a consumer that has not
+    been wired to the single source yet. That warning must stay while the lag is
+    real: `apps/macos` is its own aidev component and the plist placeholder plus
+    assemble-app.sh substitution (docs/RELEASE.md 1a item 1) has not landed.
     """
+    root_path = os.path.join(repo, "VERSION")
+    root_ver = None
+    if os.path.isfile(root_path):
+        with open(root_path) as fh:
+            root_ver = fh.read().strip() or None
+
     plist_path = os.path.join(repo, "apps", "macos", "Bundle", "Info.plist")
     mac_ver = None
     if os.path.isfile(plist_path):
         with open(plist_path, "rb") as fh:
             mac_ver = plistlib.load(fh).get("CFBundleShortVersionString")
-    gtk_ver = None
-    mb = os.path.join(repo, "apps", "gtk", "meson.build")
-    if os.path.isfile(mb):
-        with open(mb) as fh:
-            m = re.search(r"version\s*:\s*'([^']+)'", fh.read())
-            if m:
-                gtk_ver = m.group(1)
 
     warn = None
-    if mac_ver and gtk_ver and mac_ver != gtk_ver:
-        warn = ("version is not single-sourced: macOS Info.plist says %s, "
-                "apps/gtk/meson.build says %s" % (mac_ver, gtk_ver))
-    return (override or mac_ver or gtk_ver or "0.0.0"), warn
+    if root_ver is None:
+        warn = ("%s is missing — it is the single home for the version; "
+                "falling back to the macOS plist" % root_path)
+    elif mac_ver and mac_ver != root_ver:
+        warn = ("macOS Info.plist still hardcodes %s while the single source "
+                "(VERSION) says %s — apps/macos has not been wired to it yet "
+                "(docs/RELEASE.md 1a item 1)" % (mac_ver, root_ver))
+    return (override or root_ver or mac_ver or "0.0.0"), warn
 
 
 def newest_mtime(paths, exts=None):
@@ -624,13 +650,14 @@ def build_linux(repo, out, version, arches, do_verify, notes):
             os.makedirs(payload)
             shutil.copy(built, os.path.join(payload, "less-sheet-gtk"))
             os.chmod(os.path.join(payload, "less-sheet-gtk"), 0o755)
-            shutil.copy(os.path.join(gtk, "data", GTK_APP_ID + ".svg"),
-                        os.path.join(payload, GTK_APP_ID + ".svg"))
-            with open(os.path.join(payload, GTK_APP_ID + ".desktop"), "w") as fh:
-                fh.write(DESKTOP_ENTRY.format(app_id=GTK_APP_ID))
+            app_id = _gtk_app_id(gtk)
+            shutil.copy(os.path.join(gtk, "data", app_id + ".svg"),
+                        os.path.join(payload, app_id + ".svg"))
+            with open(os.path.join(payload, app_id + ".desktop"), "w") as fh:
+                fh.write(DESKTOP_ENTRY.format(app_id=app_id))
             ish = os.path.join(payload, "install.sh")
             with open(ish, "w") as fh:
-                fh.write(INSTALL_SH.replace("{app_id}", GTK_APP_ID))
+                fh.write(INSTALL_SH.replace("{app_id}", app_id))
             os.chmod(ish, 0o755)
             with open(os.path.join(payload, "README.txt"), "w") as fh:
                 fh.write(README_LINUX.format(version=version, arch=arch, glibc=glibc))
