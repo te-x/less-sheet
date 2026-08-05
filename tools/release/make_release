@@ -316,11 +316,45 @@ def build_macos(repo, out, version, do_verify, formats, notes):
     with open(os.path.join(app, "Contents", "Info.plist"), "rb") as fh:
         pl = plistlib.load(fh)
     ls_min = pl.get("LSMinimumSystemVersion")
-    if minos and ls_min and minos.split(".")[0] != ls_min.split(".")[0]:
-        notes.append("MIN-OS MISMATCH: the binary declares minos %s but Info.plist "
-                     "LSMinimumSystemVersion is %s - a user below the real floor gets a "
-                     "dyld crash instead of a clean 'requires macOS %s' message"
-                     % (minos, ls_min, minos))
+    # ASYMMETRIC ON PURPOSE, AND FATAL IN THE DANGEROUS DIRECTION.
+    #
+    # If Info.plist declares a floor BELOW what the binary actually requires,
+    # Finder happily offers the app on that OS and dyld then kills it: the user
+    # gets a crash where they should have got "requires macOS N or later". That is
+    # a shipped crash, so it must ABORT the release, not append a note. This is a
+    # live defect, not a hypothetical — the plist read 15.0 while the binary
+    # required 26.0 until 2026-08-05, and it was a note that nobody had to act on.
+    #
+    # The reverse (a declared floor ABOVE the binary's) only over-restricts: the
+    # app refuses to launch somewhere it would have worked. Worth reporting, not
+    # worth blocking.
+    #
+    # Compare full version tuples, not just the major: 26.0 vs 26.1 is exactly the
+    # kind of near-miss a major-only test waves through, and it is the same
+    # dyld-kill outcome.
+    def _ver(s):
+        try:
+            return tuple(int(p) for p in str(s).split("."))
+        except (TypeError, ValueError):
+            return None
+
+    mv, lv = _ver(minos), _ver(ls_min)
+    if mv and lv:
+        if lv < mv:
+            die("MIN-OS MISMATCH, refusing to package: the binary requires macOS "
+                "%s but Info.plist LSMinimumSystemVersion declares %s. Finder would "
+                "offer this app on %s and dyld would then kill it — a crash instead "
+                "of a clean 'requires macOS %s or later'. Fix Info.plist (or the "
+                "deployment target) so the declared floor is not below the real one."
+                % (minos, ls_min, ls_min, minos))
+        if lv > mv:
+            notes.append("Info.plist declares LSMinimumSystemVersion %s while the "
+                         "binary only requires %s - not a crash, but the app refuses "
+                         "to launch on systems it would run on" % (ls_min, minos))
+    elif minos and ls_min and minos != ls_min:
+        die("MIN-OS MISMATCH, refusing to package: binary minos %s vs Info.plist "
+            "LSMinimumSystemVersion %s, and at least one of them is not a parseable "
+            "version so the comparison cannot be trusted" % (minos, ls_min))
 
     # Non-system dynamic dependencies would have to be bundled + re-signed.
     otool = run(["otool", "-L", binary]).stdout.splitlines()[1:]
@@ -519,6 +553,23 @@ def merge_outputs(out, arts, version, notes):
     for a in arts:
         merged[a["file"]] = a
     ordered = [merged[k] for k in sorted(merged)]
+
+    # MIXED VERSIONS IN ONE OUTPUT DIRECTORY IS A PUBLISHING ACCIDENT WAITING TO
+    # HAPPEN. Carrying the other platform's artifacts across runs is deliberate
+    # (see the docstring) — carrying another VERSION's is not. When the version
+    # moved 0.1 -> 0.1.0 (single-sourcing it in `5ac88d7`), this directory ended up
+    # holding both, and SHA256SUMS listed all of them: uploading `dist/*` would
+    # have published two different versions of the same app side by side, each with
+    # a valid checksum. Refuse, loudly and non-destructively — deleting a built and
+    # verified artifact is worse than stopping and saying which files to move.
+    stale = sorted(a["file"] for a in ordered
+                   if ("-%s-" % version) not in a["file"])
+    if stale:
+        die("refusing to write SHA256SUMS/manifest.json: %s holds artifacts from a "
+            "different version than this run (%s).\n  offending: %s\nMove or delete "
+            "them, or build into a clean directory with --out. Publishing a "
+            "directory that mixes versions ships two apps at once."
+            % (out, version, ", ".join(stale)))
 
     with open(os.path.join(out, "SHA256SUMS"), "w") as fh:
         for a in ordered:
