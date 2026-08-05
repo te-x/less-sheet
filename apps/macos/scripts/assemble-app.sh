@@ -46,4 +46,40 @@ for res in "$bin_dir"/*.bundle; do
     [ -e "$res" ] && cp -R "$res" "$app/Contents/MacOS/" || true
 done
 
+# 5) SEAL THE BUNDLE. This must be the LAST step: codesign hashes the bundle's
+# contents into Contents/_CodeSignature/CodeResources, so ANY write into the
+# bundle after this point (copying a resource, touching Info.plist, an editor
+# writing .DS_Store) invalidates the signature again.
+#
+# Why this exists: the linker ad-hoc-signs the executable ONLY. Wrapping that
+# executable in a .app produced a bundle whose signature says "I have sealed
+# resources" while Contents/_CodeSignature did not exist, so macOS refused to
+# launch it and told the user the app was "damaged and can't be opened - move it
+# to the Trash". The app was never damaged; the bundle was just unsealed. This
+# bit the author on his own installed app (2026-08-05), and `syspolicy_check
+# distribution` grades the unsealed bundle a FATAL error:
+#   "Code has no resources but signature indicates they must be present."
+# Ad-hoc signing (identity "-") needs no certificate, no Apple account and no
+# network, and it fixes exactly that. It does NOT make the app distributable:
+# a DOWNLOADED copy still carries the quarantine attribute and Gatekeeper still
+# demands a Developer ID signature + notarization (see docs/RELEASE.md).
+#
+# When a Developer ID exists, set LESSSHEET_CODESIGN_IDENTITY to it (e.g.
+# "Developer ID Application: Name (TEAMID)"); notarization stays a separate,
+# deliberate publishing step and is intentionally NOT done here.
+identity="${LESSSHEET_CODESIGN_IDENTITY:--}"
+if [ "$identity" = "-" ]; then
+    # Ad-hoc: a secure timestamp is not available for it, and --timestamp=none
+    # keeps this build step offline.
+    codesign --force --sign - --timestamp=none "$app"
+else
+    # Real identity: notarization REQUIRES a secure timestamp (so this one does
+    # reach Apple's timestamp server) and the hardened runtime. Signing here
+    # still does not submit anything — notarization remains a separate step.
+    codesign --force --sign "$identity" --timestamp --options runtime "$app"
+fi
+# Verify rather than assume: --strict catches the unsealed-resources case that
+# a bare `codesign -dv` reports as "Sealed Resources=none" without failing.
+codesign --verify --strict --verbose=2 "$app"
+
 echo "Assembled $app"

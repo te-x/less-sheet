@@ -1,8 +1,14 @@
 # less-sheet — Build & Release Runbook
 
-**Purpose:** how to build the app, publish the first version, and ship updates — for the author (who executes) and the orchestrator (who can later script it). **Nothing here has been run.** No artifact is signed, notarized, packaged, or uploaded yet.
+**Purpose:** how to build the app, publish the first version, and ship updates — for the author (who executes) and the orchestrator (who can later script it).
 
-> **Status (2026-07-23):** Pre-launch. macOS ships **unsigned** (no Apple Developer account yet). The security-hardening program (#41) is in flight — **publish the hardened build, not today's.** The version is not yet single-sourced (macOS `CFBundleShortVersionString = 0.1`, GTK `meson project version = 0.0.0` — reconcile before v1, see §1). GTK/Flatpak app-id must be confirmed (see §4). EULA not yet written (§6).
+> **Status (2026-08-05):** Pre-launch. **Building and packaging are now scripted and exercised**; publishing still is not. `tools/release/make_release` builds the macOS `.zip`/`.dmg` and the Linux `.tar.gz` (aarch64 + x86_64), verifies each artifact by **running it**, and writes `SHA256SUMS` + `manifest.json`. Nothing is uploaded, notarized, or submitted anywhere, and no Developer ID is used.
+>
+> Two defects were found and fixed while first exercising this path:
+> - **The assembled `.app` was unsealed and macOS refused to launch it** — the user-visible symptom was *"damaged and can't be opened … move it to the Trash"*, which hit the author's own installed app. Cause: `assemble-app.sh` wrapped a linker-ad-hoc-signed executable in a bundle without ever sealing the bundle, so the signature claimed sealed resources that did not exist. `assemble-app.sh` now ad-hoc-seals the bundle as its last step and verifies with `codesign --verify --strict`. See §3a.
+> - **`LSMinimumSystemVersion` claimed 15.0 while the binary requires macOS 26.0** (`Package.swift` targets `.macOS("26.0")` for Liquid Glass). A macOS 15 user would have been offered the app and then got a dyld failure instead of a clean "requires macOS 26" message. Corrected to 26.0.
+>
+> Still open: macOS ships **ad-hoc signed, not notarized** (no Apple Developer account — §3a is now measured, not predicted). The version is not single-sourced (macOS `CFBundleShortVersionString = 0.1`, GTK `meson project version = 0.0.0` — reconcile before v1, §1). The GTK app-id in the code is **`dev.lesssheet.Gtk`**, not the `com.lesssheet.LessSheet` this doc proposes in §4b — reconcile before any Flathub submission, because a published app-id is effectively permanent. EULA not yet written (§6).
 
 ---
 
@@ -34,6 +40,29 @@
 
 ## 2. Build the release artifacts
 
+**Scripted path (use this):**
+```
+tools/release/make_release                       # everything this host can build
+tools/release/make_release --platform mac
+tools/release/make_release --platform linux --arch x86_64
+```
+It builds the ReleaseSafe core, assembles + seals the macOS `.app`, cross-builds and
+container-builds the Linux binaries, packages all of it into `dist/`, writes `SHA256SUMS` +
+`manifest.json` (which records each artifact's runtime requirements), and **verifies every
+artifact by running it** — the macOS app through the `LESSSHEET_*` probe harness, the Linux
+tarball inside a clean `fedora:43` container that has only the app's runtime dependencies and
+no compiler. It never uploads, notarizes, or submits anything. `dist/` is gitignored.
+
+Two guards worth knowing about, because both have bitten this project:
+- **Stale core:** SwiftPM does not track `liblesssheet.a`, so a green build is not evidence the
+  binary contains the current core. The script asserts `backend/src/*.zig` → `liblesssheet.a` →
+  app-binary mtime ordering and fails loudly rather than shipping a stale link.
+- **Seal-invalidating packaging:** it re-verifies `codesign --verify --strict` on the app
+  *unpacked from the finished artifact*, not on the build tree, because anything that writes into
+  a bundle after signing silently breaks it.
+
+The manual steps below remain accurate and are what the script automates.
+
 ### 2a. Shared core (built once per platform, linked by both frontends)
 Ship mode is **ReleaseSafe** (per `docs/architecture/PROJECT.md` Build & gate — safety on; `@setRuntimeSafety(false)` only on bench-justified hot loops). After #41 lands, the frontends' build scripts build ReleaseSafe automatically; to build by hand:
 ```
@@ -49,18 +78,78 @@ bash apps/macos/scripts/assemble-app.sh
 Bundle facts: `CFBundleIdentifier = com.lesssheet.app`, `CFBundleName = less-sheet`, executable `LessSheet`, `LSMinimumSystemVersion = 15.0` (macOS 15 Sequoia).
 
 ### 2c. GTK/Linux
-Built via Meson (see the CI gate for the container recipe), or — preferred for distribution — via the Flatpak manifest in §4.
+`make_release --platform linux` handles this: it cross-builds the core with Zig (native, no
+container) and builds the GTK frontend in an arch-suffixed copy of the gate's `fedora:43`
+toolchain image, then verifies the tarball in a clean container.
+
+**Architecture note.** The Zig core cross-compiles to any target from any host, but the *GTK
+frontend* links the system GTK4/libadwaita and so needs a real userland of the target
+architecture. On an Apple Silicon Mac the x86_64 leg therefore runs under emulation — which
+turned out to be cheap, not the feared multi-hour wait: the x86_64 toolchain image built in
+about 7 minutes (vs ~5 native for aarch64), and `meson setup` inside it resolves GTK 4.20.4 /
+libadwaita 1.8.6 normally. Emulation is a viable route.
+
+> **BLOCKER — x86_64 Linux cannot be built today (found 2026-08-05).** Not an emulation problem.
+> The x86_64 core archive references `__zig_probe_stack` without defining it (`nm`: 1 undefined,
+> 0 defined), so linking the GTK app with gcc/`ld.bfd` fails. **aarch64 is unaffected** — it
+> emits no stack probes, so the symbol is neither referenced nor needed (`nm`: 0 and 0), which is
+> why this never surfaced before: the gate and the GUI runs only ever built aarch64, and
+> `ARCH-backend-linux-portability`'s verified Linux path was musl + lld, which does not expose it.
+> **Fix:** bundle compiler-rt into the static library in `backend/build.zig` (confirmed:
+> `zig build-lib -fcompiler-rt` *defines* the symbol, `-fno-compiler-rt` does not).
+> `backend/build.zig` is a frozen `DEPENDENCY_PATH`, so this needs a **CHANGE-REQUEST** through
+> the planner — it is deliberately not patched here. `make_release` pre-flights the archive and
+> skips the arch with this explanation rather than emitting a wall of linker errors.
+
+To produce the x86_64 tarball natively in minutes on an x86_64 Linux box instead, do there what
+the script does in the container — the recipe is identical because the staging layout is the same
+one `tools/gtk/run_gtk_on` already uses:
+
+```
+# on the Mac: cross-build the core for the target and copy the tree over
+cd backend && zig build -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseSafe --prefix /tmp/core
+# ship apps/gtk (dereference include/lesssheet.h, it is a symlink to api/) plus
+# /tmp/core/lib/liblesssheet.a into <stage>/.core-linux/lib/, then on the Linux box:
+meson setup build --buildtype=release && meson compile -C build && strip build/less-sheet-gtk
+```
+Then package `less-sheet-gtk` + the `.desktop` + the icon + `install.sh` exactly as the script
+does. Requires GTK4 ≥ 4.20 + libadwaita ≥ 1.8 + meson/ninja/gcc on that box (`run_gtk_on`'s
+install block installs precisely this set, and carries the same floors).
+
+For distribution, §4's Flatpak is still the better answer for Linux than any tarball.
 
 ---
 
 ## 3. Publish v1 — macOS
 
-### 3a. Current path (UNSIGNED — interim, until the Apple account exists)
-- Zip the `.app` (or make a plain DMG) and put it on the download page.
-- **Document the Gatekeeper bypass** for users (an unsigned app won't open by double-click on macOS 15):
-  - Right-click the app → **Open** → **Open** in the dialog; **or**
-  - `xattr -dr com.apple.quarantine /Applications/less-sheet.app`
-- This is a rough first impression — treat it as interim; prioritize the signed path for any real launch.
+### 3a. Current path (AD-HOC SIGNED, NOT NOTARIZED — measured 2026-08-05)
+
+`tools/release/make_release --platform mac` produces the `.zip` and `.dmg`, and proves the
+packaged app runs. There are **three distinct states** here; keeping them apart matters,
+because two of them look like "the app is broken" and only one is actually a Gatekeeper issue.
+
+| State | What happens | Fixed? |
+|---|---|---|
+| **Unsealed bundle** (before 2026-08-05) | macOS refuses to launch it *even locally, with no download involved*: **"damaged and can't be opened … move it to the Trash"**. `spctl --assess` reports `code has no resources but signature indicates they must be present`; `syspolicy_check distribution` grades it **Fatal**. | **Yes** — `assemble-app.sh` now seals the bundle. |
+| **Ad-hoc sealed, not quarantined** (today, local builds) | Launches and runs normally. `codesign --verify --strict` → *valid on disk*, *satisfies its Designated Requirement*. | n/a — this is the working state. |
+| **Ad-hoc sealed, quarantined** (today, a real download) | **Gatekeeper blocks it.** `spctl --assess` → `rejected`; `syspolicy_check distribution` → *Notary Ticket Missing* (Fatal) + *adhoc signed … not suitable for distribution* (Warning). Directly exec'ing the binary is SIGKILLed. | **No** — needs §3b. |
+
+**What a first-time downloader sees, and what they must do.** The app is quarantined, ad-hoc
+signed and unnotarized, so Gatekeeper blocks the first launch and offers no in-dialog override.
+The user has to open **System Settings → Privacy & Security**, find the blocked app, and press
+**"Open Anyway"**. Note the old **right-click → Open** trick that this doc used to recommend
+**no longer works**: Apple removed that bypass in macOS 15 Sequoia, and our floor is now macOS 26,
+so every user is past that change. `xattr -dr com.apple.quarantine <app>` also works but asking
+people to run a Terminal command to open a spreadsheet viewer is a worse first impression than
+the Settings route.
+
+> Ad-hoc signing needs no certificate, no Apple account and no network — it is a *packaging
+> correctness* step, not a distribution step. It fixes the "damaged" failure and nothing else.
+> It does **not** get a downloaded app past Gatekeeper; only §3b does.
+
+If shipping unsigned anyway, the download page must say plainly that the app is not yet
+notarized and give the Privacy & Security steps — the frontpage's no-dead-links rule extends to
+no-dead-ends.
 
 ### 3b. Signed + notarized path (recommended — needs the Apple Developer account)
 Once you have a Developer ID Application cert + notarytool creds:

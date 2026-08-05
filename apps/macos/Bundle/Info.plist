@@ -24,7 +24,13 @@
     <key>CFBundleShortVersionString</key>
     <string>0.1</string>
     <key>LSMinimumSystemVersion</key>
-    <string>15.0</string>
+    <!-- Must match Package.swift's platforms: [.macOS("26.0")] and the built
+         binary's LC_BUILD_VERSION minos (26.0). The viewer-ui overlay uses the
+         macOS 26 Liquid Glass APIs, so 26.0 is the real floor. This read 15.0
+         until 2026-08-05, which let Finder accept the app on macOS 15 and then
+         let dyld fail it — a crash instead of the clean "requires macOS 26 or
+         later" message. Lower it only if the app genuinely supports lower. -->
+    <string>26.0</string>
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>CFBundleDocumentTypes</key>

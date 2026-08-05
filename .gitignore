@@ -16,3 +16,8 @@ __pycache__/
 # directory under test, so they land wherever a run happens. Results worth keeping
 # get summarised into review/ or the ARCH, not committed raw.
 bench-*.txt
+
+# Release artifacts built by tools/release/make_release (.dmg/.zip/.tar.gz +
+# SHA256SUMS + manifest.json). Reproducible from a tag, so never committed; the
+# checksums that matter get published alongside the download links.
+dist/

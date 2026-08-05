@@ -1,0 +1,764 @@
+#!/usr/bin/env python3
+"""
+Build the downloadable less-sheet artifacts, verify each one RUNS, and checksum them.
+
+    ./make_release                        # everything this host can build
+    ./make_release --platform mac
+    ./make_release --platform linux --arch aarch64
+    ./make_release --out /tmp/dist --version 0.1.0
+
+PREPARES artifacts only. It never uploads, publishes, notarizes, or submits
+anything, and it never signs with a Developer ID unless you explicitly export
+LESSSHEET_CODESIGN_IDENTITY yourself. Publishing is a separate, deliberate act
+(docs/RELEASE.md).
+
+What it produces in --out (default <repo>/dist):
+
+    less-sheet-<ver>-macos-arm64.zip        the .app, ditto-zipped (Apple's format)
+    less-sheet-<ver>-macos-arm64.dmg        the same .app in a plain disk image
+    less-sheet-<ver>-linux-<arch>.tar.gz    GTK binary + .desktop + icon + install.sh
+    SHA256SUMS                              one line per artifact
+    manifest.json                           per-artifact runtime requirements + verdicts
+
+Verification is by RUNNING, never by existence:
+  * macOS - launches the PACKAGED app (unpacked from the artifact, not the build
+    tree) headlessly via the LESSSHEET_* probe harness and requires the real
+    open marker `lesssheet.first_rows_visible_ms=`, which the app only emits
+    once a data-bearing table is on screen. No screen capture, so no TCC prompt.
+  * Linux - unpacks the tarball inside a CLEAN fedora:43 container that has only
+    the app's declared RUNTIME deps (gtk4, libadwaita - no compiler, no -devel,
+    no meson) and requires both [timing] lines. This is the load-bearing test:
+    it proves the artifact works on a machine that never built it.
+
+Host requirements: zig 0.16.0 (exact, cross-builds the core). macOS artifacts
+need a Mac with the Swift 6 toolchain. Linux artifacts need podman/docker; the
+x86_64 leg runs under emulation on Apple Silicon and is slow but real.
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import plistlib
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+# Build image: the SAME recipe the GTK gate pins (apps/gtk/.ci/Dockerfile, fedora 43
+# — the release that ships GTK 4.20 / libadwaita 1.8, the floor meson.build requires),
+# but under a release-specific, ARCH-SUFFIXED tag.
+#
+# Why not reuse the gate's `less-sheet-gtk-ci:fedora43` directly: a local image tag
+# holds exactly one architecture, and the gate only ever builds its own host arch.
+# Reusing that tag for a cross-arch release build made podman fail to even start the
+# container (exit 125). Arch-suffixed release tags let both arches coexist and leave
+# the gate's tag untouched.
+GTK_BUILD_IMAGE_FMT = "less-sheet-gtk-release:fedora43-%s"
+RUNTIME_IMAGE = "registry.fedoraproject.org/fedora:43"
+
+ARCH_ZIG = {"aarch64": "aarch64-linux-gnu", "x86_64": "x86_64-linux-gnu"}
+ARCH_PLATFORM = {"aarch64": "linux/arm64", "x86_64": "linux/amd64"}
+
+# The GTK app id the code already uses (data/dev.lesssheet.Gtk.svg + main.c's
+# gtk_window_set_icon_name). docs/RELEASE.md flags the final Flatpak app-id as
+# still-to-confirm, so this follows the code rather than inventing a new one.
+GTK_APP_ID = "dev.lesssheet.Gtk"
+
+DESKTOP_ENTRY = """[Desktop Entry]
+Type=Application
+Name=less-sheet
+GenericName=CSV Viewer
+Comment=Open huge CSV files instantly
+Exec=less-sheet-gtk %f
+Icon={app_id}
+Terminal=false
+Categories=Office;Spreadsheet;
+MimeType=text/csv;application/csv;text/comma-separated-values;
+StartupNotify=true
+"""
+
+INSTALL_SH = """#!/bin/sh
+# Install less-sheet for the current user (no root). Uninstall: pass --uninstall.
+set -e
+here="$(cd "$(dirname "$0")" && pwd)"
+bin="$HOME/.local/bin"
+apps="$HOME/.local/share/applications"
+icons="$HOME/.local/share/icons/hicolor/scalable/apps"
+
+if [ "${1:-}" = "--uninstall" ]; then
+    rm -f "$bin/less-sheet-gtk" "$apps/{app_id}.desktop" "$icons/{app_id}.svg"
+    echo "Removed less-sheet."
+    exit 0
+fi
+
+mkdir -p "$bin" "$apps" "$icons"
+install -m 755 "$here/less-sheet-gtk" "$bin/less-sheet-gtk"
+install -m 644 "$here/{app_id}.desktop" "$apps/{app_id}.desktop"
+install -m 644 "$here/{app_id}.svg" "$icons/{app_id}.svg"
+command -v update-desktop-database >/dev/null 2>&1 && \\
+    update-desktop-database "$apps" 2>/dev/null || true
+
+echo "Installed less-sheet-gtk to $bin"
+case ":$PATH:" in
+    *":$bin:"*) ;;
+    *) echo "NOTE: $bin is not on your PATH; add it or run $bin/less-sheet-gtk directly." ;;
+esac
+"""
+
+README_LINUX = """less-sheet {version} - Linux ({arch})
+=======================================
+
+Open huge CSV files instantly. Reads: CSV, CSV.GZ, http(s) URLs.
+
+INSTALL (per-user, no root)
+    ./install.sh            # -> ~/.local/bin + a desktop entry
+    ./install.sh --uninstall
+
+Or just run it in place:
+    ./less-sheet-gtk yourfile.csv
+
+WHAT THIS BINARY NEEDS AT RUNTIME
+    CPU/OS      Linux {arch}
+    glibc       >= {glibc}    (this binary references no newer glibc symbol)
+    GTK4        >= 4.20       hard floor
+    libadwaita  >= 1.8        hard floor
+    plus the usual GNOME stack these pull in (glib, gio, gobject, pango,
+    pangocairo, cairo).
+
+The GTK4/libadwaita floors are REAL, not advisory: the app uses
+AdwShortcutsDialog and the AdwStyleManager accent-color API, which do not exist
+before libadwaita 1.8 (GNOME 49). On an older stack the binary fails to start
+with a dynamic-symbol error rather than starting and misbehaving.
+
+Distributions that satisfy the floors today include Fedora 43+ and current Arch.
+Debian 13 (trixie) does NOT - it ships GTK 4.18.
+
+There is no bundled GTK: this binary uses your system's GNOME libraries, so it
+follows your theme, dark mode, and accent colour.
+"""
+
+
+def die(msg):
+    print("error: " + msg, file=sys.stderr)
+    sys.exit(1)
+
+
+def run(cmd, **kw):
+    """Run a command, streaming nothing, returning CompletedProcess (never raises)."""
+    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+
+
+def must(cmd, what, **kw):
+    r = run(cmd, **kw)
+    if r.returncode != 0:
+        die("%s failed (exit %d)\n%s" % (what, r.returncode, (r.stderr or r.stdout)[-3000:]))
+    return r
+
+
+def find_repo():
+    d = HERE
+    for _ in range(8):
+        if os.path.isfile(os.path.join(d, "api", "lesssheet.h")) and \
+           os.path.isdir(os.path.join(d, "apps")):
+            return d
+        d = os.path.dirname(d)
+    die("could not locate the less-sheet repo from " + HERE)
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def container_cmd():
+    for c in ("podman", "docker"):
+        p = shutil.which(c)
+        if p:
+            return p
+    return None
+
+
+def check_zig():
+    if not shutil.which("zig"):
+        die("zig not found; zig 0.16.0 is required to build the core")
+    v = run(["zig", "version"]).stdout.strip()
+    if v != "0.16.0":
+        die("zig 0.16.0 required (the backend gate asserts it), found %s" % v)
+    return v
+
+
+def resolve_version(repo, override):
+    """Read the two places the version lives and complain if they disagree.
+
+    docs/RELEASE.md section 1 records that the version is NOT yet single-sourced.
+    Choosing the scheme is the author's call, so this reports the split instead of
+    silently inventing a value.
+    """
+    plist_path = os.path.join(repo, "apps", "macos", "Bundle", "Info.plist")
+    mac_ver = None
+    if os.path.isfile(plist_path):
+        with open(plist_path, "rb") as fh:
+            mac_ver = plistlib.load(fh).get("CFBundleShortVersionString")
+    gtk_ver = None
+    mb = os.path.join(repo, "apps", "gtk", "meson.build")
+    if os.path.isfile(mb):
+        with open(mb) as fh:
+            m = re.search(r"version\s*:\s*'([^']+)'", fh.read())
+            if m:
+                gtk_ver = m.group(1)
+
+    warn = None
+    if mac_ver and gtk_ver and mac_ver != gtk_ver:
+        warn = ("version is not single-sourced: macOS Info.plist says %s, "
+                "apps/gtk/meson.build says %s" % (mac_ver, gtk_ver))
+    return (override or mac_ver or gtk_ver or "0.0.0"), warn
+
+
+def newest_mtime(paths, exts=None):
+    newest = 0.0
+    for p in paths:
+        if os.path.isfile(p):
+            newest = max(newest, os.path.getmtime(p))
+            continue
+        for root, _dirs, files in os.walk(p):
+            for f in files:
+                if exts and not f.endswith(exts):
+                    continue
+                newest = max(newest, os.path.getmtime(os.path.join(root, f)))
+    return newest
+
+
+# --------------------------------------------------------------------------
+# macOS
+# --------------------------------------------------------------------------
+
+def build_macos(repo, out, version, do_verify, formats, notes):
+    if sys.platform != "darwin":
+        notes.append("macOS artifacts skipped: not running on macOS")
+        return []
+    if not shutil.which("swift"):
+        die("swift not found; the Swift 6 toolchain is required for the macOS app")
+
+    print("[mac  ] assembling the .app (ReleaseSafe core + relink + bundle seal) ...", flush=True)
+    must(["bash", os.path.join(repo, "apps", "macos", "scripts", "assemble-app.sh")],
+         "assemble-app.sh")
+
+    app = os.path.join(repo, "apps", "macos", ".build", "arm64-apple-macosx",
+                       "release", "less-sheet.app")
+    if not os.path.isdir(app):
+        die("assemble-app.sh reported success but %s is missing" % app)
+    binary = os.path.join(app, "Contents", "MacOS", "LessSheet")
+
+    # --- staleness guard -------------------------------------------------
+    # SwiftPM does not track liblesssheet.a as a build input, so a successful
+    # build is NOT evidence that the shipped binary contains the current core.
+    # assemble-app.sh force-drops the link product; this re-checks the outcome
+    # by mtime ordering: binary newer than the archive, archive newer than the
+    # newest backend source.
+    core_a = os.path.join(repo, "backend", "zig-out", "lib", "liblesssheet.a")
+    if not os.path.isfile(core_a):
+        die("core archive missing at %s" % core_a)
+    src_m = newest_mtime([os.path.join(repo, "backend", "src")], exts=(".zig",))
+    if os.path.getmtime(core_a) < src_m:
+        die("STALE CORE: liblesssheet.a is older than backend/src/*.zig")
+    if os.path.getmtime(binary) < os.path.getmtime(core_a):
+        die("STALE LINK: the app binary predates liblesssheet.a (SwiftPM reused a link product)")
+    print("[mac  ] freshness OK: backend sources -> core archive -> app binary", flush=True)
+
+    # --- shape of what we are shipping ----------------------------------
+    arch = run(["lipo", "-archs", binary]).stdout.split()
+    minos = None
+    m = re.search(r"minos\s+([0-9.]+)",
+                  run(["otool", "-l", binary]).stdout)
+    if m:
+        minos = m.group(1)
+    with open(os.path.join(app, "Contents", "Info.plist"), "rb") as fh:
+        pl = plistlib.load(fh)
+    ls_min = pl.get("LSMinimumSystemVersion")
+    if minos and ls_min and minos.split(".")[0] != ls_min.split(".")[0]:
+        notes.append("MIN-OS MISMATCH: the binary declares minos %s but Info.plist "
+                     "LSMinimumSystemVersion is %s - a user below the real floor gets a "
+                     "dyld crash instead of a clean 'requires macOS %s' message"
+                     % (minos, ls_min, minos))
+
+    # Non-system dynamic dependencies would have to be bundled + re-signed.
+    otool = run(["otool", "-L", binary]).stdout.splitlines()[1:]
+    foreign = [l.split()[0] for l in otool
+               if l.strip() and not l.strip().startswith(("/usr/lib/", "/System/"))]
+    if foreign:
+        notes.append("macOS binary links non-system libraries (would need bundling): %s"
+                     % ", ".join(foreign))
+
+    seal = run(["codesign", "--verify", "--strict", "--verbose=2", app])
+    if seal.returncode != 0:
+        die("the assembled bundle is NOT validly sealed:\n" + seal.stderr)
+    sig = run(["codesign", "-dv", app]).stderr
+    adhoc = "adhoc" in sig
+    gk = run(["spctl", "--assess", "-vv", app])
+    gatekeeper = "accepted" if gk.returncode == 0 else "rejected"
+    verdict = ""
+    if shutil.which("syspolicy_check"):
+        verdict = run(["syspolicy_check", "distribution", app]).stdout
+
+    if do_verify:
+        ok, detail = verify_macos_app(app, "build tree")
+        if not ok:
+            die("the assembled app failed its headless open check: " + detail)
+        print("[mac  ] runs from the build tree: %s" % detail, flush=True)
+
+    arts = []
+    os.makedirs(out, exist_ok=True)
+    base = "less-sheet-%s-macos-%s" % (version, "-".join(arch) if arch else "unknown")
+
+    if "zip" in formats:
+        zpath = os.path.join(out, base + ".zip")
+        if os.path.exists(zpath):
+            os.remove(zpath)
+        # ditto, not zip(1): Apple's archiver round-trips a .app bundle (and its
+        # _CodeSignature seal) faithfully. A plain `zip -r` can mangle the bundle.
+        must(["ditto", "-c", "-k", "--sequesterRsrc", "--keepParent", app, zpath], "ditto zip")
+        arts.append(finish_mac_artifact(zpath, "zip", version, arch, minos, ls_min,
+                                        adhoc, gatekeeper, verdict, do_verify, notes))
+        merge_outputs(out, arts, version, notes)   # bank it before attempting the dmg
+
+    if "dmg" in formats:
+        dpath = os.path.join(out, base + ".dmg")
+        if os.path.exists(dpath):
+            os.remove(dpath)
+        stage = tempfile.mkdtemp(prefix="ls-dmg-")
+        try:
+            shutil.copytree(app, os.path.join(stage, "less-sheet.app"), symlinks=True)
+            must(["hdiutil", "create", "-quiet", "-srcfolder", stage,
+                  "-volname", "less-sheet", "-fs", "HFS+",
+                  "-format", "UDZO", "-imagekey", "zlib-level=9", dpath], "hdiutil create")
+        finally:
+            shutil.rmtree(stage, ignore_errors=True)
+        arts.append(finish_mac_artifact(dpath, "dmg", version, arch, minos, ls_min,
+                                        adhoc, gatekeeper, verdict, do_verify, notes))
+    return arts
+
+
+def finish_mac_artifact(path, kind, version, arch, minos, ls_min, adhoc,
+                        gatekeeper, verdict, do_verify, notes):
+    """Unpack the artifact, re-verify the seal SURVIVED packaging, and run it."""
+    ran = None
+    if do_verify:
+        tmp = tempfile.mkdtemp(prefix="ls-verify-")
+        try:
+            if kind == "zip":
+                must(["ditto", "-x", "-k", path, tmp], "ditto unzip")
+                app = os.path.join(tmp, "less-sheet.app")
+            else:
+                mnt = os.path.join(tmp, "mnt")
+                os.makedirs(mnt)
+                must(["hdiutil", "attach", "-quiet", "-nobrowse", "-readonly",
+                      "-mountpoint", mnt, path], "hdiutil attach")
+                try:
+                    app = os.path.join(tmp, "less-sheet.app")
+                    shutil.copytree(os.path.join(mnt, "less-sheet.app"), app, symlinks=True)
+                finally:
+                    run(["hdiutil", "detach", "-quiet", mnt])
+
+            # Order-of-operations check: packaging must not break the seal.
+            s = run(["codesign", "--verify", "--strict", "--verbose=2", app])
+            if s.returncode != 0:
+                die("the %s artifact's bundle seal is INVALID after packaging - "
+                    "something wrote into the bundle after codesign:\n%s" % (kind, s.stderr))
+            ok, detail = verify_macos_app(app, "unpacked " + kind)
+            if not ok:
+                die("the packaged %s does not run: %s" % (kind, detail))
+            ran = detail
+            print("[mac  ] %-3s artifact: seal valid after packaging, and it runs (%s)"
+                  % (kind, detail), flush=True)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    return {
+        "file": os.path.basename(path),
+        "platform": "macOS",
+        "arch": ", ".join(arch) if arch else "unknown",
+        "format": kind,
+        "bytes": os.path.getsize(path),
+        "sha256": sha256(path),
+        "requires": {
+            "os": "macOS %s or later" % (minos or "?"),
+            "declared_LSMinimumSystemVersion": ls_min,
+            "cpu": ", ".join(arch) if arch else "unknown",
+            "bundled_dependencies": "none - system frameworks only",
+        },
+        "signing": {
+            "state": "ad-hoc (no Developer ID, not notarized)" if adhoc else "signed",
+            "bundle_seal": "valid (codesign --verify --strict)",
+            "gatekeeper_spctl": gatekeeper,
+            "distributable_without_further_work": False,
+        },
+        "verified_by_running": ran,
+    }
+
+
+def verify_macos_app(app, label):
+    """Launch the app headlessly and require the real 'rows on screen' marker.
+
+    Uses the probe harness the test-suite uses: a clean environment with every
+    inherited LESSSHEET_* var stripped, LESSSHEET_DUMP_EXIT=1 to quit after
+    first paint, and the file as argv[1]. The marker is only emitted once a
+    data-bearing table is actually displayed, so its presence proves a real
+    open. Rendering is off-screen, so this triggers no macOS permission dialog.
+    """
+    binary = os.path.join(app, "Contents", "MacOS", "LessSheet")
+    if not os.path.isfile(binary):
+        return False, "no executable at Contents/MacOS/LessSheet"
+    fixture = None
+    try:
+        fd, fixture = tempfile.mkstemp(suffix=".csv", prefix="ls-fix-")
+        with os.fdopen(fd, "w") as fh:
+            fh.write("id,name,city\n1,Ada,Riverside\n2,Alan,Fairview\n3,Grace,Madison\n")
+        env = {k: v for k, v in os.environ.items() if not k.startswith("LESSSHEET_")}
+        env["LESSSHEET_DUMP_EXIT"] = "1"
+        t0 = time.time()
+        p = subprocess.run([binary, fixture], capture_output=True, text=True,
+                           env=env, timeout=90)
+        blob = (p.stderr or "") + (p.stdout or "")
+        m = re.search(r"lesssheet\.first_rows_visible_ms=(\d+)", blob)
+        if not m:
+            tail = blob.strip().splitlines()[-3:]
+            return False, ("no first_rows_visible marker from %s (exit %d after %.1fs) %s"
+                           % (label, p.returncode, time.time() - t0, tail))
+        return True, "first rows visible in %s ms" % m.group(1)
+    except subprocess.TimeoutExpired:
+        return False, "timed out launching %s" % label
+    finally:
+        if fixture and os.path.exists(fixture):
+            os.remove(fixture)
+
+
+# --------------------------------------------------------------------------
+# Linux / GTK
+# --------------------------------------------------------------------------
+
+def ensure_build_image(ctr, repo, arch):
+    """Return a build image for `arch`, building it from the gate's Dockerfile if absent.
+
+    Uses the gate's own recipe so the release build and the gate agree on the GNOME
+    stack, but under an arch-suffixed tag (see GTK_BUILD_IMAGE_FMT).
+    """
+    image = GTK_BUILD_IMAGE_FMT % arch
+    if run([ctr, "image", "inspect", image]).returncode == 0:
+        return image
+    ci = os.path.join(repo, "apps", "gtk", ".ci")
+    dockerfile = os.path.join(ci, "Dockerfile")
+    if not os.path.isfile(dockerfile):
+        die("cannot build the Linux toolchain image: %s is missing" % dockerfile)
+    print("[linux] %s: building the toolchain image %s (one-off, from the gate's "
+          "apps/gtk/.ci/Dockerfile) ..." % (arch, image), flush=True)
+    must([ctr, "build", "--platform", ARCH_PLATFORM[arch], "-t", image,
+          "-f", dockerfile, ci], "toolchain image build for " + arch)
+    return image
+
+
+def merge_outputs(out, arts, version, notes):
+    """Write SHA256SUMS + manifest.json covering EVERY artifact present in `out`.
+
+    A --platform-scoped run must not erase the other platform's entries: the author will
+    plausibly build the Mac artifacts on the Mac and the Linux ones in another run.
+    Entries for files that no longer exist are dropped; same-named entries are
+    replaced by this run's fresher data.
+    """
+    mpath = os.path.join(out, "manifest.json")
+    merged = {}
+    if os.path.isfile(mpath):
+        try:
+            with open(mpath) as fh:
+                for a in json.load(fh).get("artifacts", []):
+                    if os.path.isfile(os.path.join(out, a.get("file", ""))):
+                        merged[a["file"]] = a
+        except (ValueError, KeyError):
+            notes.append("existing manifest.json was unreadable and was rebuilt")
+    carried = [f for f in merged if f not in {a["file"] for a in arts}]
+    for a in arts:
+        merged[a["file"]] = a
+    ordered = [merged[k] for k in sorted(merged)]
+
+    with open(os.path.join(out, "SHA256SUMS"), "w") as fh:
+        for a in ordered:
+            fh.write("%s  %s\n" % (a["sha256"], a["file"]))
+    with open(mpath, "w") as fh:
+        json.dump({"product": "less-sheet", "version": version,
+                   "built_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                   "published": False, "artifacts": ordered, "notes": notes},
+                  fh, indent=2)
+        fh.write("\n")
+    return ordered, carried
+
+
+def build_linux(repo, out, version, arches, do_verify, notes):
+    ctr = container_cmd()
+    if not ctr:
+        notes.append("Linux artifacts skipped: no podman/docker on this host")
+        return []
+
+    arts = []
+    for arch in arches:
+        image = ensure_build_image(ctr, repo, arch)
+        print("[linux] %s: cross-building the ReleaseSafe core (glibc) ..." % arch, flush=True)
+        work = tempfile.mkdtemp(prefix="ls-linux-%s-" % arch)
+        try:
+            prefix = os.path.join(work, "core")
+            must(["zig", "build", "-Dtarget=" + ARCH_ZIG[arch],
+                  "-Doptimize=ReleaseSafe", "--prefix", prefix],
+                 "core cross-build for " + arch, cwd=os.path.join(repo, "backend"))
+            core_a = os.path.join(prefix, "lib", "liblesssheet.a")
+            if not os.path.isfile(core_a):
+                die("core cross-built for %s but %s is missing" % (arch, core_a))
+
+            # Stage the GTK sources OUT OF TREE so a release build never touches
+            # apps/gtk/ (which would disturb the gate's working tree). Whole
+            # directories, dereferencing symlinks: include/lesssheet.h is a
+            # symlink to api/lesssheet.h, and src/ carries a private header.
+            stage = os.path.join(work, "src")
+            os.makedirs(os.path.join(stage, ".core-linux", "lib"))
+            gtk = os.path.join(repo, "apps", "gtk")
+            shutil.copy(os.path.join(gtk, "meson.build"), stage)
+            for sub in ("include", "src", "data", "tests"):
+                shutil.copytree(os.path.join(gtk, sub), os.path.join(stage, sub),
+                                symlinks=False)
+            shutil.copy(core_a, os.path.join(stage, ".core-linux", "lib"))
+
+            # Pre-flight: the core archive must not leave compiler-rt helpers
+            # undefined, or the meson link fails with a wall of linker output that
+            # looks like a frontend bug when it is really a core build-config issue.
+            #
+            # Concretely: on x86_64 the Zig backend emits calls to
+            # `__zig_probe_stack` (stack probing) but the installed static archive
+            # does not define it, because backend/build.zig does not set
+            # `bundle_compiler_rt` for non-macOS targets. aarch64 never hit this —
+            # it emits no stack probes, so the symbol is neither referenced nor
+            # needed. The verified Linux path in ARCH-backend-linux-portability was
+            # musl + lld, which does not expose this; we link glibc with gcc/ld.bfd.
+            # Fix (needs a backend CHANGE-REQUEST — build.zig is a frozen
+            # DEPENDENCY_PATH): bundle compiler-rt into the static library.
+            missing = run([ctr, "run", "--rm", "--platform", ARCH_PLATFORM[arch],
+                           "--security-opt", "label=disable", "-v", stage + ":/b:ro",
+                           image, "sh", "-c",
+                           "nm --undefined-only /b/.core-linux/lib/liblesssheet.a "
+                           "2>/dev/null | grep -o '__[a-z_]*probe_stack' | sort -u"]).stdout.split()
+            if missing:
+                notes.append(
+                    "Linux %s SKIPPED: the cross-built core archive leaves %s undefined, so the "
+                    "GTK app cannot be linked with gcc/ld.bfd. aarch64 is unaffected (no stack "
+                    "probes emitted). Fix = bundle compiler-rt into the static library in "
+                    "backend/build.zig, which is a frozen DEPENDENCY_PATH and needs a "
+                    "CHANGE-REQUEST; verified that building with -fcompiler-rt defines the symbol."
+                    % (arch, ", ".join(missing)))
+                print("[linux] %s: SKIPPED - core archive leaves %s undefined (see notes)"
+                      % (arch, ", ".join(missing)), flush=True)
+                continue
+
+            print("[linux] %s: building the app in %s ..." % (arch, image), flush=True)
+            # --buildtype=release matters: meson's default is a -O0 -g debug build.
+            # The gate only needs it to compile; a shipped binary needs optimisation.
+            must([ctr, "run", "--rm", "--platform", ARCH_PLATFORM[arch],
+                  "--security-opt", "label=disable", "-v", stage + ":/b", "-w", "/b",
+                  image, "sh", "-euc",
+                  # Do NOT silence meson/ninja here: they write compile errors to
+                  # stdout, so redirecting it to /dev/null turns any build failure
+                  # into a bare "exit 1" with no diagnostics to act on.
+                  "meson setup build --buildtype=release && "
+                  "meson compile -C build && strip build/less-sheet-gtk"],
+                 "GTK build for " + arch)
+            built = os.path.join(stage, "build", "less-sheet-gtk")
+            if not os.path.isfile(built):
+                die("GTK build for %s produced no binary" % arch)
+
+            # Read the real runtime requirements off the ELF rather than assuming.
+            probe = run([ctr, "run", "--rm", "--platform", ARCH_PLATFORM[arch],
+                         "--security-opt", "label=disable", "-v", stage + ":/b",
+                         image, "sh", "-euc",
+                         "readelf -d /b/build/less-sheet-gtk | grep NEEDED; echo ---; "
+                         "readelf -V /b/build/less-sheet-gtk | grep -o 'GLIBC_[0-9.]*' "
+                         "| sort -uV | tail -1"]).stdout
+            needed = re.findall(r"Shared library: \[([^\]]+)\]", probe)
+            gl = re.findall(r"GLIBC_([0-9.]+)", probe)
+            glibc = sorted(gl, key=lambda s: [int(x) for x in s.split(".")])[-1] if gl else "?"
+
+            # Lay out the tarball payload.
+            payload = os.path.join(work, "less-sheet")
+            os.makedirs(payload)
+            shutil.copy(built, os.path.join(payload, "less-sheet-gtk"))
+            os.chmod(os.path.join(payload, "less-sheet-gtk"), 0o755)
+            shutil.copy(os.path.join(gtk, "data", GTK_APP_ID + ".svg"),
+                        os.path.join(payload, GTK_APP_ID + ".svg"))
+            with open(os.path.join(payload, GTK_APP_ID + ".desktop"), "w") as fh:
+                fh.write(DESKTOP_ENTRY.format(app_id=GTK_APP_ID))
+            ish = os.path.join(payload, "install.sh")
+            with open(ish, "w") as fh:
+                fh.write(INSTALL_SH.replace("{app_id}", GTK_APP_ID))
+            os.chmod(ish, 0o755)
+            with open(os.path.join(payload, "README.txt"), "w") as fh:
+                fh.write(README_LINUX.format(version=version, arch=arch, glibc=glibc))
+
+            os.makedirs(out, exist_ok=True)
+            tpath = os.path.join(out, "less-sheet-%s-linux-%s.tar.gz" % (version, arch))
+            if os.path.exists(tpath):
+                os.remove(tpath)
+            # --no-xattrs + COPYFILE_DISABLE: macOS tar otherwise stores its own
+            # xattrs (com.apple.provenance) in the archive, and GNU tar on the
+            # user's Linux box then prints "Ignoring unknown extended header
+            # keyword" once per file. Harmless, but it makes a first unpack look
+            # like something went wrong.
+            must(["tar", "--no-xattrs", "-C", work, "-czf", tpath, "less-sheet"], "tar",
+                 env=dict(os.environ, COPYFILE_DISABLE="1"))
+
+            ran = None
+            if do_verify:
+                ran = verify_linux_tarball(ctr, arch, tpath)
+                print("[linux] %s: runs from the tarball in a clean runtime-only "
+                      "container (%s)" % (arch, ran), flush=True)
+
+            arts.append({
+                "file": os.path.basename(tpath),
+                "platform": "Linux",
+                "arch": arch,
+                "format": "tar.gz",
+                "bytes": os.path.getsize(tpath),
+                "sha256": sha256(tpath),
+                "requires": {
+                    "os": "Linux (glibc)",
+                    "glibc": ">= " + glibc,
+                    "gtk4": ">= 4.20",
+                    "libadwaita": ">= 1.8",
+                    "shared_libraries": needed,
+                    "bundled_dependencies": "none - uses the system GNOME stack",
+                    "known_good": "Fedora 43+, current Arch",
+                    "known_bad": "Debian 13 trixie (GTK 4.18)",
+                },
+                "signing": {"state": "n/a on Linux"},
+                "verified_by_running": ran,
+            })
+            # Bank each artifact as soon as it is verified. The x86_64 leg can take
+            # hours when it has to run under emulation, and an abort part-way must
+            # not lose an artifact that is already built and proven.
+            merge_outputs(out, arts, version, notes)
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+    return arts
+
+
+def verify_linux_tarball(ctr, arch, tarball):
+    """Unpack the tarball in a CLEAN fedora:43 container with only runtime deps.
+
+    Deliberately uses the upstream base image, NOT the build image: it has no
+    compiler, no -devel packages and no meson, so a success here proves the
+    artifact runs on a machine that never built it. Xvfb and dbus are test
+    scaffolding for a headless display, not app dependencies; GSK_RENDERER=cairo
+    avoids needing a GPU, and GTK_A11Y=none avoids the absent a11y bus.
+    """
+    script = r"""
+set -e
+dnf -y install --setopt=install_weak_deps=False gtk4 libadwaita \
+    xorg-x11-server-Xvfb dbus-daemon >/dev/null 2>&1
+if command -v gcc >/dev/null 2>&1 || command -v meson >/dev/null 2>&1; then
+    echo "VERIFY-FAIL: build tools present, this is not a clean runtime host" >&2
+    exit 2
+fi
+mkdir -p /t && tar -C /t -xzf /art/app.tar.gz
+printf 'id,name,city\n1,Ada,Riverside\n2,Alan,Fairview\n3,Grace,Madison\n' > /t/p.csv
+ldd /t/less-sheet/less-sheet-gtk | grep 'not found' && {
+    echo "VERIFY-FAIL: unresolved shared libraries" >&2; exit 3; }
+export LESSSHEET_GTK_TIMING=1 GTK_A11Y=none GSK_RENDERER=cairo
+# The app runs until its window closes, so `timeout` ending it is the expected
+# outcome; the verdict is whether it reported a mapped window AND a filled one.
+timeout 60 xvfb-run -a --server-args="-screen 0 1280x900x24" \
+    /t/less-sheet/less-sheet-gtk /t/p.csv > /t/out.txt 2>&1 || true
+cat /t/out.txt
+"""
+    art = tempfile.mkdtemp(prefix="ls-lxv-")
+    try:
+        shutil.copy(tarball, os.path.join(art, "app.tar.gz"))
+        r = run([ctr, "run", "--rm", "--platform", ARCH_PLATFORM[arch],
+                 "--security-opt", "label=disable", "-v", art + ":/art:ro",
+                 RUNTIME_IMAGE, "sh", "-euc", script])
+        blob = (r.stdout or "") + (r.stderr or "")
+        if "VERIFY-FAIL" in blob:
+            die("clean-container verification failed for %s:\n%s" % (arch, blob[-2000:]))
+        cold = re.search(r"ui cold-start \(main -> window mapped\):\s*([0-9.]+) ms", blob)
+        fill = re.search(r"window-fill \(open begin -> first frame\):\s*([0-9.]+) ms", blob)
+        if not (cold and fill):
+            die("the %s tarball did not open a window+file in a clean container:\n%s"
+                % (arch, blob[-2000:]))
+        return "cold-start %s ms, window-fill %s ms" % (cold.group(1), fill.group(1))
+    finally:
+        shutil.rmtree(art, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Build, verify and checksum the downloadable less-sheet artifacts.")
+    ap.add_argument("--platform", choices=("mac", "linux", "all"), default="all")
+    ap.add_argument("--arch", choices=("aarch64", "x86_64", "both"), default="both",
+                    help="Linux architectures (default both; x86_64 is emulated on ARM hosts)")
+    ap.add_argument("--mac-format", choices=("zip", "dmg", "both"), default="both")
+    ap.add_argument("--out", default=None, help="output directory (default <repo>/dist)")
+    ap.add_argument("--version", default=None, help="override the version string")
+    ap.add_argument("--skip-verify", action="store_true",
+                    help="package without running the artifacts (NOT recommended)")
+    args = ap.parse_args()
+
+    repo = find_repo()
+    zig = check_zig()
+    out = args.out or os.path.join(repo, "dist")
+    version, vwarn = resolve_version(repo, args.version)
+    do_verify = not args.skip_verify
+    notes = []
+    if vwarn:
+        notes.append(vwarn)
+
+    print("less-sheet release build")
+    print("  repo    %s" % repo)
+    print("  version %s" % version)
+    print("  zig     %s" % zig)
+    print("  out     %s" % out)
+    print("  verify  %s" % ("run each artifact" if do_verify else "DISABLED"))
+    print()
+
+    arts = []
+    if args.platform in ("mac", "all"):
+        formats = ("zip", "dmg") if args.mac_format == "both" else (args.mac_format,)
+        arts += build_macos(repo, out, version, do_verify, formats, notes)
+    if args.platform in ("linux", "all"):
+        arches = ("aarch64", "x86_64") if args.arch == "both" else (args.arch,)
+        arts += build_linux(repo, out, version, arches, do_verify, notes)
+
+    if not arts:
+        die("no artifacts were produced")
+
+    os.makedirs(out, exist_ok=True)
+    ordered, carried = merge_outputs(out, arts, version, notes)
+
+    print("\n%-44s %9s  %s" % ("ARTIFACT", "SIZE", "RUNS?"))
+    for a in ordered:
+        run_note = a["verified_by_running"] or "not verified"
+        if a["file"] in carried:
+            run_note = "(from an earlier run) " + run_note
+        print("%-44s %8.1fM  %s" % (a["file"], a["bytes"] / 1048576.0, run_note))
+    print("\nwrote %s/SHA256SUMS and %s/manifest.json" % (out, out))
+    if notes:
+        print("\nNOTES / THINGS THAT NEED A DECISION:")
+        for n in notes:
+            print("  - " + n)
+    print("\nNothing has been published. Uploading these is a separate, deliberate "
+          "step (docs/RELEASE.md).")
+
+
+if __name__ == "__main__":
+    main()
