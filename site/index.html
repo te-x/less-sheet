@@ -3,277 +3,403 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>less-sheet — open huge spreadsheets instantly</title>
-<meta name="description" content="A native macOS viewer for CSV files — local or over the network — that opens a 10 GB file as fast as a 10 KB one.">
+<title>less-sheet — open spreadsheet-sized data instantly</title>
+<meta name="description" content="A native, read-only viewer for spreadsheet-sized data. It reads CSV — plain, gzipped, or streamed from a URL — and nothing else, which is why it opens 2 GB as fast as 500 MB.">
 <style>
+  /* ---------------------------------------------------------------------
+     Zero build step, zero third-party requests, zero webfonts, and no
+     JavaScript is required for any content, the theme, or the platform
+     toggle. ARCH-frontpage decisions 7.1 / 7.3 / 7.4.
+     --------------------------------------------------------------------- */
   :root {
-    --ink: #1b1b1f;
-    --muted: #5c5c66;
-    --line: #e8e8ee;
+    color-scheme: light dark;
+    --ink: #16161a;
+    --dim: #5a5a66;
+    --line: #e6e6ee;
+    --panel: #fbfbfd;
+    --bg: #ffffff;
+    --accent: #6f63e6;
     --wash: linear-gradient(135deg, #A4ECF3 0%, #B6ADFF 100%);
-    --wash-soft: linear-gradient(135deg, rgba(164,236,243,.35) 0%, rgba(182,173,255,.35) 100%);
-    color-scheme: light;
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ink: #ececf2; --dim: #a0a0ae; --line: #2a2a33;
+      --panel: #16161b; --bg: #0e0e12; --accent: #a99cff;
+    }
   }
   * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
   body {
-    margin: 0; color: var(--ink); background: #fff;
-    font: 17px/1.65 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif;
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Cantarell, sans-serif;
     -webkit-font-smoothing: antialiased;
+    overflow-x: hidden;            /* the body never scrolls horizontally */
   }
-  .col { max-width: 780px; margin: 0 auto; padding: 0 24px; }
+  a { color: inherit; }
+  .col { max-width: 1180px; margin: 0 auto; padding: 0 24px; }
 
-  header.site { padding: 20px 0; border-bottom: 1px solid var(--line); }
-  header.site .col { display: flex; align-items: center; gap: 10px; }
-  header.site img { width: 28px; height: 28px; }
-  header.site .name { font-weight: 650; font-size: 16px; letter-spacing: -.01em; }
-  header.site nav { margin-left: auto; display: flex; gap: 22px; font-size: 15px; }
-  header.site a { color: var(--muted); text-decoration: none; }
-  header.site a:hover { color: var(--ink); }
+  /* ---- masthead ---- */
+  header.site { border-bottom: 1px solid var(--line); }
+  header.site .col { display: flex; align-items: center; gap: 10px; height: 56px; }
+  header.site img { width: 24px; height: 24px; }
+  header.site .name { font-weight: 650; letter-spacing: -.01em; }
+  header.site nav { margin-left: auto; display: flex; gap: 20px; font-size: 14.5px; }
+  header.site nav a { color: var(--dim); text-decoration: none; }
+  header.site nav a:hover { color: var(--ink); }
 
-  .hero { text-align: center; padding: 72px 0 56px; background:
-    radial-gradient(1100px 420px at 50% -80px, rgba(164,236,243,.5), rgba(182,173,255,.22) 55%, transparent 75%); }
-  .hero img.mark { width: 148px; height: 148px; filter: drop-shadow(0 14px 30px rgba(40,40,90,.18)); }
-  .hero h1 { font-size: 46px; line-height: 1.12; letter-spacing: -.02em; margin: 26px 0 0; font-weight: 750; }
-  .hero p.sub { font-size: 20px; color: var(--muted); max-width: 34em; margin: 16px auto 0; }
-  .cta { margin-top: 30px; display: flex; gap: 14px; justify-content: center; align-items: center; }
+  /* ---- the band grid: prose left, imagery right ---- */
+  .band { border-bottom: 1px solid var(--line); }
+  .band > .col {
+    display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 7fr);
+    gap: 48px; align-items: center; padding-top: 52px; padding-bottom: 52px;
+  }
+  .band .prose { min-width: 0; }
+  .band .shots { min-width: 0; }
+  .eyebrow {
+    font: 600 12px/1 var(--mono); letter-spacing: .10em; text-transform: uppercase;
+    color: var(--accent); margin-bottom: 14px;
+  }
+  .band h2 { font-size: 25px; line-height: 1.22; letter-spacing: -.015em; margin: 0 0 12px; }
+  .band p { color: var(--dim); margin: 0 0 12px; }
+  .band p strong { color: var(--ink); font-weight: 600; }
+  @media (max-width: 900px) {
+    .band > .col { grid-template-columns: 1fr; gap: 26px; }
+  }
+
+  /* ---- imagery ---- */
+  figure { margin: 0; }
+  .shot {
+    display: block; width: 100%; height: auto; border-radius: 10px;
+    border: 1px solid var(--line); background: var(--panel);
+    box-shadow: 0 18px 44px -26px rgba(30,30,60,.35);
+  }
+  figcaption { margin-top: 9px; font: 12.5px/1.45 var(--mono); color: var(--dim); }
+  .rail { display: flex; gap: 18px; overflow-x: auto; padding-bottom: 6px; scroll-snap-type: x mandatory; }
+  .rail figure { flex: 0 0 min(560px, 82%); scroll-snap-align: start; }
+
+  /* Placeholder for imagery that does not exist yet. Deliberately looks like a
+     placeholder — never like a broken image. */
+  .pending {
+    aspect-ratio: 3 / 2; display: grid; place-content: center; text-align: center;
+    border: 1px dashed var(--line); border-radius: 10px; background: var(--panel);
+    color: var(--dim); font: 12.5px/1.6 var(--mono); padding: 20px;
+  }
+
+  /* ---- CSS-only platform toggle (no JS): radios drive sibling visibility ---- */
+  .plat-in { position: absolute; opacity: 0; pointer-events: none; }
+  .seg {
+    display: inline-flex; border: 1px solid var(--line); border-radius: 9px;
+    overflow: hidden; margin-bottom: 14px; font: 13px/1 var(--mono);
+  }
+  .seg label { padding: 8px 14px; cursor: pointer; color: var(--dim); }
+  .seg label:not(:first-of-type) { border-left: 1px solid var(--line); }
+  #plat-mac:checked ~ * .seg label[for="plat-mac"],
+  #plat-linux:checked ~ * .seg label[for="plat-linux"] { background: var(--panel); color: var(--ink); font-weight: 600; }
+  .only-linux { display: none; }
+  #plat-linux:checked ~ * .only-linux { display: block; }
+  #plat-linux:checked ~ * .only-mac { display: none; }
+
+  /* ---- the hero proof pair: the scaling law IS the visual ---- */
+  .proof {
+    display: grid; grid-template-columns: auto auto; gap: 2px 18px;
+    font-family: var(--mono); margin: 22px 0 8px; width: max-content;
+  }
+  .proof .size { font-size: 15px; color: var(--dim); text-align: right; align-self: baseline; }
+  .proof .time { font-size: 30px; font-weight: 650; letter-spacing: -.02em; font-variant-numeric: tabular-nums; }
+  .proof .note { grid-column: 1 / -1; font-size: 12.5px; color: var(--dim); margin-top: 6px; }
+  .draft {
+    display: inline-block; font: 600 11px/1 var(--mono); letter-spacing: .06em;
+    color: #8a5300; background: #fff2d6; border: 1px solid #f0d9a8;
+    border-radius: 5px; padding: 4px 7px; vertical-align: 2px;
+  }
+  @media (prefers-color-scheme: dark) {
+    .draft { color: #ffcf7a; background: #37280d; border-color: #5a441a; }
+  }
+
+  h1 { font-size: 38px; line-height: 1.1; letter-spacing: -.025em; margin: 0 0 14px; }
+  .sub { font-size: 18px; color: var(--dim); margin: 0; }
+  .sub b { color: var(--ink); font-weight: 600; }
+
+  /* ---- downloads ---- */
   .btn {
-    display: inline-block; padding: 12px 26px; border-radius: 12px; font-weight: 600; font-size: 16px;
+    display: inline-block; padding: 11px 22px; border-radius: 10px; font-weight: 600;
     text-decoration: none; color: #14141a; background: var(--wash);
-    box-shadow: 0 6px 18px rgba(120,110,220,.35), inset 0 1px 0 rgba(255,255,255,.55);
+    box-shadow: 0 5px 16px rgba(120,110,220,.3), inset 0 1px 0 rgba(255,255,255,.5);
   }
-  .btn:hover { filter: brightness(1.04); }
-  .btn.secondary {
-    background: #fff; border: 1.5px solid #c9c4ef; box-shadow: none; color: var(--ink);
+  .dl { display: grid; gap: 26px; grid-template-columns: repeat(auto-fit, minmax(270px, 1fr)); }
+  .dl h3 { margin: 0 0 8px; font-size: 16px; }
+  .reqs { font: 12.5px/1.55 var(--mono); color: var(--dim); margin: 10px 0 0; }
+  .gk {
+    margin-top: 12px; padding: 12px 14px; border-radius: 9px;
+    background: var(--panel); border: 1px solid var(--line);
+    font-size: 13.5px; line-height: 1.55; color: var(--dim);
   }
-  .btn.secondary:hover { border-color: #a89ff0; }
-  .cta-fine { margin-top: 12px; font-size: 13.5px; color: var(--muted); }
+  .gk b { color: var(--ink); }
+  .pills { display: flex; gap: 9px; flex-wrap: wrap; margin-top: 12px; }
+  .pill { padding: 6px 13px; border-radius: 99px; border: 1px solid var(--line); font: 13px/1.4 var(--mono); }
+  .pill.on { border-color: transparent; background: var(--wash); color: #14141a; }
+  .pill.off { color: var(--dim); }
 
-  .shot { display: block; width: 100%; border-radius: 14px; border: 1px solid var(--line);
-          box-shadow: 0 24px 60px -24px rgba(40,40,90,.28); }
-  .hero .shotwrap { margin: 40px auto 0; max-width: 980px; padding: 0 24px; }
-  .split { position: relative; aspect-ratio: 1832 / 1054; border-radius: 14px; overflow: hidden;
-           box-shadow: 0 26px 60px -22px rgba(40,40,90,.35), 0 0 0 1px var(--line); }
-  .split img { position: absolute; inset: 0; width: 100%; height: 100%; }
-  .split img.dark { clip-path: polygon(58% 0, 100% 0, 100% 100%, 42% 100%); }
-  .split-caption { margin-top: 14px; font-size: 13.5px; color: var(--muted); text-align: center; }
-  /* Full-bleed strip: breaks out of the centered column to span the viewport. */
-  .strip { display: flex; gap: 22px; overflow-x: auto; scroll-snap-type: x mandatory;
-           margin-top: 26px; padding: 4px 0 16px; scrollbar-width: thin;
-           width: 100vw; margin-left: calc(50% - 50vw);
-           padding-left: max(24px, calc(50vw - 345px)); padding-right: 24px;
-           scroll-padding-left: max(24px, calc(50vw - 345px)); }
-  .strip figure { flex: 0 0 min(690px, 88vw); scroll-snap-align: start; margin: 0; }
-  .strip img { display: block; width: 100%; border-radius: 14px;
-               box-shadow: 0 22px 50px -20px rgba(40,40,90,.33), 0 0 0 1px var(--line); }
-  .strip figcaption { margin-top: 10px; font-size: 13.5px; color: var(--muted); text-align: center; }
+  /* ---- comparison ---- */
+  .cmp { width: 100%; border-collapse: collapse; font-size: 14.5px; }
+  .cmp th, .cmp td { text-align: left; padding: 11px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  .cmp thead th { font: 600 12px/1 var(--mono); letter-spacing: .07em; text-transform: uppercase; color: var(--dim); }
+  .cmp td:first-child { color: var(--dim); }
+  .cmp-wrap { overflow-x: auto; }
 
-  section.feature { padding: 64px 0 8px; }
-  section.feature h2 { font-size: 27px; letter-spacing: -.015em; margin: 0 0 10px; font-weight: 700; }
-  section.feature h2 .tick { display: inline-block; width: 26px; height: 8px; border-radius: 4px;
-    background: var(--wash); margin-right: 12px; vertical-align: middle; }
-  section.feature p { color: #3a3a44; max-width: 44em; }
-  section.feature .shot { margin-top: 26px; }
-  .trio { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-top: 26px; }
-  .trio figure { margin: 0; }
-  .trio img { display: block; width: 100%; border-radius: 10px; border: 1px solid var(--line);
-              box-shadow: 0 14px 34px -18px rgba(40,40,90,.25); }
-  .trio figcaption { font-size: 13px; color: var(--muted); text-align: center; margin-top: 8px; }
-  @media (max-width: 640px) { .trio { grid-template-columns: 1fr; } }
-
-  .bench { padding: 72px 0 8px; }
-  .bench h2 { font-size: 27px; margin-bottom: 6px; }
-  .bench p.lead { color: #3a3a44; max-width: 44em; }
-  .rows { margin-top: 30px; display: grid; gap: 22px; }
-  .brow { display: grid; grid-template-columns: 200px 1fr; gap: 18px; align-items: center; }
-  .brow .what .t { font-weight: 650; }
-  .brow .what .s { color: var(--muted); font-size: 13.5px; }
-  .barwrap { }
-  .bar { display: flex; height: 30px; border-radius: 8px; overflow: hidden;
-         background: #f4f4f8; border: 1px solid var(--line); }
-  .bar .app { background: var(--wash-soft); }
-  .bar .data { background: #1b1b1f; }
-  .bar-label { margin-top: 6px; font-size: 13.5px; color: var(--muted);
-               font-variant-numeric: tabular-nums; display: flex; justify-content: space-between; }
-  .legend { display: flex; gap: 22px; margin-top: 26px; font-size: 13.5px; color: var(--muted); }
-  .legend .sw { display: inline-block; width: 14px; height: 14px; border-radius: 4px;
-                vertical-align: -2px; margin-right: 7px; border: 1px solid var(--line); }
-  .legend .sw.app { background: var(--wash-soft); }
-  .legend .sw.data { background: #1b1b1f; border-color: #1b1b1f; }
-  .method { font-size: 13.5px; color: var(--muted); margin-top: 20px; }
-
-  .formats { padding: 48px 0 8px; }
-  .formats .pills { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 14px; }
-  .pill { padding: 8px 16px; border-radius: 999px; border: 1px solid var(--line); font-size: 14.5px; font-weight: 600; }
-  .pill.on { background: var(--wash-soft); border-color: transparent; }
-  .pill.off { color: var(--muted); font-weight: 500; }
-
-  footer { margin-top: 88px; border-top: 1px solid var(--line); padding: 36px 0 56px;
-           font-size: 14px; color: var(--muted); }
-  footer .col { display: flex; gap: 12px; flex-wrap: wrap; justify-content: space-between; }
-  @media (max-width: 640px) {
-    .hero h1 { font-size: 34px; }
-    .brow { grid-template-columns: 1fr; gap: 8px; }
-  }
+  footer { padding: 34px 0 56px; font-size: 13.5px; color: var(--dim); }
+  footer .col { display: flex; gap: 14px; flex-wrap: wrap; justify-content: space-between; }
 </style>
 </head>
 <body>
 
+<!-- Platform radios live before everything so the sibling selectors above can
+     reach the whole page. Hidden inputs; the visible control is .seg below. -->
+<input class="plat-in" type="radio" name="plat" id="plat-mac" checked>
+<input class="plat-in" type="radio" name="plat" id="plat-linux">
+
+<div>
 <header class="site">
   <div class="col">
     <img src="assets/logo.svg" alt=""><span class="name">less-sheet</span>
-    <nav><a href="#benchmarks">Benchmarks</a><a href="#download">Download</a></nav>
+    <nav>
+      <a href="#speed">Speed</a>
+      <a href="#compare">vs. Excel</a>
+      <a href="#download">Download</a>
+    </nav>
   </div>
 </header>
 
-<div class="hero">
+<!-- B1 ------------------------------------------------------------------ -->
+<section class="band" id="speed">
   <div class="col">
-    <img class="mark" src="assets/logo.svg" alt="less-sheet icon">
-    <h1>Open huge spreadsheets, instantly.</h1>
-    <p class="sub">A native macOS viewer for CSV files — local or straight from a URL — built on one
-    rule: a 10&nbsp;GB file must open as fast as a 10&nbsp;KB one.</p>
-    <div class="cta" id="download">
-      <a class="btn" href="#">Download</a>
-      <a class="btn secondary" href="#">Buy</a>
+    <div class="prose">
+      <h1>Open spreadsheet-sized data, instantly.</h1>
+      <p class="sub">A native, read-only viewer for tabular data. It reads
+        <b>CSV — plain, gzipped, or streamed straight from a URL</b> — and nothing
+        else, which is exactly why it opens 2&nbsp;GB as fast as 500&nbsp;MB.</p>
+
+      <div class="proof">
+        <div class="size">500 MB</div><div class="time">~100 ms</div>
+        <div class="size">2 GB</div><div class="time">~103 ms</div>
+        <div class="note">Cold open to first rows on screen. Four times the data,
+          the same wait — on a 7200 rpm spinning disk.
+          <span class="draft">DRAFT NUMBERS — NOT YET RE-MEASURED</span></div>
+      </div>
+
+      <p style="margin-top:18px"><a class="btn" href="#download">Download</a></p>
+      <p class="reqs">Free. macOS 26+ · Linux (GNOME 49-generation)</p>
     </div>
-    <div class="cta-fine">Pay what you want — the download is full and free.</div>
+
+    <div class="shots">
+      <div class="seg">
+        <label for="plat-mac">macOS</label><label for="plat-linux">Linux</label>
+      </div>
+      <figure class="only-mac">
+        <picture>
+          <source media="(prefers-color-scheme: dark)"
+                  srcset="assets/shots/shot-hero-macos-dark.avif">
+          <img class="shot" src="assets/shots/shot-hero-macos-light.avif"
+               width="1920" height="1240" alt="less-sheet showing a large CSV">
+        </picture>
+        <figcaption>The window is the data. Nothing else.</figcaption>
+      </figure>
+      <figure class="only-linux">
+        <div class="pending">Linux screenshots not captured yet<br>
+          — placeholder, not a broken image —</div>
+        <figcaption>GNOME build, same features.</figcaption>
+      </figure>
+    </div>
   </div>
-  <div class="shotwrap">
-    <div class="split">
-      <img src="assets/shot-light.png" alt="less-sheet in light mode">
-      <img class="dark" src="assets/shot-dark.png" alt="less-sheet in dark mode">
+</section>
+
+<!-- B2 ------------------------------------------------------------------ -->
+<section class="band">
+  <div class="col">
+    <div class="prose">
+      <div class="eyebrow">Reads like less</div>
+      <h2>It never loads the file.</h2>
+      <p>less-sheet maps the file and parses only the rows in view, so opening is
+        measured in milliseconds regardless of size and <strong>memory stays flat
+        while you scroll through gigabytes</strong>.</p>
+      <p>Jump to any row — including row 100,000,000 — and it lands there without
+        reading what came before. Anything that isn't instant shows progress and
+        can be cancelled. Nothing blocks the window.</p>
+      <p>Point it at an <strong>HTTP(S) URL</strong> and it behaves the same way:
+        only the bytes you actually look at are ever fetched.</p>
     </div>
-    <div class="split-caption">One window on the data — light and dark, natively.</div>
+    <div class="shots">
+      <figure class="only-mac">
+        <picture>
+          <source media="(prefers-color-scheme: dark)"
+                  srcset="assets/shots/shot-jump-macos-dark.avif">
+          <img class="shot" src="assets/shots/shot-jump-macos-light.avif"
+               width="1800" height="1200" alt="Jump-to-row control" loading="lazy" decoding="async">
+        </picture>
+        <figcaption>Jump to any row, at any file size.</figcaption>
+      </figure>
+      <figure class="only-linux"><div class="pending">Linux screenshot pending</div></figure>
+    </div>
   </div>
-</div>
+</section>
 
-<div class="col">
-
-  <section class="feature">
-    <h2><span class="tick"></span>Reads like less, looks like a spreadsheet</h2>
-    <p>less-sheet does for tabular data what <code>less</code> does for text: it shows the part
-    you're looking at and nothing else. Files are never loaded, converted, or copied — the viewer
-    maps the file and parses only the rows in view, so opening is measured in milliseconds
-    regardless of size, and memory stays flat while you scroll through gigabytes.</p>
-  </section>
-
-  <section class="feature">
-    <h2><span class="tick"></span>Streams from a URL — never downloads the file</h2>
-    <p>Point it at an HTTP(S) link and it opens the file the same way: only the bytes you actually
-    look at are ever fetched. Opening a 5&nbsp;GB CSV from a server transfers a few megabytes; scrolling,
-    searching, and jumping fetch just enough to answer. Compressed <code>.csv.gz</code> streams and
-    inflates on the fly, without a temporary download.</p>
-  </section>
-
-  <section class="feature">
-    <h2><span class="tick"></span>Find, filter, jump — with honest progress</h2>
-    <p>Incremental search with live match counts, typed column predicates
-    (<code>qty&nbsp;≤&nbsp;2</code>), filtered views, and jump-to-row that lands exactly — even at row
-    100,000,000. Anything that isn't instant shows its progress and can be cancelled; nothing ever
-    blocks the window.</p>
-    <div class="strip">
-      <figure>
-        <img src="assets/shot-search.png" alt="Text search with highlighted matches">
-        <figcaption>Text search — live match count, every visible match highlighted.</figcaption>
-      </figure>
-      <figure>
-        <img src="assets/shot-where.png" alt="Where search with a typed column predicate">
-        <figcaption>Where — typed column predicates: city&nbsp;=&nbsp;Lisbon.</figcaption>
-      </figure>
-      <figure>
-        <img src="assets/shot-filtered.png" alt="Filtered view showing only matching rows">
-        <figcaption>Filter to matches — 223 of 4.0K rows, original row numbers kept.</figcaption>
-      </figure>
-      <figure>
-        <img src="assets/shot-jump.png" alt="Jump-to-row popup">
-        <figcaption>Jump to any row — at any file size.</figcaption>
-      </figure>
+<!-- B3 ------------------------------------------------------------------ -->
+<section class="band">
+  <div class="col">
+    <div class="prose">
+      <div class="eyebrow">Guessed, then yours</div>
+      <h2>Change how it's parsed without reopening it.</h2>
+      <p>Separator, quote character, header row and text encoding are detected
+        from the file itself — open and read, no import dialog.</p>
+      <p>When the guess is wrong, every one of those is a <strong>live
+        control</strong>: change it and the open document re-renders. No closing
+        the file, no re-importing, no starting again.</p>
     </div>
-  </section>
+    <div class="shots">
+      <figure class="only-mac">
+        <picture>
+          <source media="(prefers-color-scheme: dark)"
+                  srcset="assets/shots/shot-dialect-macos-dark.avif">
+          <img class="shot" src="assets/shots/shot-dialect-macos-light.avif"
+               width="1800" height="1200" alt="Separator and quote controls" loading="lazy" decoding="async">
+        </picture>
+        <figcaption>Separator guessed from the file — one click to override.</figcaption>
+      </figure>
+      <figure class="only-linux"><div class="pending">Linux screenshot pending</div></figure>
+    </div>
+  </div>
+</section>
 
-  <section class="feature">
-    <h2><span class="tick"></span>Guessed automatically, yours to override</h2>
-    <p>Separator, quote character, header row, and text encoding are detected from the file itself —
-    open and read, no import dialog. When a file disagrees with the guess, every one of those is a
-    click away in the floating controls or in Settings.</p>
-    <img class="shot" src="assets/shot-sep.png" alt="Separator override panel over the grid">
-    <div class="split-caption">Separator guessed from the file — one click to override.</div>
-  </section>
+<!-- B4 ------------------------------------------------------------------ -->
+<section class="band">
+  <div class="col">
+    <div class="prose">
+      <div class="eyebrow">Find · filter · jump</div>
+      <h2>Search a file you can't open elsewhere.</h2>
+      <p>Incremental search with live match counts, typed column predicates
+        (<code>qty&nbsp;≤&nbsp;2</code>), and filtered views that keep the original
+        row numbers so you always know where you are in the real file.</p>
+      <p>Copy returns the <strong>original values</strong> — not what the screen
+        happens to be formatting.</p>
+    </div>
+    <div class="shots">
+      <div class="rail only-mac">
+        <figure>
+          <picture>
+          <source media="(prefers-color-scheme: dark)"
+                  srcset="assets/shots/shot-search-macos-dark.avif">
+          <img class="shot" src="assets/shots/shot-search-macos-light.avif"
+               width="1800" height="1200" alt="Text search with live match count" loading="lazy" decoding="async">
+        </picture>
+          <figcaption>Live match count, every visible match highlighted.</figcaption>
+        </figure>
+        <figure>
+          <picture>
+          <source media="(prefers-color-scheme: dark)"
+                  srcset="assets/shots/shot-filter-macos-dark.avif">
+          <img class="shot" src="assets/shots/shot-filter-macos-light.avif"
+               width="1800" height="1200" alt="Typed column predicate" loading="lazy" decoding="async">
+        </picture>
+          <figcaption>Typed column predicates.</figcaption>
+        </figure>
+      </div>
+      <div class="only-linux"><div class="pending">Linux screenshots pending</div></div>
+    </div>
+  </div>
+</section>
 
-  <section class="feature">
-    <h2><span class="tick"></span>Settings for the rest</h2>
-    <p>Per-column control lives in Settings: types, number and date formatting, visibility, and
-    widths — display-only transforms over the untouched source file. Copying and searching always
-    use the original values.</p>
-    <img class="shot" src="assets/shot-settings.png" alt="Settings: parsing options and per-column controls" style="max-width: 620px; margin-left: auto; margin-right: auto;">
-  </section>
+<!-- B5 ------------------------------------------------------------------ -->
+<section class="band" id="compare">
+  <div class="col">
+    <div class="prose">
+      <div class="eyebrow">The same CSV, opened in each</div>
+      <h2>Why a spreadsheet struggles with this.</h2>
+      <p>Nothing here is a knock on spreadsheets — they're built to edit and
+        compute. That design costs them the things a viewer needs.</p>
+      <p>less-sheet is <strong>read-only by design</strong>. Formatting is a
+        display transform over untouched bytes, so what you see never becomes what
+        your file contains.</p>
+    </div>
+    <div class="shots cmp-wrap">
+      <table class="cmp">
+        <thead><tr><th></th><th>Spreadsheet</th><th>less-sheet</th></tr></thead>
+        <tbody>
+          <tr><td>Opening</td><td>Imports the whole file before showing anything</td>
+              <td>Shows the viewport; reads nothing else</td></tr>
+          <tr><td>Row limit</td><td>1,048,576</td><td>None</td></tr>
+          <tr><td>Your values</td><td>Rewrites on import — leading zeros dropped,
+              <code>1-5</code> becomes a date, long IDs go scientific</td>
+              <td>Never modified; copy returns the original</td></tr>
+          <tr><td>Separator / quote</td><td>A one-shot dialog, before you see the data</td>
+              <td>Live controls, after</td></tr>
+          <tr><td>Memory</td><td>Scales with the file</td><td>Flat</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
 
-  <section class="bench" id="benchmarks">
-    <h2>Benchmarks</h2>
-    <p class="lead">Launch to rows on screen, cold, on an Apple silicon MacBook Pro. The light
-    segment is the app starting up — the same ~170&nbsp;ms every run; the dark segment is the work
-    that depends on the file.</p>
+<!-- B6 ------------------------------------------------------------------ -->
+<section class="band" id="download">
+  <div class="col">
+    <div class="prose">
+      <div class="eyebrow">Download</div>
+      <h2>Free, and small.</h2>
+      <p>No account, no licence, no telemetry. Checksums are published beside
+        every build.</p>
+      <div class="pills">
+        <span class="pill on">CSV</span>
+        <span class="pill on">CSV.GZ</span>
+        <span class="pill on">HTTP(S) URLs</span>
+        <span class="pill off">More formats later</span>
+      </div>
+    </div>
 
-    <div class="rows">
-      <!-- scale: 100% = 280ms -->
-      <div class="brow">
-        <div class="what"><div class="t">CSV · local</div><div class="s">5.4 GB</div></div>
-        <div class="barwrap">
-          <div class="bar"><div class="app" style="width:61%"></div><div class="data" style="width:2.2%"></div></div>
-          <div class="bar-label"><span>177 ms</span><span>data: 6 ms · memory 34 MB</span></div>
+    <div class="shots">
+      <div class="dl">
+        <div>
+          <h3>macOS</h3>
+          <a class="btn" href="DOWNLOAD_BASE/less-sheet-VERSION-macos-arm64.dmg">Download&nbsp;.dmg</a>
+          <p class="reqs">macOS 26.0+ · Apple silicon · ~3.3 MB<br>
+            Reads: CSV · CSV.GZ · http(s)</p>
+          <div class="gk">
+            <b>First launch takes one extra step.</b> This build is signed, but not
+            notarized through Apple's paid developer programme — it's a free app.
+            macOS will refuse it until you allow it once:
+            <b>System&nbsp;Settings → Privacy&nbsp;&amp;&nbsp;Security → “Open Anyway”</b>.
+            After that it opens normally.
+          </div>
+        </div>
+        <div>
+          <h3>Linux</h3>
+          <a class="btn" href="DOWNLOAD_BASE/less-sheet-VERSION-linux-x86_64.tar.gz">Download&nbsp;.tar.gz</a>
+          <p class="reqs">
+            x86_64 · ~0.8 MB &nbsp;·&nbsp;
+            <a href="DOWNLOAD_BASE/less-sheet-VERSION-linux-aarch64.tar.gz">aarch64</a><br>
+            glibc 2.34+ · GTK 4.20 / libadwaita 1.8<br>
+            Fedora 43+ and current Arch. <b>Debian 13 ships GTK 4.18 and will not
+            run this build.</b><br>
+            Reads: CSV · CSV.GZ · http(s)</p>
+          <div class="gk">A Flatpak, which carries its own GNOME runtime and works
+            regardless of your distribution's version, is planned.</div>
         </div>
       </div>
-      <div class="brow">
-        <div class="what"><div class="t">CSV.GZ · local</div><div class="s">158 MB · 1.1 GB uncompressed</div></div>
-        <div class="barwrap">
-          <div class="bar"><div class="app" style="width:61%"></div><div class="data" style="width:15.4%"></div></div>
-          <div class="bar-label"><span>201 ms</span><span>data: 43 ms · memory 38 MB</span></div>
-        </div>
-      </div>
-      <div class="brow">
-        <div class="what"><div class="t">CSV · over HTTP</div><div class="s">5.4 GB — fetched only 4.4 MB</div></div>
-        <div class="barwrap">
-          <div class="bar"><div class="app" style="width:61%"></div><div class="data" style="width:36%"></div></div>
-          <div class="bar-label"><span>≈270 ms</span><span>data: 101 ms · memory ≈33 MB</span></div>
-        </div>
-      </div>
-      <div class="brow">
-        <div class="what"><div class="t">CSV.GZ · over HTTP</div><div class="s">158 MB — fetched only 1.2 MB</div></div>
-        <div class="barwrap">
-          <div class="bar"><div class="app" style="width:61%"></div><div class="data" style="width:27.5%"></div></div>
-          <div class="bar-label"><span>≈240 ms</span><span>data: 77 ms · memory ≈37 MB</span></div>
-        </div>
-      </div>
+      <p class="reqs" style="margin-top:18px">
+        <a href="DOWNLOAD_BASE/SHA256SUMS">SHA256SUMS</a> ·
+        <span class="draft">LINKS NOT LIVE — DOWNLOAD_BASE AND VERSION ARE PLACEHOLDERS</span>
+      </p>
     </div>
-
-    <div class="legend">
-      <span><span class="sw app"></span>app launch &amp; render — constant</span>
-      <span><span class="sw data"></span>reading your data</span>
-    </div>
-
-    <p class="method">Median of 3 cold runs; memory is <code>phys_footprint</code> at steady state.
-    The launch segment is drawn at its cross-run median (≈170&nbsp;ms); run to run it varies by
-    about ±10&nbsp;ms, independent of the file. Network rows measured over localhost — timing
-    depends on the connection, the bytes fetched don't.</p>
-  </section>
-
-  <section class="formats">
-    <h2 style="font-size:27px">Formats</h2>
-    <div class="pills">
-      <span class="pill on">CSV</span>
-      <span class="pill on">CSV.GZ</span>
-      <span class="pill off">More formats coming soon</span>
-    </div>
-  </section>
-
-</div>
+  </div>
+</section>
 
 <footer>
   <div class="col">
-    <span>less-sheet — a spreadsheet viewer built for speed.</span>
-    <span>macOS 26+ · Apple silicon</span>
+    <span>less-sheet — a viewer for data that's too big to open.</span>
+    <span>macOS 26+ · Linux</span>
   </div>
 </footer>
-
+</div>
 
 </body>
 </html>
