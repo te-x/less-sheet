@@ -70,6 +70,75 @@
 /* Per-pull chunk the copy worker frames. */
 #define COPY_CHUNK_BYTES (1u << 16)
 
+/* ------------------------------------------------------------------------- */
+/* Screenshot-capture affordance (LESSSHEET_GTK_CAPTURE) — the state type. The
+ * whole contract, and every reason it looks the way it does, is documented at
+ * the capture section near the bottom of this file. The types live up here
+ * because the state is a field of App and three paths report into it.
+ */
+/* ------------------------------------------------------------------------- */
+
+/* The five frontpage presentation states, in the page's own order. NONE is
+ * every normal run: nothing is armed and nothing runs. */
+typedef enum
+{
+  LSG_CAPTURE_NONE = 0,
+  LSG_CAPTURE_HERO,    /* a document open, nothing else */
+  LSG_CAPTURE_JUMP,    /* jump control open, landed on a large row */
+  LSG_CAPTURE_DIALECT, /* the separator dropdown open over the grid */
+  LSG_CAPTURE_SEARCH,  /* live find: final match count + highlights */
+  LSG_CAPTURE_FILTER,  /* filtered view + the find popover's toggle on */
+} LsgCaptureShot;
+
+/* Where the one-shot settle machine is. It only ever moves forwards, except
+ * PAINTING -> SETTLING when a settled state regresses before it is announced.
+ */
+typedef enum
+{
+  LSG_CAPTURE_STAGE_IDLE = 0, /* unarmed, or the first data paint not seen */
+  LSG_CAPTURE_STAGE_ARMING,   /* first data paint seen; arming on an idle  */
+  LSG_CAPTURE_STAGE_SETTLING, /* driven; waiting for the promised state    */
+  LSG_CAPTURE_STAGE_PAINTING, /* state reached; waiting for painted frames */
+  LSG_CAPTURE_STAGE_TERMINAL, /* the one marker is printed; nothing left   */
+} LsgCaptureStage;
+
+/* Frame boundaries the settled state must survive, PAST the frame that painted
+ * it, before the marker is printed — so the frame carrying the settled cells
+ * has been handed to the compositor before the tool is told to shoot. */
+#define LSG_CAPTURE_SETTLE_FRAMES 2
+/* How long the last state-changing drive must have been quiet before a settled
+ * state is announced. The find entry is a GtkSearchEntry, so setting its text
+ * schedules a "search-changed" ~150 ms LATER that re-runs the query and flips
+ * the count back to "Searching…"; announcing in front of that pending re-run
+ * would hand the tool a window that is about to change. The ONE knob for "no
+ * further self-inflicted change is pending", at ~2.6x the toolkit's delay.
+ * This never REPLACES the settle predicate — both must hold. */
+#define LSG_CAPTURE_QUIET_MS 400
+/* Hard budget before the hook gives up and says so, so a capture tool waiting
+ * on a marker fails loudly instead of hanging forever. */
+#define LSG_CAPTURE_BUDGET_MS 60000
+
+/* The capture hook's whole state: all-zero (NONE / IDLE) unless the env var
+ * arms it. `env` BORROWS the process environment (valid for the process
+ * lifetime); the hook allocates nothing until it is armed. */
+typedef struct
+{
+  const char *env;     /* LESSSHEET_GTK_CAPTURE verbatim; NULL == inert */
+  LsgCaptureShot shot; /* parsed at arm time, never before */
+  LsgCaptureStage stage;
+  guint tick_id;       /* frame-clock tick callback (0 == none) */
+  gint64 t_arm;        /* arm instant (monotonic µs): the budget's base */
+  gint64 t_drive;      /* last state-changing drive: the quiet window's base */
+  gboolean paint_seen; /* a data-bearing frame carried the settled state */
+  gint64 paint_frame;  /* that frame's GdkFrameClock counter */
+  guint32 paint_rows;  /* and the cells it actually carried — the proof that */
+  guint32 paint_cols;  /* the window is not a half-painted empty grid */
+  gboolean jump_landed;   /* jump_poll_fold observed a LANDED   */
+  gboolean jump_reject;   /* ... or a REJECTED (honest failure) */
+  gboolean jump_reopened; /* the popover has been re-presented after landing */
+  guint64 jump_row;       /* the landed 0-based data row */
+} LsgCaptureState;
+
 typedef struct
 {
   AdwApplication *app;
@@ -283,6 +352,11 @@ typedef struct
   gint64 t_open_begin;          /* file-open begin (monotonic µs) */
   gboolean first_frame_pending; /* one-shot: awaiting the first painted grid
                                    frame */
+
+  /* Env-gated screenshot-capture affordance (LESSSHEET_GTK_CAPTURE). Entirely
+   * inert — no output, no allocation, no frame-clock work — unless
+   * `capture.env` is non-NULL, which only the env var can make it. */
+  LsgCaptureState capture;
 } App;
 
 /* Selection modes (slice 5): a cell rectangle, whole rows (gutter drag), or
@@ -419,6 +493,16 @@ static void
 settings_reopen_apply (App *app); /* F5 re-anchor + F7 replay/reset */
 static void column_cache_effective (App *app, guint32 col); /* fmt kind/sem */
 static void reopen_state_clear (App *app); /* drop a pending dialect re-open */
+
+/* Screenshot-capture affordance (LESSSHEET_GTK_CAPTURE): the three report
+ * hooks into the one-shot settle machine defined near the bottom of this file.
+ * Each is a single test away from a no-op when the hook is not armed — which
+ * is every normal run, including the LESSSHEET_GTK_TIMING cold-start
+ * measurement.
+ */
+static void capture_note_paint (App *app, guint32 rows, guint32 cols);
+static void capture_note_find_run (App *app);
+static void capture_note_jump (App *app, gboolean landed, guint64 row);
 
 /* ------------------------------------------------------------------------- */
 /* View teardown */
@@ -1160,6 +1244,14 @@ grid_draw (GtkDrawingArea *area, cairo_t *cr, int width, int height,
   cairo_stroke (cr);
 
   g_object_unref (layout);
+
+  /* Screenshot-capture affordance: report THIS completed frame — and, on the
+   * first DATA-bearing one, arm the hook (the same moment the window-fill
+   * marker above calls "first frame"). Deliberately at the BOTTOM of the draw,
+   * not beside that marker: a capture must never be gated on a frame whose
+   * cells are not drawn yet, which is exactly how the macOS filter shot came
+   * out with a perfect popover and no cell text. */
+  capture_note_paint (app, got_rows, got_cols);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -2318,6 +2410,7 @@ find_run_query (App *app)
   filter_update_toggle_sensitivity (
       app); /* canApplyFilter follows the query */
   gtk_widget_queue_draw (GTK_WIDGET (app->area));
+  capture_note_find_run (app); /* a query was (re)issued — see the hook */
 }
 
 /* Forward-declared above; folds one search poll into the display. */
@@ -2958,11 +3051,15 @@ jump_poll_fold (App *app)
     {
     case LSG_JUMP_FLOW_LANDED:
       scroll_to_first_row (app, app->jump.landed_row);
+      /* Observed BEFORE the popdown: the popdown resets the flow to idle, so
+       * this is the only place a capture can learn the landing happened. */
+      capture_note_jump (app, TRUE, app->jump.landed_row);
       gtk_popover_popdown (app->jump_popover); /* closes -> resets to idle */
       break;
     case LSG_JUMP_FLOW_REJECTED:
       if (app->jump.has_restore)
         scroll_to_first_row (app, app->jump.restore_first_row);
+      capture_note_jump (app, FALSE, 0);
       jump_reject_feedback (app);
       /* Keep the field open + re-armed; the flow is terminal (not scanning).
        */
@@ -3066,6 +3163,10 @@ do_jump_submit (App *app)
     }
   else
     {
+      /* The jump has TWO reject paths and a capture must see both: this
+       * UPFRONT one (unparseable, or past a known-exact last row — no scan, no
+       * move) and the post-scan one in jump_poll_fold. */
+      capture_note_jump (app, FALSE, 0);
       jump_reject_feedback (app); /* upfront reject: no scan, no move */
     }
   jump_update_ui (app);
@@ -4294,6 +4395,15 @@ on_window_destroy (GtkWidget *widget, gpointer data)
     {
       g_source_remove (app->prefs_infer_poll_id);
       app->prefs_infer_poll_id = 0;
+    }
+  /* The capture settle machine's frame-clock tick — removed here, while
+   * app->area is still a live widget, for the same leaf-before-root reason the
+   * timers above are. Always 0 in an unarmed run. */
+  if (app->capture.tick_id != 0 && app->area != NULL)
+    {
+      gtk_widget_remove_tick_callback (GTK_WIDGET (app->area),
+                                       app->capture.tick_id);
+      app->capture.tick_id = 0;
     }
   app->window = NULL;
   app->title_box = NULL;
@@ -6635,6 +6745,577 @@ register_app_shortcuts (App *app, GApplication *gapp)
     }
 }
 
+/* ========================================================================= */
+/* Screenshot-capture affordance (LESSSHEET_GTK_CAPTURE)                     */
+/*                                                                          */
+/* The frontpage shows five screenshots per platform (hero / jump / dialect /
+ */
+/* search / filter) behind a macOS|Linux toggle. The macOS ten are captured  */
+/* by tools/shots/capture_shots photographing the REAL window; the Linux     */
+/* column was placeholders because this app took a file path and one env var */
+/* (LESSSHEET_GTK_TIMING) — there was no way to reach the other four states. */
+/* This is the GTK half of apps/macos/Sources/LessSheetApp/CaptureProbe.swift
+ */
+/* and it keeps that file's two rules:                                       */
+/*                                                                          */
+/*   INERT UNLESS ASKED. With LESSSHEET_GTK_CAPTURE unset, main() does one   */
+/*     g_getenv and nothing else: no parse, no allocation, no frame-clock    */
+/*     work, and the three report hooks are one struct test from a no-op. So */
+/*     this never appears in the < 500 ms cold-start LESSSHEET_GTK_TIMING    */
+/*     measures.                                                            */
+/*   NEVER BEFORE THE FIRST DATA-BEARING PAINT. The hook arms at the END of  */
+/*     the first grid_draw that painted actual rows AND columns — the same */
+/*     moment the window-fill marker reports, taken at frame completion */
+/*     instead of frame entry.                                              */
+/*                                                                          */
+/* ENV SURFACE (the whole of it):                                            */
+/*   LESSSHEET_GTK_CAPTURE=hero|jump|dialect|search|filter */
+/*   LESSSHEET_GTK_CAPTURE_QUERY=<text>   search + filter: the find query */
+/*   LESSSHEET_GTK_CAPTURE_ROW=<n>        jump: the row, exactly as typed */
+/* An armed run that cannot use its arguments says so and stops; it never */
+/* degrades into a different shot.                                          */
+/*                                                                          */
+/* DELIBERATELY NOT HERE, because the platform already provides it: */
+/*   THEME — libadwaita honours ADW_DEBUG_COLOR_SCHEME=prefer-dark | */
+/*     prefer-light | default itself (verified against the pinned container's
+ */
+/*     libadwaita 1.8.6), so both page variants come for free. macOS needed */
+/*     LESSSHEET_CAPTURE_APPEARANCE only because AppKit has no such hook. */
+/*   GEOMETRY — the window is sized by the compositor from outside (a */
+/*     Hyprland/sway rule on the app id), which under Wayland is the only */
+/*     authority anyway: a client can request a size, not impose one. And */
+/*     unlike the macOS window this one autosaves no frame — it opens at a */
+/*     fixed default size every run — so there is no geometry to pin.        */
+/*   WINDOW ID — macOS prints one because `screencapture -l` takes a */
+/*     CGWindowID. Wayland has no client-visible window id; the compositor */
+/*     side matches on the app id (LSG_APP_ID) and title, both already set. */
+/*                                                                          */
+/* THE STATES ARE DRIVEN THROUGH THE APP'S REAL HANDLERS — the same entry */
+/* points a click or a keystroke reaches (open_find / open_jump are the */
+/* Ctrl+F / Ctrl+G actions, gtk_menu_button_popup is the separator button's */
+/* own click, do_jump_submit is Enter, and the filter is turned on by setting
+ */
+/* the toggle ACTIVE so its "toggled" handler runs). Nothing here            */
+/* reimplements a feature and nothing synthesizes an input event, because a */
+/* screenshot of a fake state is worse than no screenshot.                   */
+/*                                                                          */
+/* THE SETTLE MARKER IS THE POINT. The capture tool gates on the app's own */
+/* marker and never on a sleep, so each state announces when it is GENUINELY */
+/* finished — and "finished" is two independent claims, both required: */
+/*                                                                          */
+/*   1. the feature reports done (the find count is FINAL, the jump LANDED, */
+/*      the filter scan's count is EXACT), and                               */
+/*   2. a frame that carried real cells has been painted with it, and */
+/*      survived LSG_CAPTURE_SETTLE_FRAMES further frame boundaries.         */
+/*                                                                          */
+/* Claim 2 exists because claim 1 alone already shipped a wrong image once: */
+/* the macOS filter shot was captured mid-rematerialize — perfect popover, */
+/* correct "Filtered — 400 of 2.0K rows" pill, correct filtered gutter */
+/* numbers, and NO CELL TEXT AT ALL — purely because it keyed on a marker */
+/* that fired before the repaint. Only looking at the image caught it. So the
+ */
+/* row/column counts of the frame that settled are checked here AND printed */
+/* in the marker, which makes that failure visible in the log instead of */
+/* only in the picture.                                                      */
+/*                                                                          */
+/* Exactly ONE marker is printed per run, to stderr: */
+/*   lesssheet.gtk.capture_ready=<shot> <facts…>    settled; shoot now */
+/*   lesssheet.gtk.capture_failed=<shot> reason=…   cannot be reached honestly
+ */
+/*   lesssheet.gtk.capture_timeout=<shot> waited_ms=…  never settled */
+/* ========================================================================= */
+
+static LsgCaptureShot
+capture_parse_shot (const char *name)
+{
+  if (name == NULL)
+    return LSG_CAPTURE_NONE;
+  if (g_strcmp0 (name, "hero") == 0)
+    return LSG_CAPTURE_HERO;
+  if (g_strcmp0 (name, "jump") == 0)
+    return LSG_CAPTURE_JUMP;
+  if (g_strcmp0 (name, "dialect") == 0)
+    return LSG_CAPTURE_DIALECT;
+  if (g_strcmp0 (name, "search") == 0)
+    return LSG_CAPTURE_SEARCH;
+  if (g_strcmp0 (name, "filter") == 0)
+    return LSG_CAPTURE_FILTER;
+  return LSG_CAPTURE_NONE;
+}
+
+/* The shot's name as the marker spells it — the same spelling the env var
+ * takes, so a log line round-trips to the request that produced it. */
+static const char *
+capture_shot_name (LsgCaptureShot shot)
+{
+  switch (shot)
+    {
+    case LSG_CAPTURE_HERO:
+      return "hero";
+    case LSG_CAPTURE_JUMP:
+      return "jump";
+    case LSG_CAPTURE_DIALECT:
+      return "dialect";
+    case LSG_CAPTURE_SEARCH:
+      return "search";
+    case LSG_CAPTURE_FILTER:
+      return "filter";
+    case LSG_CAPTURE_NONE:
+    default:
+      return "none";
+    }
+}
+
+/* A popover is genuinely ON SCREEN, not merely asked to pop up:
+ * gtk_menu_button_popup returns nothing and the popover's own surface appears
+ * a frame later. Same `mapped` test the resize re-present already uses. */
+static gboolean
+capture_popover_shown (GtkPopover *pop)
+{
+  return pop != NULL && gtk_widget_get_mapped (GTK_WIDGET (pop));
+}
+
+/* The separator quick-control's dropdown — the widget its header-bar button
+ * owns, so the dialect shot shows the real control and not a copy of it. */
+static GtkPopover *
+capture_sep_popover (App *app)
+{
+  return (app->sep_button != NULL)
+             ? gtk_menu_button_get_popover (app->sep_button)
+             : NULL;
+}
+
+/* The marker's facts: the numbers that make a shot checkable from the log
+ * alone. Every shot ends with the painted window's row/column counts — the
+ * "there IS cell text on screen" proof whose absence is exactly how the macOS
+ * filter shot shipped empty. Caller frees. */
+static char *
+capture_facts (App *app)
+{
+  char *head;
+  switch (app->capture.shot)
+    {
+    case LSG_CAPTURE_JUMP:
+      head
+          = g_strdup_printf ("landed_row_0based=%" G_GUINT64_FORMAT
+                             " gutter_1based=%" G_GUINT64_FORMAT " ",
+                             app->capture.jump_row, app->capture.jump_row + 1);
+      break;
+    case LSG_CAPTURE_DIALECT:
+      head = g_strdup ("control=separator ");
+      break;
+    case LSG_CAPTURE_SEARCH:
+      head = g_strdup_printf ("position=%" G_GUINT64_FORMAT
+                              " total=%" G_GUINT64_FORMAT " count_final=1 ",
+                              app->find.display.position,
+                              app->find.display.total);
+      break;
+    case LSG_CAPTURE_FILTER:
+      head = g_strdup_printf ("matching=%" G_GUINT64_FORMAT
+                              " of=%" G_GUINT64_FORMAT " count_final=1 ",
+                              app->filter.snapshot.total,
+                              app->filter.document_rows.count);
+      break;
+    default:
+      head = g_strdup ("");
+      break;
+    }
+  char *facts = g_strdup_printf (
+      "%stop_row=%" G_GUINT64_FORMAT " painted_rows=%u painted_cols=%u", head,
+      app->cur_top_row, app->capture.paint_rows, app->capture.paint_cols);
+  g_free (head);
+  return facts;
+}
+
+/* Print the run's ONE marker and end the hook. `facts` is consumed (freed
+ * here) so every call site can build it inline. The tick callback sees
+ * TERMINAL and removes itself. */
+static void
+capture_finish (App *app, const char *event, char *facts)
+{
+  g_printerr ("lesssheet.gtk.capture_%s=%s%s%s\n", event,
+              capture_shot_name (app->capture.shot),
+              (facts != NULL && facts[0] != '\0') ? " " : "",
+              (facts != NULL) ? facts : "");
+  g_free (facts);
+  app->capture.stage = LSG_CAPTURE_STAGE_TERMINAL;
+}
+
+/* Is the promised state on screen and FINISHED? (Claim 1 of the two the
+ * section comment sets out; claim 2 — that a data-bearing frame carried it —
+ * is the tick callback's PAINTING stage.) IMPOSSIBLE is for a state that can
+ * never be reached truthfully with these arguments: the tool must fail loudly
+ * rather than photograph a lie.
+ *
+ * `*out_reason` is ALWAYS written: the unmet condition's name on a WAIT (which
+ * the timeout marker reports, so "it never settled" says WHAT it was waiting
+ * for instead of leaving the operator to guess), the failure's name on an
+ * IMPOSSIBLE, and "settled" otherwise. */
+typedef enum
+{
+  LSG_CAPTURE_WAIT = 0,   /* not there yet — keep ticking */
+  LSG_CAPTURE_SETTLED,    /* the promised state is on screen and done */
+  LSG_CAPTURE_IMPOSSIBLE, /* it can never be reached; *out_reason says why */
+} LsgCaptureVerdict;
+
+/* Small helper so each condition below reads as one line: record the unmet
+ * condition's name and return WAIT. */
+static LsgCaptureVerdict
+capture_wait (const char **out_reason, const char *condition)
+{
+  *out_reason = condition;
+  return LSG_CAPTURE_WAIT;
+}
+
+static LsgCaptureVerdict
+capture_state_verdict (App *app, const char **out_reason)
+{
+  const LsgFindDisplay *fd = &app->find.display;
+
+  *out_reason = "settled";
+  switch (app->capture.shot)
+    {
+    case LSG_CAPTURE_HERO:
+      /* An open document IS the state; the painted-frame claim carries the
+       * rest (that its rows are actually on screen). */
+      return LSG_CAPTURE_SETTLED;
+
+    case LSG_CAPTURE_JUMP:
+      if (app->capture.jump_reject)
+        {
+          /* The row is past the last one, or unparseable: there is no landing
+           * to photograph. */
+          *out_reason = "jump_rejected";
+          return LSG_CAPTURE_IMPOSSIBLE;
+        }
+      if (!app->capture.jump_landed)
+        return capture_wait (out_reason, "jump_not_landed");
+      if (!app->capture.jump_reopened)
+        return capture_wait (out_reason, "jump_popover_not_reopened");
+      /* The landing must be INSIDE the materialized window. Equality with
+       * cur_top_row would be wrong: the viewport clamps near end-of-file, so a
+       * legitimate landing can sit below the top row. */
+      if (app->capture.jump_row < app->cur_span.first_row
+          || app->capture.jump_row
+                 >= app->cur_span.first_row + app->cur_span.row_count)
+        return capture_wait (out_reason, "landed_row_outside_window");
+      if (!capture_popover_shown (app->jump_popover))
+        return capture_wait (out_reason, "jump_popover_not_shown");
+      return LSG_CAPTURE_SETTLED;
+
+    case LSG_CAPTURE_DIALECT:
+      if (!capture_popover_shown (capture_sep_popover (app)))
+        return capture_wait (out_reason, "separator_popover_not_shown");
+      return LSG_CAPTURE_SETTLED;
+
+    case LSG_CAPTURE_SEARCH:
+      if (!capture_popover_shown (app->find_popover))
+        return capture_wait (out_reason, "find_popover_not_shown");
+      if (!fd->active)
+        return capture_wait (out_reason, "no_active_search");
+      if (!fd->total_final)
+        return capture_wait (out_reason, "count_not_final");
+      if (fd->total == 0)
+        {
+          *out_reason = "no_matches";
+          return LSG_CAPTURE_IMPOSSIBLE;
+        }
+      /* A landing is what puts the current-match highlight and the "n of m"
+       * rank on screen; a final count with no landing is a half state. */
+      if (!fd->has_current)
+        return capture_wait (out_reason, "no_landing");
+      return LSG_CAPTURE_SETTLED;
+
+    case LSG_CAPTURE_FILTER:
+      if (!capture_popover_shown (app->find_popover))
+        return capture_wait (out_reason, "find_popover_not_shown");
+      if (app->filter_toggle == NULL
+          || !gtk_toggle_button_get_active (app->filter_toggle))
+        return capture_wait (out_reason, "toggle_not_on");
+      if (!app->filter.active)
+        return capture_wait (out_reason, "filter_not_active");
+      /* total_exact is the filter scan's OWN "the set is final" — the fact the
+       * macOS shot did not wait for. The rows it selected still have to be
+       * painted; that is claim 2. */
+      if (!app->filter.snapshot.total_exact)
+        return capture_wait (out_reason, "filter_count_not_final");
+      if (app->filter.snapshot.total == 0)
+        {
+          *out_reason = "no_matching_rows";
+          return LSG_CAPTURE_IMPOSSIBLE;
+        }
+      return LSG_CAPTURE_SETTLED;
+
+    case LSG_CAPTURE_NONE:
+    default:
+      *out_reason = "unknown_shot";
+      return LSG_CAPTURE_IMPOSSIBLE;
+    }
+}
+
+/* Drive the shot's state through the app's REAL handlers (see the section
+ * comment). `query` / `row` are validated by the caller. */
+static void
+capture_drive (App *app, const char *query, const char *row)
+{
+  switch (app->capture.shot)
+    {
+    case LSG_CAPTURE_HERO:
+      break; /* the open document is the state */
+
+    case LSG_CAPTURE_JUMP:
+      gtk_editable_set_text (app->jump_entry, row);
+      open_jump (app);      /* the Ctrl+G action */
+      do_jump_submit (app); /* Enter / the "Go" button */
+      break;
+
+    case LSG_CAPTURE_DIALECT:
+      if (app->sep_button != NULL)
+        gtk_menu_button_popup (app->sep_button); /* the button's own click */
+      break;
+
+    case LSG_CAPTURE_SEARCH:
+      gtk_editable_set_text (app->find_entry, query);
+      /* The Ctrl+F action; its "show" handler re-runs the retained query, so
+       * the search starts down the same path a user's would. */
+      open_find (app);
+      break;
+
+    case LSG_CAPTURE_FILTER:
+      gtk_editable_set_text (app->find_entry, query);
+      open_find (app);
+      /* set_active EMITS "toggled" -> on_filter_toggled -> do_apply_filter:
+       * the click path. filter_set_toggle would guard that handler out and
+       * silently change nothing but the button's look. */
+      gtk_toggle_button_set_active (app->filter_toggle, TRUE);
+      break;
+
+    case LSG_CAPTURE_NONE:
+    default:
+      break;
+    }
+  app->capture.t_drive = g_get_monotonic_time ();
+}
+
+/* The settle machine: one step per frame-clock beat. A tick callback and not a
+ * timeout, because the whole question is "has the settled state been PAINTED",
+ * and only the frame clock can answer it. Ticks run in the clock's UPDATE
+ * phase, so a queue_draw issued here is served by THIS frame's paint. */
+static gboolean
+capture_tick (GtkWidget *widget, GdkFrameClock *clock, gpointer data)
+{
+  App *app = data;
+  (void)widget;
+
+  if (app->capture.stage == LSG_CAPTURE_STAGE_TERMINAL || app->area == NULL)
+    {
+      app->capture.tick_id = 0;
+      return G_SOURCE_REMOVE;
+    }
+
+  const char *reason = NULL;
+  LsgCaptureVerdict verdict;
+
+  gint64 waited_ms = (g_get_monotonic_time () - app->capture.t_arm) / 1000;
+  if (waited_ms > LSG_CAPTURE_BUDGET_MS)
+    {
+      /* Say WHAT it was waiting for: a bare "timeout" leaves the operator to
+       * guess between "the state never happened" and "the marker is wrong". */
+      capture_state_verdict (app, &reason);
+      capture_finish (app, "timeout",
+                      g_strdup_printf ("waited_ms=%" G_GINT64_FORMAT
+                                       " waiting_on=%s",
+                                       waited_ms, reason));
+      app->capture.tick_id = 0;
+      return G_SOURCE_REMOVE;
+    }
+
+  if (app->capture.stage == LSG_CAPTURE_STAGE_SETTLING)
+    {
+      /* A jump LANDING pops its own popover down (jump_poll_fold), so "control
+       * open, landed" is reached the way a user reaches it: press Ctrl+G
+       * again. The entry still holds the row — no close path clears it. */
+      if (app->capture.shot == LSG_CAPTURE_JUMP && app->capture.jump_landed
+          && !app->capture.jump_reopened)
+        {
+          app->capture.jump_reopened = TRUE;
+          open_jump (app);
+          app->capture.t_drive = g_get_monotonic_time ();
+          return G_SOURCE_CONTINUE;
+        }
+
+      verdict = capture_state_verdict (app, &reason);
+      if (verdict == LSG_CAPTURE_IMPOSSIBLE)
+        {
+          capture_finish (app, "failed",
+                          g_strdup_printf ("reason=%s", reason));
+          app->capture.tick_id = 0;
+          return G_SOURCE_REMOVE;
+        }
+      if (verdict != LSG_CAPTURE_SETTLED)
+        return G_SOURCE_CONTINUE;
+      /* Settled — but a drive can still have a delayed re-run queued behind it
+       * (LSG_CAPTURE_QUIET_MS says which and why). */
+      if ((g_get_monotonic_time () - app->capture.t_drive) / 1000
+          < LSG_CAPTURE_QUIET_MS)
+        return G_SOURCE_CONTINUE;
+
+      app->capture.stage = LSG_CAPTURE_STAGE_PAINTING;
+      app->capture.paint_seen = FALSE;
+      gtk_widget_queue_draw (GTK_WIDGET (app->area));
+      return G_SOURCE_CONTINUE;
+    }
+
+  /* PAINTING. */
+  verdict = capture_state_verdict (app, &reason);
+  if (verdict != LSG_CAPTURE_SETTLED)
+    {
+      /* It regressed before being announced (a late re-run). Nothing is lost —
+       * no marker has been printed — so go back to waiting; an IMPOSSIBLE now
+       * reports itself on the next SETTLING tick. */
+      app->capture.stage = LSG_CAPTURE_STAGE_SETTLING;
+      app->capture.paint_seen = FALSE;
+      return G_SOURCE_CONTINUE;
+    }
+  if (!app->capture.paint_seen)
+    {
+      /* capture_note_paint records the frame that carries real cells. Keep
+       * asking for one until it does. */
+      gtk_widget_queue_draw (GTK_WIDGET (app->area));
+      return G_SOURCE_CONTINUE;
+    }
+  if (gdk_frame_clock_get_frame_counter (clock)
+      < app->capture.paint_frame + LSG_CAPTURE_SETTLE_FRAMES)
+    return G_SOURCE_CONTINUE;
+
+  capture_finish (app, "ready", capture_facts (app));
+  app->capture.tick_id = 0;
+  return G_SOURCE_REMOVE;
+}
+
+/* Arm: read the rest of the env surface, refuse an unusable request LOUDLY,
+ * drive the state, and start the settle machine. Runs exactly once per process
+ * and only when the env var is set. Deferred onto an idle by
+ * capture_note_paint so the handlers below are never entered from inside a
+ * draw. */
+static void
+capture_arm (App *app)
+{
+  app->capture.shot = capture_parse_shot (app->capture.env);
+  app->capture.stage = LSG_CAPTURE_STAGE_SETTLING;
+  app->capture.t_arm = g_get_monotonic_time ();
+
+  /* Read here, not in main(): an unarmed run must not even look. Borrowed for
+   * the length of this function only. */
+  const char *query = g_getenv ("LESSSHEET_GTK_CAPTURE_QUERY");
+  const char *row = g_getenv ("LESSSHEET_GTK_CAPTURE_ROW");
+
+  if (app->capture.shot == LSG_CAPTURE_NONE)
+    {
+      capture_finish (app, "failed",
+                      g_strdup_printf ("reason=unknown_shot requested=%s",
+                                       app->capture.env));
+      return;
+    }
+  if (app->capture.shot == LSG_CAPTURE_JUMP
+      && (row == NULL || row[0] == '\0' || app->jump_entry == NULL))
+    {
+      capture_finish (app, "failed",
+                      g_strdup ("reason=missing_row"
+                                " need=LESSSHEET_GTK_CAPTURE_ROW"));
+      return;
+    }
+  if ((app->capture.shot == LSG_CAPTURE_SEARCH
+       || app->capture.shot == LSG_CAPTURE_FILTER)
+      && (query == NULL || query[0] == '\0' || app->find_entry == NULL
+          || app->filter_toggle == NULL))
+    {
+      capture_finish (app, "failed",
+                      g_strdup ("reason=missing_query"
+                                " need=LESSSHEET_GTK_CAPTURE_QUERY"));
+      return;
+    }
+
+  capture_drive (app, query, row);
+  app->capture.tick_id = gtk_widget_add_tick_callback (
+      GTK_WIDGET (app->area), capture_tick, app, NULL);
+}
+
+static gboolean
+capture_arm_idle (gpointer data)
+{
+  App *app = data;
+  /* The window can be gone between the draw that scheduled this and now. */
+  if (app->area != NULL && app->doc != NULL)
+    capture_arm (app);
+  return G_SOURCE_REMOVE;
+}
+
+/* Forward-declared at the top of the file. Called at the END of every
+ * completed grid_draw: arm on the first DATA-bearing frame, and while settling
+ * record the frame that carried the settled cells. */
+static void
+capture_note_paint (App *app, guint32 rows, guint32 cols)
+{
+  if (app->capture.env == NULL)
+    return; /* not armed — every normal run stops on this one test */
+
+  if (app->capture.stage == LSG_CAPTURE_STAGE_IDLE)
+    {
+      /* "Data-bearing" is literal: a frame with no rows or no columns has no
+       * cells on it, and arming on one would start driving a state over an
+       * empty grid. An empty document therefore never arms; the budget then
+       * reports the timeout, which is the honest answer. */
+      if (rows == 0 || cols == 0)
+        return;
+      app->capture.stage = LSG_CAPTURE_STAGE_ARMING;
+      /* Off the draw: capture_arm pops popovers and submits a jump, none of
+       * which belongs inside a snapshot. */
+      g_idle_add (capture_arm_idle, app);
+      return;
+    }
+
+  if (app->capture.stage == LSG_CAPTURE_STAGE_PAINTING
+      && !app->capture.paint_seen && rows > 0 && cols > 0)
+    {
+      GdkFrameClock *clock
+          = gtk_widget_get_frame_clock (GTK_WIDGET (app->area));
+      app->capture.paint_seen = TRUE;
+      app->capture.paint_frame
+          = (clock != NULL) ? gdk_frame_clock_get_frame_counter (clock) : 0;
+      app->capture.paint_rows = rows;
+      app->capture.paint_cols = cols;
+    }
+}
+
+/* Forward-declared at the top of the file. A find query was (re)issued, so the
+ * quiet window restarts — see LSG_CAPTURE_QUIET_MS for the pending
+ * "search-changed" this exists to outlast. */
+static void
+capture_note_find_run (App *app)
+{
+  if (app->capture.stage == LSG_CAPTURE_STAGE_SETTLING
+      || app->capture.stage == LSG_CAPTURE_STAGE_PAINTING)
+    app->capture.t_drive = g_get_monotonic_time ();
+}
+
+/* Forward-declared at the top of the file. The jump flow reached a terminal
+ * state; a LANDED also carries the row it landed on. */
+static void
+capture_note_jump (App *app, gboolean landed, guint64 row)
+{
+  if (app->capture.shot != LSG_CAPTURE_JUMP
+      || app->capture.stage != LSG_CAPTURE_STAGE_SETTLING)
+    return;
+  if (landed)
+    {
+      app->capture.jump_landed = TRUE;
+      app->capture.jump_row = row;
+    }
+  else
+    app->capture.jump_reject = TRUE;
+}
+
 /* No file: launch screen. */
 static void
 on_activate (GtkApplication *gtk_app, gpointer data)
@@ -6668,6 +7349,12 @@ main (int argc, char *argv[])
   App app = { 0 };
   app.t_start = g_get_monotonic_time (); /* capture entry ASAP */
   app.timing = (g_getenv ("LESSSHEET_GTK_TIMING") != NULL);
+  /* Screenshot-capture affordance: ONE env read, and deliberately nothing else
+   * — the value is not even PARSED until after the first data-bearing paint,
+   * and the query/row vars are not read at all, so an unarmed run (every
+   * normal run, including the one LESSSHEET_GTK_TIMING measures above) costs a
+   * single getenv and allocates nothing. See the capture section. */
+  app.capture.env = g_getenv ("LESSSHEET_GTK_CAPTURE");
   app.row_estimate = 1;
   app.find = lsg_find_initial ();
   app.find_nav_direction = LSG_SEARCH_FORWARD;
