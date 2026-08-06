@@ -154,6 +154,12 @@ final class DocumentModel {
     // Overlay presentation state.
     var expandedPill: PillKind?
     var jumpFieldActive = false
+    /// The jump field's 1-based row text — model-side (like the find field's
+    /// `findSession.draft`) because ↑/↓ step it against document knowledge the
+    /// view does not own (row count / top visible row; see `stepJumpField`).
+    /// Survives closing the popup, exactly as the typed text always has; a
+    /// SUCCESSFUL submit clears it.
+    var jumpFieldText = ""
     var findFieldActive = false
     var settingsOpen = false
     /// Bumped by the ⌘J command to ask the overlay to reveal + focus the jump

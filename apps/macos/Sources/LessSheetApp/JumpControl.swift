@@ -15,7 +15,6 @@ struct JumpControlView: View {
     @Environment(\.overlayJumpRejected) private var dumpRejected
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @FocusState private var fieldFocused: Bool
-    @State private var text = ""
     @State private var shake: CGFloat = 0        // 0…1 drives the reject shake
     @State private var rejectedFlash = false     // red blink while true
 
@@ -132,16 +131,24 @@ struct JumpControlView: View {
             Group {
                 if dumpChrome {
                     // ImageRenderer can't snapshot a live TextField; show its state.
-                    Text(text.isEmpty ? "Row" : text)
-                        .foregroundStyle(rejected ? Color.red : (text.isEmpty ? Color.secondary : Color.primary))
+                    let typed = model.jumpFieldText
+                    Text(typed.isEmpty ? "Row" : typed)
+                        .foregroundStyle(rejected ? Color.red : (typed.isEmpty ? Color.secondary : Color.primary))
                         .frame(width: 84, alignment: .leading)
                 } else {
-                    TextField("Row", text: $text)
+                    TextField("Row", text: $model.jumpFieldText)
                         .textFieldStyle(.plain)
                         .frame(width: 84)
                         .foregroundStyle(rejected ? Color.red : Color.primary)
                         .focused($fieldFocused)
                         .onSubmit(submit)
+                        // ↑/↓ step the row number — INVERTED on purpose (↑ goes
+                        // toward row 1, ↓ toward the end; see `JumpFieldStep`).
+                        // They only EDIT the field: nothing travels until Enter.
+                        // Attached to the field itself, so they exist only while
+                        // it does — a closed popup leaves the arrows to the grid.
+                        .onKeyPress(.upArrow, phases: .down) { _ in stepped(.towardStart) }
+                        .onKeyPress(.downArrow, phases: .down) { _ in stepped(.towardEnd) }
                 }
             }
             .font(.callout.monospacedDigit())
@@ -193,11 +200,18 @@ struct JumpControlView: View {
     }
 
     private func submit() {
-        if model.submitJump(text) {
-            text = ""
+        if model.submitJump(model.jumpFieldText) {
+            model.jumpFieldText = ""
             if case .scanning = model.jumpFlow {} else { model.jumpFieldActive = false }
         }
         // Invalid input: keep the field open for correction (no re-open).
+    }
+
+    /// One arrow keypress: step the field's number and consume the key (so the
+    /// field editor does not also move the caret). No jump, no scan, no scroll.
+    private func stepped(_ direction: JumpFieldStep) -> KeyPress.Result {
+        model.stepJumpField(direction)
+        return .handled
     }
 }
 

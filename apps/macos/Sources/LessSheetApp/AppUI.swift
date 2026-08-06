@@ -229,6 +229,11 @@ struct ContentView: View {
                 // arrival dumps + terminates itself, so skip the first-frame
                 // dump/terminate (which would quit before the jump completes).
                 JumpProbe.run(model: model)
+            } else if JumpStepProbe.active {
+                // Verification: drive the jump field's ↑/↓ stepping (direction,
+                // wrap, seed, no-landing, Enter, real key routing) — logs +
+                // terminates itself.
+                JumpStepProbe.run(model: model)
             } else if LandingStallProbe.active {
                 // Verification: drive 5 alternating far find/jump landings and
                 // report the worst main-thread gap (the < 100 ms no-stall proof).
