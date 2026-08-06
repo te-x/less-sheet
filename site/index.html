@@ -229,8 +229,13 @@
         <figcaption>the window is the data</figcaption>
       </figure>
       <figure class="only-linux">
-        <div class="pending">linux screenshots not captured yet<br>— placeholder, not a broken image —</div>
-        <figcaption>GNOME build, same features</figcaption>
+        <picture>
+          <source media="(prefers-color-scheme: dark)"
+                  srcset="assets/shots/shot-hero-linux-dark.webp">
+          <img class="shot" src="assets/shots/shot-hero-linux-light.webp"
+               width="1500" height="989" alt="less-sheet on GNOME showing a large CSV">
+        </picture>
+        <figcaption>the GNOME build — same core, same features</figcaption>
       </figure>
     </div>
   </div>
@@ -289,7 +294,15 @@
         </picture>
         <figcaption>jump to any row, at any file size</figcaption>
       </figure>
-      <figure class="only-linux"><div class="pending">linux screenshot pending</div></figure>
+      <figure class="only-linux">
+        <picture>
+          <source media="(prefers-color-scheme: dark)"
+                  srcset="assets/shots/shot-jump-linux-dark.webp">
+          <img class="shot" src="assets/shots/shot-jump-linux-light.webp"
+               width="1500" height="989" alt="jump to any row, at any file size" loading="lazy" decoding="async">
+        </picture>
+        <figcaption>jump to any row, at any file size</figcaption>
+      </figure>
     </div>
   </div>
 </section>
@@ -318,7 +331,15 @@
         </picture>
         <figcaption>separator guessed from the file — one click to override</figcaption>
       </figure>
-      <figure class="only-linux"><div class="pending">linux screenshot pending</div></figure>
+      <figure class="only-linux">
+        <picture>
+          <source media="(prefers-color-scheme: dark)"
+                  srcset="assets/shots/shot-dialect-linux-dark.webp">
+          <img class="shot" src="assets/shots/shot-dialect-linux-light.webp"
+               width="1500" height="989" alt="separator guessed from the file — one click to override" loading="lazy" decoding="async">
+        </picture>
+        <figcaption>separator guessed from the file — one click to override</figcaption>
+      </figure>
     </div>
   </div>
 </section>
@@ -358,7 +379,26 @@
           <figcaption>typed column predicates</figcaption>
         </figure>
       </div>
-      <div class="only-linux"><div class="pending">linux screenshots pending</div></div>
+      <div class="rail only-linux">
+        <figure class="only-linux">
+        <picture>
+          <source media="(prefers-color-scheme: dark)"
+                  srcset="assets/shots/shot-search-linux-dark.webp">
+          <img class="shot" src="assets/shots/shot-search-linux-light.webp"
+               width="1500" height="989" alt="live match count, every visible match highlighted" loading="lazy" decoding="async">
+        </picture>
+        <figcaption>live match count, every visible match highlighted</figcaption>
+      </figure>
+        <figure class="only-linux">
+        <picture>
+          <source media="(prefers-color-scheme: dark)"
+                  srcset="assets/shots/shot-filter-linux-dark.webp">
+          <img class="shot" src="assets/shots/shot-filter-linux-light.webp"
+               width="1500" height="989" alt="typed column predicates" loading="lazy" decoding="async">
+        </picture>
+        <figcaption>typed column predicates</figcaption>
+      </figure>
+      </div>
     </div>
   </div>
 </section>
