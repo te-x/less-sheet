@@ -10,6 +10,7 @@
 import Foundation
 
 LaunchTiming.begin()
+LaunchTiming.phase("main_entry")
 
 // Halve the tooltip show delay before AppKit spins up (NSToolTipManager reads
 // `NSInitialToolTipDelay`, in ms, near launch — SwiftUI's `.help()` bridges to
@@ -22,4 +23,5 @@ LaunchTiming.begin()
 // system-wide default on disk.
 UserDefaults.standard.set(1_000, forKey: "NSInitialToolTipDelay")
 
+LaunchTiming.phase("before_swiftui_main")
 LessSheetApp.main()

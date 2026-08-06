@@ -41,13 +41,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        LaunchTiming.phase("did_finish_launching")
         // PRIMARY CLI path: a document path in argv (direct exec / `open --args`).
         if !routedLaunchOpen, let path = LaunchArguments.documentPath(from: CommandLine.arguments) {
             routedLaunchOpen = true
             route(path)
         }
+        LaunchTiming.phase("before_show_window")
         showMainWindow()
+        LaunchTiming.phase("after_show_window")
         NSApp.activate(ignoringOtherApps: true)
+        LaunchTiming.phase("after_activate")
 
         // No document on launch: rest on the launch state (LaunchStateView),
         // which spells out both entry points (⌘O local file, ⌘⇧O Open URL).
@@ -75,7 +79,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func route(_ path: String) {
-        Task { await DocumentModel.shared.open(path: path, forcing: launchForcedOverride()) }
+        LaunchTiming.phase("route_enqueued")
+        Task {
+            LaunchTiming.phase("open_begin")
+            await DocumentModel.shared.open(path: path, forcing: launchForcedOverride())
+            LaunchTiming.phase("open_done")
+        }
     }
 
     /// Creates the single chromeless main window (idempotent) hosting the
@@ -106,7 +115,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // opaque strip (that was the regression). The grid insets its top by the
         // title-bar height (see GridView) so at rest row 1 sits fully below the
         // title-bar region while scrolled content still travels under it.
+        LaunchTiming.phase("before_hosting_view")
         window.contentView = NSHostingView(rootView: ContentView(model: .shared))
+        LaunchTiming.phase("after_hosting_view")
         window.setFrameAutosaveName("LessSheetMain")
         if !window.setFrameUsingName("LessSheetMain") {
             window.center()
@@ -118,7 +129,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         for type in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
             window.standardWindowButton(type)?.alphaValue = 1
         }
+        LaunchTiming.phase("before_order_front")
         window.makeKeyAndOrderFront(nil)
+        LaunchTiming.phase("after_order_front")
         mainWindow = window
     }
 

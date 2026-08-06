@@ -215,6 +215,7 @@ struct ContentView: View {
         .task(id: model.openGeneration) {
             // First data-bearing frame: emit the cold-start marker (guarded to
             // once per open), then dump the requested frame for verification.
+            LaunchTiming.phase("first_rows_task")
             model.markFirstRowsVisible()
             // Screenshot capture (CaptureProbe): announce the window id and
             // apply any requested pill reveal ALONGSIDE the probe chain below —
