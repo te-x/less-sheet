@@ -153,8 +153,11 @@ struct JumpControlView: View {
                         // implementer found by reading this file and could not fix
                         // from its side. Holding to run through rows is what every
                         // stepper does, so macOS matches GTK rather than the reverse.
-                        .onKeyPress(.upArrow, phases: [.down, .repeat]) { _ in stepped(.towardStart) }
-                        .onKeyPress(.downArrow, phases: [.down, .repeat]) { _ in stepped(.towardEnd) }
+                        // `.up` too: a held arrow ACCELERATES (step 1 → 10 → 100 →
+                        // 1000, see `JumpFieldRamp`) and releasing the key is what
+                        // returns the next press to step 1.
+                        .onKeyPress(.upArrow, phases: [.down, .repeat, .up]) { stepped(.towardStart, $0) }
+                        .onKeyPress(.downArrow, phases: [.down, .repeat, .up]) { stepped(.towardEnd, $0) }
                 }
             }
             .font(.callout.monospacedDigit())
@@ -213,10 +216,16 @@ struct JumpControlView: View {
         // Invalid input: keep the field open for correction (no re-open).
     }
 
-    /// One arrow keypress: step the field's number and consume the key (so the
-    /// field editor does not also move the caret). No jump, no scan, no scroll.
-    private func stepped(_ direction: JumpFieldStep) -> KeyPress.Result {
-        model.stepJumpField(direction)
+    /// One arrow key event: a press (or an auto-repeat) steps the field's number,
+    /// a RELEASE ends the hold so the ramp cannot stay accelerated into the user's
+    /// next single tap. Either way the key is consumed, so the field editor never
+    /// also moves the caret. No jump, no scan, no scroll.
+    private func stepped(_ direction: JumpFieldStep, _ keyPress: KeyPress) -> KeyPress.Result {
+        if keyPress.phase.contains(.up) {
+            model.endJumpFieldHold()
+        } else {
+            model.stepJumpField(direction)
+        }
         return .handled
     }
 }

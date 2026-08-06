@@ -160,6 +160,9 @@ final class DocumentModel {
     /// Survives closing the popup, exactly as the typed text always has; a
     /// SUCCESSFUL submit clears it.
     var jumpFieldText = ""
+    /// Hold-to-accelerate state for the jump field's ↑/↓ (`stepJumpField`). Pure
+    /// control state — no view observes it — so it stays out of observation.
+    @ObservationIgnored var jumpFieldRamp = JumpFieldRamp()
     var findFieldActive = false
     var settingsOpen = false
     /// Bumped by the ⌘J command to ask the overlay to reveal + focus the jump

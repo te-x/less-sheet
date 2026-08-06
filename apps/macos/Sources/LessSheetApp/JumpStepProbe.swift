@@ -30,8 +30,8 @@ enum JumpStepProbe {
     private static let env = ProcessInfo.processInfo.environment
     static let active: Bool = env["LESSSHEET_JUMP_STEP"] != nil
 
-    private static var checks = 0
-    private static var failures = 0
+    static var checks = 0
+    static var failures = 0
 
     static func run(model: DocumentModel) {
         guard active else { return }
@@ -196,7 +196,7 @@ enum JumpStepProbe {
                        extra: "active=\(model.jumpFieldActive) focus=\(firstResponderName())")
                 log("lesssheet.jumpstep.grid_selection before=\(selectionBefore)"
                     + " after=\(selectionName(model.selection))")
-                finish()
+                rampPhase(model)
             }
         }
     }
@@ -237,13 +237,17 @@ enum JumpStepProbe {
 
     // MARK: - Reporting
 
-    private static func step(_ model: DocumentModel, from text: String, _ direction: JumpFieldStep) -> String {
+    /// One deliberate TAP: `endJumpFieldHold` first, so every single-step check
+    /// below is about the step-1 rule and not about how fast the probe happens to
+    /// run (the hold ramp is exercised separately, in `JumpStepProbe+Ramp`).
+    static func step(_ model: DocumentModel, from text: String, _ direction: JumpFieldStep) -> String {
         model.jumpFieldText = text
+        model.endJumpFieldHold()
         model.stepJumpField(direction)
         return model.jumpFieldText
     }
 
-    private static func expect(_ name: String, _ got: String, _ want: String, extra: String = "") {
+    static func expect(_ name: String, _ got: String, _ want: String, extra: String = "") {
         checks += 1
         let passed = got == want
         if !passed { failures += 1 }
@@ -251,14 +255,14 @@ enum JumpStepProbe {
             + (extra.isEmpty ? "" : " \(extra)"))
     }
 
-    private static func finish() {
+    static func finish() {
         log("lesssheet.jumpstep.summary checks=\(checks) failures=\(failures) pass=\(failures == 0)")
         if env["LESSSHEET_DUMP_EXIT"] != nil {
             after(0.2) { NSApp.terminate(nil) }
         }
     }
 
-    private static func after(_ seconds: Double, _ work: @escaping @MainActor () -> Void) {
+    static func after(_ seconds: Double, _ work: @escaping @MainActor () -> Void) {
         DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { MainActor.assumeIsolated(work) }
     }
 
@@ -281,7 +285,7 @@ enum JumpStepProbe {
         return String(describing: type(of: responder))
     }
 
-    private static func log(_ line: String) {
+    static func log(_ line: String) {
         FileHandle.standardError.write(Data((line + "\n").utf8))
     }
 }
