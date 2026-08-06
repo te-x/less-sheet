@@ -47,11 +47,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             routedLaunchOpen = true
             route(path)
         }
-        LaunchTiming.phase("before_show_window")
         showMainWindow()
         LaunchTiming.phase("after_show_window")
         NSApp.activate(ignoringOtherApps: true)
-        LaunchTiming.phase("after_activate")
 
         // No document on launch: rest on the launch state (LaunchStateView),
         // which spells out both entry points (⌘O local file, ⌘⇧O Open URL).
@@ -78,13 +76,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return true
     }
 
-    private func route(_ path: String) {
-        LaunchTiming.phase("route_enqueued")
-        Task {
-            LaunchTiming.phase("open_begin")
-            await DocumentModel.shared.open(path: path, forcing: launchForcedOverride())
-            LaunchTiming.phase("open_done")
-        }
+    private func route(_ path: String) {   // launch-phase stamps: see LaunchTiming.phase
+        Task { await DocumentModel.shared.open(path: path, forcing: launchForcedOverride()) }
     }
 
     /// Creates the single chromeless main window (idempotent) hosting the
@@ -122,16 +115,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if !window.setFrameUsingName("LessSheetMain") {
             window.center()
         }
-        // Screenshot-capture affordance: deterministic size/appearance when the
-        // LESSSHEET_CAPTURE_* env vars are set; inert otherwise (CaptureProbe).
-        CaptureProbe.configure(window: window)
+        CaptureProbe.configure(window: window)   // inert without LESSSHEET_CAPTURE_*
         // Traffic lights always visible (no fade).
         for type in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
             window.standardWindowButton(type)?.alphaValue = 1
         }
-        LaunchTiming.phase("before_order_front")
         window.makeKeyAndOrderFront(nil)
-        LaunchTiming.phase("after_order_front")
         mainWindow = window
     }
 

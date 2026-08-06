@@ -66,6 +66,28 @@ enum CaptureProbe {
         }
     }
 
+    /// Called when a jump reaches its landing (`JumpProbe.arrived`). Inert unless
+    /// `LESSSHEET_CAPTURE_REVEAL=jump`.
+    ///
+    /// Why it exists: landing DISMISSES the jump field, so a jump shot driven by
+    /// `LESSSHEET_JUMP` alone photographs a grid parked at row 1500 with no
+    /// control visible — a picture indistinguishable from the hero, which is
+    /// exactly what shipped in the first macOS set. the author caught it by looking.
+    /// Re-requesting focus reopens the field on the landed rows, the same state a
+    /// user sees when they press ⌘J again, and the same workaround the GTK side
+    /// already uses (Ctrl+G after the landing).
+    ///
+    /// Prints `lesssheet.capture_jump_reopened=<row>` so the capture tool can
+    /// gate on the field being BACK rather than on the landing, which would shoot
+    /// too early.
+    static func afterJumpLanded(model: DocumentModel, row: UInt64) {
+        guard active,
+              env["LESSSHEET_CAPTURE_REVEAL"]?.lowercased() == "jump" else { return }
+        model.requestJumpFocus()
+        FileHandle.standardError.write(
+            Data("lesssheet.capture_jump_reopened=\(row)\n".utf8))
+    }
+
     /// Called once after the first data-bearing paint (AppUI's probe hook,
     /// alongside — not instead of — the verification probes, so a state probe
     /// like LESSSHEET_FIND still runs and leaves its popup open).

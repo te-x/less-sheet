@@ -40,7 +40,7 @@ enum LaunchTiming {
 
     static func phase(_ name: String) {
         guard phasesOn else { return }
-        let ms = Int((DispatchTime.now().uptimeNanoseconds &- startNanos) / 1_000_000)
-        FileHandle.standardError.write(Data("lesssheet.phase.\(name)=\(ms)\n".utf8))
+        let elapsedMs = Int((DispatchTime.now().uptimeNanoseconds &- startNanos) / 1_000_000)
+        FileHandle.standardError.write(Data("lesssheet.phase.\(name)=\(elapsedMs)\n".utf8))
     }
 }

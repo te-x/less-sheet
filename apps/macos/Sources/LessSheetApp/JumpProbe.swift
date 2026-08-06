@@ -110,6 +110,9 @@ enum JumpProbe {
         guard active, index < targets.count else { return }
         log("lesssheet.jump.landed seq=\(index) landed_row_0based=\(row) gutter_1based=\(row &+ 1)"
             + " at_ms=\(elapsedMs()) max_gap_ms=\(maxGapMs)")
+        // Screenshot capture only: landing dismisses the jump field, so reopen it
+        // for the shot (inert without LESSSHEET_CAPTURE_REVEAL=jump).
+        CaptureProbe.afterJumpLanded(model: model, row: row)
         advance(finalDump: .arrival)
     }
 
