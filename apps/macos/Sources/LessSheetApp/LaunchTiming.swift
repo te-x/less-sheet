@@ -43,4 +43,29 @@ enum LaunchTiming {
         let elapsedMs = Int((DispatchTime.now().uptimeNanoseconds &- startNanos) / 1_000_000)
         FileHandle.standardError.write(Data("lesssheet.phase.\(name)=\(elapsedMs)\n".utf8))
     }
+
+    /// Names already stamped by `phaseOnce`. Main-actor isolated because its one
+    /// caller is AppKit's main-thread draw path — a real isolation guarantee, so
+    /// no lock and no `nonisolated(unsafe)` escape hatch is needed.
+    @MainActor private static var stampedOnce: Set<String> = []
+
+    /// One-shot `phase(_:)` for a stamp that sits in a PER-FRAME path: the first
+    /// call for a given name emits, every later call is a `Set` lookup. Inert
+    /// without `LESSSHEET_LAUNCH_PHASES`, exactly like `phase(_:)` — in the
+    /// shipped launch path this costs one `Bool` read per row draw.
+    ///
+    /// This exists for `first_row_pixels`, stamped from `SheetRowView.draw` on
+    /// the first real data row: the GROUND TRUTH for "the rows are on screen",
+    /// and the number the launch work is measured against. Note that
+    /// `markFirstRowsVisible()` / `lesssheet.first_rows_visible_ms` is an
+    /// APPROXIMATION of the same moment that fires EARLIER (~15 ms on a 50 MB
+    /// file) — it marks the point where SwiftUI schedules the document `.task`,
+    /// before AppKit has laid out and drawn a single row. That marker is
+    /// contract-adjacent (pinned by the frozen corpus cold-open tests) and is
+    /// deliberately left exactly as it is.
+    @MainActor
+    static func phaseOnce(_ name: String) {
+        guard phasesOn, stampedOnce.insert(name).inserted else { return }
+        phase(name)
+    }
 }

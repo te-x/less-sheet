@@ -12,6 +12,16 @@ import Foundation
 LaunchTiming.begin()
 LaunchTiming.phase("main_entry")
 
+// Start the LAUNCH document's core open HERE, at process entry, when the path
+// arrived on argv (direct exec / `open --args`): it then overlaps AppKit and
+// SwiftUI bring-up on a background thread instead of queuing behind them on the
+// main actor. A BUNDLE launch (Finder double-click, `open -a`, drag-onto-icon)
+// carries no path in argv — it gets one from an Apple Event ~90 ms in, and
+// `AppDelegate.route` starts the same prewarm there. Idempotent either way.
+if let launchDocument = LaunchArguments.documentPath(from: CommandLine.arguments) {
+    LaunchOpenPrewarm.start(path: launchDocument, forcing: launchForcedOverride())
+}
+
 // Halve the tooltip show delay before AppKit spins up (NSToolTipManager reads
 // `NSInitialToolTipDelay`, in ms, near launch — SwiftUI's `.help()` bridges to
 // it). Baseline: `defaults read -g NSInitialToolTipDelay` is unset on a stock

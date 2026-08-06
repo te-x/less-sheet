@@ -60,6 +60,10 @@ final class SheetRowView: NSTableRowView {
     private static let font = NSFont.monospacedSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
 
     override func draw(_ dirtyRect: NSRect) {
+        // Launch-measurement ground truth: the first REAL data row to actually
+        // paint. Filler rows (past EOF) and not-yet-servable rows carry no
+        // cells, so neither can stamp it. Inert without LESSSHEET_LAUNCH_PHASES.
+        if !isFiller, !cells.isEmpty { LaunchTiming.phaseOnce("first_row_pixels") }
         NSColor.textBackgroundColor.setFill()
         bounds.fill()
         guard let controller else { return }

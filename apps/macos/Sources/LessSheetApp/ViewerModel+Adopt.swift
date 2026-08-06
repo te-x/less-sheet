@@ -4,9 +4,11 @@ import Foundation
 import LessSheetKit
 import Observation
 
-// DocumentModel — the network open funnel (`openURL`) and the shared
+// DocumentModel — the network open funnel (`openURL`), the shared
 // session-adoption tail (`adoptSession`) reached by both the local and network
-// funnels. Pure code motion out of ViewerModel.swift (no behavior change).
+// funnels, and `adoptLaunchOpen` (the launch document's prewarmed open, which
+// enters that same tail). Everything but `adoptLaunchOpen` is pure code motion
+// out of ViewerModel.swift (no behavior change).
 
 extension DocumentModel {
     /// Open a CSV / .csv.gz served over HTTP(S) (ARCH-network-source req 9) —
@@ -108,6 +110,51 @@ extension DocumentModel {
     /// (`networkCancelToken` is cleared as soon as `openURL` returns/throws).
     func cancelNetworkOpen() {
         networkCancelToken?.cancel()
+    }
+
+    /// Adopts the LAUNCH document's prewarmed open (`LaunchOpenPrewarm`): the
+    /// FRESH-open tail of `open(path:forcing:)` with everything that cannot
+    /// apply at launch removed.
+    ///
+    /// Why this shortened tail is safe HERE and only here: on a virgin launch
+    /// there is no prior session to close, no poll to stop, no in-flight copy to
+    /// cancel, no carried column visibility to replay and no re-open decision to
+    /// make — `open(path:)`'s whole prologue and its `resolveReopen` branch are
+    /// no-ops. The guard below PROVES that state rather than assuming it, so an
+    /// unexpected ordering can never let this shortcut stomp a live document.
+    func adoptLaunchOpen(_ outcome: Result<any DocumentSession, DocumentOpenError>, path: String) {
+        guard session == nil, phase == .launch else {
+            // Not a virgin launch — something already opened a document (e.g. a
+            // multi-document launch whose second path took the normal funnel and
+            // won). The prewarm loses: close its handle, leave the live document
+            // (or its error panel) exactly as it is.
+            if case let .success(candidate) = outcome { candidate.close() }
+            return
+        }
+        switch outcome {
+        case let .success(candidate):
+            adoptSession(SessionAdoption(
+                candidate: candidate, path: path, kind: .local, previous: nil,
+                replayAuthoredSettings: false, reopenDecision: nil, oldSession: nil,
+                authoredSettings: [:], authoredManualWidths: [:]
+            ))
+        case let .failure(error):
+            // Byte-for-byte `open(path:)`'s no-carry failure branch, so the
+            // in-window ErrorPanel renders exactly as it does today (unreadable
+            // / nonexistent / malformed / empty all still land here).
+            self.session = nil
+            self.phase = .failure(error, path: path)
+        }
+        openGeneration += 1
+        // Parity with `open(path:)`'s cross-window poke. At launch the grid is
+        // not built or attached yet, so this is a guarded no-op — kept so the
+        // two tails stay shape-identical and cannot drift apart.
+        NativeGridController.live?.apply()
+        if SettingsRedesignProbe.active {
+            DispatchQueue.main.async {
+                AppDelegate.shared?.runSettingsProbeAfterFirstPaint(model: self)
+            }
+        }
     }
 
     /// The bundled inputs to `adoptSession` (was a 9-parameter call): the

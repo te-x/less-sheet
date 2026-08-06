@@ -187,7 +187,10 @@ struct ContentView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .allowsHitTesting(false)
             }
-            OverlayView(model: model)
+            // The glass control row, one main-queue turn behind the rows (see
+            // DeferredOverlay). Always-visible chrome either way — only WHEN it
+            // joins the first paint changes, and never on a verification run.
+            DeferredOverlay(model: model)
             // Our own always-visible filename, drawn in the title-bar band
             // (the native title stays hidden to preserve the under-titlebar
             // frost + header alignment). Centered, clear of the traffic
