@@ -147,8 +147,14 @@ struct JumpControlView: View {
                         // They only EDIT the field: nothing travels until Enter.
                         // Attached to the field itself, so they exist only while
                         // it does — a closed popup leaves the arrows to the grid.
-                        .onKeyPress(.upArrow, phases: .down) { _ in stepped(.towardStart) }
-                        .onKeyPress(.downArrow, phases: .down) { _ in stepped(.towardEnd) }
+                        // `.repeat` included so HOLDING an arrow keeps stepping.
+                        // Without it a held key steps once, while GTK auto-repeats
+                        // natively — a user-visible divergence the GTK
+                        // implementer found by reading this file and could not fix
+                        // from its side. Holding to run through rows is what every
+                        // stepper does, so macOS matches GTK rather than the reverse.
+                        .onKeyPress(.upArrow, phases: [.down, .repeat]) { _ in stepped(.towardStart) }
+                        .onKeyPress(.downArrow, phases: [.down, .repeat]) { _ in stepped(.towardEnd) }
                 }
             }
             .font(.callout.monospacedDigit())

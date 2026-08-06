@@ -23,6 +23,9 @@
 #include <gdk/gdkkeysyms.h>
 #include <pango/pangocairo.h>
 
+/* Private (src-local) pure helper — the jump field's arrow-key stepping. */
+#include "lsg_jump_step.h"
+
 #include <lsg_a11y.h>
 #include <lsg_column.h>
 #include <lsg_copy.h>
@@ -3123,6 +3126,21 @@ net_drive_poll (App *app)
     }
 }
 
+/*
+ * The row-count knowledge the jump FIELD speaks in — the ONE resolver for it,
+ * read by both consumers: Enter (upfront out-of-range validation) and the
+ * arrow stepper (the wrap bound). Composition: while filtered the field takes
+ * ORIGINAL row numbers, so it hints with the captured base document count M,
+ * never the filtered m. `exact` rides along untouched (an ESTIMATE is a
+ * legitimate answer here — see lsg_jump_step_row).
+ */
+static LsgRowCount
+jump_field_rowcount (App *app)
+{
+  return lsg_filter_jump_rowcount (app->filter,
+                                   lsg_document_row_count (app->doc));
+}
+
 /* Enter / Go: parse + validate + start (or reject) the jump. */
 static void
 do_jump_submit (App *app)
@@ -3143,11 +3161,10 @@ do_jump_submit (App *app)
     }
 
   const char *text = gtk_editable_get_text (app->jump_entry);
-  /* Composition: while filtered the jump box takes ORIGINAL row numbers, so
-   * hint with the base document count M and drive the frozen jump with
-   * filtered=TRUE (which suppresses its out-of-range reject). */
-  LsgRowCount rc = lsg_filter_jump_rowcount (
-      app->filter, lsg_document_row_count (app->doc));
+  /* The field's row-count knowledge (the one resolver above), driven with
+   * filtered=TRUE while filtered — which suppresses the out-of-range reject.
+   */
+  LsgRowCount rc = jump_field_rowcount (app);
   LsgJumpSubmit sub
       = lsg_jump_submit (text, rc, app->filter.active, app->cur_top_row);
   app->jump = sub.flow;
@@ -3208,13 +3225,57 @@ on_jump_cancel_clicked (GtkButton *button, gpointer data)
   do_jump_cancel ((App *)data);
 }
 
+/*
+ * The 1-based ORIGINAL row number of the TOP visible row — exactly the number
+ * grid_draw paints in the gutter on the viewport's first line (same
+ * `lsg_window_source_row` lookup), so under a filter this seeds the field with
+ * the ORIGINAL row number it speaks in, not a filtered index. Reads the
+ * ALREADY-materialized window: no core window allocation, no fetch. 0 when the
+ * window cannot answer (no rows yet / top row outside the current span), which
+ * `lsg_jump_step_row` reads as "seed at row 1".
+ */
+static guint64
+jump_top_visible_row_1based (App *app)
+{
+  if (app->win == NULL || app->cur_top_row < app->cur_span.first_row)
+    return 0;
+  guint64 ri = app->cur_top_row - app->cur_span.first_row;
+  if (ri >= lsg_window_row_count (app->win))
+    return 0;
+  guint64 src = lsg_window_source_row (app->win, (guint32)ri);
+  return (src == LSG_NO_ROW) ? 0 : src + 1;
+}
+
+/*
+ * Up/Down with the jump field open: step the row number IN THE FIELD ONLY.
+ * NO LANDING — no ls_jump_start, no scan, no viewport change, no popover
+ * change; the arrows just retype the number, and Enter submits it exactly as
+ * it submits a typed one. The direction is inverted on purpose and the wrap
+ * works at both ends off a possibly-ESTIMATED count; all of that decision is
+ * lsg_jump_step_row (src/lsg_jump_step.h).
+ */
+static void
+jump_step_entry (App *app, LsgJumpStepDir dir)
+{
+  if (app->doc == NULL || app->jump_entry == NULL)
+    return;
+  guint64 row = lsg_jump_step_row (gtk_editable_get_text (app->jump_entry),
+                                   dir, jump_field_rowcount (app).count,
+                                   jump_top_visible_row_1based (app));
+  char *text = g_strdup_printf ("%" G_GUINT64_FORMAT, row);
+  gtk_editable_set_text (app->jump_entry, text);
+  g_free (text);
+  /* Caret after the digits: set_text leaves it at position 0, where the next
+   * typed digit would land BEFORE the stepped number. */
+  gtk_editable_set_position (app->jump_entry, -1);
+}
+
 static gboolean
 on_jump_entry_key (GtkEventControllerKey *ctrl, guint keyval, guint keycode,
                    GdkModifierType state, gpointer data)
 {
   (void)ctrl;
   (void)keycode;
-  (void)state;
   App *app = data;
   /* Enter is handled by the entry's "activate" signal (the internal GtkText
    * consumes Return before this bubble-phase controller — that was the bug);
@@ -3227,6 +3288,29 @@ on_jump_entry_key (GtkEventControllerKey *ctrl, guint keyval, guint keycode,
       app->jump_explicit_close = TRUE;
       gtk_popover_popdown (app->jump_popover);
       return GDK_EVENT_STOP;
+    }
+  /*
+   * Up/Down step the row number in the field (inverted: up = a smaller row
+   * number, down = a bigger one — the gutter's numbers grow downward). BARE
+   * arrows only: a modifier is left alone (no page-step was asked for, and
+   * Shift+arrow must keep the entry's own text selection).
+   *
+   * Consumed here (GDK_EVENT_STOP) because this controller sits on the FOCUSED
+   * field: without the stop, the toplevel's arrow bindings move focus out of
+   * the entry, which is what makes an arrow useless inside a popover. And
+   * because a key event only reaches this controller while the jump entry has
+   * focus, the arrows stay inert everywhere else — the grid's own cursor
+   * navigation (on_key_pressed, on the drawing area) is a different controller
+   * on a different widget and is untouched by this.
+   */
+  if ((state & (GDK_CONTROL_MASK | GDK_ALT_MASK | GDK_SHIFT_MASK)) == 0)
+    {
+      LsgJumpStepDir dir = lsg_jump_step_dir_for_keyval (keyval);
+      if (dir != LSG_JUMP_STEP_NONE)
+        {
+          jump_step_entry (app, dir);
+          return GDK_EVENT_STOP;
+        }
     }
   return GDK_EVENT_PROPAGATE;
 }
