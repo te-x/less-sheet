@@ -66,7 +66,11 @@ WINDOW_SIZE = "1240x780"
 # `screencapture -l` takes, printed by CaptureProbe after first paint).
 SHOTS = {
     "hero": ({}, r"first_rows_visible_ms", None),
-    "jump": ({"LESSSHEET_JUMP": "1500"}, r"lesssheet\.jump\.", None),
+    # Gate on the REOPEN, not the landing: landing dismisses the jump field, so
+    # a shot taken at `jump.landed` is a grid parked at row 1500 with no control
+    # visible — indistinguishable from the hero, which is what first shipped.
+    "jump": ({"LESSSHEET_JUMP": "1500", "LESSSHEET_CAPTURE_REVEAL": "jump"},
+             r"lesssheet\.capture_jump_reopened=", None),
     "dialect": ({"LESSSHEET_CAPTURE_REVEAL": "separator"}, r"first_rows_visible_ms",
                 None),
     "search": ({"LESSSHEET_FIND": "Lisbon"}, r"lesssheet\.find\.count_final", None),
