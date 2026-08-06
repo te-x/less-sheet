@@ -91,12 +91,20 @@ struct JumpFieldRamp {
 
     private var startedAt: ContinuousClock.Instant?
     private var steppedAt: ContinuousClock.Instant?
+    /// Which arrow the open hold belongs to. A press in the OTHER direction is a
+    /// new intent, never a continuation — the third defence, after the key-up and
+    /// the lapse. Without it, a swallowed key-up followed within 300 ms by the
+    /// opposite arrow would step 1000 in the new direction. Added to match the GTK
+    /// implementation, which had this guard while this side did not.
+    private var direction: JumpFieldStep?
 
     /// The step size for a press at `now`, opening a FRESH hold (step 1) whenever
     /// this press is not a continuation of the current one.
-    mutating func magnitude(pressedAt now: ContinuousClock.Instant) -> UInt64 {
-        if !continues(at: now) { startedAt = now }
+    mutating func magnitude(pressedAt now: ContinuousClock.Instant,
+                            going way: JumpFieldStep) -> UInt64 {
+        if !continues(at: now, going: way) { startedAt = now }
         steppedAt = now
+        direction = way
         return Self.magnitude(held: now - (startedAt ?? now))
     }
 
@@ -104,12 +112,13 @@ struct JumpFieldRamp {
     mutating func release() {
         startedAt = nil
         steppedAt = nil
+        direction = nil
     }
 
     /// A press continues the current hold only if one is open AND it follows the
     /// previous step closely enough to belong to the same auto-repeat stream.
-    private func continues(at now: ContinuousClock.Instant) -> Bool {
-        guard startedAt != nil, let steppedAt else { return false }
+    private func continues(at now: ContinuousClock.Instant, going way: JumpFieldStep) -> Bool {
+        guard startedAt != nil, let steppedAt, direction == way else { return false }
         return now - steppedAt <= Self.holdLapse
     }
 
@@ -133,7 +142,7 @@ extension DocumentModel {
     /// keypress the grid owns can never arm it.
     func stepJumpField(_ direction: JumpFieldStep) {
         guard jumpFieldActive else { return }
-        let magnitude = jumpFieldRamp.magnitude(pressedAt: progressClock.now)
+        let magnitude = jumpFieldRamp.magnitude(pressedAt: progressClock.now, going: direction)
         // Read the current text through the FROZEN parser the submit path uses
         // (`parseTarget` is 0-based; the field is 1-based), so "what counts as a
         // row number" can never disagree between stepping and submitting.

@@ -60,7 +60,7 @@ extension JumpStepProbe {
         var lastMs = 0
         for press in 0...38 {
             lastMs = press * 90
-            let magnitude = ramp.magnitude(pressedAt: base + .milliseconds(lastMs))
+            let magnitude = ramp.magnitude(pressedAt: base + .milliseconds(lastMs), going: .towardEnd)
             if tiers.last != magnitude {
                 tiers.append(magnitude)
                 crossedAt[magnitude] = lastMs
@@ -69,25 +69,47 @@ extension JumpStepProbe {
         expect("ramp_hold_tiers", tiers.map(String.init).joined(separator: ","), "1,10,100,1000",
                extra: "crossed_at_ms=" + ([1, 10, 100, 1000] as [UInt64])
                    .map { "\($0)@\(crossedAt[$0] ?? -1)" }.joined(separator: ","))
-        expect("ramp_hot_at_top", String(ramp.magnitude(pressedAt: base + .milliseconds(lastMs))), "1000")
+        expect("ramp_hot_at_top",
+               String(ramp.magnitude(pressedAt: base + .milliseconds(lastMs), going: .towardEnd)),
+               "1000")
 
         // Reset 1 — the key came up.
         ramp.release()
         expect("ramp_reset_on_release",
-               String(ramp.magnitude(pressedAt: base + .milliseconds(lastMs + 90))), "1")
+               String(ramp.magnitude(pressedAt: base + .milliseconds(lastMs + 90), going: .towardEnd)), "1")
 
         // Reset 2 — the DANGEROUS path: no release ever arrives, only a gap.
         var hot = JumpFieldRamp()
-        for press in 0...38 { _ = hot.magnitude(pressedAt: base + .milliseconds(press * 90)) }
+        for press in 0...38 { _ = hot.magnitude(pressedAt: base + .milliseconds(press * 90), going: .towardEnd) }
         expect("ramp_reset_on_gap_no_release",
-               String(hot.magnitude(pressedAt: base + .milliseconds(lastMs) + lapsedGap)), "1")
+               String(hot.magnitude(pressedAt: base + .milliseconds(lastMs) + lapsedGap, going: .towardEnd)), "1")
 
         // …and a gap UNDER the lapse is the same hold, so a genuine 90 ms repeat
         // stream (or a briefly stuttering one) keeps its acceleration.
         var warm = JumpFieldRamp()
-        for press in 0...38 { _ = warm.magnitude(pressedAt: base + .milliseconds(press * 90)) }
+        for press in 0...38 { _ = warm.magnitude(pressedAt: base + .milliseconds(press * 90), going: .towardEnd) }
         expect("ramp_gap_under_lapse_holds",
-               String(warm.magnitude(pressedAt: base + .milliseconds(lastMs + 290))), "1000")
+               String(warm.magnitude(pressedAt: base + .milliseconds(lastMs + 290), going: .towardEnd)), "1000")
+
+        // Reset 3 — the OPPOSITE arrow ends the hold, with no key-up and no gap.
+        // This guard came from the GTK implementer, who had it and found this side
+        // did not: a swallowed key-up followed within the lapse by the other arrow
+        // gave step 1 there and step 1000 here. Both sides now agree on step 1.
+        var flip = JumpFieldRamp()
+        for press in 0...38 { _ = flip.magnitude(pressedAt: base + .milliseconds(press * 90), going: .towardEnd) }
+        expect("ramp_reset_on_direction_flip",
+               String(flip.magnitude(pressedAt: base + .milliseconds(lastMs + 20), going: .towardStart)), "1")
+        // …and that flip opened a FRESH hold: held for a second IN THE NEW
+        // DIRECTION it reaches step 10, on its own clock rather than inheriting the
+        // abandoned one. Note this must be a STREAM, not two presses a second
+        // apart — my first version asserted the latter and correctly got 1, because
+        // a 1 s gap is two taps, not a hold. The lapse is what makes that true.
+        var flipMagnitude: UInt64 = 0
+        for press in 0...12 {
+            flipMagnitude = flip.magnitude(
+                pressedAt: base + .milliseconds(lastMs + 20 + press * 90), going: .towardStart)
+        }
+        expect("ramp_flip_opens_fresh_hold", String(flipMagnitude), "10")
     }
 
     // MARK: - 2. Wrap + clamp at every step size
@@ -212,8 +234,27 @@ extension JumpStepProbe {
         model.endJumpFieldHold()
         hold(model, forMs: shortHoldMs) { samples in
             let deltas = zip(samples, samples.dropFirst()).map { $1.value &- $0.value }
-            expect("live_hold_was_hot", String(deltas.last ?? 0), "10",
-                   extra: "presses=\(samples.count) last_row=\(samples.last?.value ?? 0)")
+            let hottest = deltas.max() ?? 0
+            let spanMs = (samples.last?.ms ?? 0) - (samples.first?.ms ?? 0)
+            // Assert the ramp LEFT step 1; do NOT pin the delta to exactly 10.
+            // Two independent reasons, and the second is the fundamental one:
+            //   * timing — a 1150 ms target hold is only ~12 presses at this
+            //     cadence, so under load the span falls short of the 1 s tier;
+            //   * SNAPPING — a step of 10 from row 12 lands on 20, a delta of 8.
+            //     With snapping the delta is the distance to the next multiple, so
+            //     it is <= the step size and equality can never hold in general.
+            // The exact version failed 1 run in 3 and a later run showed
+            // hottest_step=8, which is snapping, not load. The synthetic tier checks
+            // above pin the boundaries precisely; this one only needs to establish
+            // that the live ramp was hot before the gap test runs.
+            if spanMs < 1000 {
+                log("lesssheet.jumpstep.live_hold_was_hot skipped span_ms=\(spanMs)"
+                    + " presses=\(samples.count)"
+                    + " reason=hold_never_crossed_the_1s_tier_under_load")
+            } else {
+                expect("live_hold_was_hot", hottest > 1 ? "hot" : "cold", "hot",
+                       extra: "presses=\(samples.count) span_ms=\(spanMs) hottest_step=\(hottest)")
+            }
             let before = UInt64(model.jumpFieldText) ?? 0
             after(0.35) {                              // > holdLapse, and NO release
                 model.stepJumpField(.towardEnd)

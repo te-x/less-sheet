@@ -253,6 +253,10 @@ typedef struct
                                  * closed handler cancels+restores the scan;
                                  * an incidental autohide (FALSE) keeps a
                                  * live deep/net scan alive so it lands. */
+  /* The held-arrow acceleration ramp for the jump field (src/lsg_jump_step.h).
+   * Reset on key release, on a > 300 ms gap, on a direction change, and on
+   * every popover open/close — a hot ramp must never greet a single tap. */
+  LsgJumpStepRamp jump_ramp;
 
   /* Filter-to-matches (slice 4): the pure state + the toggle. The passive
    * "Filtered — N of M rows" status is shown in the header-bar subtitle
@@ -3250,17 +3254,24 @@ jump_top_visible_row_1based (App *app)
  * Up/Down with the jump field open: step the row number IN THE FIELD ONLY.
  * NO LANDING — no ls_jump_start, no scan, no viewport change, no popover
  * change; the arrows just retype the number, and Enter submits it exactly as
- * it submits a typed one. The direction is inverted on purpose and the wrap
- * works at both ends off a possibly-ESTIMATED count; all of that decision is
- * lsg_jump_step_row (src/lsg_jump_step.h).
+ * it submits a typed one. The direction is inverted on purpose, a HELD arrow
+ * ACCELERATES (1 -> 10 -> 100 -> 1000 on one-second rungs), and the wrap/clamp
+ * hold at every step size off a possibly-ESTIMATED count; all of that decision
+ * is lsg_jump_step_row / lsg_jump_step_ramp_press (src/lsg_jump_step.h).
+ *
+ * The ramp is keyed off the MONOTONIC CLOCK — elapsed hold time, never a
+ * repeat count — so it accelerates at the same rows whatever this desktop's
+ * key-repeat rate is set to, and identically to the macOS frontend.
  */
 static void
 jump_step_entry (App *app, LsgJumpStepDir dir)
 {
   if (app->doc == NULL || app->jump_entry == NULL)
     return;
+  guint64 step = lsg_jump_step_ramp_press (&app->jump_ramp, dir,
+                                           g_get_monotonic_time ());
   guint64 row = lsg_jump_step_row (gtk_editable_get_text (app->jump_entry),
-                                   dir, jump_field_rowcount (app).count,
+                                   dir, step, jump_field_rowcount (app).count,
                                    jump_top_visible_row_1based (app));
   char *text = g_strdup_printf ("%" G_GUINT64_FORMAT, row);
   gtk_editable_set_text (app->jump_entry, text);
@@ -3316,6 +3327,29 @@ on_jump_entry_key (GtkEventControllerKey *ctrl, guint keyval, guint keycode,
 }
 
 /*
+ * Arrow RELEASED: the hold is over, so the acceleration ramp goes cold and the
+ * next press starts again at one row per press. This is only the FIRST of the
+ * ramp's three defences — a release that never arrives (swallowed by a grab, a
+ * focus change, an X server that drops it) must not leave the ramp armed, so
+ * lsg_jump_step_ramp_press independently goes cold after a > 300 ms gap and on
+ * a direction change. Releases are otherwise ignored: no keyval but an arrow's
+ * touches the ramp, and this handler never consumes anything (releases are
+ * reported, not vetoed, by GtkEventControllerKey).
+ */
+static void
+on_jump_entry_key_released (GtkEventControllerKey *ctrl, guint keyval,
+                            guint keycode, GdkModifierType state,
+                            gpointer data)
+{
+  (void)ctrl;
+  (void)keycode;
+  (void)state;
+  App *app = data;
+  if (lsg_jump_step_dir_for_keyval (keyval) != LSG_JUMP_STEP_NONE)
+    lsg_jump_step_ramp_reset (&app->jump_ramp);
+}
+
+/*
  * Close handler. There are two very different reasons the popover closes and
  * they must NOT be conflated (this was the valid-deep-jump-vanishes gap):
  *
@@ -3360,6 +3394,9 @@ on_jump_popover_closed (GtkPopover *popover, gpointer data)
         scroll_to_first_row (app, c.restore_first_row);
     }
   app->jump = lsg_jump_initial ();
+  /* The field is gone, so any hold it was under is gone with it: no release
+   * can still be in flight for a widget that is no longer taking keys. */
+  lsg_jump_step_ramp_reset (&app->jump_ramp);
   jump_clear_feedback (app);
   jump_update_ui (app);
 }
@@ -3371,6 +3408,9 @@ on_jump_popover_show (GtkWidget *popover, gpointer data)
   App *app = data;
   app->jump_explicit_close
       = FALSE; /* fresh open: default to incidental close */
+  /* A fresh field is never mid-hold: the first arrow after opening steps by
+   * one row, whatever happened before the popover went away. */
+  lsg_jump_step_ramp_reset (&app->jump_ramp);
   gtk_widget_grab_focus (GTK_WIDGET (app->jump_entry));
   gtk_editable_set_position (app->jump_entry, -1);
 }
@@ -3440,6 +3480,9 @@ build_jump_popover (App *app)
 
   GtkEventController *keys = gtk_event_controller_key_new ();
   g_signal_connect (keys, "key-pressed", G_CALLBACK (on_jump_entry_key), app);
+  /* The same controller reports the RELEASE that ends a held-arrow ramp. */
+  g_signal_connect (keys, "key-released",
+                    G_CALLBACK (on_jump_entry_key_released), app);
   gtk_widget_add_controller (entry, keys);
 }
 
