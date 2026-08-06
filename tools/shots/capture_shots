@@ -35,6 +35,7 @@ Usage:
 """
 
 import argparse
+import functools
 import os
 import re
 import shutil
@@ -92,24 +93,48 @@ LAUNCH_DEADLINE = 40       # per variant, before the launch is declared failed
 PER_SHOT_BUDGET_KB = 150   # ARCH-frontpage §3.3
 
 
+print = functools.partial(print, flush=True)   # a hang must not look silent
+
+
 def die(msg):
     sys.stderr.write("error: %s\n" % msg)
     sys.exit(1)
 
 
 def find_app(explicit):
-    if explicit:
-        return explicit
-    cands = [
-        os.path.join(REPO, "apps", "macos", ".build", "arm64-apple-macosx",
-                     "release", "LessSheet"),
-        "/Applications/less-sheet.app/Contents/MacOS/LessSheet",
-    ]
-    for c in cands:
-        if os.path.isfile(c) and os.access(c, os.X_OK):
-            return c
-    die("no app binary found. Build it (cd apps/macos && swift build -c release) "
-        "or pass --app. Looked in:\n  " + "\n  ".join(cands))
+    """The freshly built binary — and NEVER a silent fallback to an older one.
+
+    This cost a 400-second dead run. `apps/macos/.aidev/profile.sh`'s conformance
+    step does `rm -rf .build/*/release/LessSheet` before rebuilding, so ANY gate
+    run can leave that path missing for a while. The first version of this
+    function then fell back to /Applications/less-sheet.app — an installed copy
+    from two days earlier that predates CaptureProbe, so no capture_window marker
+    ever arrived and all ten variants burned their 40 s deadline in silence.
+    Same family as the stale-bundle traps already recorded for this app: a
+    verified-looking run against the wrong binary.
+
+    So: build path only (or --app), and the binary must actually CONTAIN the
+    capture affordance. Refuse loudly instead of guessing."""
+    build = os.path.join(REPO, "apps", "macos", ".build", "arm64-apple-macosx",
+                         "release", "LessSheet")
+    app = explicit or build
+    if not (os.path.isfile(app) and os.access(app, os.X_OK)):
+        die("no app binary at %s\n"
+            "  (a gate run deletes it before rebuilding, so this is normal after one)\n"
+            "  build it:  cd apps/macos && swift build -c release\n"
+            "  or pass --app <path> — but NOT an installed .app unless it is fresh"
+            % app)
+    # Capability check, not a version guess: the marker string must be in the
+    # binary. Without it the run cannot possibly succeed.
+    try:
+        with open(app, "rb") as fh:
+            blob = fh.read()
+    except OSError as e:
+        die("cannot read %s: %s" % (app, e))
+    if b"lesssheet.capture_window=" not in blob:
+        die("%s predates the capture affordance (no capture_window marker).\n"
+            "  rebuild:  cd apps/macos && swift build -c release" % app)
+    return app
 
 
 def write_fixture(path, rows=FIXTURE_ROWS):
@@ -139,31 +164,45 @@ def png_size(path):
     return struct.unpack(">II", head[16:24])
 
 
-AVIF_QUALITY = "70"    # sips formatOptions; measured on first-generation sources
+# Tuned against REAL captures, not a resampled sample: a first pass measured q82
+# on a PNG that had already been through AVIF, so it reported ~137 KB and the
+# real sources then landed 159-175 KB — over budget. q76 at 1500 px measures
+# 133-144 KB on the true sources. Resolution was the honest lever, quality
+# second.
+WEBP_QUALITY = "76"
 # Captures are 2704 px wide (1240 pt content + shadow at 2x) but display at
-# ~600 CSS px, so 1600 px keeps >2.5x oversampling for retina while roughly
-# halving the encoded bytes. Applied to the PNG before AVIF encoding; the
+# ~600 CSS px, so 1500 px keeps >2.4x oversampling for retina while roughly
+# halving the encoded bytes. Applied to the PNG before encoding; the
 # dimension post-check runs on the resized output, so identity still holds.
-RESIZE_MAX_PX = "1600"
+RESIZE_MAX_PX = "1500"
 
 
-def to_avif(png):
-    """PNG -> AVIF via macOS `sips` (no third-party encoder). Absolute paths
-    only: sips reports a path it cannot resolve as "not a valid file" and
-    still exits 0 — a silent no-op this tool refuses to inherit."""
-    avif = os.path.splitext(os.path.abspath(png))[0] + ".avif"
-    if os.path.exists(avif):
-        os.remove(avif)
+def to_webp(png):
+    """PNG -> WebP via cwebp (alpha preserved for the window shadow).
+
+    WHY NOT AVIF: the first shipping set was AVIF from macOS `sips`, and
+    the author found the pages images blank in Firefox — Apple's encoder emits
+    the progressive/layered flavor (brand `MiPr`) that Firefox's decoder
+    does not render, while Safari shows it fine. WebP decodes everywhere
+    this page supports, carries alpha, and cwebp is purpose-built for it.
+    (cwebp arrives via `brew install webp`; if it dies loading libtiff, a
+    stale brew state is missing its declared dependency — `brew install
+    libtiff` repairs it. Both happened on the machine this was built on.)"""
+    if not shutil.which("cwebp"):
+        die("cwebp not found - `brew install webp` (and `brew install libtiff` "
+            "if cwebp dies at launch missing libtiff.6.dylib)")
+    webp = os.path.splitext(os.path.abspath(png))[0] + ".webp"
+    if os.path.exists(webp):
+        os.remove(webp)
     subprocess.run(["sips", "-Z", RESIZE_MAX_PX, os.path.abspath(png)],
                    capture_output=True, text=True)
-    proc = subprocess.run(["sips", "-s", "format", "avif",
-                           "-s", "formatOptions", AVIF_QUALITY,
-                           os.path.abspath(png), "--out", avif],
+    proc = subprocess.run(["cwebp", "-quiet", "-q", WEBP_QUALITY,
+                           "-alpha_q", "100", os.path.abspath(png), "-o", webp],
                           capture_output=True, text=True)
-    if not os.path.isfile(avif):
+    if not os.path.isfile(webp):
         return None, ((proc.stderr or proc.stdout or "").strip().splitlines()
-                      or ["sips produced no file"])[-1]
-    return avif, os.path.getsize(avif) / 1024.0
+                      or ["cwebp produced no file"])[-1]
+    return webp, os.path.getsize(webp) / 1024.0
 
 
 # ---------------------------------------------------------------------------
@@ -318,17 +357,17 @@ def main():
                 failed.append((shot, theme, tail))
                 print("  %-8s %-5s  FAILED (%.1fs)" % (shot, theme, secs))
                 continue
-            avif, kb = to_avif(path)   # resizes the PNG in place first
+            webp, kb = to_webp(path)   # resizes the PNG in place first
             sz = png_size(path)        # so the recorded size is what ships
-            if avif is None:
-                failed.append((shot, theme, ["AVIF conversion failed: %s" % kb]))
-                print("  %-8s %-5s  rendered, AVIF FAILED: %s" % (shot, theme, kb))
+            if webp is None:
+                failed.append((shot, theme, ["WebP conversion failed: %s" % kb]))
+                print("  %-8s %-5s  rendered, WebP FAILED: %s" % (shot, theme, kb))
                 continue
             os.remove(path)
-            produced.setdefault(shot, {})[theme] = (avif, sz, kb)
+            produced.setdefault(shot, {})[theme] = (webp, sz, kb)
             over = "  OVER BUDGET" if kb > PER_SHOT_BUDGET_KB else ""
             print("  %-8s %-5s  %s  %s  %5.0f KB%s  %.1fs"
-                  % (shot, theme, os.path.basename(avif),
+                  % (shot, theme, os.path.basename(webp),
                      "%dx%d" % sz if sz else "?", kb, over, secs))
 
     print("\n-- dimension post-check (the reason this tool exists) --")
