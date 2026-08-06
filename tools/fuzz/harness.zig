@@ -104,6 +104,13 @@ var raw_buf: [doc_max + 4096]u8 = undefined;
 var win_buf: [gzbuild.window_len]u8 = undefined;
 var copy_buf: [16 * 1024]u8 = undefined;
 var cell_buf: [api.cell_max_bytes]u8 = undefined;
+/// The quiesced copy/cell oracle's own destination — comparing against a cell
+/// borrowed from the window must not overwrite the buffer under comparison.
+var copy_cmp_buf: [api.cell_max_bytes]u8 = undefined;
+/// The RACER THREAD's own destination. It must never share `cell_buf` with the
+/// main thread: two threads writing one static buffer is a HARNESS data race that
+/// would surface as a corrupted cell and be triaged as a core defect.
+var racer_buf: [8 * 1024]u8 = undefined;
 var col_ids: [64]u32 = undefined;
 var col_meta: [64]api.ColumnMetadata = undefined;
 
@@ -249,11 +256,55 @@ const Drive = struct {
 };
 
 /// One drawn input: the document bytes, three config words, a needle.
+/// Copy-vs-filter knobs.
+///
+/// Drawn from w1's UNUSED HIGH BITS: `Dialect.from` consumes 47 of 64, w2 is
+/// fully spoken for, and adding a fourth entropy word would change the replay
+/// blob format and invalidate every committed pack. These come from bits the
+/// seeds already carry, so the corpus stays byte-exact.
+const Race = struct {
+    /// WHEN `ls_cell_copy` runs relative to the filter's lifetime, and the knob
+    /// that enters `window.cellCopyFilteredLocked` at all. `exercise` only ever
+    /// copied BEFORE `ls_filter_set`, so `filter_state` was always `.idle` at the
+    /// copy and the filtered arm (35 PCs) was unreachable — the identical
+    /// call-ordering defect that hid 210 PCs of `search.zig`.
+    ///   0 = before only (the old behavior)   1 = while the filter is SCANNING
+    ///   2 = after it settles                 3 = both, with a transition between
+    when: u2,
+    /// Which FILTERED row index to copy: 0, mid, the last one, and past the end
+    /// (`row >= d.filter_total`, the early return).
+    row_mode: u2,
+    /// Copy several COLUMNS of one filtered row — the `row == copy_cursor_row`
+    /// zero-advance branch.
+    col_walk: bool,
+    /// Length of an ASCENDING copy run, sized against the two real constants:
+    /// `copy_cursor_trust_gap_max` (1) and `copy_reanchor_gap_max` (2048).
+    ascend: u2,
+    /// Filter TRANSITION around the copy: clear it, or re-set it with a different
+    /// query so `filter_gen` moves and `copy_cursor_gen` stops matching.
+    transition: u2,
+    /// Run the copies on a SECOND THREAD while this one flips the filter (1 in 4).
+    concurrent: bool,
+
+    fn from(word: u64) Race {
+        var w = word;
+        return .{
+            .when = @intCast(take(&w, 2)),
+            .row_mode = @intCast(take(&w, 2)),
+            .col_walk = take(&w, 1) != 0,
+            .ascend = @intCast(take(&w, 2)),
+            .transition = @intCast(take(&w, 2)),
+            .concurrent = take(&w, 2) == 3,
+        };
+    }
+};
+
 const Input = struct {
     data: []u8,
     w0: u64,
     dialect: Dialect,
     drive: Drive,
+    race: Race,
     needle: []u8,
 
     fn draw(smith: *Smith, data_buf: []u8) Input {
@@ -267,6 +318,8 @@ const Input = struct {
             .w0 = w0,
             .dialect = .from(w1),
             .drive = .from(w2),
+            // w1's bits 47..: everything below is already claimed by `Dialect`.
+            .race = .from(w1 >> 47),
             .needle = needle_buf[0..m],
         };
     }
@@ -613,6 +666,141 @@ fn searchDrive(doc: *api.Doc, k: Drive, needle: []const u8, cols: u32) void {
     api.ls_search_cancel(doc);
 }
 
+// ---------------------------------------------------------------------------
+// The filtered COPY path (window.cellCopyFilteredLocked)
+//
+// `cellCopy` reads `filter_state` and dispatches to the filtered arm UNDER
+// `d.lock()`. That single acquisition is a FIX: reading `filter_state`
+// unsynchronized was both a data race and a TOCTOU — a filter landing between the
+// read and the work serves an IDENTITY row index as a FILTERED coordinate, i.e.
+// the wrong cell, reported `.ok`. The frozen suite covers the fix; until now no
+// adversarial input had ever executed it, because `exercise` copied only while
+// the filter was idle.
+// ---------------------------------------------------------------------------
+
+/// Copy filtered cells, walking the copy cursor's real branch boundaries:
+/// gap 0 (another column of the same row), gap 1 (`copy_cursor_trust_gap_max`,
+/// trusted unconditionally), a run inside `copy_reanchor_gap_max` (2048, so the
+/// checkpoint comparison decides), and a run past it (a fresh locate).
+fn filteredCopyDrive(doc: *api.Doc, cols: u32, rc: Race) void {
+    var out_len: usize = 0;
+    var out_trunc: bool = false;
+    // While filtered, `ls_row_count_get` reports the FILTERED total — the domain
+    // these row indices live in.
+    const total = api.ls_row_count_get(doc).count;
+    const first: u64 = switch (rc.row_mode) {
+        0 => 0,
+        1 => total / 2,
+        2 => total -| 1,
+        else => total +| 3, // past the filtered end: the early-return arm
+    };
+    const steps: u64 = switch (rc.ascend) {
+        0 => 1,
+        1 => 2, // gap 1
+        2 => 64, // beyond the trust gap, inside the re-anchor gap
+        else => 2100, // beyond copy_reanchor_gap_max
+    };
+    // Multiple columns only on the short runs: 2100 rows x 4 columns would be
+    // 8400 locates for no extra branch.
+    const nc: u32 = if (rc.col_walk and steps <= 64) @min(@max(cols, 1), 4) else 1;
+    var i: u64 = 0;
+    while (i < steps) : (i += 1) {
+        var c: u32 = 0;
+        while (c < nc) : (c += 1) {
+            _ = api.ls_cell_copy(doc, first +| i, c, &cell_buf, cell_buf.len, &out_len, &out_trunc);
+        }
+    }
+}
+
+/// QUIESCED ORACLE — the only thing here that can see the TOCTOU's actual
+/// signature.
+///
+/// Every other check in this harness is crash-shaped ("the process survives"), and
+/// a wrong cell reported `.ok` is not a crash. With the filter settled and a
+/// window materialized over the filtered view, the window-independent full-cell
+/// read must agree BYTE FOR BYTE with the window's borrowed cell at the same
+/// FILTERED coordinate. A mis-anchored cursor or an identity index served as a
+/// filtered one shows up here and nowhere else.
+///
+/// Soundness guards, each from a real divergence in the contract rather than
+/// caution for its own sake:
+///   * first byte `=` `@` `+` `-` — ONLY `ls_cell_copy` prepends the `'`
+///     (`copyCellNeutralizes`); `ls_cell` does not, so those legitimately differ.
+///     Skipped on the first byte alone, so this never has to re-derive
+///     `isPlainNumber`'s stricter number grammar.
+///   * either side truncated — `ls_cell` is bounded by the window's byte budget
+///     and `ls_cell_copy` is not, so a cut window cell is a prefix, not a bug.
+///   * oversized rows — served through a different path with its own budget.
+///   * rows outside the materialized window, where `ls_cell` returns empty.
+fn filteredCopyAgrees(doc: *api.Doc, r: api.RowRange, cols: u32) void {
+    const rows = @min(r.row_count, 16);
+    const nc = @min(cols, 4);
+    var i: u64 = 0;
+    while (i < rows) : (i += 1) {
+        const row = r.first_row + i;
+        if (api.ls_row_oversized(doc, row)) continue;
+        var c: u32 = 0;
+        while (c < nc) : (c += 1) {
+            if (api.ls_cell_truncated(doc, row, c)) continue;
+            const win = api.ls_cell(doc, row, c);
+            if (win.len != 0) switch (win.ptr[0]) {
+                '=', '@', '+', '-' => continue,
+                else => {},
+            };
+            var out_len: usize = 0;
+            var out_trunc: bool = false;
+            const st = api.ls_cell_copy(doc, row, c, &copy_cmp_buf, copy_cmp_buf.len, &out_len, &out_trunc);
+            if (st != .ok or out_trunc) continue;
+            if (out_len != win.len) std.debug.panic(
+                "FILTERED COPY/CELL LENGTH DISAGREE: filtered row {d} col {d}: copy={d}B cell={d}B",
+                .{ row, c, out_len, win.len },
+            );
+            if (win.len != 0 and !std.mem.eql(u8, copy_cmp_buf[0..out_len], win.ptr[0..win.len])) std.debug.panic(
+                "FILTERED COPY/CELL BYTES DISAGREE: filtered row {d} col {d}, {d}B",
+                .{ row, c, out_len },
+            );
+        }
+    }
+}
+
+/// The transition filter's query. A single common byte, so it usually MATCHES
+/// something (a filter with zero matches makes every filtered copy an early
+/// return and tests nothing), and different from the drawn needle so re-setting
+/// really does move `filter_gen`.
+const alt_filter_token = "a";
+
+const RaceCtx = struct { doc: *api.Doc, rounds: u32, cols: u32 };
+
+/// Hammer `ls_cell_copy` while the main thread flips the filter under it.
+///
+/// Bounded by ITERATION COUNT and never by waiting for a state, so `join` always
+/// terminates unless a C-ABI call itself never returns — which is a finding, and
+/// the one hang class this harness documents it cannot bound (see HANGS above).
+fn raceCopyThread(ctx: *RaceCtx) void {
+    var out_len: usize = 0;
+    var out_trunc: bool = false;
+    var i: u32 = 0;
+    while (i < ctx.rounds) : (i += 1) {
+        const col: u32 = if (ctx.cols == 0) 0 else i % @min(ctx.cols, 3);
+        _ = api.ls_cell_copy(ctx.doc, i % 11, col, &racer_buf, racer_buf.len, &out_len, &out_trunc);
+    }
+}
+
+/// The copy-vs-filter-TRANSITION race: a concurrent copier against set / clear /
+/// re-set on this thread. This is the adversarial shape for the lock-ordering fix
+/// — if the dispatch and the work it selects were not covered by ONE acquisition,
+/// a transition landing mid-copy is what would expose it, as a panic from an index
+/// derived against the other view or as a deadlock.
+fn filterFlipRace(doc: *api.Doc, cols: u32, req: *const api.SearchRequest, alt: *const api.SearchRequest) void {
+    var ctx: RaceCtx = .{ .doc = doc, .rounds = 96, .cols = cols };
+    const th = std.Thread.spawn(.{}, raceCopyThread, .{&ctx}) catch return;
+    api.ls_filter_clear(doc);
+    _ = api.ls_filter_set(doc, alt);
+    api.ls_filter_clear(doc);
+    _ = api.ls_filter_set(doc, req);
+    th.join();
+}
+
 /// Read every cell of a materialized window, plus the per-row predicates.
 fn sweepWindow(doc: *api.Doc, r: api.RowRange, cols: u32) void {
     const rows = @min(r.row_count, 64);
@@ -640,7 +828,7 @@ fn sweepWindow(doc: *api.Doc, r: api.RowRange, cols: u32) void {
 /// every hotspot module AC-c1 enumerates — which in turn means the seed generator
 /// never has to know this file's bit layout to produce a seed that lands deep in
 /// the code. Gating them would trade that guarantee for throughput.
-fn exercise(doc: *api.Doc, d: Dialect, k: Drive, needle: []const u8) void {
+fn exercise(doc: *api.Doc, d: Dialect, k: Drive, rc: Race, needle: []const u8) void {
     settle(doc, 512 + d.spins);
 
     _ = api.ls_dialect_get(doc);
@@ -693,6 +881,12 @@ fn exercise(doc: *api.Doc, d: Dialect, k: Drive, needle: []const u8) void {
             .case_sensitive = k.case_sensitive,
         };
         if (api.ls_filter_set(doc, &req)) {
+            // COPY WHILE THE FILTER IS STILL SCANNING — before `settle`, on
+            // purpose. This races the filter WORKER, which is concurrently
+            // appending to `filter_block_counts` and moving `filter_total`, so it
+            // needs no extra thread to be a genuine concurrent read.
+            if (rc.when == 1 or rc.when == 3) filteredCopyDrive(doc, cols, rc);
+
             settle(doc, 256);
             _ = api.ls_filter_poll(doc);
             const fr = api.ls_window_set(doc, 0, @min(d.row_count, 64));
@@ -700,6 +894,42 @@ fn exercise(doc: *api.Doc, d: Dialect, k: Drive, needle: []const u8) void {
             while (j < @min(fr.row_count, 32)) : (j += 1) {
                 _ = api.ls_cell(doc, fr.first_row + j, 0);
                 _ = api.ls_source_row(doc, fr.first_row + j);
+            }
+
+            // COPY WITH THE FILTER SETTLED, then check the two reads agree. The
+            // oracle runs only here: mid-transition there is no single correct
+            // answer to compare against, so asserting then would be a false
+            // positive generator rather than a check.
+            if (rc.when == 2 or rc.when == 3) {
+                filteredCopyDrive(doc, cols, rc);
+                filteredCopyAgrees(doc, fr, cols);
+            }
+
+            // FILTER TRANSITIONS around the copy. `alt` deliberately differs from
+            // `req` so `ls_filter_set` moves `filter_gen` and any copy cursor
+            // tagged for the previous generation must be rejected rather than
+            // trusted.
+            const alt: api.SearchRequest = .{
+                .kind = .text,
+                .value_ptr = alt_filter_token.ptr,
+                .value_len = alt_filter_token.len,
+                .case_sensitive = false,
+            };
+            switch (rc.transition) {
+                0 => {},
+                1 => { // clear, then copy against the IDENTITY view again
+                    api.ls_filter_clear(doc);
+                    filteredCopyDrive(doc, cols, rc);
+                },
+                2 => { // re-set under a new generation, then copy
+                    _ = api.ls_filter_set(doc, &alt);
+                    filteredCopyDrive(doc, cols, rc);
+                },
+                else => if (rc.concurrent) filterFlipRace(doc, cols, &req, &alt) else {
+                    api.ls_filter_clear(doc);
+                    _ = api.ls_filter_set(doc, &alt);
+                    filteredCopyDrive(doc, cols, rc);
+                },
             }
             // SEARCH COMPOSED WITH AN ACTIVE FILTER — the single biggest gap the
             // wave (c) campaign left. `exercise` used to cancel its search
@@ -784,7 +1014,7 @@ fn openAndExercise(sb: *Sandbox, in: Input, opts: api.OpenOptions) void {
     }
     const d = doc orelse return;
     defer api.ls_close(d);
-    exercise(d, in.dialect, in.drive, in.needle);
+    exercise(d, in.dialect, in.drive, in.race, in.needle);
 }
 
 /// Bounded wait for a scan lane to leave `scanning`. More generous than `settle`
@@ -951,7 +1181,7 @@ fn oneCsv(sb: *Sandbox, smith: *Smith) anyerror!void {
 /// `many_rows_shape_min` sits just below it, so shape 0 — by far the most common
 /// value in a generated corpus — is the ordinary, cheap path.
 const deep_shape = 0x3f;
-const many_rows_shape_min = 0x37;
+const many_rows_shape_min = 0x3d;
 
 /// One more than `base.checkpoint_interval` (2048): the floor for the many-rows
 /// shape, so it ALWAYS crosses at least one checkpoint boundary rather than
@@ -1108,7 +1338,7 @@ fn oneNet(sb: *Sandbox, smith: *Smith) anyerror!void {
     }
     const doc = st.doc orelse return;
     defer api.ls_close(doc);
-    exercise(doc, in.dialect, in.drive, in.needle);
+    exercise(doc, in.dialect, in.drive, in.race, in.needle);
     _ = api.netRangeMode(doc);
     _ = api.netFetchCount(doc);
     _ = api.netResidentBytes(doc);

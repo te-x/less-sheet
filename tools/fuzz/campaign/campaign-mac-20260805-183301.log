@@ -1,0 +1,89 @@
+=== less-sheet fuzz campaign (security-hardening wave (c)) ===
+date        : 2026-08-05T16:33:01Z
+host        : MAC-mac Darwin arm64
+zig         : 0.16.0
+repo tip    : 1d69b93 (master)
+tree        : DIRTY
+budget      : WALL CLOCK, 10 minute(s) (iteration cap lifted)
+              comparable across harness versions; iteration counts are NOT
+mode        : ReleaseSafe (the shipped mode — a safety panic counts as a crash)
+log         : $HOME/Documents/projects/less-sheet/tools/fuzz/campaign/campaign-MAC-mac-20260805-183301.log
+
+--- wiping accumulated fuzzer state (.zig-cache/f, .zig-cache/v) ---
+--- quarantines in force ---
+900:const quarantine_utf16_streaming = false; // LIFTED: F1 fixed (streaming end-of-stream verdict)
+
+--- document shapes (csv target) — why iterations are not a constant unit ---
+953:const deep_shape = 0x3f;
+954:const many_rows_shape_min = 0x37;
+959:const base_rows = 2049;
+  ordinary  <=1 MiB (rep amplifier)          ~1-5 ms/iteration
+  many_rows >2048 rows, ~166 KiB             8/64 of draws, 15/219 csv seeds
+  deep      >8 MiB, forces off-main nav      1/64 of draws,  2/219 csv seeds, ~82 ms
+  Sentinels are NON-ZERO on purpose: 93 of the 219 csv seeds carry w0 == 0,
+  so a zero-valued shape selector would make the >8 MiB shape the default.
+
+--- corpus ---
+  csv.pack                1535750 bytes
+  gz_raw.pack              315812 bytes
+  gz_trunc.pack            130819 bytes
+  net.pack                 409205 bytes
+
+--- seed replay (deterministic, every committed entry once) ---
+replay exit status: 0
+
+--- campaign ---
+campaign stopped by the 10-minute WALL-CLOCK BUDGET (raw status 143)
+campaign exit status: 0
+
+--- coverage report ---
+binary match        : attributed=6095 project PCs (best of the cached lsfuzz builds)
+instrumented binary : .zig-cache/o/a46563cf7f1d1a678f9343ed7053d986/lsfuzz
+coverage map        : .zig-cache/v/088ba809e4036922
+
+======= COVERAGE REPORT =======
+binary      : .zig-cache/o/a46563cf7f1d1a678f9343ed7053d986/lsfuzz
+coverage    : .zig-cache/v/088ba809e4036922
+runs        : 383415
+unique runs : 9471
+PCs covered : 5706/22826 (25.00%)
+unresolved  : 332 PCs (no debug line info)
+
+-- required hotspot modules (AC-c1) --
+  csv_reader   ENTERED      662/783 PCs in 1 file(s)
+  source       ENTERED      329/521 PCs in 1 file(s)
+  net_source   ENTERED      196/365 PCs in 1 file(s)
+  window       ENTERED      219/376 PCs in 1 file(s)
+  index        ENTERED      213/336 PCs in 1 file(s)
+  search       ENTERED      302/417 PCs in 1 file(s)
+  encoding     ENTERED      471/522 PCs in 1 file(s)
+
+-- per-file coverage (project files only) --
+  base.zig                         74/99      74.75%
+  column.zig                      403/880     45.80%
+  column_state.zig                 16/60      26.67%
+  csv_reader.zig                  662/783     84.55%
+  encoding.zig                    471/522     90.23%
+  fault_guard.zig                  15/51      29.41%
+  filter.zig                       78/153     50.98%
+  gzbuild.zig                      36/54      66.67%
+  harness.zig                     119/207     57.49%
+  index.zig                       213/336     63.39%
+  lexer.zig                       166/177     93.79%
+  matcher.zig                     428/479     89.35%
+  nav.zig                          77/132     58.33%
+  net.zig                          78/116     67.24%
+  net_source.zig                  196/365     53.70%
+  open.zig                         29/48      60.42%
+  reader.zig                       18/18     100.00%
+  root.zig                        190/243     78.19%
+  search.zig                      302/417     72.42%
+  sniff.zig                        51/54      94.44%
+  source.zig                      329/521     63.15%
+  sysio.zig                         1/4       25.00%
+  window.zig                      219/376     58.24%
+attributed  : 6095 PCs in 23 project file(s)  <- maximize to match binary/map
+==============================
+
+--- triage (AC-c2) ---
+no crashing input saved

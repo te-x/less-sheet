@@ -1,0 +1,43 @@
+=== less-sheet fuzz campaign (security-hardening wave (c)) ===
+date        : 2026-08-05T17:08:41Z
+host        : MAC-mac Darwin arm64
+zig         : 0.16.0
+repo tip    : 1d69b93 (master)
+tree        : DIRTY
+budget      : WALL CLOCK, 10 minute(s) (iteration cap lifted)
+              comparable across harness versions; iteration counts are NOT
+mode        : ReleaseSafe (the shipped mode — a safety panic counts as a crash)
+log         : $HOME/Documents/projects/less-sheet/tools/fuzz/campaign/campaign-MAC-mac-20260805-190841.log
+
+--- wiping accumulated fuzzer state (.zig-cache/f, .zig-cache/v) ---
+    + .zig-cache/o, .zig-cache/h (one instrumented binary, deterministically)
+--- quarantines in force ---
+1130:const quarantine_utf16_streaming = false; // LIFTED: F1 fixed (streaming end-of-stream verdict)
+
+--- document shapes (csv target) — why iterations are not a constant unit ---
+1183:const deep_shape = 0x3f;
+1184:const many_rows_shape_min = 0x37;
+1189:const base_rows = 2049;
+  ordinary  <=1 MiB (rep amplifier)          ~1-5 ms/iteration
+  many_rows >2048 rows, ~166 KiB             8/64 of draws, 15/219 csv seeds
+  deep      >8 MiB, forces off-main nav      1/64 of draws,  2/219 csv seeds, ~82 ms
+  Sentinels are NON-ZERO on purpose: 93 of the 219 csv seeds carry w0 == 0,
+  so a zero-valued shape selector would make the >8 MiB shape the default.
+
+--- corpus ---
+  csv.pack                1535750 bytes
+  gz_raw.pack              315812 bytes
+  gz_trunc.pack            130819 bytes
+  net.pack                 409205 bytes
+
+--- seed replay (deterministic, every committed entry once) ---
+replay exit status: 0
+
+--- campaign ---
+campaign stopped by the 10-minute WALL-CLOCK BUDGET (raw status 143)
+campaign exit status: 0
+
+--- coverage report ---
+coverage report UNAVAILABLE: expected EXACTLY ONE instrumented lsfuzz
+binary in .zig-cache/o, found 0:
+fuzz.sh: line 263: instrumented[@]: unbound variable

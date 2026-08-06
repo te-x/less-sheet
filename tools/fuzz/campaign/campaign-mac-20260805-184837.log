@@ -1,0 +1,94 @@
+=== less-sheet fuzz campaign (security-hardening wave (c)) ===
+date        : 2026-08-05T16:48:37Z
+host        : MAC-mac Darwin arm64
+zig         : 0.16.0
+repo tip    : 1d69b93 (master)
+tree        : DIRTY
+budget      : WALL CLOCK, 10 minute(s) (iteration cap lifted)
+              comparable across harness versions; iteration counts are NOT
+mode        : ReleaseSafe (the shipped mode — a safety panic counts as a crash)
+log         : $HOME/Documents/projects/less-sheet/tools/fuzz/campaign/campaign-MAC-mac-20260805-184837.log
+
+--- wiping accumulated fuzzer state (.zig-cache/f, .zig-cache/v) ---
+--- quarantines in force ---
+1130:const quarantine_utf16_streaming = false; // LIFTED: F1 fixed (streaming end-of-stream verdict)
+
+--- document shapes (csv target) — why iterations are not a constant unit ---
+1183:const deep_shape = 0x3f;
+1184:const many_rows_shape_min = 0x37;
+1189:const base_rows = 2049;
+  ordinary  <=1 MiB (rep amplifier)          ~1-5 ms/iteration
+  many_rows >2048 rows, ~166 KiB             8/64 of draws, 15/219 csv seeds
+  deep      >8 MiB, forces off-main nav      1/64 of draws,  2/219 csv seeds, ~82 ms
+  Sentinels are NON-ZERO on purpose: 93 of the 219 csv seeds carry w0 == 0,
+  so a zero-valued shape selector would make the >8 MiB shape the default.
+
+--- corpus ---
+  csv.pack                1535750 bytes
+  gz_raw.pack              315812 bytes
+  gz_trunc.pack            130819 bytes
+  net.pack                 409205 bytes
+
+--- seed replay (deterministic, every committed entry once) ---
+replay exit status: 0
+
+--- campaign ---
+campaign stopped by the 10-minute WALL-CLOCK BUDGET (raw status 143)
+campaign exit status: 0
+
+--- coverage report ---
+  map .zig-cache/v/7c93e7e75a9e8243: 67989382 runs
+  map .zig-cache/v/d68f9632c42b41a4: 1378577 runs
+  map .zig-cache/v/d24cf8e8fe93334f: 408316 runs
+binary match        : attributed=4502 project PCs (best of the cached lsfuzz builds)
+instrumented binary : .zig-cache/o/e4212fe2d3b392f530f89babbeb5cc61/lsfuzz
+coverage map        : .zig-cache/v/7c93e7e75a9e8243
+
+======= COVERAGE REPORT =======
+binary      : .zig-cache/o/e4212fe2d3b392f530f89babbeb5cc61/lsfuzz
+coverage    : .zig-cache/v/7c93e7e75a9e8243
+runs        : 67989382
+unique runs : 162
+PCs covered : 68/21992 (0.31%)
+unresolved  : 326 PCs (no debug line info)
+
+-- required hotspot modules (AC-c1) --
+  csv_reader   NOT ENTERED  0/701 PCs in 1 file(s)
+  source       NOT ENTERED  0/408 PCs in 1 file(s)
+  net_source   NOT ENTERED  0/219 PCs in 1 file(s)
+  window       NOT ENTERED  0/271 PCs in 1 file(s)
+  index        NOT ENTERED  0/161 PCs in 1 file(s)
+  search       NOT ENTERED  0/397 PCs in 1 file(s)
+  encoding     NOT ENTERED  0/318 PCs in 1 file(s)
+
+-- per-file coverage (project files only) --
+  base.zig                          0/142      0.00%
+  column.zig                        0/627      0.00%
+  column_state.zig                  0/48       0.00%
+  csv_reader.zig                    0/701      0.00%
+  encoding.zig                      0/318      0.00%
+  fault_guard.zig                   0/13       0.00%
+  filter.zig                        0/143      0.00%
+  gzbuild.zig                       0/21       0.00%
+  harness.zig                       0/111      0.00%
+  index.zig                         0/161      0.00%
+  lexer.zig                         0/111      0.00%
+  matcher.zig                       0/228      0.00%
+  nav.zig                           0/155      0.00%
+  net.zig                           0/87       0.00%
+  net_source.zig                    0/219      0.00%
+  open.zig                          0/51       0.00%
+  reader.zig                        0/60       0.00%
+  root.zig                          0/159      0.00%
+  search.zig                        0/397      0.00%
+  sniff.zig                         0/69       0.00%
+  source.zig                        0/408      0.00%
+  sysio.zig                         0/2        0.00%
+  window.zig                        0/271      0.00%
+attributed  : 4502 PCs in 23 project file(s)  <- maximize to match binary/map
+==============================
+
+covreport: 7 required hotspot module(s) NOT ENTERED
+
+--- triage (AC-c2) ---
+no crashing input saved

@@ -43,6 +43,34 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd "$here/../.." && pwd)"
 cd "$here"
 
+# The ONE definition of "the instrumented binary": the lsfuzz build CARRYING THE
+# FUZZER RUNTIME. Presence/absence of the `-ffuzz` runtime symbols, never
+# recency and never a ranking — see ARTIFACT IDENTITY below for the three wrong
+# reports that guessing produced. Two callers share it: the campaign watchdog
+# (to learn when fuzzing could first have begun) and the coverage report (to
+# name the binary it decodes), so the two can never disagree about which build
+# this campaign is talking about. Prints one path per line, nothing if none.
+#
+# `grep -c`, never `grep -q`, and the `|| true` is load-bearing. This script
+# runs under `set -o pipefail` (line 40). `grep -q` exits the INSTANT it
+# matches, closing the pipe while `nm` is still writing megabytes of symbols;
+# `nm` then dies of SIGPIPE (141), pipefail adopts that as the pipeline's
+# status, and the `if` reads a successful match as a FAILURE. Deterministic on
+# a binary this size, not a race — which is why the coverage report was not
+# merely broken but STRUCTURALLY IMPOSSIBLE: it reported "found 0 instrumented
+# binaries" while the correct binary sat in the cache carrying 44 of them.
+# `grep -c` drains its input, so nothing gets SIGPIPEd; it exits 1 on zero
+# matches, which `|| true` absorbs so `set -e` does not kill the run.
+instrumented_binaries() {
+  local cand syms
+  for cand in $(find .zig-cache/o -name lsfuzz -type f 2>/dev/null); do
+    syms=$(nm "$cand" 2>/dev/null | grep -c "__sanitizer_cov\|fuzzer" || true)
+    if [ "${syms:-0}" -gt 0 ]; then
+      printf '%s\n' "$cand"
+    fi
+  done
+}
+
 iters=20000
 minutes=""
 fresh=0
@@ -96,7 +124,12 @@ fi
 
 if [ "$fresh" = 1 ]; then
   echo "--- wiping accumulated fuzzer state (.zig-cache/f, .zig-cache/v) ---"
-  rm -rf .zig-cache/f .zig-cache/v
+  # Also drop the COMPILED cache, so exactly one instrumented lsfuzz exists
+  # afterwards and the ARTIFACT IDENTITY assertions below hold by construction.
+  # Deleting build outputs while leaving their manifests behind poisons the cache
+  # ("failed to spawn ...: FileNotFound"), so o/ and h/ go together.
+  echo "    + .zig-cache/o, .zig-cache/h (one instrumented binary, deterministically)"
+  rm -rf .zig-cache/f .zig-cache/v .zig-cache/o .zig-cache/h
 fi
 
 echo "--- quarantines in force ---"
@@ -119,9 +152,11 @@ done
 echo
 
 echo "--- seed replay (deterministic, every committed entry once) ---"
-# Note: `zig build test --fuzz=N` below re-runs this replay itself (the build
-# runner only discovers fuzz tests from a run step that actually executed), so a
-# corpus that cannot replay clean can never start a campaign either.
+# Note: the campaign below re-runs the harness replay itself (the build runner
+# only discovers fuzz tests from a run step that actually executed), so a corpus
+# that cannot replay clean can never start a campaign either. This step uses the
+# `test` step, which ALSO runs both diff oracles' deterministic sweeps; the
+# campaign deliberately does not (see ARTIFACT IDENTITY).
 set +e
 zig build test
 replay_status=$?
@@ -130,13 +165,13 @@ echo "replay exit status: $replay_status"
 echo
 
 echo "--- campaign ---"
-# A marker file dates the fuzz-mode rebuild: `--fuzz` recompiles the test binary
-# with -ffuzz into .zig-cache/o/<hash>/lsfuzz, and covreport must resolve PCs
-# against THAT binary (a different build has a different PC table).
+# `--fuzz` recompiles the test binary with -ffuzz into .zig-cache/o/<hash>/lsfuzz,
+# and covreport must resolve PCs against THAT binary — a different build has a
+# different PC table. It is identified below by an exact predicate, not by date.
 marker="$(mktemp)"
-# A fresh --seed each run: `zig build test --fuzz=N` only discovers fuzz tests
-# from a run step that actually EXECUTED, and the test run step is cacheable, so
-# an identical argv would cache-hit and report "no fuzz tests found".
+# A fresh --seed each run: `zig build --fuzz=N` only discovers fuzz tests from a
+# run step that actually EXECUTED, and the run step is cacheable, so an identical
+# argv would cache-hit and report "no fuzz tests found".
 # `set -e` must NOT abort here: a campaign that FINDS something exits non-zero,
 # and that is exactly when the coverage report and the triage hint below matter
 # most. Capture the status and keep going.
@@ -164,13 +199,25 @@ if [ -n "$minutes" ]; then
   # stop it. That happened here once. The trap guarantees the campaign cannot
   # outlive its supervisor however this script ends.
   set -m
-  zig build test --fuzz="$iters" --seed "$(( RANDOM * 65536 + RANDOM ))" &
+  zig build --fuzz="$iters" --seed "$(( RANDOM * 65536 + RANDOM ))" &
   fuzz_pid=$!
   set +m
   trap 'kill -TERM -'"$fuzz_pid"' 2>/dev/null || true' EXIT INT TERM
   deadline=$(( $(date +%s) + minutes * 60 ))
   budget_hit=0
+  # WHEN the instrumented binary appeared, i.e. when fuzzing could first have
+  # started. `--fuzz` COMPILES before it fuzzes, and that compile is inside the
+  # budget: a campaign whose budget expires mid-build never executes a single
+  # iteration, yet is otherwise indistinguishable from a clean one — same
+  # "stopped by the WALL-CLOCK BUDGET" line, same forced status 0, no crash.
+  # That is how a 10-minute run reported a clean campaign having fuzzed for
+  # zero seconds (2026-08-05, 19:19:13). Time is not evidence; only the fuzzer
+  # having actually been on CPU is, so the transition is recorded here.
+  build_done_at=""
   while kill -0 "$fuzz_pid" 2>/dev/null; do
+    if [ -z "$build_done_at" ] && [ -n "$(instrumented_binaries)" ]; then
+      build_done_at=$(date +%s)
+    fi
     if [ "$(date +%s)" -ge "$deadline" ]; then
       budget_hit=1
       kill -TERM -"$fuzz_pid" 2>/dev/null || true
@@ -183,10 +230,22 @@ if [ -n "$minutes" ]; then
   # A budget expiry must never read as a finding, nor a finding as an expiry.
   if [ "$budget_hit" = 1 ]; then
     echo "campaign stopped by the $minutes-minute WALL-CLOCK BUDGET (raw status $status)"
-    status=0
+    if [ -z "$build_done_at" ]; then
+      echo
+      echo "campaign NEVER FUZZED: the ${minutes}-minute budget expired while the"
+      echo "instrumented binary was STILL BUILDING, so zero iterations ran. This is"
+      echo "NOT a clean campaign — it is no campaign. Re-run with a longer --minutes"
+      echo "(the -ffuzz build alone costs ~1 min from a cold cache), or warm the"
+      echo "build first so the whole budget is spent fuzzing."
+      status=1
+    else
+      echo "  instrumented build ready $(( build_done_at - (deadline - minutes * 60) ))s in;"
+      echo "  ACTUALLY FUZZED for ~$(( deadline - build_done_at ))s of the ${minutes}-minute budget"
+      status=0
+    fi
   fi
 else
-  zig build test --fuzz="$iters" --seed "$(( RANDOM * 65536 + RANDOM ))"
+  zig build --fuzz="$iters" --seed "$(( RANDOM * 65536 + RANDOM ))"
   status=$?
 fi
 set -e
@@ -197,44 +256,75 @@ echo "--- coverage report ---"
 set +e
 zig build covreport
 rm -f "$marker"
-cov="$(find .zig-cache/v -type f -print0 2>/dev/null | xargs -0 ls -t 2>/dev/null | head -1)"
 
-# Pick the instrumented binary whose PC table actually MATCHES the coverage map,
-# by asking covreport which candidate ATTRIBUTES THE MOST PCs to project files.
+# ---------------------------------------------------------------------------
+# ARTIFACT IDENTITY — NEVER BY RECENCY, NEVER BY RANKING.
 #
-# Timestamp heuristics are not enough and fail silently, which is the worst way
-# to fail: the cache can hold several `lsfuzz` builds (a `-Donly` triage build, a
-# previous campaign, the plain non-instrumented test binary), `find -newer` can
-# match more than one, and handing covreport the wrong one resolves almost
-# nothing — every module then reads as a near-zero count, which looks like a
-# catastrophic coverage collapse instead of the binary mismatch it is. This bit
-# a real run in this tree: a 22-minute campaign reported `window NOT ENTERED
-# 0/138` when the true figure was 215/376.
+# "Take the newest/best candidate" produced three confidently WRONG coverage
+# reports in this one script in one day, each of which looked like a real result:
 #
-# `unresolved` is NOT a usable discriminator — 316 vs 323 between a matching and a
-# non-matching binary on the same map, i.e. noise. The count of PCs ATTRIBUTED to
-# project files is: 5901 vs 3492 vs 1605 on that same map, a margin no near-miss
-# closes. So maximize `attributed`, and log it as the audit trail.
-bin=""
-best_attr=-1
-if [ -n "$cov" ]; then
-  for cand in $(find .zig-cache/o -name lsfuzz -type f 2>/dev/null); do
-    a="$(./zig-out/bin/covreport "$cand" "$cov" 2>&1 | awk '/^attributed /{print $3; exit}')"
-    case "$a" in ''|*[!0-9]*) continue ;; esac
-    if [ "$a" -gt "$best_attr" ]; then
-      best_attr="$a"
-      bin="$cand"
-    fi
-  done
-fi
-echo "binary match        : attributed=${best_attr} project PCs (best of the cached lsfuzz builds)"
-echo "instrumented binary : ${bin:-<not found>}"
-echo "coverage map        : ${cov:-<not found>}"
-echo
-if [ -z "$bin" ] || [ -z "$cov" ]; then
-  echo "coverage report UNAVAILABLE (missing binary or coverage map)"
+#   1. newest BINARY by timestamp -> a completed 22-minute campaign reported
+#      `window NOT ENTERED 0/138` when the truth was 215/376. A wrong-binary
+#      report can FAIL the AC-c1 gate on a perfectly healthy run.
+#   2. highest `attributed` BINARY -> better, still a guess.
+#   3. most-runs MAP -> picked `lsdiff`, whose tiny in-memory iterations reach
+#      67,989,382 runs against the harness's 408,316, and reported ALL SEVEN
+#      hotspot modules NOT ENTERED at 0.31% coverage.
+#
+# So identity is now established by EXACT PREDICATES with an asserted cardinality,
+# and anything else is a hard failure. A campaign that refuses to report is
+# recoverable; a campaign that reports another target's numbers under this
+# heading is not.
+#
+#   MAP: the campaign phase runs `zig build --fuzz` — the DEFAULT step, which
+#        depends on the harness run step ALONE (build.zig:82). The diff oracles
+#        hang off `test`/`diff` (build.zig:108,128) and are deliberately not in
+#        the campaign, so the harness writes EXACTLY ONE map. Any other count
+#        means the assumption broke: stop.
+#   BIN: the instrumented build is the one CARRYING THE FUZZER RUNTIME. That is
+#        presence/absence, not a score: 44 `__sanitizer_cov`/`fuzzer` symbols in
+#        the `-ffuzz` rebuild, 0 in the plain test binary.
+# ---------------------------------------------------------------------------
+shopt -s nullglob
+maps=( .zig-cache/v/* )
+shopt -u nullglob
+if [ "${#maps[@]}" -ne 1 ]; then
+  echo "coverage report UNAVAILABLE: expected EXACTLY ONE coverage map under"
+  echo ".zig-cache/v (the campaign runs the harness alone), found ${#maps[@]}:"
+  # `${a[@]+"${a[@]}"}`, not `"${a[@]}"`: this is bash 3.2 (what macOS ships and
+  # what `env bash` finds here), where expanding an EMPTY array under `set -u`
+  # is itself an "unbound variable" error. Listing the offenders is the failure
+  # path, so the naive form crashed exactly when it was needed — the count-is-0
+  # case — and buried the real message under a bash error.
+  for m in ${maps[@]+"${maps[@]}"}; do echo "    $m"; done
+  echo "Refusing to guess which map belongs to this campaign — see ARTIFACT IDENTITY"
+  echo "in this script. Re-run with --fresh to start from a known-empty state."
   exit 1
 fi
+cov="${maps[0]}"
+
+instrumented=()
+while IFS= read -r cand; do
+  [ -n "$cand" ] && instrumented+=( "$cand" )
+done <<EOF
+$(instrumented_binaries)
+EOF
+if [ "${#instrumented[@]}" -ne 1 ]; then
+  echo "coverage report UNAVAILABLE: expected EXACTLY ONE instrumented lsfuzz"
+  echo "binary in .zig-cache/o, found ${#instrumented[@]}:"
+  for b in ${instrumented[@]+"${instrumented[@]}"}; do echo "    $b"; done
+  echo "Stale -ffuzz builds from an earlier harness version cannot be told apart"
+  echo "from this campaign's without guessing. Re-run with --fresh (which clears"
+  echo "them) — see ARTIFACT IDENTITY in this script."
+  exit 1
+fi
+bin="${instrumented[0]}"
+
+echo "instrumented binary : $bin"
+echo "                      (sole build carrying the fuzzer runtime)"
+echo "coverage map        : $cov"
+echo "                      (sole map written by the harness-only campaign step)"
+echo
 ./zig-out/bin/covreport "$bin" "$cov"
 cov_status=$?
 set -e
