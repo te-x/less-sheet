@@ -382,12 +382,13 @@ mkdir -p /tmp/pagesite && cp -R site/* /tmp/pagesite/
 # second pass cannot rewrite it twice.
 sed -i '' -e "s|DOWNLOAD_BASE|$BASE|g" -e "s|VERSION|$VER|g" \
           -e "s|TAP_OWNER|<you>|g" \
+          -e "s|RELEASES_URL|https://github.com/<you>/less-sheet/releases|g" \
           -e '/class="draft"/d' /tmp/pagesite/index.html
 
 # The draft banner is only true while the placeholders are unfilled, so the same
 # pass that fills them deletes it. This is the check that it worked — and that no
 # placeholder survived, which would otherwise ship as a dead link.
-grep -nE 'LINKS NOT LIVE|DOWNLOAD_BASE|TAP_OWNER' /tmp/pagesite/index.html \
+grep -nE 'LINKS NOT LIVE|DOWNLOAD_BASE|TAP_OWNER|RELEASES_URL' /tmp/pagesite/index.html \
   && { echo "placeholder or draft banner survived — do not publish"; exit 1; }
 echo "page is clean"
 ```

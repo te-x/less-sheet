@@ -240,11 +240,13 @@
   <div class="col">
     <div class="prose">
       <div class="rn">01</div>
-      <h1>Open huge spreadsheets instantly.</h1>
+      <h1>Open any CSV instantly.</h1>
       <p class="lede">less-sheet is a native, read-only viewer for
-        spreadsheet-sized data. It reads <b>CSV — plain, gzipped, or streamed
-        straight from a URL — and nothing else</b>, which is exactly why it opens
-        ten gigabytes as fast as ten megabytes.</p>
+        spreadsheet-sized data, focused on <b>speed and low memory use whatever
+        the file size</b>. Today it reads CSV — plain or gzipped, local or
+        streamed from a URL — with more formats coming.</p>
+      <p class="lede">It never loads the whole file into memory, only the
+        minimum needed to fill the window.</p>
 
       <div class="ledger">
         <div class="only-mac">
@@ -255,13 +257,8 @@
           <div class="row"><span class="size">10 MB</span><span class="time">166 ms</span></div>
           <div class="row"><span class="size">10 GB</span><span class="time">168 ms</span></div>
         </div>
-        <div class="note">launch to first rows on screen, GUI included — a
-          thousand times the data, and the engine holds it in under three
-          megabytes</div>
+        <div class="note">cold launch to data on screen</div>
       </div>
-
-      <p><a class="btn" href="#download">download</a></p>
-      <p class="reqs">free · macOS 26+ · Linux (GNOME 49 generation)</p>
     </div>
 
     <div class="figs">
@@ -275,7 +272,6 @@
           <img class="shot" src="assets/shots/shot-hero-macos-light.webp"
                width="1500" height="989" alt="less-sheet showing a large CSV">
         </picture>
-        <figcaption>the window is the data</figcaption>
       </figure>
       <figure class="only-linux">
         <picture>
@@ -284,7 +280,6 @@
           <img class="shot" src="assets/shots/shot-hero-linux-light.webp"
                width="1500" height="989" alt="less-sheet on GNOME showing a large CSV">
         </picture>
-        <figcaption>the GNOME build — same core, same features</figcaption>
       </figure>
     </div>
   </div>
@@ -296,18 +291,14 @@
     <div class="prose">
       <div class="rn">02</div>
       <h2>Benchmarks.</h2>
-      <p>Every time on this page is <b>launch to first rows on screen</b> —
-        application start, file open, and the GUI actually drawing, because the
-        backend alone is irrelevant to you.</p>
-      <p>A thousand times the data costs about forty milliseconds more, because
-        the same few hundred kilobytes get read either way. Width costs more than
-        length: two thousand columns is more work than a thousandfold more rows.</p>
+      <p>Time and memory to get your first look at the data. Both barely move as
+        the file grows.<sup>*</sup></p>
+      <p class="quiet" style="font-size:14.5px">* Very wide CSVs — thousands of
+        columns — do add to the load time.</p>
       <p>Memory is quoted as <b>engine + window</b>. Only the first number is
-        about your file — and it is the small one. A ten-gigabyte document, a
-        hundred and thirty-five million rows, rests in under three megabytes,
-        because the file is mapped rather than loaded and none of it is dirty.
-        The second number is the window itself, and it does not move whatever
-        you open.</p>
+        about your file, and it is the small one: ten gigabytes, a hundred and
+        thirty-five million rows, rests in under three megabytes. The second is
+        the window itself, and it does not move whatever you open.</p>
     </div>
     <div class="figs cmp-wrap">
       <div class="only-mac">
@@ -322,8 +313,8 @@
             <tr><td>10 GB</td><td>214 ms</td><td>2.5 + 59</td><td>201 ms</td><td>7.9 + 59</td><td>213 ms</td><td>10.6 + 59</td></tr>
           </tbody>
         </table>
-        <p class="reqs" style="margin-top:14px">MacBook Pro, Apple M2 Pro, internal
-          NVMe, Retina (2× backing) · memory in MiB, engine + window</p>
+        <p class="reqs" style="margin-top:14px">MacBook Pro, Apple M2 Pro, Samsung
+          NVMe · memory in MiB</p>
       </div>
       <div class="only-linux">
         <table class="cmp grid7">
@@ -337,68 +328,20 @@
             <tr><td>10 GB</td><td>168 ms</td><td>2.3 + 68</td><td>182 ms</td><td>6.9 + 67</td><td>259 ms</td><td>9.5 + 68</td></tr>
           </tbody>
         </table>
-        <p class="reqs" style="margin-top:14px">Arch Linux, x86_64, Samsung 960 EVO,
-          1× display · memory in MiB, engine + window</p>
+        <p class="reqs" style="margin-top:14px">Arch Linux, Ryzen 3600, Samsung
+          960 EVO · memory in MiB</p>
       </div>
-      <p class="reqs" style="margin-top:14px">launch → first rows on screen, GUI
-        included · each app timed by its own monotonic clock, so no measurement
-        harness is inside the number · memory measured with the document open and
-        indexing finished; the engine figure is the same quantity on both systems
-        and comes out within ten per cent, which is expected — it is the same
-        code · the window figure is not comparable between them and is not meant
-        to be: it is each platform’s toolkit at that display’s scale · a
-        2000-column file cannot be 10 KB, since the header alone is 15 KB</p>
     </div>
   </div>
 </section>
+
 
 <!-- 03 ──────────────────────────────────────────────────────────────────── -->
 <section class="band">
   <div class="col">
     <div class="prose">
       <div class="rn">03</div>
-      <h2>It never loads the file.</h2>
-      <p>less-sheet does for tabular data what <code>less</code> does for text:
-        it maps the file and parses only the rows in view. Opening costs
-        milliseconds at any size, and memory stays flat while you scroll —
-        or jump — through gigabytes.</p>
-      <p>Point it at an HTTP(S) URL and it behaves the same way — only the
-        bytes you actually look at are ever fetched. Opening a ten-gigabyte CSV
-        over the network costs <b>one range request and 256&nbsp;KB</b> before
-        the first rows appear, which is exactly what a ten-kilobyte one costs.
-        How long that takes is your connection’s business, not ours, so there
-        is no number for it on this page.</p>
-    </div>
-    <div class="figs">
-      <figure class="only-mac">
-        <picture>
-          <source media="(prefers-color-scheme: dark)"
-                  srcset="assets/shots/shot-jump-macos-dark.webp">
-          <img class="shot" src="assets/shots/shot-jump-macos-light.webp"
-               width="1500" height="989" alt="Jump-to-row control"
-               loading="lazy" decoding="async">
-        </picture>
-        <figcaption>jump to any row, at any file size</figcaption>
-      </figure>
-      <figure class="only-linux">
-        <picture>
-          <source media="(prefers-color-scheme: dark)"
-                  srcset="assets/shots/shot-jump-linux-dark.webp">
-          <img class="shot" src="assets/shots/shot-jump-linux-light.webp"
-               width="1500" height="989" alt="jump to any row, at any file size" loading="lazy" decoding="async">
-        </picture>
-        <figcaption>jump to any row, at any file size</figcaption>
-      </figure>
-    </div>
-  </div>
-</section>
-
-<!-- 03 ──────────────────────────────────────────────────────────────────── -->
-<section class="band">
-  <div class="col">
-    <div class="prose">
-      <div class="rn">04</div>
-      <h2>Change how it’s parsed without reopening it.</h2>
+      <h2>Quick toggles for the most common parameters.</h2>
       <p>Separator, quote character, header row and text encoding are detected
         from the file itself. You open the file and read it — there is no
         import step.</p>
@@ -434,13 +377,12 @@
 <section class="band">
   <div class="col">
     <div class="prose">
-      <div class="rn">05</div>
-      <h2>Search the whole file, not the loaded part.</h2>
-      <p>Incremental search with live match counts. Typed column predicates —
-        <code>qty ≤ 2</code> — and filtered views that keep the original row
-        numbers, so you always know where you are in the real file.</p>
-      <p>Copying returns the original bytes, not whatever the screen happens
-        to be formatting.</p>
+      <div class="rn">04</div>
+      <h2>Search &amp; filter.</h2>
+      <p>Quickly find content across the entire file, or filter down to just
+        the rows you need.</p>
+      <p>Copying returns the original bytes, regardless of any formatting you
+        applied in the viewer.</p>
     </div>
     <div class="figs">
       <div class="rail only-mac">
@@ -493,13 +435,13 @@
 <section class="band" id="compare">
   <div class="col">
     <div class="prose">
-      <div class="rn">06</div>
+      <div class="rn">05</div>
       <h2>Why a spreadsheet struggles here.</h2>
-      <p>Excel and LibreOffice are built to edit and compute, and that design
-        has costs a viewer doesn’t pay.</p>
-      <p>less-sheet is read-only by design. Formatting is a display transform
-        over untouched bytes — what you see never becomes what your file
-        contains.</p>
+      <p>Spreadsheets like Excel and LibreOffice are powerful tools, built to
+        edit and compute. But they interpret your file’s contents, cap how many
+        rows it can have, and make changing the parsing options slow.</p>
+      <p>less-sheet is read-only by design. It guesses the parsing options from
+        the data, and you can change them in a moment when it guesses wrong.</p>
     </div>
     <div class="figs cmp-wrap">
       <table class="cmp">
@@ -532,12 +474,9 @@
 <section class="band" id="download">
   <div class="col">
     <div class="prose top">
-      <div class="rn">07</div>
-      <h2>Download.</h2>
-      <p>Free. No account, no telemetry. Checksums are published beside every
-        build.</p>
-      <p class="reads">reads: <b>.csv</b> · <b>.csv.gz</b> · <b>https://</b><br>
-        <span class="quiet">more formats later — nothing else today</span></p>
+      <div class="rn">06</div>
+      <h2>Free. Tiny. No account. No telemetry.</h2>
+      <p>Checksums are published beside every build.</p>
     </div>
 
     <div class="figs">
@@ -555,21 +494,18 @@ brew install --cask less-sheet --no-quarantine</code></pre>
           <pre class="cmd"><code>curl -fsSL DOWNLOAD_BASE/less-sheet-VERSION-macos-arm64.tar.gz | tar xz -C /Applications</code></pre>
 
           <p class="dl-way"><b>Or download it</b></p>
-          <p style="margin:0"><a class="btn" href="DOWNLOAD_BASE/less-sheet-VERSION-macos-arm64.dmg">download .dmg</a></p>
+          <p style="margin:0"><a class="btn" href="RELEASES_URL">download .dmg</a></p>
           <div class="fn">
-            <b>Downloading it in a browser costs one extra step.</b> This build
-            is signed, but not notarized through Apple’s paid developer
-            programme — it’s a free app. So macOS refuses it once, until you
-            allow it: <span class="path">System Settings → Privacy &amp;
-            Security → “Open Anyway”</span>. After that it opens normally.
+            Downloading the .dmg in a browser causes macOS to refuse it until
+            you allow it: <span class="path">System Settings → Privacy &amp;
+            Security → “Open Anyway”</span>. After that it opens normally. The
+            two commands above skip that.
             <br><br>
-            The two commands above skip that, and it’s worth knowing why rather
-            than trusting it: macOS blocks the <i>first launch of a file marked
-            as downloaded</i>, and only browsers mark files that way. Both
-            routes above therefore also mean you are trusting us instead of
-            Apple’s check — so verify the download against
-            <a href="DOWNLOAD_BASE/SHA256SUMS">SHA256SUMS</a> if that matters to
-            you.
+            Worth knowing why, rather than trusting it: macOS blocks the
+            <i>first launch of a file marked as downloaded</i>, and only
+            browsers mark files that way. So both commands also mean trusting us
+            instead of Apple’s check — verify against the checksums if that
+            matters to you.
           </div>
         </div>
         <div>
@@ -587,7 +523,7 @@ brew install --cask less-sheet --no-quarantine</code></pre>
       </div>
       <p class="reqs" style="margin-top:24px">
         <a href="DOWNLOAD_BASE/SHA256SUMS">SHA256SUMS</a> &nbsp;
-        <span class="draft">LINKS NOT LIVE — DOWNLOAD_BASE, VERSION AND TAP_OWNER ARE PLACEHOLDERS</span>
+        <span class="draft">LINKS NOT LIVE — DOWNLOAD_BASE, VERSION, TAP_OWNER AND RELEASES_URL ARE PLACEHOLDERS</span>
       </p>
     </div>
   </div>
