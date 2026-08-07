@@ -41,7 +41,7 @@
     font: 17px/1.55 var(--serif);
     overflow-x: hidden;                 /* the body never scrolls horizontally */
   }
-  .col { max-width: 1100px; margin: 0 auto; padding: 0 24px; }
+  .col { max-width: 1280px; margin: 0 auto; padding: 0 24px; }
   a { color: inherit; text-decoration-thickness: 1px; text-underline-offset: 2px; }
   a:hover { color: var(--dim); }
   code { font-family: inherit; font-style: italic; }
@@ -58,14 +58,25 @@
   /* ---- bands: each one a row of the table ---- */
   .band { border-bottom: 1px solid var(--line); }
   .band > .col {
-    display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 7fr);
-    padding-top: 56px; padding-bottom: 56px;
+    display: grid; grid-template-columns: minmax(0, 4fr) minmax(0, 8fr);
+    padding-top: 64px; padding-bottom: 64px;
   }
   .band .prose { min-width: 0; padding-right: 44px; }
   .band .figs  { min-width: 0; padding-left: 44px; border-left: 1px solid var(--line); }
-  @media (max-width: 900px) {
+  /* The text sits against the MIDDLE of its screenshot, not its top edge. Only
+     the prose is centred, deliberately: centring the grid as a whole would let
+     the figure shrink to its content too, and the divider rule beside it would
+     stop short of the band instead of running its full height. The figure keeps
+     stretching; only the words move. */
+  .band .prose { align-self: center; }
+  /* A short paragraph next to a tall screenshot would otherwise centre into a
+     lot of empty space at the top and bottom of a very tall band. This is the
+     one place that reads worse centred than aligned, so bands whose prose is
+     much shorter than their figure opt back out. */
+  .band .prose.top { align-self: start; }
+  @media (max-width: 980px) {
     .band > .col { grid-template-columns: 1fr; }
-    .band .prose { padding-right: 0; }
+    .band .prose { padding-right: 0; align-self: start; }
     .band .figs  { padding-left: 0; border-left: 0; margin-top: 30px; }
   }
 
@@ -106,7 +117,7 @@
   .shot { display: block; width: 100%; height: auto; }
   figcaption { font: 12.5px/1.5 var(--sans); color: var(--dim); padding-top: 9px; }
   .rail { display: flex; gap: 22px; overflow-x: auto; scroll-snap-type: x mandatory; padding-bottom: 4px; }
-  .rail figure { flex: 0 0 min(540px, 84%); scroll-snap-align: start; }
+  .rail figure { flex: 0 0 min(700px, 88%); scroll-snap-align: start; }
   .pending {
     aspect-ratio: 3 / 2; display: grid; place-content: center; text-align: center;
     border: 1px dashed var(--line); color: var(--dim);
@@ -502,7 +513,7 @@
 <!-- 06 ──────────────────────────────────────────────────────────────────── -->
 <section class="band" id="download">
   <div class="col">
-    <div class="prose">
+    <div class="prose top">
       <div class="rn">07</div>
       <h2>Download.</h2>
       <p>Free. No account, no telemetry. Checksums are published beside every
