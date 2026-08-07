@@ -47,6 +47,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             routedLaunchOpen = true
             route(path)
         }
+        // Headless NETWORK open. ⌘⇧O is a MODAL sheet, so until now the network
+        // funnel had no scriptable entry — and therefore no headless coverage
+        // and no way to measure a network open end to end. This supplies the URL
+        // exactly as the sheet does: same `openURL`, same forced-dialect
+        // override, no recents entry. argv wins if both are present, so it can
+        // never divert a real document. Inert without the variable.
+        if !routedLaunchOpen,
+           let url = ProcessInfo.processInfo.environment["LESSSHEET_OPEN_URL"],
+           !url.isEmpty {
+            routedLaunchOpen = true
+            Task { await DocumentModel.shared.openURL(url, forcing: launchForcedOverride()) }
+        }
         showMainWindow()
         LaunchTiming.phase("after_show_window")
         NSApp.activate(ignoringOtherApps: true)

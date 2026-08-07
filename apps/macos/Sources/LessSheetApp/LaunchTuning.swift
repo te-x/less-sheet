@@ -58,10 +58,16 @@ enum LaunchTuning {
     /// pre-hidden columns, and the plain frame dump (see above — its capture is
     /// fired from `makeNSView`, not from the racing `.task`). Anything ELSE
     /// prefixed `LESSSHEET_` is a hook.
+    /// `LESSSHEET_OPEN_URL` is benign for a structural reason worth stating: it
+    /// names the launch DOCUMENT, exactly as a path in argv does, and drives no
+    /// probe. It also cannot interact with the prewarm, which is local-only and
+    /// never engages for a network open — so a network launch differs from the
+    /// shipped one in nothing, and measuring it here measures what users get.
     private static let benignVariables: Set<String> = [
         "LESSSHEET_LAUNCH_PHASES", "LESSSHEET_DUMP_EXIT", "LESSSHEET_HIDE_COLS",
         "LESSSHEET_FORCE_SEP", "LESSSHEET_FORCE_QUOTE", "LESSSHEET_FORCE_HEADER",
-        "LESSSHEET_DUMP_FRAME", "LESSSHEET_DUMP_SCENE", "LESSSHEET_DUMP_APPEARANCE"
+        "LESSSHEET_DUMP_FRAME", "LESSSHEET_DUMP_SCENE", "LESSSHEET_DUMP_APPEARANCE",
+        "LESSSHEET_OPEN_URL"
     ]
 
     static let applies: Bool = !ProcessInfo.processInfo.environment.keys.contains {
