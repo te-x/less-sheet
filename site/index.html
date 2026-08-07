@@ -126,6 +126,14 @@
   .only-linux { display: none; }
   #plat-linux:checked ~ div .only-linux { display: block; }
   #plat-linux:checked ~ div .only-mac   { display: none; }
+  /* The reveal rule above is MORE SPECIFIC than `.rail` (an id + a class beats
+     one class), so it blockifies whatever it shows. That is right for a plain
+     div, and wrong for the screenshot rail: `.rail` is a horizontal flex
+     carousel with scroll-snap, and blockified it collapses into a vertical
+     stack of full-width shots. The macOS rail never hit this because it is only
+     ever HIDDEN by the toggle, never re-shown — so the bug was visible on
+     exactly one of the two tabs. Restore the carousel explicitly. */
+  #plat-linux:checked ~ div .rail.only-linux { display: flex; }
 
   /* ---- buttons: a rectangle with a border, like a key on a keyboard ---- */
   .btn {
@@ -204,11 +212,16 @@
         ten gigabytes as fast as ten megabytes.</p>
 
       <div class="ledger">
-        <div class="row"><span class="size">10 MB</span><span class="time">~200 ms</span></div>
-        <div class="row"><span class="size">10 GB</span><span class="time">~200 ms</span></div>
+        <div class="only-mac">
+          <div class="row"><span class="size">10 MB</span><span class="time">164 ms</span></div>
+          <div class="row"><span class="size">10 GB</span><span class="time">164 ms</span></div>
+        </div>
+        <div class="only-linux">
+          <div class="row"><span class="size">10 MB</span><span class="time">158 ms</span></div>
+          <div class="row"><span class="size">10 GB</span><span class="time">158 ms</span></div>
+        </div>
         <div class="note">launch to first rows on screen, GUI included — a
-          thousand times the data, the same wait<br>
-          <span class="draft">DRAFT NUMBERS — NOT YET RE-MEASURED</span></div>
+          thousand times the data, the same wait</div>
       </div>
 
       <p><a class="btn" href="#download">download</a></p>
@@ -250,22 +263,46 @@
       <p>Every time on this page is <b>launch to first rows on screen</b> —
         application start, file open, and the GUI actually drawing, because the
         backend alone is irrelevant to you.</p>
-      <p>Cold cache, from a standing start, on ordinary hardware. The point is
-        not any single number: it’s that the numbers barely move across six
-        orders of magnitude of file size.</p>
+      <p>From a standing start, on ordinary hardware. The point is not any
+        single number: it’s that the numbers barely move across six orders of
+        magnitude of file size. A gigabyte costs what a kilobyte costs, because
+        the same few hundred kilobytes get read either way.</p>
+      <p>Gzip is the one thing that does cost extra, and it costs a
+        <i>constant</i> extra: the first screenful has to be decompressed, and
+        that is all — so a 10&nbsp;GB archive lands within a millisecond or two
+        of a 10&nbsp;MB one.</p>
     </div>
     <div class="figs cmp-wrap">
-      <table class="cmp">
-        <thead><tr><th>file size</th><th>NVMe</th><th>7200 rpm hard disk</th></tr></thead>
-        <tbody>
-          <tr><td>10 KB</td><td>—</td><td>—</td></tr>
-          <tr><td>10 MB</td><td>—</td><td>—</td></tr>
-          <tr><td>10 GB</td><td>—</td><td>—</td></tr>
-        </tbody>
-      </table>
-      <p class="reqs" style="margin-top:14px">cold open · launch → rows on screen ·
-        median of repeated runs · hardware named here when measured<br>
-        <span class="draft">MEASUREMENTS PENDING — STRUCTURE ONLY, NOTHING SHIPS LIKE THIS</span></p>
+      <div class="only-mac">
+        <table class="cmp">
+          <thead><tr><th>file size</th><th>CSV</th><th>gzipped</th></tr></thead>
+          <tbody>
+            <tr><td>10 KB</td><td>162 ms</td><td>164 ms</td></tr>
+            <tr><td>10 MB</td><td>164 ms</td><td>183 ms</td></tr>
+            <tr><td>10 GB</td><td>164 ms</td><td>182 ms</td></tr>
+          </tbody>
+        </table>
+        <p class="reqs" style="margin-top:14px">MacBook Pro, Apple M2 Pro, internal
+          NVMe · median of 15 interleaved runs · warm page cache</p>
+      </div>
+      <div class="only-linux">
+        <table class="cmp">
+          <thead><tr><th>file size</th><th>CSV</th><th>gzipped</th></tr></thead>
+          <tbody>
+            <tr><td>10 KB</td><td>147 ms</td><td>152 ms</td></tr>
+            <tr><td>10 MB</td><td>158 ms</td><td>221 ms</td></tr>
+            <tr><td>10 GB</td><td>158 ms</td><td>219 ms</td></tr>
+          </tbody>
+        </table>
+        <p class="reqs" style="margin-top:14px">Arch Linux, x86_64, Samsung 960 EVO ·
+          median of 10 interleaved runs · warm page cache · headless X server,
+          software compositing</p>
+      </div>
+      <p class="reqs" style="margin-top:14px">launch → first rows on screen, GUI
+        included · each app timed by its own monotonic clock, so no measurement
+        harness is inside the number · the cache could not be dropped without
+        root on these machines, and since opening reads only the head of the
+        file, that difference is one seek</p>
     </div>
   </div>
 </section>
@@ -281,7 +318,11 @@
         milliseconds at any size, and memory stays flat while you scroll —
         or jump — through gigabytes.</p>
       <p>Point it at an HTTP(S) URL and it behaves the same way — only the
-        bytes you actually look at are ever fetched.</p>
+        bytes you actually look at are ever fetched. Opening a ten-gigabyte CSV
+        over the network costs <b>one range request and 256&nbsp;KB</b> before
+        the first rows appear, which is exactly what a ten-kilobyte one costs.
+        How long that takes is your connection’s business, not ours, so there
+        is no number for it on this page.</p>
     </div>
     <div class="figs">
       <figure class="only-mac">
