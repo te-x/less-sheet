@@ -61,9 +61,19 @@ final class SheetRowView: NSTableRowView {
 
     override func draw(_ dirtyRect: NSRect) {
         // Launch-measurement ground truth: the first REAL data row to actually
-        // paint. Filler rows (past EOF) and not-yet-servable rows carry no
-        // cells, so neither can stamp it. Inert without LESSSHEET_LAUNCH_PHASES.
-        if !isFiller, !cells.isEmpty { LaunchTiming.phaseOnce("first_row_pixels") }
+        // paint. Inert without LESSSHEET_LAUNCH_PHASES.
+        //
+        // All three conditions are load-bearing. `isFiller` excludes the rows
+        // past EOF, and `cells.isEmpty` a row with nothing to draw — but
+        // `pending` is the one that is easy to get wrong: a not-yet-servable row
+        // is populated (`NativeGrid+Rows` sets `pending` AND `cells` together)
+        // and draws a LOADING PLACEHOLDER, so without this it could stamp
+        // "rows are on screen" for a grid showing no data. It cannot happen at
+        // launch today — `establishInitialWindow` materializes the first
+        // screenful synchronously before `phase` becomes `.document` — but a
+        // measurement instrument that is only accidentally correct will report
+        // the wrong number the moment that changes.
+        if !isFiller, !pending, !cells.isEmpty { LaunchTiming.phaseOnce("first_row_pixels") }
         NSColor.textBackgroundColor.setFill()
         bounds.fill()
         guard let controller else { return }

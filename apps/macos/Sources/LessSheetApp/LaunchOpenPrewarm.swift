@@ -64,9 +64,10 @@ enum LaunchOpenPrewarm {
     static func start(path: String, forcing override: DialectOverride) -> Bool {
         // A verification run keeps EXACTLY today's launch: no prewarm at all, so
         // the caller falls through to `DocumentModel.open`'s async funnel — see
-        // `LaunchTuning`. The SHIPPING configuration is still covered by the
-        // frozen corpus cold-open tests, which strip every `LESSSHEET_*`
-        // variable but the dump-exit and therefore run with the prewarm ON.
+        // `LaunchTuning`, which also explains what does and does NOT cover the
+        // shipping ordering. Do not read the frozen corpus cold-open tests as
+        // that cover: they assert a marker line under 500 ms, with retries, and
+        // would pass a blank grid.
         guard LaunchTuning.applies else { return false }
         let decision: StartDecision = state.withLock { state in
             guard let owned = state.path else {
