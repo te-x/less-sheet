@@ -173,6 +173,19 @@ pub const Probe = struct {
 /// `decideProbe` should gain hermetic unit-test seams (they are the crux of
 /// two fixed real-transport bugs the fake-transport gate path can't reach).
 pub fn parseContentRangeTotal(head_bytes: []const u8) ?u64 {
+    return parseContentRange(head_bytes).total;
+}
+
+/// What a `Content-Range` header says, in the two fields we act on: where the
+/// returned bytes START in the resource and how long the resource IS. ONE parse,
+/// two consumers -- `parseContentRangeTotal` (the pinned public seam, above,
+/// which is the classification input) and the probe's head-retention check
+/// (`RealTransport.probe`), which must not keep a body that does not begin at
+/// byte 0. Splitting these into two scanners would be two places to get the same
+/// header wrong. Either field is null when absent, `*`, or unparseable.
+const ContentRange = struct { start: ?u64 = null, total: ?u64 = null };
+
+fn parseContentRange(head_bytes: []const u8) ContentRange {
     var lines = std.mem.splitSequence(u8, head_bytes, "\r\n");
     _ = lines.next(); // status line
     while (lines.next()) |line| {
@@ -180,12 +193,29 @@ pub fn parseContentRangeTotal(head_bytes: []const u8) ?u64 {
         const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
         if (!std.ascii.eqlIgnoreCase(line[0..colon], "content-range")) continue;
         const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
-        const slash = std.mem.lastIndexOfScalar(u8, value, '/') orelse return null;
+        // `bytes <start>-<end>/<total>`; the total is everything past the LAST
+        // '/' (unchanged from the original scanner, byte for byte).
+        const slash = std.mem.lastIndexOfScalar(u8, value, '/') orelse return .{};
         const total_str = value[slash + 1 ..];
-        if (std.mem.eql(u8, total_str, "*")) return null;
-        return std.fmt.parseInt(u64, total_str, 10) catch null;
+        const total: ?u64 = if (std.mem.eql(u8, total_str, "*"))
+            null
+        else
+            std.fmt.parseInt(u64, total_str, 10) catch null;
+        // The range spec, minus its unit token: `bytes 0-262143` -> `0-262143`.
+        // `bytes */N` (unsatisfied) has no '-' and yields a null start, which is
+        // exactly the "do not retain this body" answer.
+        const spec = std.mem.trim(u8, value[0..slash], " \t");
+        const rng = if (std.mem.indexOfScalar(u8, spec, ' ')) |sp|
+            std.mem.trim(u8, spec[sp + 1 ..], " \t")
+        else
+            spec;
+        const start: ?u64 = if (std.mem.indexOfScalar(u8, rng, '-')) |dash|
+            std.fmt.parseInt(u64, rng[0..dash], 10) catch null
+        else
+            null;
+        return .{ .start = start, .total = total };
     }
-    return null;
+    return .{};
 }
 
 /// The pure fill-strategy / length classification from a SUCCESSFUL (2xx)
@@ -255,6 +285,20 @@ pub const RealTransport = struct {
     url: []u8, // owned NUL-free copy
     client: std.http.Client,
     seq: ?*SeqStream = null, // the persistent sequential body reader (lazy)
+    /// THE PROBE'S OWN BODY, KEPT. `probe()` must issue a ranged GET to learn the
+    /// status / Content-Range / gzip magic, and a range server answers it by
+    /// writing the WHOLE requested range -- `open_bytes` of it -- whether or not
+    /// we read it. Keeping those bytes here is what stops `buildNet` from asking
+    /// for the identical range a second time; `fetchInto` serves the open's head
+    /// demand out of this and the head crosses the wire ONCE.
+    ///
+    /// Holds resource bytes [0, head_len) and ONLY that: it is populated solely
+    /// on a 206 whose `Content-Range` both carries a total and starts at byte 0
+    /// (see `probe`). Freed the moment the head demand consumes it (`fetchInto`)
+    /// so it does not sit on the document's whole life, and with the transport
+    /// otherwise.
+    head_buf: []u8 = &.{},
+    head_len: u64 = 0,
 
     pub fn init(gpa: std.mem.Allocator, url: []const u8) !*RealTransport {
         const self = try gpa.create(RealTransport);
@@ -267,6 +311,7 @@ pub const RealTransport = struct {
     }
 
     pub fn deinit(self: *RealTransport) void {
+        self.releaseHead();
         if (self.seq) |ss| {
             ss.req.deinit();
             self.gpa.destroy(ss);
@@ -274,6 +319,14 @@ pub const RealTransport = struct {
         self.client.deinit();
         self.gpa.free(self.url);
         self.gpa.destroy(self);
+    }
+
+    /// Drop the retained probe head. Idempotent, and the ONE free site for it.
+    fn releaseHead(self: *RealTransport) void {
+        if (self.head_buf.len == 0) return;
+        self.gpa.free(self.head_buf);
+        self.head_buf = &.{};
+        self.head_len = 0;
     }
 
     /// SEQUENTIAL fill (TD3): drain the resource body forward. `offset` must
@@ -324,11 +377,33 @@ pub const RealTransport = struct {
 
     /// One ranged GET for the head bound. 206 + Content-Range total => random
     /// fill; 200 + Content-Length => sequential fill (known); no usable length
-    /// => sequential fill of an unknown-length stream. Also reads the first 2
-    /// body bytes (already in flight on this same request/response — no extra
-    /// round-trip) so `decideProbe` classifies exactly as the fake transport
-    /// does; `buildNet` then detects the `.csv.gz` magic on the fetched head and
-    /// composes the gzip Source over the same spool (never a full download).
+    /// => sequential fill of an unknown-length stream. Also reads the body head
+    /// (already in flight on this same request/response — no extra round-trip)
+    /// so `decideProbe` classifies exactly as the fake transport does; `buildNet`
+    /// then detects the `.csv.gz` magic on the fetched head and composes the gzip
+    /// Source over the same spool (never a full download).
+    ///
+    /// AND KEEPS THAT BODY when it is the random-fill head (`head_buf`). This
+    /// request asks for `bytes=0-{open_bytes-1}` because that range is what
+    /// classifies a server identically in every case the fill strategy turns on
+    /// — narrowing it is a live risk that a server answers 200 where it answered
+    /// 206 and silently demotes the whole document to sequential fill. So the
+    /// range stays, and the 256 KiB the server writes for it stops being thrown
+    /// away: it used to be read 2 bytes deep and discarded, after which
+    /// `buildNet` fetched the byte-identical range AGAIN (measured: two full
+    /// `bytes=0-262143` transfers per open, 512 KiB for a 256 KiB head, both
+    /// before first paint).
+    ///
+    /// Nothing about the CLASSIFICATION changes here — `decideProbe` gets the
+    /// same three inputs from the same response — only what happens to the body
+    /// afterwards. Two further consequences, both good:
+    ///   * one round trip fewer on the open's critical path, which is the part
+    ///     that matters against real latency rather than local bandwidth;
+    ///   * the connection survives. `Client.Request.deinit` only returns a
+    ///     connection to the pool if its body was consumed (Client.zig:890-909);
+    ///     abandoning 256 KiB mid-body marked it `closing`, so the "one client,
+    ///     one pooled connection for probe AND every fetch" design above was in
+    ///     fact re-handshaking (TLS included) for the head. Draining restores it.
     pub fn probe(self: *RealTransport) Probe {
         const uri = std.Uri.parse(self.url) catch return .{ .err = .invalid_argument };
         var range_buf: [64]u8 = undefined;
@@ -372,11 +447,42 @@ pub const RealTransport = struct {
         // must be consumed first, never interleaved with body reads (an earlier
         // draft read Content-Range AFTER the body reader and segfaulted).
         const content_length: ?u64 = response.head.content_length;
-        const range_total: ?u64 = if (code == 206) parseContentRangeTotal(response.head.bytes) else null;
+        const cr: ContentRange = if (code == 206) parseContentRange(response.head.bytes) else .{};
+        const range_total: ?u64 = cr.total;
+        // Is this response the RANDOM-fill head, i.e. is its body the very bytes
+        // `buildNet` is about to demand? Exactly when `decideProbe` will answer
+        // `.range` (206 + a usable total) AND the server actually served from
+        // byte 0. The start is CHECKED, not assumed: a server answering
+        // `Content-Range: bytes 100-200/N` to `bytes=0-…` still classifies as
+        // random fill (decideProbe is deliberately untouched) but its body is not
+        // the head, and retaining it would feed the document wrong bytes. When
+        // this is false we behave exactly as before — read the magic, discard.
+        const from_zero = if (cr.start) |st| st == 0 else false;
+        const keep_head = code == 206 and cr.total != null and from_zero;
         var magic: [2]u8 = .{ 0, 0 };
+        var magic_len: usize = 0;
         var transfer_buf: [4096]u8 = undefined;
         const body = response.reader(&transfer_buf);
-        const magic_len = body.readSliceShort(&magic) catch 0;
+        if (keep_head) blk: {
+            // Bounded by `open_bytes` — the ONE net-head constant this file
+            // already reads — so a server that answers with more than it was
+            // asked for cannot make us buffer it. A 206's Content-Length is the
+            // partial slice, so the normal case reads the body to its end and
+            // leaves the connection reusable; a short read just retains less.
+            const buf = self.gpa.alloc(u8, @intCast(open_bytes)) catch break :blk;
+            const n = body.readSliceShort(buf) catch 0;
+            if (n == 0) {
+                self.gpa.free(buf);
+                break :blk;
+            }
+            self.head_buf = buf;
+            self.head_len = n;
+            magic_len = @min(n, magic.len);
+            @memcpy(magic[0..magic_len], buf[0..magic_len]);
+        }
+        // Not retaining (or the retain fell through on OOM / an empty body): the
+        // 2 magic bytes are all this request is read for, exactly as before.
+        if (self.head_len == 0) magic_len = body.readSliceShort(&magic) catch 0;
         const is_gz = magic_len == 2 and magic[0] == 0x1f and magic[1] == 0x8b;
         // All the (bug-prone) classification now lives in the pure, unit-tested
         // decideProbe; probe() is just the I/O around it.
@@ -386,9 +492,30 @@ pub const RealTransport = struct {
 
     fn fetchInto(self: *RealTransport, dest: []u8, offset: u64) FetchOutcome {
         if (dest.len == 0) return .ok;
+        // The probe's retained head first (`head_buf`). This is where the
+        // never-re-fetch invariant (AC6/AC13) was actually being broken and could
+        // not be seen: its instrument, `HttpRange.fetch_count`, lives on the
+        // Source, and the probe runs before a Source exists — so the duplicate
+        // transfer happened entirely outside the counter's view. Serving the head
+        // from here means the bytes cross the wire once and the counter's answer
+        // is the true one.
+        var out = dest;
+        var at = offset;
+        if (at < self.head_len) {
+            const n: usize = @intCast(@min(@as(u64, out.len), self.head_len - at));
+            @memcpy(out[0..n], self.head_buf[@intCast(at)..][0..n]);
+            out = out[n..];
+            at += n;
+            // Consumed to its end: the spool owns those bytes now and no demand
+            // returns for them, so the buffer is released rather than held for the
+            // document's life. A request that reaches PAST the head continues over
+            // the network from `at` — never re-requesting a byte we just served.
+            if (at >= self.head_len) self.releaseHead();
+            if (out.len == 0) return .ok;
+        }
         const uri = std.Uri.parse(self.url) catch return .failed;
         var range_buf: [64]u8 = undefined;
-        const range_val = std.fmt.bufPrint(&range_buf, "bytes={d}-{d}", .{ offset, offset + dest.len - 1 }) catch return .failed;
+        const range_val = std.fmt.bufPrint(&range_buf, "bytes={d}-{d}", .{ at, at + out.len - 1 }) catch return .failed;
         // See `probe()`: `request()` owns connect (TLS prelude / `client.now`).
         var req = self.client.request(.GET, uri, .{
             .redirect_behavior = .init(redirect_cap),
@@ -407,8 +534,10 @@ pub const RealTransport = struct {
         const body = response.reader(&transfer_buf);
         // security-hardening (e) AC-e3: a short body delivers fewer bytes than the
         // requested range -- report it (never zero-fill the undelivered tail).
-        const got = body.readSliceShort(dest) catch return .failed;
-        return if (got < dest.len) .short else .ok;
+        // `out` is `dest` minus any prefix already served from the retained head,
+        // so a short tail is still reported against what was actually requested.
+        const got = body.readSliceShort(out) catch return .failed;
+        return if (got < out.len) .short else .ok;
     }
 };
 
