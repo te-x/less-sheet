@@ -15,6 +15,9 @@ LESSSHEET_CODESIGN_IDENTITY yourself. Publishing is a separate, deliberate act
 What it produces in --out (default <repo>/dist):
 
     less-sheet-<ver>-macos-arm64.zip        the .app, ditto-zipped (Apple's format)
+    less-sheet-<ver>-macos-arm64.tar.gz     the same .app, for the curl one-liner
+                                            (curl sets no quarantine bit, so it
+                                             opens with no Gatekeeper prompt)
     less-sheet-<ver>-macos-arm64.dmg        the same .app in a plain disk image
     less-sheet-<ver>-linux-<arch>.tar.gz    GTK binary + .desktop + icon + install.sh
     SHA256SUMS                              one line per artifact
@@ -396,6 +399,34 @@ def build_macos(repo, out, version, do_verify, formats, notes):
                                         adhoc, gatekeeper, verdict, do_verify, notes))
         merge_outputs(out, arts, version, notes)   # bank it before attempting the dmg
 
+    if "tgz" in formats:
+        tpath = os.path.join(out, base + ".tar.gz")
+        if os.path.exists(tpath):
+            os.remove(tpath)
+        # This artifact exists for ONE reason: `curl` does not set
+        # com.apple.quarantine, and a browser does. Gatekeeper's first-launch
+        # refusal keys on that attribute, NOT on the signature — an ad-hoc
+        # signed build that spctl rejects still launches with no prompt when
+        # the attribute is absent. So a piped curl|tar install is the only
+        # route that is genuinely one step for an unnotarized app.
+        #
+        # tar, not ditto: `ditto -c -k` writes a zip, and unzipping in a
+        # one-liner needs a temp file. tar streams. The bundle survives it —
+        # the ad-hoc signature is EMBEDDED in the Mach-O, not carried in an
+        # xattr, and the executable bit is preserved (verified below by
+        # actually unpacking and re-running the seal check).
+        #
+        # --no-xattrs + COPYFILE_DISABLE for the same reason as the Linux
+        # tarball: macOS tar otherwise stores com.apple.provenance and GNU tar
+        # warns once per file about it on the other end.
+        tenv = dict(os.environ)
+        tenv["COPYFILE_DISABLE"] = "1"
+        must(["tar", "--no-xattrs", "-C", os.path.dirname(app), "-czf", tpath,
+              os.path.basename(app)], "tar czf", env=tenv)
+        arts.append(finish_mac_artifact(tpath, "tgz", version, arch, minos, ls_min,
+                                        adhoc, gatekeeper, verdict, do_verify, notes))
+        merge_outputs(out, arts, version, notes)
+
     if "dmg" in formats:
         dpath = os.path.join(out, base + ".dmg")
         if os.path.exists(dpath):
@@ -422,6 +453,9 @@ def finish_mac_artifact(path, kind, version, arch, minos, ls_min, adhoc,
         try:
             if kind == "zip":
                 must(["ditto", "-x", "-k", path, tmp], "ditto unzip")
+                app = os.path.join(tmp, "less-sheet.app")
+            elif kind == "tgz":
+                must(["tar", "-xzf", path, "-C", tmp], "tar xzf")
                 app = os.path.join(tmp, "less-sheet.app")
             else:
                 mnt = os.path.join(tmp, "mnt")
@@ -823,13 +857,48 @@ cat /t/out.txt
 
 # --------------------------------------------------------------------------
 
+def write_cask(repo, out, ordered, version, base):
+    """Fill packaging/homebrew/Casks/less-sheet.rb from THIS run's real digest.
+
+    The digest is the one thing in a cask that cannot be checked by the person
+    writing it: a wrong sha256 still installs fine for the author, whose
+    Homebrew already has the file cached, and fails for every later user with an
+    error that reads like a corrupted download. So it is copied from
+    SHA256SUMS mechanically and never typed.
+    """
+    tpl = os.path.join(repo, "packaging", "homebrew", "Casks", "less-sheet.rb")
+    if not os.path.isfile(tpl):
+        return None
+    zips = [a for a in ordered if a["file"].endswith(".zip") and "macos" in a["file"]]
+    if not zips:
+        return None
+    with open(tpl) as fh:
+        body = fh.read()
+    body = (body.replace('version "VERSION"', 'version "%s"' % version)
+                .replace('sha256 "SHA256"', 'sha256 "%s"' % zips[0]["sha256"])
+                .replace("DOWNLOAD_BASE", base.rstrip("/")))
+    # HOMEPAGE is deliberately NOT guessed from the download URL — a release
+    # base and a project page are not reliably the same host, and a cask that
+    # points somewhere plausible-but-wrong is worse than one that visibly still
+    # needs a value.
+    cpath = os.path.join(out, "less-sheet.rb")
+    with open(cpath, "w") as fh:
+        fh.write(body)
+    if "HOMEPAGE" in body:
+        print("  note: the cask still has HOMEPAGE unset — fill it before pushing")
+    return cpath
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Build, verify and checksum the downloadable less-sheet artifacts.")
     ap.add_argument("--platform", choices=("mac", "linux", "all"), default="all")
     ap.add_argument("--arch", choices=("aarch64", "x86_64", "both"), default="both",
                     help="Linux architectures (default both; x86_64 is emulated on ARM hosts)")
-    ap.add_argument("--mac-format", choices=("zip", "dmg", "both"), default="both")
+    ap.add_argument("--mac-format", choices=("zip", "dmg", "tgz", "all"), default="all")
+    ap.add_argument("--cask-base", metavar="URL",
+                    help="release download base URL; writes dist/less-sheet.rb "
+                         "with this run's real version and sha256 filled in")
     ap.add_argument("--out", default=None, help="output directory (default <repo>/dist)")
     ap.add_argument("--version", default=None, help="override the version string")
     ap.add_argument("--skip-verify", action="store_true",
@@ -855,7 +924,7 @@ def main():
 
     arts = []
     if args.platform in ("mac", "all"):
-        formats = ("zip", "dmg") if args.mac_format == "both" else (args.mac_format,)
+        formats = ("zip", "tgz", "dmg") if args.mac_format == "all" else (args.mac_format,)
         arts += build_macos(repo, out, version, do_verify, formats, notes)
     if args.platform in ("linux", "all"):
         arches = ("aarch64", "x86_64") if args.arch == "both" else (args.arch,)
@@ -874,6 +943,14 @@ def main():
             run_note = "(from an earlier run) " + run_note
         print("%-44s %8.1fM  %s" % (a["file"], a["bytes"] / 1048576.0, run_note))
     print("\nwrote %s/SHA256SUMS and %s/manifest.json" % (out, out))
+    if getattr(args, "cask_base", None):
+        cpath = write_cask(repo, out, ordered, version, args.cask_base)
+        if cpath:
+            print("wrote %s (paste into your homebrew-tap; see "
+                  "packaging/homebrew/README.md)" % cpath)
+        else:
+            print("no .zip artifact in this run, so no cask was written "
+                  "(the cask installs the zip)")
     if notes:
         print("\nNOTES / THINGS THAT NEED A DECISION:")
         for n in notes:

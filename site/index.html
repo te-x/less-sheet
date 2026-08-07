@@ -24,12 +24,14 @@
     --ink: #1c1b18;
     --dim: #6b6960;
     --line: #dedcd3;
+    --tint: #f1efe8;
     --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Cantarell, "Helvetica Neue", Arial, sans-serif;
     --serif: Charter, "Bitstream Charter", "Source Serif 4", Georgia, "Liberation Serif", serif;
   }
   @media (prefers-color-scheme: dark) {
     :root {
       --paper: #131311; --ink: #e8e6df; --dim: #98958a; --line: #2c2b26;
+      --tint: #1d1c19;
     }
   }
   * { box-sizing: border-box; }
@@ -162,6 +164,20 @@
   .cmp td:first-child { font: 12.5px var(--sans); color: var(--dim); width: 9em; padding-top: 15px; }
 
   /* ---- download ---- */
+  /* A command to copy. NOT monospace — the page has no mono face anywhere, and
+     one introduced here for three short lines would read as a different
+     document. `pre` still does the load-bearing part (it keeps the line breaks
+     and the exact spacing); the tint and the rule are what say "copy this".
+     Wraps rather than scrolls, because a horizontally clipped shell command is
+     a command you cannot copy correctly on a phone. */
+  .dl-way { font: 600 12px var(--sans); letter-spacing: .06em; text-transform: uppercase;
+            color: var(--dim); margin: 22px 0 7px; }
+  .cmd {
+    margin: 0; padding: 11px 13px; background: var(--tint); border-left: 2px solid var(--line);
+    font: 13.5px/1.65 var(--sans); color: var(--ink);
+    white-space: pre-wrap; overflow-wrap: anywhere; -webkit-user-select: all; user-select: all;
+  }
+  .cmd code { font-style: normal; }
   .dl { display: grid; grid-template-columns: 1fr 1fr; gap: 0; }
   .dl > div { padding: 0 28px; }
   .dl > div:first-child { padding-left: 0; }
@@ -499,15 +515,32 @@
       <div class="dl">
         <div>
           <h3>macOS</h3>
+          <p class="reqs" style="margin:0 0 10px">macOS 26.0+ · Apple silicon ·
+            ~3&nbsp;MB · reads csv · csv.gz · http(s)</p>
+
+          <p class="dl-way"><b>Homebrew</b></p>
+          <pre class="cmd"><code>brew tap TAP_OWNER/tap
+brew install --cask less-sheet --no-quarantine</code></pre>
+
+          <p class="dl-way"><b>One line, no Homebrew</b></p>
+          <pre class="cmd"><code>curl -fsSL DOWNLOAD_BASE/less-sheet-VERSION-macos-arm64.tar.gz | tar xz -C /Applications</code></pre>
+
+          <p class="dl-way"><b>Or download it</b></p>
           <p style="margin:0"><a class="btn" href="DOWNLOAD_BASE/less-sheet-VERSION-macos-arm64.dmg">download .dmg</a></p>
-          <p class="reqs">macOS 26.0+ · Apple silicon · ~3.3 MB<br>
-            reads csv · csv.gz · http(s)</p>
           <div class="fn">
-            <b>First launch takes one extra step.</b> This build is signed but
-            not notarized through Apple’s paid developer programme — it’s a
-            free app. macOS will refuse it once, until you allow it:
-            <span class="path">System Settings → Privacy &amp; Security →
-            “Open Anyway”</span>. After that it opens normally.
+            <b>Downloading it in a browser costs one extra step.</b> This build
+            is signed, but not notarized through Apple’s paid developer
+            programme — it’s a free app. So macOS refuses it once, until you
+            allow it: <span class="path">System Settings → Privacy &amp;
+            Security → “Open Anyway”</span>. After that it opens normally.
+            <br><br>
+            The two commands above skip that, and it’s worth knowing why rather
+            than trusting it: macOS blocks the <i>first launch of a file marked
+            as downloaded</i>, and only browsers mark files that way. Both
+            routes above therefore also mean you are trusting us instead of
+            Apple’s check — so verify the download against
+            <a href="DOWNLOAD_BASE/SHA256SUMS">SHA256SUMS</a> if that matters to
+            you.
           </div>
         </div>
         <div>
@@ -525,7 +558,7 @@
       </div>
       <p class="reqs" style="margin-top:24px">
         <a href="DOWNLOAD_BASE/SHA256SUMS">SHA256SUMS</a> &nbsp;
-        <span class="draft">LINKS NOT LIVE — DOWNLOAD_BASE AND VERSION ARE PLACEHOLDERS</span>
+        <span class="draft">LINKS NOT LIVE — DOWNLOAD_BASE, VERSION AND TAP_OWNER ARE PLACEHOLDERS</span>
       </p>
     </div>
   </div>
