@@ -998,10 +998,24 @@ grid_draw (GtkDrawingArea *area, cairo_t *cr, int width, int height,
   if (app->timing && app->first_frame_pending)
     {
       app->first_frame_pending = FALSE;
-      gint64 dt = g_get_monotonic_time () - app->t_open_begin;
+      gint64 now = g_get_monotonic_time ();
+      gint64 dt = now - app->t_open_begin;
       g_printerr (
           "[timing] window-fill (open begin -> first frame): %.1f ms\n",
           (double)dt / 1000.0);
+      /* The TOTAL a user actually waits: process entry -> the first painted
+       * grid frame. The two lines above and below it are SEGMENTS (main ->
+       * window mapped, open begin -> first frame) which overlap and cannot be
+       * added, so neither one answers "how long until I see rows".
+       *
+       * Deliberately the same quantity as the macOS `first_row_pixels` stamp —
+       * process start to a real data row on screen — because these two numbers
+       * are published side by side and a reader will compare them. Two
+       * platforms measuring subtly different things would be worse than not
+       * publishing the second one. */
+      g_printerr (
+          "[timing] first-rows-visible (main -> first frame): %.1f ms\n",
+          (double)(now - app->t_start) / 1000.0);
     }
 
   /* All colors resolve from the active theme — no literal color constants. */
