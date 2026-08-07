@@ -173,6 +173,14 @@
   .cmp thead th { font: 600 11px var(--sans); letter-spacing: .09em; text-transform: uppercase; color: var(--dim); }
   .cmp td { font-size: 15.5px; }
   .cmp td:first-child { font: 12.5px var(--sans); color: var(--dim); width: 9em; padding-top: 15px; }
+  /* The benchmark table carries three variants x (time, memory) = seven
+     columns. It needs to be tighter than a two-column comparison or it wraps
+     inside the cells; .cmp-wrap already scrolls it horizontally on narrow
+     screens rather than letting the page scroll. */
+  .cmp.grid7 th, .cmp.grid7 td { padding: 9px 10px 9px 0; font-size: 14px; white-space: nowrap; }
+  .cmp.grid7 td:first-child { width: 5.5em; padding-top: 11px; }
+  .cmp.grid7 thead tr:first-child th { border-bottom: 0; padding-bottom: 2px; }
+  .cmp.grid7 thead tr:first-child th[colspan] { color: var(--ink); }
 
   /* ---- download ---- */
   /* A command to copy. NOT monospace — the page has no mono face anywhere, and
@@ -240,15 +248,16 @@
 
       <div class="ledger">
         <div class="only-mac">
-          <div class="row"><span class="size">10 MB</span><span class="time">164 ms</span></div>
-          <div class="row"><span class="size">10 GB</span><span class="time">164 ms</span></div>
+          <div class="row"><span class="size">10 MB</span><span class="time">168 ms</span></div>
+          <div class="row"><span class="size">10 GB</span><span class="time">214 ms</span></div>
         </div>
         <div class="only-linux">
-          <div class="row"><span class="size">10 MB</span><span class="time">158 ms</span></div>
-          <div class="row"><span class="size">10 GB</span><span class="time">158 ms</span></div>
+          <div class="row"><span class="size">10 MB</span><span class="time">166 ms</span></div>
+          <div class="row"><span class="size">10 GB</span><span class="time">168 ms</span></div>
         </div>
         <div class="note">launch to first rows on screen, GUI included — a
-          thousand times the data, the same wait</div>
+          thousand times the data, and the engine holds it in under three
+          megabytes</div>
       </div>
 
       <p><a class="btn" href="#download">download</a></p>
@@ -290,46 +299,55 @@
       <p>Every time on this page is <b>launch to first rows on screen</b> —
         application start, file open, and the GUI actually drawing, because the
         backend alone is irrelevant to you.</p>
-      <p>From a standing start, on ordinary hardware. The point is not any
-        single number: it’s that the numbers barely move across six orders of
-        magnitude of file size. A gigabyte costs what a kilobyte costs, because
-        the same few hundred kilobytes get read either way.</p>
-      <p>Gzip is the one thing that does cost extra, and it costs a
-        <i>constant</i> extra: the first screenful has to be decompressed, and
-        that is all — so a 10&nbsp;GB archive lands within a millisecond or two
-        of a 10&nbsp;MB one.</p>
+      <p>A thousand times the data costs about forty milliseconds more, because
+        the same few hundred kilobytes get read either way. Width costs more than
+        length: two thousand columns is more work than a thousandfold more rows.</p>
+      <p>Memory is quoted as <b>engine + window</b>. Only the first number is
+        about your file — and it is the small one. A ten-gigabyte document, a
+        hundred and thirty-five million rows, rests in under three megabytes,
+        because the file is mapped rather than loaded and none of it is dirty.
+        The second number is the window itself, and it does not move whatever
+        you open.</p>
     </div>
     <div class="figs cmp-wrap">
       <div class="only-mac">
-        <table class="cmp">
-          <thead><tr><th>file size</th><th>CSV</th><th>gzipped</th></tr></thead>
+        <table class="cmp grid7">
+          <thead>
+            <tr><th></th><th colspan="2">CSV · 10 cols</th><th colspan="2">CSV · 2000 cols</th><th colspan="2">CSV.gz</th></tr>
+            <tr><th>size</th><th>open</th><th>memory</th><th>open</th><th>memory</th><th>open</th><th>memory</th></tr>
+          </thead>
           <tbody>
-            <tr><td>10 KB</td><td>162 ms</td><td>164 ms</td></tr>
-            <tr><td>10 MB</td><td>164 ms</td><td>183 ms</td></tr>
-            <tr><td>10 GB</td><td>164 ms</td><td>182 ms</td></tr>
+            <tr><td>10 KB</td><td>167 ms</td><td>1.2 + 59</td><td>—</td><td>—</td><td>166 ms</td><td>8.4 + 59</td></tr>
+            <tr><td>10 MB</td><td>168 ms</td><td>1.2 + 59</td><td>219 ms</td><td>7.9 + 59</td><td>215 ms</td><td>8.4 + 59</td></tr>
+            <tr><td>10 GB</td><td>214 ms</td><td>2.5 + 59</td><td>201 ms</td><td>7.9 + 59</td><td>213 ms</td><td>10.6 + 59</td></tr>
           </tbody>
         </table>
         <p class="reqs" style="margin-top:14px">MacBook Pro, Apple M2 Pro, internal
-          NVMe · median of 15 interleaved runs · warm page cache</p>
+          NVMe, Retina (2× backing) · memory in MiB, engine + window</p>
       </div>
       <div class="only-linux">
-        <table class="cmp">
-          <thead><tr><th>file size</th><th>CSV</th><th>gzipped</th></tr></thead>
+        <table class="cmp grid7">
+          <thead>
+            <tr><th></th><th colspan="2">CSV · 10 cols</th><th colspan="2">CSV · 2000 cols</th><th colspan="2">CSV.gz</th></tr>
+            <tr><th>size</th><th>open</th><th>memory</th><th>open</th><th>memory</th><th>open</th><th>memory</th></tr>
+          </thead>
           <tbody>
-            <tr><td>10 KB</td><td>147 ms</td><td>152 ms</td></tr>
-            <tr><td>10 MB</td><td>158 ms</td><td>221 ms</td></tr>
-            <tr><td>10 GB</td><td>158 ms</td><td>219 ms</td></tr>
+            <tr><td>10 KB</td><td>151 ms</td><td>0.8 + 68</td><td>—</td><td>—</td><td>158 ms</td><td>7.9 + 68</td></tr>
+            <tr><td>10 MB</td><td>166 ms</td><td>0.8 + 68</td><td>179 ms</td><td>6.9 + 67</td><td>258 ms</td><td>7.9 + 68</td></tr>
+            <tr><td>10 GB</td><td>168 ms</td><td>2.3 + 68</td><td>182 ms</td><td>6.9 + 67</td><td>259 ms</td><td>9.5 + 68</td></tr>
           </tbody>
         </table>
-        <p class="reqs" style="margin-top:14px">Arch Linux, x86_64, Samsung 960 EVO ·
-          median of 10 interleaved runs · warm page cache · headless X server,
-          software compositing</p>
+        <p class="reqs" style="margin-top:14px">Arch Linux, x86_64, Samsung 960 EVO,
+          1× display · memory in MiB, engine + window</p>
       </div>
       <p class="reqs" style="margin-top:14px">launch → first rows on screen, GUI
         included · each app timed by its own monotonic clock, so no measurement
-        harness is inside the number · the cache could not be dropped without
-        root on these machines, and since opening reads only the head of the
-        file, that difference is one seek</p>
+        harness is inside the number · memory measured with the document open and
+        indexing finished; the engine figure is the same quantity on both systems
+        and comes out within ten per cent, which is expected — it is the same
+        code · the window figure is not comparable between them and is not meant
+        to be: it is each platform’s toolkit at that display’s scale · a
+        2000-column file cannot be 10 KB, since the header alone is 15 KB</p>
     </div>
   </div>
 </section>
