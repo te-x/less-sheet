@@ -275,6 +275,180 @@ flatpak build-bundle repo less-sheet.flatpak com.lesssheet.LessSheet       # sel
 
 ---
 
+## 7. GitHub: closed source, public downloads — a walkthrough
+
+**Goal:** keep the code private, while binaries, the frontpage, and a feedback
+channel are all public. Follow this once, top to bottom.
+
+### 7.0 Do this first: amend the architecture decision
+
+`docs/architecture` records the signed non-goal **"Never publish this
+workspace"**, and the orchestrator works under a standing rule never to add a git
+remote here. Everything below adds one.
+
+That decision is yours to change, but change it **deliberately**: amend the ARCH
+doc and sign it, the same way the security amendment was handled. Nothing in §7
+should be executed while the doc still says the opposite — a runbook that
+contradicts a signed decision is how a project ends up not knowing what it
+decided.
+
+### 7.1 Why this needs two repositories
+
+Repository visibility is **one switch that governs four things**. Make a repo
+private and its Releases, Issues, and Pages all go private with it:
+
+- **Release assets** are then served from temporary *authenticated* URLs.
+  `brew` cannot authenticate, and neither can the `curl` one-liner, so both
+  install routes in §3a break by construction.
+- **Issues** can only be filed by people with repo access.
+- **Pages** will not publish at all on a Free account. GitHub's own wording:
+  *"If the account that owns the repository uses GitHub Free or GitHub Free for
+  organizations, the repository must be public."* (Paid tiers can serve Pages
+  from a private repo, so a single private repo is possible on Pro — but the
+  release-asset problem above remains, so it does not actually save you a repo.)
+
+So:
+
+| repository        | visibility  | what lives there                                   |
+| ----------------- | ----------- | -------------------------------------------------- |
+| `less-sheet-dev`  | **private** | all source, `.aidev/`, `review/`, `docs/`, the site |
+| `less-sheet`      | **public**  | Releases, Issues, Pages. **No source.**             |
+| `homebrew-tap`    | **public**  | the cask (see `packaging/homebrew/README.md`)       |
+
+The public repo gets the good name, because that is what users see in a download
+URL and in a bug report.
+
+### 7.2 Create the repositories
+
+```sh
+# 1. the private one, from this workspace
+gh repo create <you>/less-sheet-dev --private --source=. --remote=origin --push
+
+# 2. the public face — created EMPTY, it never receives source
+gh repo create <you>/less-sheet --public --description "less-sheet — downloads and issues"
+```
+
+Give the public repo a `README.md` that says what it is ("this is where
+less-sheet is released and where you report problems; the source is not public")
+and nothing else. Then, in its settings, **turn off Wikis and Projects** and
+leave **Issues on**; on the *private* repo, turn Issues **off**, so there is one
+place feedback can land and no split tracker.
+
+### 7.3 First release — build locally, publish by hand
+
+This is the recommended path, and §7.6 explains why it is not CI.
+
+```sh
+# build + verify every artifact by RUNNING it, and write SHA256SUMS
+python3 tools/release/make_release --cask-base \
+  "https://github.com/<you>/less-sheet/releases/download/v$(cat VERSION)"
+
+# publish into the PUBLIC repo (note --repo: you are standing in the private one)
+gh release create "v$(cat VERSION)" --repo <you>/less-sheet \
+   --title "less-sheet $(cat VERSION)" --notes-file <(printf '...changelog...\n') \
+   dist/less-sheet-*-macos-arm64.dmg \
+   dist/less-sheet-*-macos-arm64.tar.gz \
+   dist/less-sheet-*-macos-arm64.zip \
+   dist/less-sheet-*-linux-*.tar.gz \
+   dist/SHA256SUMS
+```
+
+**Then prove the URLs are public**, because this is the failure that silently
+breaks Homebrew and the one-liner for everyone but you:
+
+```sh
+curl -fsSLI -o /dev/null -w '%{http_code}\n' \
+  "https://github.com/<you>/less-sheet/releases/download/v$(cat VERSION)/SHA256SUMS"
+# 200 = public. 404 while logged out = the release or the repo is still private.
+```
+
+Check it **logged out** (a private browser window, or `curl` with no
+credentials). A logged-in check passes even when the asset is private.
+
+### 7.4 The frontpage on Pages
+
+`site/index.html` stays in the **private** repo — one source of truth. Deploying
+is a copy into the public repo, and the copy is where the placeholders get
+filled:
+
+```sh
+VER=$(cat VERSION)
+BASE="https://github.com/<you>/less-sheet/releases/download/v$VER"
+
+mkdir -p /tmp/pagesite && cp -R site/* /tmp/pagesite/
+
+# order matters only in that DOWNLOAD_BASE is substituted with a string that
+# itself contains the version — written as `v$VER`, not `vVERSION`, so the
+# second pass cannot rewrite it twice.
+sed -i '' -e "s|DOWNLOAD_BASE|$BASE|g" -e "s|VERSION|$VER|g" \
+          -e "s|TAP_OWNER|<you>|g" \
+          -e '/class="draft"/d' /tmp/pagesite/index.html
+
+# The draft banner is only true while the placeholders are unfilled, so the same
+# pass that fills them deletes it. This is the check that it worked — and that no
+# placeholder survived, which would otherwise ship as a dead link.
+grep -nE 'LINKS NOT LIVE|DOWNLOAD_BASE|TAP_OWNER' /tmp/pagesite/index.html \
+  && { echo "placeholder or draft banner survived — do not publish"; exit 1; }
+echo "page is clean"
+```
+
+Commit `/tmp/pagesite` into the public repo (root, or a `docs/` folder), then
+**Settings → Pages → Source: Deploy from a branch**, pick the branch and folder.
+The site appears at `https://<you>.github.io/less-sheet/`; a custom domain goes
+in the same screen plus a `CNAME` file.
+
+Substituting at deploy time rather than editing the page by hand is the point:
+the version and every download URL derive from the tag, so the page cannot ship
+pointing at a release that does not exist (§1's rule — never hand-typed).
+
+### 7.5 The Homebrew tap
+
+Full steps are in `packaging/homebrew/README.md`. Two things that matter here:
+the tap repo must be **public** (brew fetches it unauthenticated), and the cask's
+`sha256` must come from `dist/SHA256SUMS` via `make_release --cask-base`, never
+typed. A wrong digest still installs fine for you — your Homebrew has the file
+cached — and fails for every user after you.
+
+### 7.6 If you later want CI to build
+
+Not first, and here is the honest reason: `make_release` already builds **and
+verifies by running** — macOS launches the unpacked app headlessly and requires
+the real rows-are-visible marker, and Linux runs inside a clean `fedora:43`
+container carrying only the declared runtime deps, which proves the binary works
+on a machine that never built it. A GitHub runner does not check anything
+stronger.
+
+The cost is real: private repos bill Actions minutes, and **macOS runners bill at
+a 10× multiplier**, so a Free plan's 2,000 minutes is roughly 200 macOS minutes a
+month. When you do add CI, add the **Linux** leg first — 1× multiplier, and it is
+the platform you cannot conveniently build on the Mac anyway.
+
+A CI job in the private repo publishing into the public repo needs a
+**fine-grained personal access token**: repository access limited to
+`<you>/less-sheet` only, permission **Contents: Read and write** (releases live
+under Contents). Store it as a secret in the *private* repo — never in the public
+one, which anyone can fork.
+
+### 7.7 Things that will bite
+
+- **A private release asset is not a download link.** If `curl` on the release
+  URL returns 404 while logged out, Homebrew and the one-liner are broken for
+  everyone, and you will not notice, because you are logged in.
+- **Pages needs a public repo on Free** (quoted above). Do not discover this
+  after writing the deploy script.
+- **The private repo carries `.aidev/`, `review/` and `docs/architecture`** —
+  the whole development process, including every review record. That is fine
+  while it is private. Read it as "what would be exposed" before ever flipping
+  that repo's visibility, and treat flipping it as a decision, not a setting.
+- **Closed source + LGPL: you are compliant today, do not break it.** GTK and
+  libadwaita are LGPL, which requires that a user can relink. The Linux build
+  satisfies that by linking the *system* libraries — "no bundled GTK" is in the
+  release README. If bundling GTK is ever proposed to simplify distribution,
+  that is the change that turns a compliant closed-source binary into a licence
+  problem. §4a has the longer note.
+
+---
+
 ## Appendix — current gaps / TODO before a real launch
 - [x] Single-source the version — root `VERSION`, read by the GTK build (§1).
 - [ ] Convert the last two version consumers: the macOS `Info.plist` and `make_release` (§1a).
@@ -285,3 +459,8 @@ flatpak build-bundle repo less-sheet.flatpak com.lesssheet.LessSheet       # sel
 - [ ] Write the EULA/LICENSE (§6) + legal review.
 - [ ] Draft + Linux-test the Flatpak manifest (§4c); add metainfo + .desktop.
 - [ ] Decide Flathub vs self-host (§4d).
+- [ ] **Amend + sign the ARCH non-goal "Never publish this workspace"** before adding any git remote (§7.0).
+- [ ] Create the private source repo + the public downloads/issues repo (§7.1–7.2).
+- [ ] First release published, and the asset URL verified **logged out** (§7.3).
+- [ ] Pages serving the frontpage with the placeholders substituted at deploy (§7.4).
+- [ ] Homebrew tap published, digest taken from `SHA256SUMS` (§7.5).
