@@ -3806,6 +3806,13 @@ do_apply_filter (App *app)
   app->find_wrap_issued = FALSE;
   find_clear_mask (app);
   app->jump = lsg_jump_initial ();
+  /* Clearing the STATE is not clearing the LABEL. Without this the status line
+   * keeps whatever it last rendered — typing a Where value starts a live
+   * search that shows "Searching…", and applying the filter then invalidated
+   * that search without ever repainting the widget, so the app sat there fully
+   * filtered while still claiming to be searching. Shipped in a screenshot
+   * before anyone noticed. */
+  find_update_labels (app);
 
   filter_rebuild_grid (app, 0); /* land on filtered row 0 */
   /* Net-park (Bug 2): ls_filter_set parks the filter-scan immediately (count
@@ -3847,6 +3854,7 @@ do_clear_filter (App *app)
   app->find_sticky_notice = LSG_FIND_NOTICE_NONE;
   find_clear_mask (app);
   app->jump = lsg_jump_initial ();
+  find_update_labels (app); /* same omission on the clear path */
 
   filter_set_toggle (app, FALSE); /* the (x) path also un-presses the toggle */
   filter_rebuild_grid (app, restore); /* identity view, re-anchored */
