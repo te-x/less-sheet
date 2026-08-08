@@ -348,11 +348,22 @@ pub fn release(job: *NetOpenJob) void {
         // actually TEARS DOWN a parked fetch: the executor interrupts the
         // worker's blocking socket syscall (SIGIO) until it acknowledges, the
         // read fails with `error.Canceled`, and the worker unwinds — so this
-        // join terminates even when the peer accepted the TCP connection and
-        // then answered nothing. Idempotent; a already-finished task returns at
-        // once. There is no request-WITHOUT-await primitive in the 0.16 `Io`
-        // vtable, which is why the teardown lands here (release joins, and is
-        // documented to) rather than in the non-blocking `cancel`.
+        // join terminates whether the peer accepted the TCP connection and then
+        // answered nothing (parked in `receiveHead`) or sent valid 206 headers
+        // and a few KiB and then went silent (parked in the BODY read).
+        //   THAT SECOND CASE IS NOT FREE, and the join is only as reliable as
+        // the worker's unwind. The interrupt lands ONCE: it leaves the executor
+        // thread `.canceled`, and every syscall the worker makes AFTERWARDS is
+        // uninterruptible (`Syscall.start` -> `.{ .thread = null }`,
+        // Threaded.zig:1364). So a worker that answers `error.Canceled` by
+        // reading again does not get a second cancel — it parks forever and
+        // takes this join with it. `net_source`'s ONE-SHOT CANCELLATION note has
+        // the mechanism and the rule it imposes (a failed read is TERMINAL);
+        // `probe` violating it with one `catch 0` was the whole of net_body_hang.
+        //   Idempotent; an already-finished task returns at once. There is no
+        // request-WITHOUT-await primitive in the 0.16 `Io` vtable, which is why
+        // the teardown lands here (release joins, and is documented to) rather
+        // than in the non-blocking `cancel`.
         f.cancel(net_source.netIo());
         job.future = null;
     } else {

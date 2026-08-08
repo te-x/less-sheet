@@ -69,11 +69,39 @@ const redirect_cap: u32 = 3; // Zig std's small fixed redirect cap (AC12)
 //   both. A LOCAL document's worker stays a raw `std.Thread.spawn` (uncancellable
 //   — `Thread.current` unset, Io/Threaded.zig:1347-1348) because it never makes
 //   an interruptible blocking syscall; `stop` alone terminates it.
-// Do not restate either claim without re-running the silent-peer probes — one
-// covers the OPEN JOB (`ls_net_open_release`), one the SCAN WORKER (`ls_close`).
+// Do not restate either claim without re-running the wedged-peer probes, and
+// note that there are TWO SHAPES of wedged peer, not one: a peer that accepts
+// and answers NOTHING parks the worker in `receiveHead`, a peer that answers
+// valid 206 headers plus a few KiB and THEN goes silent parks it in the BODY
+// read. The silent-peer probe alone PASSED while the body-stall peer wedged
+// release forever (net_body_hang) — see ONE-SHOT CANCELLATION below. Run both,
+// against the OPEN JOB (`ls_net_open_release`) and the SCAN WORKER (`ls_close`).
 // The hermetic timeout TAXONOMY (a stalled connect -> LS_NET_ERROR_TIMEOUT) is
 // still exercised by the fake (NetFault.timeout); only real-transport enforcement
 // is absent.
+//
+// ONE-SHOT CANCELLATION — the condition that whole cover depends on, and the one
+// this file must keep. `std.Io.Threaded` cancellation is delivered EXACTLY ONCE
+// per task, and it is TERMINAL for the thread, not sticky: `Future.cancel` drives
+// the worker's thread status `.blocked` -> `.blocked_canceling`, SIGIO interrupts
+// the `readv`, `Syscall.checkCancel` reports `error.Canceled` and leaves the
+// status `.canceled` (Threaded.zig:1371-1385) — and from then on `Syscall.start`
+// returns `.{ .thread = null }` for EVERY later syscall on that thread
+// (Threaded.zig:1364, the same line `base.Document.joinWorker` cites). A `.thread = null` syscall has no cancellation point
+// at all: `netReadPosix` re-enters `readv` on EINTR forever, and
+// `signalCanceledSyscall` will not even signal it again (its status is no longer
+// `.blocked_canceling`, Threaded.zig:1314-1318).
+//   THE RULE THAT FOLLOWS: once a network read on the worker has FAILED, the
+// worker must not perform another one. A failed read is terminal — unwind, do not
+// read past it, do not retry. `base.Document.joinWorker` states the same
+// invariant for the SCAN worker and pairs `Future.cancel` with the `shutdown`
+// flag that stops the NEXT fetch; the OPEN job's equivalent of that flag is this
+// rule plus the `cancel_flag` checks at each stage boundary in `net.realWorker`.
+// Breaking it does not cost a hung read — it costs a PERMANENTLY hung read, with
+// no cancel left to break it. That was net_body_hang exactly: `probe` did
+// `catch 0` on the head read and then read the gzip magic, so the head read's
+// `error.Canceled` was swallowed and the magic read parked uninterruptibly,
+// wedging `ls_net_open_release` forever.
 
 // ---------------------------------------------------------------------------
 // The ONE `std.Io` behind every real network operation: the open-job worker TASK
@@ -470,7 +498,15 @@ pub const RealTransport = struct {
             // partial slice, so the normal case reads the body to its end and
             // leaves the connection reusable; a short read just retains less.
             const buf = self.gpa.alloc(u8, @intCast(open_bytes)) catch break :blk;
-            const n = body.readSliceShort(buf) catch 0;
+            const n = body.readSliceShort(buf) catch {
+                // A FAILED read ENDS this request — see ONE-SHOT CANCELLATION
+                // at the top of this file. This used to be `catch 0`, which fell
+                // through to the magic read below; after a cancel that second
+                // read was UNINTERRUPTIBLE and `ls_net_open_release` never
+                // returned (net_body_hang).
+                self.gpa.free(buf);
+                return .{ .err = .unreachable_ };
+            };
             if (n == 0) {
                 self.gpa.free(buf);
                 break :blk;
@@ -480,9 +516,11 @@ pub const RealTransport = struct {
             magic_len = @min(n, magic.len);
             @memcpy(magic[0..magic_len], buf[0..magic_len]);
         }
-        // Not retaining (or the retain fell through on OOM / an empty body): the
-        // 2 magic bytes are all this request is read for, exactly as before.
-        if (self.head_len == 0) magic_len = body.readSliceShort(&magic) catch 0;
+        // Not retaining (the retain fell through on OOM, or this is not the
+        // random-fill head): the 2 magic bytes are all this request is read for.
+        // Terminal on failure for the same reason as the head read above.
+        if (self.head_len == 0) magic_len = body.readSliceShort(&magic) catch
+            return .{ .err = .unreachable_ };
         const is_gz = magic_len == 2 and magic[0] == 0x1f and magic[1] == 0x8b;
         // All the (bug-prone) classification now lives in the pure, unit-tested
         // decideProbe; probe() is just the I/O around it.
