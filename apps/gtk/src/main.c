@@ -7230,55 +7230,87 @@ capture_drive (App *app, const char *query, const char *row)
          * tab, same popover — so the predicate feature is never pictured.
          * Mirrors the macOS LESSSHEET_FILTER_WHERE contract, header by NAME so
          * a fixture gaining a column cannot silently retarget the shot. */
+        /* LESSSHEET_GTK_CAPTURE_WHERE=<header>=<value> shoots a COLUMN
+         * PREDICATE instead of a text match filtered to hits. Without it the
+         * filter shot differs from the search shot only by the toggle — same
+         * tab, same popover — so the predicate feature is never pictured.
+         * Mirrors the macOS LESSSHEET_FILTER_WHERE contract, header by NAME so
+         * a fixture gaining a column cannot silently retarget the shot. */
         const char *where = g_getenv ("LESSSHEET_GTK_CAPTURE_WHERE");
         const char *eq = (where != NULL) ? strchr (where, '=') : NULL;
-        if (eq != NULL && eq != where && *(eq + 1) != '\0'
-            && app->find_stack != NULL && app->where_column != NULL)
-          {
-            char *header = g_strndup (where, (gsize)(eq - where));
-            open_find (app);
-            gtk_stack_set_visible_child_name (app->find_stack, "where");
-            where_ensure_columns (app); /* model is lazy; it must exist now */
+        gboolean did_where = FALSE;
 
-            GListModel *model = gtk_drop_down_get_model (app->where_column);
-            guint found = GTK_INVALID_LIST_POSITION;
-            for (guint i = 0;
-                 model != NULL && i < g_list_model_get_n_items (model); i++)
+        if (eq != NULL && eq != where && *(eq + 1) != '\0')
+          {
+            /* open_find FIRST. The Where widgets do not exist until the
+             * popover is built, so testing them before this point always
+             * failed and the shot silently fell back to the text filter —
+             * which is exactly the wrong picture this hook exists to stop
+             * shipping. */
+            open_find (app);
+            if (app->find_stack != NULL && app->where_column != NULL)
               {
-                const char *label
-                    = gtk_string_list_get_string (GTK_STRING_LIST (model), i);
-                /* The label may carry a disambiguating tag for duplicate
-                 * headers, so match the leading name, not the whole string. */
-                if (label != NULL
-                    && g_ascii_strncasecmp (label, header, strlen (header))
-                           == 0)
+                char *header = g_strndup (where, (gsize)(eq - where));
+                gtk_stack_set_visible_child_name (app->find_stack, "where");
+                where_ensure_columns (app); /* model is lazy; needed now */
+
+                GListModel *model
+                    = gtk_drop_down_get_model (app->where_column);
+                guint found = GTK_INVALID_LIST_POSITION;
+                guint n
+                    = (model != NULL) ? g_list_model_get_n_items (model) : 0;
+                for (guint i = 0; i < n; i++)
                   {
-                    found = i;
-                    break;
+                    const char *label = gtk_string_list_get_string (
+                        GTK_STRING_LIST (model), i);
+                    /* The label may carry a disambiguating tag for duplicate
+                     * headers, so match the leading name, not the whole
+                     * string. */
+                    if (label != NULL
+                        && g_ascii_strncasecmp (label, header, strlen (header))
+                               == 0)
+                      {
+                        found = i;
+                        break;
+                      }
                   }
-              }
-            if (found != GTK_INVALID_LIST_POSITION)
-              {
-                gtk_drop_down_set_selected (app->where_column, found);
-                if (app->where_op != NULL)
-                  gtk_drop_down_set_selected (app->where_op, LSG_SEARCH_OP_EQ);
-                if (app->where_value != NULL)
-                  gtk_editable_set_text (app->where_value, eq + 1);
-                gtk_toggle_button_set_active (app->filter_toggle, TRUE);
+                if (found != GTK_INVALID_LIST_POSITION)
+                  {
+                    gtk_drop_down_set_selected (app->where_column, found);
+                    if (app->where_op != NULL)
+                      gtk_drop_down_set_selected (app->where_op,
+                                                  LSG_SEARCH_OP_EQ);
+                    if (app->where_value != NULL)
+                      gtk_editable_set_text (app->where_value, eq + 1);
+                    did_where = TRUE;
+                    /* Report SUCCESS too, not just the failures. A hook that
+                     * is silent when it works and silent when it quietly falls
+                     * back cannot be diagnosed from a log at all — which is
+                     * exactly the position this one left us in. */
+                    g_printerr (
+                        "lesssheet.gtk.capture_where=applied column=%u\n",
+                        found);
+                  }
+                else
+                  g_printerr (
+                      "lesssheet.gtk.capture_where_unknown_column=%s\n",
+                      header);
                 g_free (header);
-                break;
               }
-            g_printerr ("lesssheet.gtk.capture_where_unknown_column=%s\n",
-                        header);
-            g_free (header);
+            else
+              g_printerr ("lesssheet.gtk.capture_where_no_widgets\n");
           }
+
+        if (!did_where)
+          {
+            gtk_editable_set_text (app->find_entry, query);
+            open_find (app);
+          }
+        /* set_active EMITS "toggled" -> on_filter_toggled -> do_apply_filter:
+         * the click path. filter_set_toggle would guard that handler out and
+         * silently change nothing but the button's look. */
+        gtk_toggle_button_set_active (app->filter_toggle, TRUE);
       }
-      gtk_editable_set_text (app->find_entry, query);
-      open_find (app);
-      /* set_active EMITS "toggled" -> on_filter_toggled -> do_apply_filter:
-       * the click path. filter_set_toggle would guard that handler out and
-       * silently change nothing but the button's look. */
-      gtk_toggle_button_set_active (app->filter_toggle, TRUE);
       break;
 
     case LSG_CAPTURE_NONE:
@@ -7288,10 +7320,11 @@ capture_drive (App *app, const char *query, const char *row)
   app->capture.t_drive = g_get_monotonic_time ();
 }
 
-/* The settle machine: one step per frame-clock beat. A tick callback and not a
- * timeout, because the whole question is "has the settled state been PAINTED",
- * and only the frame clock can answer it. Ticks run in the clock's UPDATE
- * phase, so a queue_draw issued here is served by THIS frame's paint. */
+/* The settle machine: one step per frame-clock beat. A tick callback and not
+ * a timeout, because the whole question is "has the settled state been
+ * PAINTED", and only the frame clock can answer it. Ticks run in the clock's
+ * UPDATE phase, so a queue_draw issued here is served by THIS frame's paint.
+ */
 static gboolean
 capture_tick (GtkWidget *widget, GdkFrameClock *clock, gpointer data)
 {
@@ -7311,7 +7344,8 @@ capture_tick (GtkWidget *widget, GdkFrameClock *clock, gpointer data)
   if (waited_ms > LSG_CAPTURE_BUDGET_MS)
     {
       /* Say WHAT it was waiting for: a bare "timeout" leaves the operator to
-       * guess between "the state never happened" and "the marker is wrong". */
+       * guess between "the state never happened" and "the marker is wrong".
+       */
       capture_state_verdict (app, &reason);
       capture_finish (app, "timeout",
                       g_strdup_printf ("waited_ms=%" G_GINT64_FORMAT
@@ -7323,9 +7357,10 @@ capture_tick (GtkWidget *widget, GdkFrameClock *clock, gpointer data)
 
   if (app->capture.stage == LSG_CAPTURE_STAGE_SETTLING)
     {
-      /* A jump LANDING pops its own popover down (jump_poll_fold), so "control
-       * open, landed" is reached the way a user reaches it: press Ctrl+G
-       * again. The entry still holds the row — no close path clears it. */
+      /* A jump LANDING pops its own popover down (jump_poll_fold), so
+       * "control open, landed" is reached the way a user reaches it: press
+       * Ctrl+G again. The entry still holds the row — no close path clears
+       * it. */
       if (app->capture.shot == LSG_CAPTURE_JUMP && app->capture.jump_landed
           && !app->capture.jump_reopened)
         {
@@ -7345,8 +7380,8 @@ capture_tick (GtkWidget *widget, GdkFrameClock *clock, gpointer data)
         }
       if (verdict != LSG_CAPTURE_SETTLED)
         return G_SOURCE_CONTINUE;
-      /* Settled — but a drive can still have a delayed re-run queued behind it
-       * (LSG_CAPTURE_QUIET_MS says which and why). */
+      /* Settled — but a drive can still have a delayed re-run queued behind
+       * it (LSG_CAPTURE_QUIET_MS says which and why). */
       if ((g_get_monotonic_time () - app->capture.t_drive) / 1000
           < LSG_CAPTURE_QUIET_MS)
         return G_SOURCE_CONTINUE;
@@ -7361,9 +7396,9 @@ capture_tick (GtkWidget *widget, GdkFrameClock *clock, gpointer data)
   verdict = capture_state_verdict (app, &reason);
   if (verdict != LSG_CAPTURE_SETTLED)
     {
-      /* It regressed before being announced (a late re-run). Nothing is lost —
-       * no marker has been printed — so go back to waiting; an IMPOSSIBLE now
-       * reports itself on the next SETTLING tick. */
+      /* It regressed before being announced (a late re-run). Nothing is lost
+       * — no marker has been printed — so go back to waiting; an IMPOSSIBLE
+       * now reports itself on the next SETTLING tick. */
       app->capture.stage = LSG_CAPTURE_STAGE_SETTLING;
       app->capture.paint_seen = FALSE;
       return G_SOURCE_CONTINUE;
@@ -7385,8 +7420,8 @@ capture_tick (GtkWidget *widget, GdkFrameClock *clock, gpointer data)
 }
 
 /* Arm: read the rest of the env surface, refuse an unusable request LOUDLY,
- * drive the state, and start the settle machine. Runs exactly once per process
- * and only when the env var is set. Deferred onto an idle by
+ * drive the state, and start the settle machine. Runs exactly once per
+ * process and only when the env var is set. Deferred onto an idle by
  * capture_note_paint so the handlers below are never entered from inside a
  * draw. */
 static void
@@ -7396,8 +7431,8 @@ capture_arm (App *app)
   app->capture.stage = LSG_CAPTURE_STAGE_SETTLING;
   app->capture.t_arm = g_get_monotonic_time ();
 
-  /* Read here, not in main(): an unarmed run must not even look. Borrowed for
-   * the length of this function only. */
+  /* Read here, not in main(): an unarmed run must not even look. Borrowed
+   * for the length of this function only. */
   const char *query = g_getenv ("LESSSHEET_GTK_CAPTURE_QUERY");
   const char *row = g_getenv ("LESSSHEET_GTK_CAPTURE_ROW");
 
@@ -7443,8 +7478,8 @@ capture_arm_idle (gpointer data)
 }
 
 /* Forward-declared at the top of the file. Called at the END of every
- * completed grid_draw: arm on the first DATA-bearing frame, and while settling
- * record the frame that carried the settled cells. */
+ * completed grid_draw: arm on the first DATA-bearing frame, and while
+ * settling record the frame that carried the settled cells. */
 static void
 capture_note_paint (App *app, guint32 rows, guint32 cols)
 {
@@ -7479,8 +7514,8 @@ capture_note_paint (App *app, guint32 rows, guint32 cols)
     }
 }
 
-/* Forward-declared at the top of the file. A find query was (re)issued, so the
- * quiet window restarts — see LSG_CAPTURE_QUIET_MS for the pending
+/* Forward-declared at the top of the file. A find query was (re)issued, so
+ * the quiet window restarts — see LSG_CAPTURE_QUIET_MS for the pending
  * "search-changed" this exists to outlast. */
 static void
 capture_note_find_run (App *app)
@@ -7540,19 +7575,20 @@ main (int argc, char *argv[])
   App app = { 0 };
   app.t_start = g_get_monotonic_time (); /* capture entry ASAP */
   app.timing = (g_getenv ("LESSSHEET_GTK_TIMING") != NULL);
-  /* Screenshot-capture affordance: ONE env read, and deliberately nothing else
-   * — the value is not even PARSED until after the first data-bearing paint,
-   * and the query/row vars are not read at all, so an unarmed run (every
-   * normal run, including the one LESSSHEET_GTK_TIMING measures above) costs a
-   * single getenv and allocates nothing. See the capture section. */
+  /* Screenshot-capture affordance: ONE env read, and deliberately nothing
+   * else — the value is not even PARSED until after the first data-bearing
+   * paint, and the query/row vars are not read at all, so an unarmed run
+   * (every normal run, including the one LESSSHEET_GTK_TIMING measures
+   * above) costs a single getenv and allocates nothing. See the capture
+   * section. */
   app.capture.env = g_getenv ("LESSSHEET_GTK_CAPTURE");
   app.row_estimate = 1;
   app.find = lsg_find_initial ();
   app.find_nav_direction = LSG_SEARCH_FORWARD;
   app.jump = lsg_jump_initial ();
   app.filter = lsg_filter_initial ();
-  /* Data cell VALUES: small MONOSPACE (uniform advance -> accurate O(1) column
-   * widths + macOS parity). Headers + all chrome stay sans-serif. */
+  /* Data cell VALUES: small MONOSPACE (uniform advance -> accurate O(1)
+   * column widths + macOS parity). Headers + all chrome stay sans-serif. */
   app.font_desc = pango_font_description_from_string ("Monospace 10");
   app.header_font_desc = pango_font_description_from_string ("Sans Bold 10");
   app.gutter_font_desc = pango_font_description_from_string ("Sans 10");
