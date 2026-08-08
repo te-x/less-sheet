@@ -6601,7 +6601,26 @@ ensure_window (App *app, GtkApplication *gtk_app)
    * GActions with accelerators (register_app_shortcuts, from the single accel
    * table), so no window-level key controller is needed here. */
   gtk_window_set_title (app->window, "less-sheet");
-  gtk_window_set_default_size (app->window, 1024, 720);
+  {
+    /* LESSSHEET_GTK_CAPTURE_SIZE=<w>x<h> pins the window for a screenshot run,
+     * the twin of macOS's LESSSHEET_CAPTURE_SIZE. Without it the Linux shots
+     * could not be made to sit at the same proportion of the frame as the
+     * macOS ones: the frame is identical (1500x989) but this window's 1024x720
+     * has a different ASPECT from the macOS window, so it read as noticeably
+     * bigger on the page even at the same frame size. Inert in normal use. */
+    int dw = 1024, dh = 720;
+    const char *size = g_getenv ("LESSSHEET_GTK_CAPTURE_SIZE");
+    if (size != NULL)
+      {
+        int w = 0, h = 0;
+        if (sscanf (size, "%dx%d", &w, &h) == 2 && w >= 480 && h >= 360)
+          {
+            dw = w;
+            dh = h;
+          }
+      }
+    gtk_window_set_default_size (app->window, dw, dh);
+  }
 
   /* App logo: register the embedded GResource icon (compiled into the binary
    * as a hicolor-laid-out resource) so the running app shows it without an
