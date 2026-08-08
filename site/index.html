@@ -155,6 +155,14 @@
     padding: 11px 20px; text-decoration: none;
   }
   .btn:hover { background: var(--ink); color: var(--paper); }
+  /* A "coming soon" chip, not a button pretending to be one: no link, no hover
+     lift, dimmed border. Nothing here is clickable yet, and a control that looks
+     pressable but does nothing is worse than one that plainly says wait. */
+  .btn.soon {
+    color: var(--dim); border-color: var(--line); cursor: default;
+    text-transform: lowercase;
+  }
+  .btn.soon:hover { background: none; color: var(--dim); }
   .reqs { font: 12.5px/1.7 var(--sans); color: var(--dim); margin: 12px 0 0; }
   .reqs b { color: var(--ink); font-weight: 600; }
 
@@ -438,10 +446,11 @@
       <div class="rn">05</div>
       <h2>Why a spreadsheet struggles here.</h2>
       <p>Spreadsheets like Excel and LibreOffice are powerful tools, built to
-        edit and compute. But they interpret your file’s contents, cap how many
-        rows it can have, and make changing the parsing options slow.</p>
-      <p>less-sheet is read-only by design. It guesses the parsing options from
-        the data, and you can change them in a moment when it guesses wrong.</p>
+        edit and compute. But they load the whole file into memory, interpret
+        its contents, cap how many rows it can have, and make changing the
+        parsing options slow.</p>
+      <p>less-sheet guesses the parsing options from the data, and you can
+        change them easily when it guesses wrong.</p>
     </div>
     <div class="figs cmp-wrap">
       <table class="cmp">
@@ -476,43 +485,22 @@
     <div class="prose top">
       <div class="rn">06</div>
       <h2>Free. Tiny. No account. No telemetry.</h2>
-      <p>Checksums are published beside every build.</p>
+      <p>macOS and Linux versions available.</p>
     </div>
 
     <div class="figs">
       <div class="dl">
         <div>
           <h3>macOS</h3>
-          <p class="reqs" style="margin:0 0 10px">macOS 26.0+ · Apple silicon ·
-            ~3&nbsp;MB · reads csv · csv.gz · http(s)</p>
-
-          <p class="dl-way"><b>Homebrew</b></p>
-          <pre class="cmd"><code>brew tap TAP_OWNER/tap
-brew install --cask less-sheet --no-quarantine</code></pre>
-
-          <p class="dl-way"><b>One line, no Homebrew</b></p>
-          <pre class="cmd"><code>curl -fsSL DOWNLOAD_BASE/less-sheet-VERSION-macos-arm64.tar.gz | tar xz -C /Applications</code></pre>
-
-          <p class="dl-way"><b>Or download it</b></p>
-          <p style="margin:0"><a class="btn" href="RELEASES_URL">download .dmg</a></p>
-          <div class="fn">
-            Downloading the .dmg in a browser causes macOS to refuse it until
-            you allow it: <span class="path">System Settings → Privacy &amp;
-            Security → “Open Anyway”</span>. After that it opens normally. The
-            two commands above skip that.
-            <br><br>
-            Worth knowing why, rather than trusting it: macOS blocks the
-            <i>first launch of a file marked as downloaded</i>, and only
-            browsers mark files that way. So both commands also mean trusting us
-            instead of Apple’s check — verify against the checksums if that
-            matters to you.
-          </div>
+          <p style="margin:0"><span class="btn soon">coming soon</span></p>
+          <p class="reqs">macOS 26.0+ · Apple silicon · ~3&nbsp;MB<br>
+            via Homebrew, a one-line install, or a&nbsp;.dmg<br>
+            reads csv · csv.gz · http(s)</p>
         </div>
         <div>
           <h3>Linux</h3>
-          <p style="margin:0"><a class="btn" href="DOWNLOAD_BASE/less-sheet-VERSION-linux-x86_64.tar.gz">download .tar.gz</a></p>
-          <p class="reqs">x86_64 · ~0.8 MB ·
-            <a href="DOWNLOAD_BASE/less-sheet-VERSION-linux-aarch64.tar.gz">aarch64</a><br>
+          <p style="margin:0"><span class="btn soon">coming soon</span></p>
+          <p class="reqs">x86_64 and aarch64 · ~0.8&nbsp;MB<br>
             glibc 2.34+ · GTK 4.20 · libadwaita 1.8<br>
             Fedora 43+ and current Arch.<br>
             <b>Debian 13 ships GTK 4.18 and will not run this build.</b><br>
@@ -521,10 +509,6 @@ brew install --cask less-sheet --no-quarantine</code></pre>
             runs regardless of your distribution’s version — is planned.</div>
         </div>
       </div>
-      <p class="reqs" style="margin-top:24px">
-        <a href="DOWNLOAD_BASE/SHA256SUMS">SHA256SUMS</a> &nbsp;
-        <span class="draft">LINKS NOT LIVE — DOWNLOAD_BASE, VERSION, TAP_OWNER AND RELEASES_URL ARE PLACEHOLDERS</span>
-      </p>
     </div>
   </div>
 </section>
