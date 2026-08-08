@@ -7223,6 +7223,56 @@ capture_drive (App *app, const char *query, const char *row)
       break;
 
     case LSG_CAPTURE_FILTER:
+      {
+        /* LESSSHEET_GTK_CAPTURE_WHERE=<header>=<value> shoots a COLUMN
+         * PREDICATE instead of a text match filtered to hits. Without it the
+         * filter shot differs from the search shot only by the toggle — same
+         * tab, same popover — so the predicate feature is never pictured.
+         * Mirrors the macOS LESSSHEET_FILTER_WHERE contract, header by NAME so
+         * a fixture gaining a column cannot silently retarget the shot. */
+        const char *where = g_getenv ("LESSSHEET_GTK_CAPTURE_WHERE");
+        const char *eq = (where != NULL) ? strchr (where, '=') : NULL;
+        if (eq != NULL && eq != where && *(eq + 1) != '\0'
+            && app->find_stack != NULL && app->where_column != NULL)
+          {
+            char *header = g_strndup (where, (gsize)(eq - where));
+            open_find (app);
+            gtk_stack_set_visible_child_name (app->find_stack, "where");
+            where_ensure_columns (app); /* model is lazy; it must exist now */
+
+            GListModel *model = gtk_drop_down_get_model (app->where_column);
+            guint found = GTK_INVALID_LIST_POSITION;
+            for (guint i = 0;
+                 model != NULL && i < g_list_model_get_n_items (model); i++)
+              {
+                const char *label
+                    = gtk_string_list_get_string (GTK_STRING_LIST (model), i);
+                /* The label may carry a disambiguating tag for duplicate
+                 * headers, so match the leading name, not the whole string. */
+                if (label != NULL
+                    && g_ascii_strncasecmp (label, header, strlen (header))
+                           == 0)
+                  {
+                    found = i;
+                    break;
+                  }
+              }
+            if (found != GTK_INVALID_LIST_POSITION)
+              {
+                gtk_drop_down_set_selected (app->where_column, found);
+                if (app->where_op != NULL)
+                  gtk_drop_down_set_selected (app->where_op, LSG_SEARCH_OP_EQ);
+                if (app->where_value != NULL)
+                  gtk_editable_set_text (app->where_value, eq + 1);
+                gtk_toggle_button_set_active (app->filter_toggle, TRUE);
+                g_free (header);
+                break;
+              }
+            g_printerr ("lesssheet.gtk.capture_where_unknown_column=%s\n",
+                        header);
+            g_free (header);
+          }
+      }
       gtk_editable_set_text (app->find_entry, query);
       open_find (app);
       /* set_active EMITS "toggled" -> on_filter_toggled -> do_apply_filter:

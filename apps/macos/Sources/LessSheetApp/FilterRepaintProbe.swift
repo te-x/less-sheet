@@ -53,6 +53,33 @@ enum FilterRepaintProbe {
         return (raw.isEmpty || raw == "1") ? "a" : raw
     }
 
+    /// `LESSSHEET_FILTER_WHERE=<header>=<value>` switches the probe from a text
+    /// filter to a COLUMN PREDICATE, e.g. `city=Lisbon`.
+    ///
+    /// Resolves the column by its HEADER TEXT rather than an index on purpose:
+    /// an index silently points at a different column the moment the fixture
+    /// gains a field, and the screenshot would still look plausible — filtered
+    /// rows, a correct pill, the wrong column. Returns nil when the variable is
+    /// absent or names a header this document does not have, in which case the
+    /// probe keeps its original text-filter behaviour.
+    @MainActor
+    private static func predicate(model: DocumentModel) -> (column: Int, value: String)? {
+        guard let raw = env["LESSSHEET_FILTER_WHERE"],
+              let split = raw.firstIndex(of: "=") else { return nil }
+        let header = String(raw[raw.startIndex..<split])
+        let value = String(raw[raw.index(after: split)...])
+        guard !header.isEmpty, !value.isEmpty else { return nil }
+        let labels = (0..<model.columnCount).map { model.columnLabel($0) }
+        guard let column = labels.firstIndex(where: {
+            $0.compare(header, options: .caseInsensitive) == .orderedSame
+        }) else {
+            log("lesssheet.filterrepaint.where_unknown_column header=\(header)"
+                + " available=\(labels.prefix(12).joined(separator: ","))")
+            return nil
+        }
+        return (column, value)
+    }
+
     private static var started = false
     private static var startTime = DispatchTime.now()
 
@@ -96,8 +123,21 @@ enum FilterRepaintProbe {
         // the "Filter to matches" toggle's binding calls (`applyFindAsFilter`,
         // incl. the fix's explicit `NativeGridController.live?.apply()` poke).
         model.openFindField()
-        model.findSession.draft.mode = .text
-        model.findSession.draft.text = query
+        if let (column, value) = predicate(model: model) {
+            // "Where" mode: a COLUMN PREDICATE, not a text match filtered to
+            // hits. The two look nearly identical on screen otherwise — the
+            // first screenshot set shipped two images that differed only by the
+            // "Filter to matches" switch, so the predicate feature was never
+            // actually pictured. Same submit path as the UI (`applyFindAsFilter`
+            // reads the draft), only the draft's mode differs.
+            model.findSession.draft.mode = .predicate
+            model.findSession.draft.column = column
+            model.findSession.draft.comparison = .equals
+            model.findSession.draft.value = value
+        } else {
+            model.findSession.draft.mode = .text
+            model.findSession.draft.text = query
+        }
         model.applyFindAsFilter()
 
         // SAME synchronous main-actor turn (no await, no DispatchQueue between

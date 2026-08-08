@@ -79,8 +79,14 @@ SHOTS = {
     # perfect popover, a correct "Filtered - 400 of 2.0K rows" pill, correct
     # filtered gutter numbers - and NO CELL TEXT. Only looking at the image
     # caught it; the light variant of the same run happened to win the race.
-    "filter": ({"LESSSHEET_FILTER_REPAINT": "Lisbon"}, r"lesssheet\.filterrepaint\.done",
-               None),
+    # A COLUMN PREDICATE (Where: city = Lisbon), not a text match filtered to
+    # hits. The first set shipped a "filter" shot that differed from the search
+    # shot only by the "Filter to matches" switch — same tab, same popover — so
+    # the predicate feature was never actually pictured. FILTER_REPAINT still
+    # supplies the fallback text and the settle marker.
+    "filter": ({"LESSSHEET_FILTER_REPAINT": "Lisbon",
+                "LESSSHEET_FILTER_WHERE": "city=Lisbon"},
+               r"lesssheet\.filterrepaint\.done", None),
 }
 
 # Flat mode renders FrameDump scenes instead (kept for headless smoke tests).
@@ -339,7 +345,7 @@ def main():
 
     app = find_app(args.app)
     os.makedirs(args.out, exist_ok=True)
-    fixture = write_fixture(os.path.join(args.out, ".fixture-2000.csv"))
+    fixture = write_fixture(os.path.join(args.out, "orders-2000.csv"))
 
     print("capture_shots (%s mode)" % args.mode)
     print("  app     %s" % app)
