@@ -502,10 +502,31 @@ pub const Gzip = struct {
     /// then truncate the whole document (silent wrong data, the exact failure the
     /// standing bar forbids). Parking `.budget` instead is the honest answer:
     /// "these bytes are not here yet", which is what `.budget` already means.
-    fn fenceCanMove(self: *const Gzip, fence: usize, may_fetch: bool) bool {
+    ///
+    /// `demand_met` is the SAME QUESTION for the fetching arm, and it exists
+    /// because "we asked the peer and it refused" and "we never asked" are
+    /// different facts that `awaitsBytes` cannot tell apart on the RANDOM fill
+    /// arm — where it answers a flat `false` precisely because a hole there is
+    /// normally a short/failed range (see net_source.awaitsBytes). But `produce`
+    /// sizes its read-ahead from the seek it holds ON ENTRY, and ONE op can
+    /// consume every byte of it: at a compression ratio at or below 1.0 (a STORED
+    /// gzip is the extreme) 256 KiB of output eats 256 KiB of input, so the op
+    /// ends sitting exactly on a fence it never asked to move. Calling that
+    /// `.damaged` publishes the DOCUMENT-GLOBAL terminal in the middle of a
+    /// perfectly healthy stream, and the count that follows is COMPLETE, EXACT and
+    /// WRONG — measured: a 12000-row stored `.csv.gz` served 3440 rows with
+    /// `exact = 1` after a single 256 KiB request, while a ratio-6.7 file (whose
+    /// read-ahead outlives the op) was correct, which is why every gz fixture
+    /// passed. So: a demand the provider SATISFIED leaves an artificial fence — we
+    /// stopped asking, the peer did not stop answering — and the next op, whose
+    /// `want` is computed from the advanced seek, moves it. A demand it did NOT
+    /// satisfy is the refusal `awaitsBytes` already speaks for, and classifies
+    /// exactly as before. Strict relaxation, so no stop that was `.budget` becomes
+    /// `.damaged`; it costs at most the one round trip that was missing.
+    fn fenceCanMove(self: *const Gzip, fence: usize, may_fetch: bool, demand_met: bool) bool {
         if (fence >= self.physicalLen()) return false;
         const hr = self.provider orelse return true;
-        if (may_fetch) return hr.awaitsBytes();
+        if (may_fetch) return demand_met or hr.awaitsBytes();
         // NO PERMIT. "Can this fence move?" is then NOT only a question about the
         // peer, because the reason we are sitting at it is that WE declined to move
         // it. It is also a question about whether the designated fetcher has settled
@@ -677,6 +698,10 @@ pub const Gzip = struct {
         // LOCAL gzip: no provider, so no permission question is ever asked and
         // this stays `true` at zero cost (the thread-local is not even read).
         var may_fetch = true;
+        // Whether the provider DELIVERED the read-ahead this op asked for; see
+        // `fenceCanMove`, the only reader. `false` for a local gzip is never read
+        // (that arm returns before it).
+        var demand_met = false;
         if (self.provider) |hr| {
             // THE FETCH PERMIT (AC-e1 residual). The read-ahead below is a FIXED
             // 256 KiB look-ahead, not a demand this row needs, so on the
@@ -693,6 +718,12 @@ pub const Gzip = struct {
             may_fetch = fetchPermitted();
             const want = s.input.seek + chunk_bytes;
             const fetched = if (may_fetch) hr.ensureCompressed(want) else hr.presentCompressed(want);
+            // Clamped to the resource total because BOTH arms clamp their answer
+            // there (`ensureCompressed`: `@min(self.total, want)`), so a read-ahead
+            // that runs off the end of the resource is satisfied by definition —
+            // and a fence AT the total is not this predicate's business anyway
+            // (`fenceCanMove` returns terminal for it before reading this).
+            demand_met = fetched >= @min(want, hr.physicalTotal() orelse std.math.maxInt(u64));
             var raised: u64 = @min(fetched, self.mapping.len);
             // Re-apply the lane's physical cap on EVERY raise. Without this a
             // budgeted provider lane reads straight past its budget, and nothing
@@ -717,7 +748,7 @@ pub const Gzip = struct {
         // still move, so a stop there parks and waits; an edge AT the total is
         // the end of the stream, so a stop there is terminal.
         const fence = s.input.end;
-        const resumable = self.fenceCanMove(fence, may_fetch);
+        const resumable = self.fenceCanMove(fence, may_fetch, demand_met);
 
         var written: usize = 0;
         while (written < out.len) {
