@@ -37,7 +37,19 @@ bash "$macos_dir/../../branding/generate-icons.sh"
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$bin_dir/LessSheet" "$app/Contents/MacOS/LessSheet"
-cp "$macos_dir/Bundle/Info.plist" "$app/Contents/Info.plist"
+# Info.plist carries __LESSSHEET_VERSION__; the real number comes from the root
+# VERSION file and is substituted into the COPY only, so the tracked plist never
+# holds a number that can drift from it.
+version="$(cat "$macos_dir/../../VERSION")"
+case "$version" in
+    [0-9]*.[0-9]*.[0-9]*) ;;
+    *) echo "assemble-app: VERSION is '$version', expected MAJOR.MINOR.PATCH" >&2; exit 1 ;;
+esac
+sed "s/__LESSSHEET_VERSION__/$version/" \
+    "$macos_dir/Bundle/Info.plist" > "$app/Contents/Info.plist"
+if grep -q "__LESSSHEET_VERSION__" "$app/Contents/Info.plist"; then
+    echo "assemble-app: version placeholder survived substitution" >&2; exit 1
+fi
 cp "$macos_dir/../../branding/generated/AppIcon.icns" "$app/Contents/Resources/AppIcon.icns"
 
 # 4) SwiftPM copies target resources (the empty-bundle case has none) next to

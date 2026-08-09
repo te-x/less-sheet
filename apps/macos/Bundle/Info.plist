@@ -21,8 +21,14 @@
     <string>APPL</string>
     <key>CFBundleVersion</key>
     <string>1</string>
+    <!-- Substituted from the root VERSION file by scripts/assemble-app.sh at
+         bundle-lay-out time. The placeholder MUST stay here: a real number in
+         this file is a second source of truth, and the two drifted immediately
+         last time (plist 0.1 vs VERSION 0.1.0, so artifacts were named 0.1.0
+         while the app reported 0.1 in About and Finder). CFBundleVersion below
+         is the build counter — a different fact, deliberately left alone. -->
     <key>CFBundleShortVersionString</key>
-    <string>0.1</string>
+    <string>__LESSSHEET_VERSION__</string>
     <key>LSMinimumSystemVersion</key>
     <!-- Must match Package.swift's platforms: [.macOS("26.0")] and the built
          binary's LC_BUILD_VERSION minos (26.0). The viewer-ui overlay uses the
