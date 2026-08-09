@@ -35,6 +35,30 @@ that rather than editing by hand. A wrong digest does not fail for you (your
 Homebrew has the file cached); it fails for everyone installing afterwards, with
 an error that reads like a corrupted download.
 
+## Why a tap, and not just `brew install --cask less-sheet`
+
+Homebrew does not discover anything. A tap is a public GitHub repo named
+`homebrew-<something>` full of Ruby files; `brew tap you/tap` clones it, and from
+then on the cask resolves locally. No registry, no submission, no approval —
+which is exactly why this route works today.
+
+Installing with **no tap at all** requires the cask to live in the official
+`homebrew/cask` repo, and **less-sheet is ineligible while it is ad-hoc signed**.
+From <https://docs.brew.sh/Acceptable-Casks>, a cask:
+
+> must not require System Integrity Protection or Gatekeeper to be disabled or
+> bypassed
+
+`--no-quarantine` is precisely a Gatekeeper bypass, so the cask below cannot be
+submitted as-is. There is a second, softer hurdle too — notability, judged case
+by case — but the Gatekeeper rule is a hard one, and it is the one we control.
+
+So notarization (a Developer ID, ~$99/yr) buys more than smoother first-launch:
+it is what makes official Homebrew distribution possible at all, i.e. the
+difference between "tap my repo first" and "it is just there, like any other
+app". When that happens, delete `--no-quarantine` from the docs below, drop the
+comment in the cask, and the submission becomes possible.
+
 ## What users then run
 
 ```sh
