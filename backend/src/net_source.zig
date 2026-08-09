@@ -178,6 +178,32 @@ pub const Progress = struct { ctx: *anyopaque, callback: ProgressFn };
 // Transport: the byte provider a range fetch goes through.
 // ---------------------------------------------------------------------------
 
+/// ABANDON a response body rather than DRAIN it — the non-2xx exit from every
+/// request in this file, and the ONE place that decision is spelled out.
+///
+/// `Client.Request.deinit` hands the connection back to the pool, and to do that
+/// it first calls `discardRemaining()` whenever the request is still in
+/// `.received_head` (std/http/Client.zig:889-901) — it reads the WHOLE body of a
+/// response we have already decided to throw away. A peer that answers a non-2xx
+/// with a large advertised `Content-Length` and then stops writing wedges exactly
+/// there, inside `deinit`, and the status the peer ALREADY SENT is never
+/// reported: `ls_open_url_start` stays RUNNING and the user watches a spinner
+/// instead of the error (measured: 500 and 404 both spun past 5 s; a healthy
+/// non-2xx settled in 6 ms).
+///
+/// Taking the body reader moves the request out of `.received_head`, so `deinit`
+/// takes its `else` arm — mark the connection `closing`, release, return. Costs
+/// one pooled connection on a path that is failing anyway; a non-2xx that carries
+/// `Content-Length: 0` still lands in `.ready` and keeps its connection reusable.
+/// The buffer is empty because nothing is ever read from this reader.
+///
+/// NOT a timeout, and it does not need to be: the wedged read is gone rather than
+/// bounded.
+fn abandonBody(response: *std.http.Client.Response) void {
+    var unread: [0]u8 = undefined;
+    _ = response.reader(&unread);
+}
+
 /// The result of a real probe request: the resource total length + whether the
 /// server honored Range, or the mapped failure.
 pub const Probe = struct {
@@ -385,6 +411,7 @@ pub const RealTransport = struct {
             };
             const code = @intFromEnum(ss.response.head.status);
             if (code < 200 or code >= 300) {
+                abandonBody(&ss.response); // as in `probe`, and for the same reason
                 ss.req.deinit();
                 self.gpa.destroy(ss);
                 return .{ .n = 0, .eof = true };
@@ -468,7 +495,10 @@ pub const RealTransport = struct {
         // hand-rolled scheme scan).
         if (redirectDowngrades(uri.scheme, req.uri.scheme)) return .{ .err = .insecure_redirect };
         const code: i32 = @intCast(@intFromEnum(response.head.status));
-        if (code < 200 or code >= 300) return .{ .err = .http_status, .http_status = code };
+        if (code < 200 or code >= 300) {
+            abandonBody(&response); // or `req.deinit` drains it — see abandonBody
+            return .{ .err = .http_status, .http_status = code };
+        }
         // Extract every needed field from `response.head` (a view into
         // `redirect_buf`) BEFORE touching the body reader below — reading the
         // body can reuse/overwrite that same buffer, so any head-field slice
@@ -567,7 +597,10 @@ pub const RealTransport = struct {
         // (see `probe()` -- detect-and-discard, and `uri.scheme` is the origin).
         if (redirectDowngrades(uri.scheme, req.uri.scheme)) return .failed;
         const code = @intFromEnum(response.head.status);
-        if (code < 200 or code >= 300) return .failed;
+        if (code < 200 or code >= 300) {
+            abandonBody(&response); // as in `probe`, and for the same reason
+            return .failed;
+        }
         var transfer_buf: [64 * 1024]u8 = undefined;
         const body = response.reader(&transfer_buf);
         // security-hardening (e) AC-e3: a short body delivers fewer bytes than the
