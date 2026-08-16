@@ -27,17 +27,18 @@ cask "less-sheet" do
   # It would work, and it would make `brew install --cask less-sheet` a clean
   # one-liner with no flag. It is deliberately not here: silently disabling a
   # Gatekeeper check on someone's machine, because they installed your app, is
-  # not a decision this file gets to make for them. `--no-quarantine` is the
-  # supported way to say yes, and it makes the choice theirs and visible:
+  # not a decision this file gets to make for them.
   #
-  #     brew install --cask less-sheet --no-quarantine
+  # There is no flag for it any more either: Homebrew 6 REMOVED
+  # `--no-quarantine`. Casks are always quarantined, and the user approves once
+  # in System Settings -> Privacy & Security -> "Open Anyway". Homebrew carries
+  # that approval into later upgrades (Quarantine.inherit_user_approval!) but
+  # only while the app's DESIGNATED REQUIREMENT is unchanged — and an ad-hoc
+  # signature's requirement is derived from the cdhash, so it changes on every
+  # build and every upgrade asks again.
   #
-  # Without that flag the app installs fine but macOS refuses the first launch
-  # (System Settings -> Privacy & Security -> "Open Anyway"), because this build
-  # is ad-hoc signed and not notarized through Apple's paid programme.
-  #
-  # If less-sheet is ever notarized, delete this comment and the flag disappears
-  # from the docs — nothing else here changes.
+  # Notarizing is what fixes that: a Developer ID requirement is identity-based
+  # and stable, so the approval is inherited. Nothing else here changes.
 
   zap trash: [
     "~/Library/Preferences/com.lesssheet.LessSheet.plist",

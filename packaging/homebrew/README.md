@@ -49,30 +49,39 @@ From <https://docs.brew.sh/Acceptable-Casks>, a cask:
 > must not require System Integrity Protection or Gatekeeper to be disabled or
 > bypassed
 
-`--no-quarantine` is precisely a Gatekeeper bypass, so the cask below cannot be
-submitted as-is. There is a second, softer hurdle too — notability, judged case
-by case — but the Gatekeeper rule is a hard one, and it is the one we control.
-
-So notarization (a Developer ID, ~$99/yr) buys more than smoother first-launch:
-it is what makes official Homebrew distribution possible at all, i.e. the
-difference between "tap my repo first" and "it is just there, like any other
-app". When that happens, delete `--no-quarantine` from the docs below, drop the
-comment in the cask, and the submission becomes possible.
+This argument used to rest on `--no-quarantine` being a literal Gatekeeper
+bypass. **That flag no longer exists** — Homebrew 6 removed it, and there is no
+occurrence left anywhere in `Library/Homebrew`. So the specific objection is
+obsolete; whether an ad-hoc-signed app would be accepted today is an open
+question we should not answer from memory, and notability remains a separate,
+softer hurdle. What has not changed is that notarization is what a user
+experiences as "it just installs", so the argument for a Developer ID survives
+the flag that used to carry it.
 
 ## What users then run
 
 ```sh
 brew tap <you>/tap
-brew install --cask less-sheet --no-quarantine
+brew install --cask less-sheet
 ```
 
-`--no-quarantine` is load-bearing while the app is unnotarized. Homebrew tags
-downloads with `com.apple.quarantine`, and Gatekeeper's first-launch refusal keys
-on **that attribute, not on the signature** — which is also why the `curl`
-one-liner needs no flag and no dialog: `curl` never sets it.
+**Homebrew 6 always quarantines, and there is no opt-out.** It replaced the flag
+with a user-approval model: the installed app carries `com.apple.quarantine`,
+the user allows it once in System Settings → Privacy & Security → "Open Anyway",
+and on a later upgrade Homebrew carries that approval forward — but *only* after
+confirming the app's **designated requirement** is unchanged
+(`Cask::Quarantine.inherit_user_approval!`).
 
-Without the flag the install still succeeds, but the first launch is refused
-until the user allows it in System Settings → Privacy & Security → "Open Anyway".
+That last clause is the one that costs us. An ad-hoc signature's designated
+requirement is derived from the binary's cdhash, so it changes with **every
+build** — the identity check cannot match, and approval is not inherited. Every
+Homebrew upgrade therefore asks the user to approve again. A Developer ID
+signature has a stable identity-based requirement, so approval carries forward
+after the first time.
+
+The `curl` one-liner remains the exception, and now the only one: Gatekeeper's
+refusal keys on the **quarantine attribute, not the signature**, and `curl`
+never sets it (measured: it writes `com.apple.provenance` and nothing else).
 
 The cask deliberately does **not** strip the attribute itself in a `postflight`;
 see the comment in the cask for why.

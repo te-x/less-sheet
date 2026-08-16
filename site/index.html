@@ -497,18 +497,19 @@
 
           <div class="dl-way">Homebrew</div>
           <pre class="cmd"><code>brew tap te-x/tap
-brew install --cask less-sheet --no-quarantine</code></pre>
+brew install --cask less-sheet</code></pre>
 
           <div class="dl-way">One line</div>
           <pre class="cmd"><code>curl -fsSL https://github.com/te-x/less-sheet-site/releases/download/v0.1.0/less-sheet-0.1.0-macos-arm64.tar.gz | tar -xz -C /Applications</code></pre>
 
-          <div class="fn"><b>The .dmg needs one extra step the first time.</b>
+          <div class="fn"><b>First launch needs one extra step.</b>
             This build is signed, but not notarized through Apple’s paid
-            programme, so macOS blocks anything downloaded through a browser.
-            Open <span class="path">System Settings → Privacy &amp; Security</span>,
-            find less-sheet near the bottom, and press <b>Open Anyway</b>. Once.
-            The two commands above are not affected — neither Homebrew nor
-            <span class="path">curl</span> marks a file as downloaded.</div>
+            programme, so macOS refuses the first launch of anything it treats
+            as downloaded — the .dmg and the Homebrew install both. Open
+            <span class="path">System Settings → Privacy &amp; Security</span>,
+            find less-sheet near the bottom, and press <b>Open Anyway</b>.
+            The <span class="path">curl</span> line is the exception: nothing
+            marks it as downloaded, so it simply runs.</div>
         </div>
         <div>
           <h3>Linux</h3>
