@@ -33,9 +33,9 @@ reserved.
   (c) Modify, adapt, translate, or create derivative works of the Software.
   (d) Reverse engineer, decompile or disassemble the Software, or attempt to
       derive its source code — EXCEPT to the extent that this restriction is
-      prohibited by applicable law. In particular, nothing in this Agreement
-      limits any right you have under Article 6 of Directive 2009/24/EC
-      (interoperability) or its equivalent in your national law.
+      prohibited by applicable law, including any statutory right you may have
+      to decompile for interoperability. Where the law gives you such a right,
+      it prevails over this clause.
   (e) Remove or alter any notice in the Software, including the
       THIRD-PARTY-NOTICES file.
   (f) Use the Software in breach of applicable law.
@@ -88,7 +88,8 @@ profits, data, or business interruption, arising out of or relating to the
 Software, even if advised of the possibility.
 
 To the maximum extent permitted by law, our total aggregate liability arising
-out of or relating to the Software is limited to fifty euros (EUR 50).
+out of or relating to the Software is limited to the amount you paid for it,
+which — the Software being free — is nothing.
 
 Nothing in this Agreement excludes or limits liability for death or personal
 injury caused by negligence, for fraud or fraudulent misrepresentation, or for
