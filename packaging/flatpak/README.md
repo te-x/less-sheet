@@ -56,16 +56,46 @@ and still install an app that cannot start.
 - the window carries its icon, and the app appears in the desktop's launcher
   with a name rather than as a raw app id
 
-## Publishing without Flathub
+## Publishing without Flathub — use the Bundle manifest
 
-```sh
-flatpak-builder --force-clean --repo=repo build-dir com.lesssheet.LessSheet.yaml
-flatpak build-bundle repo less-sheet-<ver>.flatpak com.lesssheet.LessSheet
+**`com.lesssheet.LessSheet.yaml` cannot produce a bundle.** `flatpak
+build-bundle` needs `xa.extra-data-sources` in the commit's *detached* metadata
+and nothing produces it: the built app has an `[Extra Data]` section, the ostree
+commit carries it as well, and the bundle still fails with
+
+```
+error: Failed to install bundle com.lesssheet.LessSheet: Extra data missing in detached metadata
 ```
 
-The `.flatpak` bundle is a single file that can be attached to the release, and
-installs with `flatpak install ./less-sheet-<ver>.flatpak`. It carries no
-auto-update — that is what Flathub buys.
+Verified on flatpak 1.18.1. It stands to reason — extra-data is a promise to
+download at install time, and a bundle exists so that nothing needs downloading.
+
+So the bundle comes from **`com.lesssheet.LessSheet.Bundle.yaml`**, which embeds
+the binary instead of promising it:
+
+```sh
+flatpak-builder --force-clean --repo=repo-bundle bundle-dir \
+  com.lesssheet.LessSheet.Bundle.yaml
+flatpak build-bundle repo-bundle less-sheet-<ver>-x86_64.flatpak com.lesssheet.LessSheet
+```
+
+Bundles are per-architecture: the file you get is for the machine you built on.
+
+It installs with `flatpak install ./less-sheet-<ver>-x86_64.flatpak`, works
+offline, and carries no auto-update — that is what Flathub buys.
+
+## Which manifest for which channel
+
+| channel | manifest | payload |
+| --- | --- | --- |
+| Flathub | `com.lesssheet.LessSheet.yaml` | `extra-data`, fetched by the user's machine |
+| download button | `com.lesssheet.LessSheet.Bundle.yaml` | embedded at build time |
+
+Flathub **requires** extra-data for a closed-source app — they will not
+redistribute a proprietary binary. A bundle **cannot** use it. Neither manifest
+can serve the other channel, which is why both exist. Both pull the same tarball
+by the same digest, so the two channels ship an identical binary, and the
+`.desktop`, icon and metainfo are shared files that cannot drift.
 
 ## Updating for a new release
 

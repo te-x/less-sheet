@@ -1,0 +1,89 @@
+# less-sheet — Flatpak manifest, SELF-CONTAINED BUNDLE variant
+#
+# ------------------------------------------------------------------------
+# WHY THIS FILE EXISTS ALONGSIDE com.lesssheet.LessSheet.yaml
+#
+# Two distribution channels want two different payload mechanisms, and neither
+# can serve the other:
+#
+#   * Flathub REQUIRES extra-data for a closed-source app — they will not
+#     redistribute a proprietary binary, so the user's machine fetches it at
+#     install time. That is the other manifest, and it is the one to submit.
+#
+#   * A single-file .flatpak bundle CANNOT carry extra-data. `flatpak
+#     build-bundle` needs `xa.extra-data-sources` in the commit's DETACHED
+#     metadata, and nothing produces it — the built app has an [Extra Data]
+#     section, the ostree commit carries it too, and the bundle still fails with
+#     "Extra data missing in detached metadata". Verified on flatpak 1.18.1.
+#     Which stands to reason: extra-data is a promise to download later, and a
+#     bundle exists so that nothing needs downloading later.
+#
+# So this variant embeds the binary instead of promising it. It is also the
+# better shape for a download button: it installs offline and does not break if
+# a release URL moves.
+#
+# KEEP IN STEP: everything below except the payload block is identical to the
+# other manifest. If you change finish-args, the runtime version, or what gets
+# installed, change BOTH. The .desktop, the icon and the metainfo are shared
+# files, so those cannot drift.
+# ------------------------------------------------------------------------
+app-id: com.lesssheet.LessSheet
+runtime: org.gnome.Platform
+runtime-version: '49'
+sdk: org.gnome.Sdk
+command: less-sheet-gtk
+
+finish-args:
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --share=ipc
+  - --device=dri
+  # Read-only, deliberately: less-sheet is a viewer and never writes to the
+  # files it opens, so write access is permission it cannot justify.
+  - --filesystem=host:ro
+  # Opening a CSV from a URL is a product feature, not an update check.
+  - --share=network
+
+modules:
+  - name: less-sheet
+    buildsystem: simple
+    build-commands:
+      # The binary goes straight onto PATH. No /app/extra and no apply_extra:
+      # there is nothing to unpack at install time in this variant.
+      - install -Dm755 less-sheet-gtk /app/bin/less-sheet-gtk
+      - install -Dm644 LICENSE /app/share/licenses/less-sheet/LICENSE
+      - install -Dm644 THIRD-PARTY-NOTICES.md
+        /app/share/licenses/less-sheet/THIRD-PARTY-NOTICES.md
+      - install -Dm644 com.lesssheet.LessSheet.desktop
+        /app/share/applications/com.lesssheet.LessSheet.desktop
+      - install -Dm644 com.lesssheet.LessSheet.metainfo.xml
+        /app/share/metainfo/com.lesssheet.LessSheet.metainfo.xml
+      - install -Dm644 com.lesssheet.LessSheet.svg
+        /app/share/icons/hicolor/scalable/apps/com.lesssheet.LessSheet.svg
+    sources:
+      # The payload, fetched at BUILD time and baked in. Same URL and digest as
+      # the extra-data manifest, so both channels ship the identical binary.
+      # strip-components drops the `less-sheet/` directory the tarball wraps
+      # everything in.
+      - type: archive
+        only-arches: [x86_64]
+        url: https://github.com/te-x/less-sheet-site/releases/download/v0.1.0/less-sheet-0.1.0-linux-x86_64.tar.gz
+        sha256: 134c2cae99cd1ef782a001c59f6fe9da7fa332abf6053057c951728f034a0eeb
+        strip-components: 1
+
+      - type: archive
+        only-arches: [aarch64]
+        url: https://github.com/te-x/less-sheet-site/releases/download/v0.1.0/less-sheet-0.1.0-linux-aarch64.tar.gz
+        sha256: 934b70198c29eca9667ab366d195584973fc8889bcc4398f77b88c8426d7c0ff
+        strip-components: 1
+
+      # Shared with the other manifest and with the plain tarball — one
+      # definition each, so they cannot drift.
+      - type: file
+        path: ../linux/com.lesssheet.LessSheet.desktop
+
+      - type: file
+        path: com.lesssheet.LessSheet.metainfo.xml
+
+      - type: file
+        path: ../../apps/gtk/data/com.lesssheet.LessSheet.svg
