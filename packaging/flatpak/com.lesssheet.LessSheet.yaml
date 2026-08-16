@@ -1,0 +1,91 @@
+# less-sheet — Flatpak manifest
+#
+# WHY extra-data AND NOT A SOURCE BUILD. less-sheet is closed source, so nobody
+# — Flathub included — can build it from source. extra-data is the shape the
+# Flatpak ecosystem provides for exactly this: the manifest carries only
+# metadata, and the USER'S machine downloads the same tarball published on the
+# release page, verifying the sha256 and size below before unpacking it. This is
+# how proprietary apps ship on Flathub, so what we self-host today is the same
+# manifest we would submit later — not a stepping stone to be redone.
+#
+# WHY THE RUNTIME MATTERS MORE THAN THE PACKAGE. The plain tarball needs GTK
+# 4.20 and libadwaita 1.8 from the distribution, which is why it cannot run on
+# Debian 13. org.gnome.Platform 49 carries exactly that pair, so the Flatpak
+# runs regardless of what the host ships. That is the entire point of shipping
+# one.
+#
+# LGPL: the runtime provides GTK/libadwaita DYNAMICALLY and we do not bundle
+# them, which is what keeps a closed-source binary compliant (docs/RELEASE.md
+# 4a). Do not "simplify" this by vendoring GTK.
+app-id: com.lesssheet.LessSheet
+runtime: org.gnome.Platform
+runtime-version: '49'
+sdk: org.gnome.Sdk
+command: less-sheet-gtk
+
+finish-args:
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --share=ipc
+  - --device=dri
+  # Read-only, and deliberately so: less-sheet is a viewer and never writes to
+  # the files it opens, so write access would be permission it cannot justify.
+  - --filesystem=host:ro
+  # Opening a CSV from a URL is a product feature, not an update check — the app
+  # contacts nothing on its own.
+  - --share=network
+
+modules:
+  - name: less-sheet
+    buildsystem: simple
+    build-commands:
+      # The launcher. The payload lands in /app/extra at install time, which does
+      # not exist yet while this builds, so the command on PATH is a wrapper.
+      - install -Dm755 less-sheet-gtk.sh /app/bin/less-sheet-gtk
+      - install -Dm755 apply_extra /app/bin/apply_extra
+      - install -Dm644 com.lesssheet.LessSheet.desktop
+        /app/share/applications/com.lesssheet.LessSheet.desktop
+      - install -Dm644 com.lesssheet.LessSheet.metainfo.xml
+        /app/share/metainfo/com.lesssheet.LessSheet.metainfo.xml
+      - install -Dm644 com.lesssheet.LessSheet.svg
+        /app/share/icons/hicolor/scalable/apps/com.lesssheet.LessSheet.svg
+    sources:
+      - type: script
+        dest-filename: less-sheet-gtk.sh
+        commands:
+          - exec /app/extra/less-sheet-gtk "$@"
+
+      - type: file
+        path: apply_extra
+
+      # ONE definition of the desktop entry, shared with the plain tarball that
+      # make_release builds. A second copy here would drift, and an Icon= that
+      # no longer matches the app id renders a launcher with no icon and no
+      # build error anywhere.
+      - type: file
+        path: ../linux/com.lesssheet.LessSheet.desktop
+
+      - type: file
+        path: com.lesssheet.LessSheet.metainfo.xml
+
+      # The app's own icon, from the GTK component. Same file the binary
+      # references at runtime through its GResource path.
+      - type: file
+        path: ../../apps/gtk/data/com.lesssheet.LessSheet.svg
+
+      # The payload. sha256 and size must match the PUBLISHED asset exactly —
+      # flatpak refuses the install otherwise, which is the property that makes
+      # downloading a binary at install time safe.
+      - type: extra-data
+        only-arches: [x86_64]
+        filename: less-sheet.tar.gz
+        url: https://github.com/te-x/less-sheet-site/releases/download/v0.1.0/less-sheet-0.1.0-linux-x86_64.tar.gz
+        sha256: 134c2cae99cd1ef782a001c59f6fe9da7fa332abf6053057c951728f034a0eeb
+        size: 803833
+
+      - type: extra-data
+        only-arches: [aarch64]
+        filename: less-sheet.tar.gz
+        url: https://github.com/te-x/less-sheet-site/releases/download/v0.1.0/less-sheet-0.1.0-linux-aarch64.tar.gz
+        sha256: 934b70198c29eca9667ab366d195584973fc8889bcc4398f77b88c8426d7c0ff
+        size: 691817

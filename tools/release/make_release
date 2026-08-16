@@ -94,18 +94,27 @@ def _gtk_app_id(gtk):
             "the app id from the app itself and will not guess it" % src)
     return m.group(1)
 
-DESKTOP_ENTRY = """[Desktop Entry]
-Type=Application
-Name=less-sheet
-GenericName=CSV Viewer
-Comment=Open huge CSV files instantly
-Exec=less-sheet-gtk %f
-Icon={app_id}
-Terminal=false
-Categories=Office;Spreadsheet;
-MimeType=text/csv;application/csv;text/comma-separated-values;
-StartupNotify=true
-"""
+# ONE desktop entry, at packaging/linux/, shared with the Flatpak manifest.
+# It was a template string here, which would have forced the Flatpak to carry a
+# second copy — and a drifting `Icon=` renders a launcher with no icon, no build
+# error and nothing in any log. That exact bug already shipped once; see
+# _gtk_app_id below.
+DESKTOP_ENTRY_PATH = ("packaging", "linux", "com.lesssheet.LessSheet.desktop")
+
+
+def desktop_entry(repo, app_id):
+    """The committed .desktop, verified against the app's OWN id."""
+    path = os.path.join(repo, *DESKTOP_ENTRY_PATH)
+    if not os.path.isfile(path):
+        die("%s is missing — it is the single definition of the desktop entry" % path)
+    with open(path) as fh:
+        body = fh.read()
+    m = re.search(r"^Icon=(.*)$", body, re.M)
+    found = m.group(1).strip() if m else "<no Icon= line>"
+    if found != app_id:
+        die("%s says Icon=%s but the app id is %s. The launcher would render "
+            "iconless, and nothing else would complain." % (path, found, app_id))
+    return body
 
 INSTALL_SH = """#!/bin/sh
 # Install less-sheet for the current user (no root). Uninstall: pass --uninstall.
@@ -789,7 +798,7 @@ def build_linux(repo, out, version, arches, do_verify, notes):
             shutil.copy(os.path.join(gtk, "data", app_id + ".svg"),
                         os.path.join(payload, app_id + ".svg"))
             with open(os.path.join(payload, app_id + ".desktop"), "w") as fh:
-                fh.write(DESKTOP_ENTRY.format(app_id=app_id))
+                fh.write(desktop_entry(repo, app_id))
             ish = os.path.join(payload, "install.sh")
             with open(ish, "w") as fh:
                 fh.write(INSTALL_SH.replace("{app_id}", app_id))

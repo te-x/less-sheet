@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=less-sheet
+GenericName=CSV Viewer
+Comment=Open huge CSV files instantly
+Exec=less-sheet-gtk %f
+Icon=com.lesssheet.LessSheet
+Terminal=false
+Categories=Office;Spreadsheet;
+MimeType=text/csv;application/csv;text/comma-separated-values;
+StartupNotify=true

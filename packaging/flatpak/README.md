@@ -1,0 +1,75 @@
+# Flatpak — how to build and publish it
+
+The manifest is `com.lesssheet.LessSheet.yaml`. It must be built on Linux;
+`flatpak-builder` does not run on macOS, so this is the one release artifact the
+Mac cannot produce.
+
+## Why this manifest downloads a binary
+
+less-sheet is closed source, so no one can build it from source — not us in a
+clean room, not Flathub. `extra-data` is the mechanism the ecosystem provides
+for that case: the manifest ships only metadata, and the **user's machine**
+fetches the tarball from the release page at install time, refusing to proceed
+unless the `sha256` and `size` match exactly.
+
+That means the Flatpak we self-host today and a future Flathub submission are
+**the same manifest**. There is no throwaway step here.
+
+## Why a Flatpak at all
+
+The plain tarball needs GTK 4.20 and libadwaita 1.8 *from the distribution*,
+which is why it cannot run on Debian 13. `org.gnome.Platform` 49 carries exactly
+that pair, so the Flatpak runs regardless of what the host ships. That is the
+whole reason it exists.
+
+GTK and libadwaita come from the runtime, dynamically, and are not bundled —
+which is what keeps a closed-source binary LGPL-compliant (`docs/RELEASE.md`
+§4a). Do not "simplify" the manifest by vendoring them.
+
+## Build and test
+
+```sh
+# once per machine
+sudo pacman -S flatpak flatpak-builder            # Arch
+flatpak remote-add --if-not-exists --user flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+flatpak install --user flathub org.gnome.Platform//49 org.gnome.Sdk//49
+
+# build, install into the user's own flatpak, and run
+cd packaging/flatpak
+flatpak-builder --force-clean --user --install build-dir com.lesssheet.LessSheet.yaml
+flatpak run com.lesssheet.LessSheet
+```
+
+The runtime and SDK are a couple of gigabytes on first install and are shared
+with every other Flatpak on the machine afterwards.
+
+## What to check once it starts
+
+The build proving nothing about the binary is the trap here — `extra-data` is
+downloaded and unpacked at **install** time, so a manifest can build perfectly
+and still install an app that cannot start.
+
+- it launches at all (the runtime's GTK is a different build than the one it was
+  compiled against)
+- open a local `.csv`, and a `.csv.gz`
+- open an `https://` URL — this exercises `--share=network`
+- the window carries its icon, and the app appears in the desktop's launcher
+  with a name rather than as a raw app id
+
+## Publishing without Flathub
+
+```sh
+flatpak-builder --force-clean --repo=repo build-dir com.lesssheet.LessSheet.yaml
+flatpak build-bundle repo less-sheet-<ver>.flatpak com.lesssheet.LessSheet
+```
+
+The `.flatpak` bundle is a single file that can be attached to the release, and
+installs with `flatpak install ./less-sheet-<ver>.flatpak`. It carries no
+auto-update — that is what Flathub buys.
+
+## Updating for a new release
+
+The payload is pinned by digest, so a new version is three edits: the `url`,
+`sha256` and `size` of each `extra-data` block (both architectures), plus a new
+`<release>` entry in the metainfo. `dist/SHA256SUMS` has the digests and
+`stat -c %s` the sizes.

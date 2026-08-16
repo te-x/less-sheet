@@ -1,0 +1,18 @@
+#!/bin/sh
+# Runs ONCE on the user's machine at install time, inside /app/extra, after
+# flatpak has downloaded the extra-data tarball and verified its sha256.
+#
+# extra-data exists because less-sheet is closed source: Flathub cannot build it
+# from source, so the manifest ships metadata and the user's machine fetches the
+# same binary tarball published on the release page. Nothing here is allowed to
+# reach the network — flatpak already did that, and checked the digest.
+set -e
+
+tar -xzf less-sheet.tar.gz
+mv less-sheet/less-sheet-gtk .
+mv less-sheet/LICENSE less-sheet/THIRD-PARTY-NOTICES.md .
+chmod 755 less-sheet-gtk
+
+# Leave nothing behind: the payload is unpacked, so the archive and the rest of
+# its directory are dead weight in every installation.
+rm -rf less-sheet less-sheet.tar.gz

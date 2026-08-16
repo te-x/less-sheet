@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.lesssheet.LessSheet</id>
+
+  <!-- The app is closed source; this metadata file is not. AppStream wants the
+       two stated separately, and LicenseRef-proprietary is the SPDX-sanctioned
+       way to say "not an open source licence" without inventing an id. -->
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>LicenseRef-proprietary</project_license>
+
+  <name>less-sheet</name>
+  <summary>Open huge CSV files instantly</summary>
+
+  <description>
+    <p>
+      A read-only viewer for spreadsheet-sized data. It reads CSV — plain,
+      gzipped, or streamed from a URL — and nothing else, which is why it opens
+      ten gigabytes as fast as ten megabytes.
+    </p>
+    <p>
+      Opening is proportional to the size of your screen, not the size of your
+      file: it reads only the rows it is about to draw. A ten gigabyte file of
+      a hundred and thirty-five million rows costs under three megabytes of
+      memory and appears in about a sixth of a second.
+    </p>
+    <p>What it does:</p>
+    <ul>
+      <li>Find, filter and jump across the whole file without loading it</li>
+      <li>Change the separator, quoting and encoding on the fly</li>
+      <li>Read gzipped CSV without unpacking it first</li>
+      <li>Stream a file over HTTP without downloading all of it</li>
+      <li>Copy cells, rows or a filtered view to the clipboard</li>
+    </ul>
+    <p>
+      It never writes to the files you open, sends no telemetry, and needs no
+      account.
+    </p>
+  </description>
+
+  <launchable type="desktop-id">com.lesssheet.LessSheet.desktop</launchable>
+
+  <developer id="io.github.te-x">
+    <name>te-x</name>
+  </developer>
+
+  <url type="homepage">https://te-x.github.io/less-sheet-site/</url>
+  <url type="bugtracker">https://github.com/te-x/less-sheet-site/issues</url>
+
+  <content_rating type="oars-1.1" />
+
+  <supports>
+    <control>pointing</control>
+    <control>keyboard</control>
+  </supports>
+
+  <screenshots>
+    <screenshot type="default">
+      <caption>Filtering a large CSV without loading it</caption>
+      <image>https://te-x.github.io/less-sheet-site/assets/shots/shot-filter-linux-light.webp</image>
+    </screenshot>
+    <screenshot>
+      <caption>Choosing the separator and quoting for a file</caption>
+      <image>https://te-x.github.io/less-sheet-site/assets/shots/shot-dialect-linux-dark.webp</image>
+    </screenshot>
+  </screenshots>
+
+  <releases>
+    <release version="0.1.0" date="2026-08-16">
+      <description>
+        <p>First release.</p>
+      </description>
+    </release>
+  </releases>
+</component>
