@@ -133,8 +133,27 @@ def add_release_entry(repo, want, today):
     print("  added %s to %s" % (want, METAINFO))
 
 
+def unfilled_links(repo):
+    """An href left as a NAMED PLACEHOLDER is a dead button on a live page.
+
+    Same family as the __LESSSHEET_VERSION__ and <PLACEHOLDER> guards: a token
+    that is obviously not a URL should stop a release rather than ship, because
+    it looks fine in review and fails only for the reader.
+    """
+    body = read(repo, "site/index.html")
+    bad = []
+    for n, line in enumerate(body.split("\n"), 1):
+        for m in re.finditer(r'href="([A-Z][A-Z0-9_]{3,})"', line):
+            bad.append("site/index.html:%d: href=\"%s\"" % (n, m.group(1)))
+    if bad:
+        die("the page still has placeholder links:\n  %s\n\n"
+            "     Fill them in, or remove the element. A button that goes "
+            "nowhere is worse than no button." % "\n  ".join(bad))
+
+
 def verify(repo, have, want):
     """The point of the tool: prove the old version is gone from the surface."""
+    unfilled_links(repo)
     stale = []
     for rel in SURFACE:
         body = read(repo, rel)
