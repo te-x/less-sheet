@@ -24,6 +24,10 @@ jobs:
           source-directory: 'site'
           destination-github-username: 'te-x'
           destination-repository-name: 'less-sheet-site'
-          user-email: 'te-x@users.noreply.github.com' # Replace with your GitHub commit email
+          # The destination repo is PUBLIC, and this address is stamped as the
+          # commit author on every deploy. A real address here publishes it.
+          # github.com noreply is undeliverable by design, which is the point.
+          user-name: 'te-x'
+          user-email: 'te-x@users.noreply.github.com'
           target-branch: 'main'
           commit-message: 'Update landing page from te-x/less-sheet@master'
