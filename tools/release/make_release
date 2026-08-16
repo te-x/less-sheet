@@ -231,9 +231,13 @@ def resolve_version(repo, override):
     reporting a disagreement it could not fix.
 
     It still checks the macOS plist, but only to report a consumer that has not
-    been wired to the single source yet. That warning must stay while the lag is
-    real: `apps/macos` is its own aidev component and the plist placeholder plus
-    assemble-app.sh substitution (docs/RELEASE.md 1a item 1) has not landed.
+    been wired to the single source. Since `cb15d2d` the tracked plist carries
+    __LESSSHEET_VERSION__ and assemble-app.sh substitutes VERSION into the copy
+    it lays down, so THE PLACEHOLDER IS THE WIRED STATE. Warning about it says
+    the opposite of the truth, and it did: a release build reported "apps/macos
+    has not been wired to it yet" about the very mechanism that had just put
+    0.1.0 into the shipped bundle. Only a concrete version that disagrees with
+    VERSION is a real lag.
     """
     root_path = os.path.join(repo, "VERSION")
     root_ver = None
@@ -246,6 +250,10 @@ def resolve_version(repo, override):
     if os.path.isfile(plist_path):
         with open(plist_path, "rb") as fh:
             mac_ver = plistlib.load(fh).get("CFBundleShortVersionString")
+    # Wired, not lagging. Clearing it here also stops the fallback below from
+    # ever resolving a "version" of __LESSSHEET_VERSION__ if VERSION goes missing.
+    if mac_ver == PLIST_VERSION_PLACEHOLDER:
+        mac_ver = None
 
     warn = None
     if root_ver is None:
@@ -264,6 +272,9 @@ def resolve_version(repo, override):
 # dynamically linked. A template placeholder reaching a user is the same class of
 # bug as a surviving Info.plist version placeholder, so it gets the same guard.
 LEGAL_FILES = ("LICENSE", "THIRD-PARTY-NOTICES.md")
+# What the TRACKED Info.plist holds; assemble-app.sh substitutes VERSION into
+# the bundle copy. Its presence is proof the wiring works, not that it is absent.
+PLIST_VERSION_PLACEHOLDER = "__LESSSHEET_VERSION__"
 LEGAL_PLACEHOLDER = re.compile(r"<[A-Z][A-Z /]{2,}>")
 
 
