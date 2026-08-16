@@ -62,8 +62,19 @@ the flag that used to carry it.
 
 ```sh
 brew tap <you>/tap
+brew trust --cask <you>/tap/less-sheet
 brew install --cask less-sheet
 ```
+
+**The trust step is not optional.** Homebrew 6 refuses to load anything from a
+non-official tap until the user allows it — `Error: Refusing to load cask ...
+from untrusted tap`. Trust is recorded in `~/.homebrew/trust.json`, and it is a
+decision only the user can make: nothing in the cask or the tap can pre-grant
+it, which is the point of the mechanism.
+
+`brew trust <you>/tap` would trust the tap wholesale, now and for anything added
+to it later. The per-cask form above is narrower, and it is what the download
+page tells people to run.
 
 **Homebrew 6 always quarantines, and there is no opt-out.** It replaced the flag
 with a user-approval model: the installed app carries `com.apple.quarantine`,
