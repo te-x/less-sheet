@@ -174,6 +174,22 @@ Debian 13 (trixie) does NOT - it ships GTK 4.18.
 
 There is no bundled GTK: this binary uses your system's GNOME libraries, so it
 follows your theme, dark mode, and accent colour.
+
+FILE ASSOCIATIONS
+    install.sh registers less-sheet as a HANDLER for CSV, so it appears under
+    "Open With". It does not set itself as your default: it never runs
+    xdg-mime and never writes mimeapps.list.
+
+    Your desktop may still make it the default anyway, if nothing else on the
+    system claims text/csv - a sole handler usually wins by default. To point
+    CSV somewhere else:
+
+        xdg-mime default org.gnome.gedit.desktop text/csv
+
+    or pick another application under "Open With -> Set as default". To check
+    what is currently handling them:
+
+        xdg-mime query default text/csv
 """
 
 
