@@ -484,17 +484,31 @@
     <div class="prose top">
       <div class="rn">06</div>
       <h2>Free. Tiny. No account. No telemetry.</h2>
-      <p>macOS and Linux versions available.</p>
+      <p>macOS is available now. Linux is next.</p>
     </div>
 
     <div class="figs">
       <div class="dl">
         <div>
           <h3>macOS</h3>
-          <p style="margin:0"><span class="btn soon">coming soon</span></p>
+          <p style="margin:0"><a class="btn" href="https://github.com/te-x/less-sheet-site/releases/download/v0.1.0/less-sheet-0.1.0-macos-arm64.dmg">Download 0.1.0 · .dmg</a></p>
           <p class="reqs">macOS 26.0+ · Apple silicon · ~3&nbsp;MB<br>
-            via Homebrew, a one-line install, or a&nbsp;.dmg<br>
             reads csv · csv.gz · http(s)</p>
+
+          <div class="dl-way">Homebrew</div>
+          <pre class="cmd"><code>brew tap te-x/tap
+brew install --cask less-sheet --no-quarantine</code></pre>
+
+          <div class="dl-way">One line</div>
+          <pre class="cmd"><code>curl -fsSL https://github.com/te-x/less-sheet-site/releases/download/v0.1.0/less-sheet-0.1.0-macos-arm64.tar.gz | tar -xz -C /Applications</code></pre>
+
+          <div class="fn"><b>The .dmg needs one extra step the first time.</b>
+            This build is signed, but not notarized through Apple’s paid
+            programme, so macOS blocks anything downloaded through a browser.
+            Open <span class="path">System Settings → Privacy &amp; Security</span>,
+            find less-sheet near the bottom, and press <b>Open Anyway</b>. Once.
+            The two commands above are not affected — neither Homebrew nor
+            <span class="path">curl</span> marks a file as downloaded.</div>
         </div>
         <div>
           <h3>Linux</h3>
