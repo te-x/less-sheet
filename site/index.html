@@ -484,7 +484,7 @@
     <div class="prose top">
       <div class="rn">06</div>
       <h2>Free. Tiny. No account. No telemetry.</h2>
-      <p>macOS is available now. Linux is next.</p>
+      <p>macOS and Linux, both available now.</p>
     </div>
 
     <div class="figs">
@@ -515,14 +515,25 @@ brew install --cask less-sheet</code></pre>
         </div>
         <div>
           <h3>Linux</h3>
-          <p style="margin:0"><span class="btn soon">coming soon</span></p>
-          <p class="reqs">x86_64 and aarch64 · ~0.8&nbsp;MB<br>
-            glibc 2.34+ · GTK 4.20 · libadwaita 1.8<br>
-            Fedora 43+ and current Arch.<br>
-            <b>Debian 13 ships GTK 4.18 and will not run this build.</b><br>
+          <p style="margin:0"><a class="btn" href="https://github.com/te-x/less-sheet-site/releases/download/v0.1.0/less-sheet-0.1.0-x86_64.flatpak">Download 0.1.0 · Flatpak</a></p>
+          <p class="reqs">x86_64 · runs on any distribution<br>
             reads csv · csv.gz · http(s)</p>
-          <div class="fn">A Flatpak — which carries its own GNOME runtime and
-            runs regardless of your distribution’s version — is planned.</div>
+
+          <div class="dl-way">Flatpak</div>
+          <pre class="cmd"><code>flatpak install ./less-sheet-0.1.0-x86_64.flatpak
+flatpak run com.lesssheet.LessSheet</code></pre>
+          <p class="reqs">Uses the GNOME 49 runtime, which Flatpak fetches from
+            Flathub if you don’t already have it.</p>
+
+          <div class="dl-way">tarball</div>
+          <pre class="cmd"><code>curl -fsSL https://github.com/te-x/less-sheet-site/releases/download/v0.1.0/less-sheet-0.1.0-linux-x86_64.tar.gz | tar -xz
+./less-sheet/install.sh</code></pre>
+          <p class="reqs">x86_64 and aarch64 · ~0.8&nbsp;MB · installs to
+            ~/.local/bin, no root<br>
+            Uses your system’s GNOME libraries, so it follows your theme —
+            but needs glibc 2.34+, GTK 4.20 and libadwaita 1.8.<br>
+            <b>Debian 13 ships GTK 4.18 and will not run this build.</b>
+            Use the Flatpak.</p>
         </div>
       </div>
     </div>
