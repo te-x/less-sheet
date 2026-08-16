@@ -254,16 +254,53 @@ flatpak build-bundle repo less-sheet.flatpak com.lesssheet.LessSheet       # sel
 
 ---
 
-## 5. Shipping updates
+## 5. Shipping updates — two commands
 
-1. Land the change; **bump the version** by editing the root `VERSION` file (§1) on a release commit; tag `v$(cat VERSION)`.
-2. Rebuild artifacts (§2) from the tag.
-3. **macOS:** re-sign → re-notarize → re-staple → new DMG (§3b); update the download link + checksum on `site/`.
-4. **Flatpak:**
-   - *Flathub:* open a PR bumping the manifest's source tag/commit (or Flathub auto-updates from a tracked commit) → it rebuilds + users auto-update.
-   - *Self-host:* rebuild the repo (`flatpak-builder --repo=repo …`), push it; installed users get the update on `flatpak update`.
-5. Update the landing page (`site/index.html`): version, download links, and a short **changelog** entry.
-6. Keep a `CHANGELOG.md` (recommended) so release notes are single-sourced.
+A bugfix release is two scripts and two transfers. Everything below §5 describes
+what they do; you should not need to perform those steps by hand.
+
+```sh
+# on the Mac — builds, verifies, stamps, commits, tags. Publishes nothing.
+tools/release/cut 0.1.1
+
+# both transfers: dist/ is gitignored, so artifacts do NOT travel with the repo
+rsync -av dist/ user@linux-box:~/Documents/less-sheet-dist/
+tools/xfer-clean user@linux-box:~/Documents/less-sheet
+
+# on the Arch box — pushes, releases, builds the Flatpak bundle, updates the
+# tap, deploys the page, and verifies all of it logged out
+cd ~/Documents/less-sheet && tools/release/publish.sh
+```
+
+**Why two scripts.** The Mac is the only machine with the Swift toolchain (and it
+runs the Linux build in podman), and it deliberately has no GitHub remote. The
+Arch box talks to GitHub and cannot build the macOS app. One script would have
+to pretend a single machine does both.
+
+**What `cut` does:** refuses a dirty tree or an existing tag → runs the root gate
+→ bumps `VERSION` → `make_release` (which runs every artifact it builds) →
+`tools/release/stamp` → commits and tags. All local, all revertible.
+
+**What `stamp` does, and why it exists.** `VERSION` is single-sourced for
+everything that can *read* it at build time. It cannot serve what carries a
+literal: download URLs on a static page, digests in a cask, Flatpak manifests
+fetched by a stranger's machine. That is 21 literals across three files plus six
+digest/size pairs per build. `stamp` rewrites them **and then greps for the old
+version and fails if any survived** — the check is the point, because a missed
+link 404s for everyone except you and nothing else complains. The metainfo is
+append-only and handled separately: its `<release>` entries are a changelog, so
+0.1.0 must still say 0.1.0 after 0.1.1 ships.
+
+**What `publish.sh` does:** verifies `dist/` actually arrived and its bytes match
+`SHA256SUMS` (a stale rsync is the quiet failure this split invites) → pushes
+source and tag → creates the release → builds and uploads the Flatpak bundle →
+updates the tap → checks **logged out** that every asset returns 200 → polls
+until the live page names the new version.
+
+**Still manual, by choice:** release notes (`dist/NOTES-<ver>.md`, else a
+one-liner is generated), and Flathub, which is a PR against `flathub/flathub`.
+
+Keep a `CHANGELOG.md` (recommended) so release notes are single-sourced.
 
 ---
 

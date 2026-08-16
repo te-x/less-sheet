@@ -1,192 +1,178 @@
 #!/usr/bin/env bash
 #
-# Cut a release: pick a version, build everything, verify it, tag it, and
-# publish the artifacts as a GitHub Release.
+# Publish a release FROM THE ARCH BOX. Pushes the source, creates the GitHub
+# release, uploads every artifact, builds and uploads the Flatpak bundle,
+# updates the Homebrew tap, and then verifies the lot LOGGED OUT.
 #
 #   tools/release/publish.sh
-#   tools/release/publish.sh --dry-run          # everything except the pushes
-#   tools/release/publish.sh --version 0.2.0    # skip the prompt
+#   tools/release/publish.sh --dry-run        # every check, no pushes
 #
-# Configure once (or pass the flags every time):
-#   LESSSHEET_SOURCE_REMOTE=origin                       # private repo, holds the code
-#   LESSSHEET_RELEASE_REPO=<you>/less-sheet              # PUBLIC repo, holds the downloads
+# Configure once (or export in your shell):
+#   LESSSHEET_RELEASE_REPO=te-x/less-sheet-site   # PUBLIC repo: downloads + page
+#   LESSSHEET_TAP_DIR=$HOME/Documents/homebrew-tap
+#   LESSSHEET_SITE_URL=https://te-x.github.io/less-sheet-site/
 #
-# WHY A TAG AND NOT A PUSH TO MASTER. Releases are deliberate acts. Building on
-# every push publishes half-finished work and buries the real releases in noise;
-# the runbook (docs/RELEASE.md §1) already says each release is a tag vX.Y.Z on
-# the release commit. This script is that act, written down.
+# THIS SCRIPT DOES NOT BUILD THE APP. `tools/release/cut` does that on the Mac,
+# which is the only machine with the Swift toolchain. This one assumes dist/
+# arrived by rsync and CHECKS THAT IT DID — a stale dist/ is the quiet failure
+# this split invites, and it would publish last release's binaries under this
+# release's version.
 #
-# WHAT IT REFUSES TO DO, and why each one has bitten this project or would:
-#   * publish from a DIRTY tree — the artifacts would not correspond to the tag,
-#     and nothing downstream could ever tell;
-#   * publish without the gate passing — a green build is not a correct one here;
-#   * reuse an existing tag — that silently changes what a version means;
-#   * skip the LOGGED-OUT check on the published asset. A private release asset
-#     404s for everyone who is not you, and you will be logged in when you look.
-#     That single mistake breaks Homebrew and the curl one-liner at once.
-set -euo pipefail
+# WHAT IT REFUSES TO DO, each because it has bitten this project or would:
+#   * publish from a dirty tree, or without the tag `cut` made;
+#   * publish artifacts whose bytes disagree with SHA256SUMS;
+#   * skip the LOGGED-OUT check. A private asset 404s for everyone but you, and
+#     you will be logged in when you look. That one mistake breaks Homebrew and
+#     the curl one-liner at the same time.
+set -uo pipefail
 
-cd "$(git rev-parse --show-toplevel)"
-
-DRY=0
-WANT_VERSION=""
-SKIP_GATE=0
-SOURCE_REMOTE="${LESSSHEET_SOURCE_REMOTE:-origin}"
-RELEASE_REPO="${LESSSHEET_RELEASE_REPO:-}"
-
-while [ $# -gt 0 ]; do
-    case "$1" in
-        --dry-run)      DRY=1 ;;
-        --version)      WANT_VERSION="${2:?--version needs a number}"; shift ;;
-        --release-repo) RELEASE_REPO="${2:?--release-repo needs owner/name}"; shift ;;
-        --source-remote) SOURCE_REMOTE="${2:?--source-remote needs a remote}"; shift ;;
-        --skip-gate)    SKIP_GATE=1 ;;
-        -h|--help)      sed -n '2,30p' "$0"; exit 0 ;;
-        *) echo "unknown argument: $1" >&2; exit 2 ;;
-    esac
-    shift
-done
-
-say()  { printf '\n\033[1m== %s\033[0m\n' "$*"; }
-die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
+say()  { printf '\n== %s\n' "$1"; }
+die()  { printf 'error: %s\n' "$1" >&2; exit 1; }
 ask()  { printf '%s ' "$1" >&2; read -r REPLY </dev/tty; }
 
+cd "$(git rev-parse --show-toplevel)" || die "not inside the repo"
+
+DRY=0
+for a in "$@"; do
+    case "$a" in
+        --dry-run) DRY=1 ;;
+        *) die "unknown option '$a'" ;;
+    esac
+done
+
+RELEASE_REPO="${LESSSHEET_RELEASE_REPO:-te-x/less-sheet-site}"
+TAP_DIR="${LESSSHEET_TAP_DIR:-$HOME/Documents/homebrew-tap}"
+SITE_URL="${LESSSHEET_SITE_URL:-https://te-x.github.io/less-sheet-site/}"
+FLATPAK_DIR="packaging/flatpak"
+
 # ---------------------------------------------------------------- preflight --
-say "preflight"
-
-command -v gh >/dev/null || die "gh CLI not found (brew install gh)"
+command -v gh >/dev/null || die "gh not found (pacman -S github-cli)"
 gh auth status >/dev/null 2>&1 || die "gh is not logged in — run: gh auth login"
+git remote get-url origin >/dev/null 2>&1 \
+    || die "no 'origin' remote. xfer-clean sets it; re-run the transfer."
 
-[ -n "$RELEASE_REPO" ] || die "set LESSSHEET_RELEASE_REPO=<owner>/<name> (the PUBLIC repo) or pass --release-repo"
-# Cheapest and most likely first: a dirty tree is the everyday mistake, and
-# reporting it before a missing-remote complaint tells you the thing you can
-# actually act on.
-if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
-    git status --short --untracked-files=no >&2
-    die "the working tree is dirty. Artifacts built from it would not match the tag."
-fi
-
-git remote get-url "$SOURCE_REMOTE" >/dev/null 2>&1 \
-    || die "no git remote named '$SOURCE_REMOTE' — add the private source repo first"
-
+VER="$(cat VERSION)"
+TAG="v$VER"
 BRANCH="$(git branch --show-current)"
-CURRENT="$(cat VERSION)"
-echo "  repo branch     : $BRANCH"
-echo "  source remote   : $SOURCE_REMOTE -> $(git remote get-url "$SOURCE_REMOTE")"
-echo "  release repo    : $RELEASE_REPO (public)"
-echo "  current version : $CURRENT"
-
-# ------------------------------------------------------------------ version --
-if [ -z "$WANT_VERSION" ]; then
-    ask "  new version (blank to keep $CURRENT):"
-    WANT_VERSION="${REPLY:-$CURRENT}"
-fi
-case "$WANT_VERSION" in
-    [0-9]*.[0-9]*.[0-9]*) ;;
-    *) die "version must be MAJOR.MINOR.PATCH, got '$WANT_VERSION'" ;;
-esac
-TAG="v$WANT_VERSION"
-
-git rev-parse -q --verify "refs/tags/$TAG" >/dev/null \
-    && die "tag $TAG already exists — a released version is immutable; pick a new number"
-if gh release view "$TAG" --repo "$RELEASE_REPO" >/dev/null 2>&1; then
-    die "release $TAG already exists in $RELEASE_REPO"
-fi
-
-if [ "$WANT_VERSION" != "$CURRENT" ]; then
-    say "bumping VERSION $CURRENT -> $WANT_VERSION"
-    printf '%s\n' "$WANT_VERSION" > VERSION
-    # ONE file changes. Everything else reads it: the GTK build via meson, the
-    # macOS bundle via assemble-app.sh's substitution, the artifact names via
-    # make_release. If this commit ever touches a second file carrying the
-    # number, the single-source rule has been broken somewhere.
-    git add VERSION
-    git commit -q -m "release $WANT_VERSION"
-    echo "  committed $(git rev-parse --short HEAD)"
-fi
-
-# --------------------------------------------------------------------- gate --
-if [ "$SKIP_GATE" = 1 ]; then
-    echo
-    echo "  WARNING: --skip-gate given. Publishing code whose gate has not run." >&2
-else
-    say "gate (root: api integrity + backend + macOS + GTK)"
-    bash .aidev/gate.sh || die "the gate failed — nothing was published"
-fi
-
-# -------------------------------------------------------------------- build --
-say "building + verifying artifacts"
 BASE="https://github.com/$RELEASE_REPO/releases/download/$TAG"
-# make_release does not merely produce files: it unpacks each one and RUNS it —
-# the macOS app must emit its real rows-are-visible marker, the Linux binary must
-# start in a clean container that has only the declared runtime deps.
-python3 tools/release/make_release --cask-base "$BASE"
 
+[ -z "$(git status --porcelain)" ] || die "the working tree is dirty — this copy should be exactly what cut produced"
+git rev-parse -q --verify "refs/tags/$TAG" >/dev/null \
+    || die "no local tag $TAG. Run tools/release/cut $VER on the Mac, then re-transfer."
+gh release view "$TAG" --repo "$RELEASE_REPO" >/dev/null 2>&1 \
+    && die "release $TAG already exists in $RELEASE_REPO — a released version is immutable"
+
+echo "less-sheet — publishing $TAG"
+echo "  source        origin/$BRANCH"
+echo "  release repo  $RELEASE_REPO"
+echo "  tap           $TAP_DIR"
+
+# ------------------------------------------------------------ dist is fresh --
+# The whole point of this check: dist/ crosses machines by rsync, outside git,
+# so nothing else can tell you it is last release's build.
+say "checking dist/ arrived and matches its digests"
+[ -f dist/SHA256SUMS ] || die "dist/SHA256SUMS missing — rsync dist/ from the Mac"
 ARTIFACTS=()
-while IFS= read -r f; do ARTIFACTS+=("$f"); done < <(
-    ls dist/less-sheet-"$WANT_VERSION"-* 2>/dev/null || true
-)
-[ "${#ARTIFACTS[@]}" -gt 0 ] || die "no artifacts named for $WANT_VERSION in dist/"
-[ -f dist/SHA256SUMS ] || die "dist/SHA256SUMS missing"
-ARTIFACTS+=(dist/SHA256SUMS)
+while IFS= read -r f; do ARTIFACTS+=("$f"); done < <(ls dist/less-sheet-"$VER"-* 2>/dev/null || true)
+[ "${#ARTIFACTS[@]}" -gt 0 ] \
+    || die "no artifacts named for $VER in dist/ — the rsync is stale or never ran"
+grep -q -- "-$VER-" dist/SHA256SUMS \
+    || die "dist/SHA256SUMS does not mention $VER — it belongs to another build"
+( cd dist && sha256sum -c --quiet SHA256SUMS ) \
+    || die "an artifact's bytes disagree with SHA256SUMS — the transfer is corrupt or partial"
+echo "  ${#ARTIFACTS[@]} artifacts, all digests verified"
 
-echo
-echo "  to publish as $TAG -> $RELEASE_REPO:"
+ARTIFACTS+=(dist/SHA256SUMS)
 for a in "${ARTIFACTS[@]}"; do printf '    %8s  %s\n' "$(du -h "$a" | cut -f1)" "$(basename "$a")"; done
 
 # ------------------------------------------------------------------ confirm --
 if [ "$DRY" = 1 ]; then
-    say "--dry-run: stopping before anything is pushed"
-    echo "  nothing was tagged, pushed or published."
+    say "--dry-run: every check passed, nothing was pushed"
     exit 0
 fi
 
 say "about to publish — this is the irreversible part"
-echo "  tag           $TAG on $(git rev-parse --short HEAD)"
-echo "  push branch   $BRANCH -> $SOURCE_REMOTE"
-echo "  release       $RELEASE_REPO ($(printf '%s' "${#ARTIFACTS[@]}") files)"
+echo "  push      $BRANCH + $TAG -> origin"
+echo "  release   $TAG in $RELEASE_REPO (${#ARTIFACTS[@]} files)"
+echo "  deploy    the frontpage, via the push (site/** triggers the workflow)"
 ask "  type the version to confirm:"
-[ "$REPLY" = "$WANT_VERSION" ] || die "confirmation did not match — nothing was published"
+[ "$REPLY" = "$VER" ] || die "confirmation did not match — nothing was published"
 
-# ------------------------------------------------------------------ publish --
-say "tagging + pushing source"
-git tag -a "$TAG" -m "less-sheet $WANT_VERSION"
-git push "$SOURCE_REMOTE" "$BRANCH"
-git push "$SOURCE_REMOTE" "$TAG"
+# ------------------------------------------------------------------- source --
+say "pushing source + tag"
+git push origin "$BRANCH" || die "push failed"
+git push origin "$TAG"    || die "tag push failed"
 
+# ------------------------------------------------------------------ release --
 say "creating the release"
-NOTES="dist/NOTES-$WANT_VERSION.md"
-[ -f "$NOTES" ] || printf 'less-sheet %s\n' "$WANT_VERSION" > "$NOTES"
+NOTES="dist/NOTES-$VER.md"
+[ -f "$NOTES" ] || printf 'less-sheet %s\n' "$VER" > "$NOTES"
 gh release create "$TAG" --repo "$RELEASE_REPO" \
-   --title "less-sheet $WANT_VERSION" --notes-file "$NOTES" \
-   "${ARTIFACTS[@]}"
+   --title "less-sheet $VER" --notes-file "$NOTES" "${ARTIFACTS[@]}" \
+   || die "gh release create failed"
 
-# -------------------------------------------------------------------- verify --
-say "verifying the published assets are PUBLIC"
-# Logged out on purpose: `gh` and a browser session both carry your credentials,
-# so a private asset looks fine to you and 404s for everybody else.
+# ------------------------------------------------------------------ flatpak --
+# Built here because flatpak-builder does not run on macOS. It uses the BUNDLE
+# manifest: a .flatpak cannot carry extra-data (see packaging/flatpak/README.md),
+# so the payload is embedded. It downloads that payload from the release we just
+# published, which is why this runs after it and not before.
+if command -v flatpak-builder >/dev/null; then
+    say "building the Flatpak bundle"
+    ARCH="$(uname -m)"
+    BUNDLE="less-sheet-$VER-$ARCH.flatpak"
+    ( cd "$FLATPAK_DIR" \
+      && flatpak-builder --force-clean --repo=repo-bundle bundle-dir \
+           com.lesssheet.LessSheet.Bundle.yaml \
+      && flatpak build-bundle repo-bundle "$BUNDLE" com.lesssheet.LessSheet ) \
+      || die "the Flatpak bundle failed to build"
+    gh release upload "$TAG" --repo "$RELEASE_REPO" "$FLATPAK_DIR/$BUNDLE" \
+      || die "uploading the bundle failed"
+    ARTIFACTS+=("$FLATPAK_DIR/$BUNDLE")
+    echo "  uploaded $BUNDLE"
+else
+    printf '\n  WARNING: flatpak-builder not found; no bundle was built.\n' >&2
+    printf '  The page links one. Install it and re-run, or the Linux button 404s.\n' >&2
+fi
+
+# ---------------------------------------------------------------------- tap --
+if [ -d "$TAP_DIR/Casks" ] && [ -f dist/less-sheet.rb ]; then
+    say "updating the Homebrew tap"
+    cp dist/less-sheet.rb "$TAP_DIR/Casks/less-sheet.rb"
+    ( cd "$TAP_DIR" && git add Casks/less-sheet.rb \
+      && git commit -q -m "less-sheet $VER" && git push ) \
+      || die "the tap did not update — brew still serves the previous version"
+    echo "  tap now serves $VER"
+else
+    printf '\n  WARNING: no tap at %s, or dist/less-sheet.rb missing.\n' "$TAP_DIR" >&2
+    printf '  brew will keep installing the previous version.\n' >&2
+fi
+
+# ------------------------------------------------------------------- verify --
+say "verifying every asset is PUBLIC"
+# Logged out on purpose: gh and a browser both carry your credentials, so a
+# private asset looks perfect to you and 404s for everyone else.
 FAIL=0
 for a in "${ARTIFACTS[@]}"; do
     url="$BASE/$(basename "$a")"
-    code="$(curl -fsSLI -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || echo 000)"
-    if [ "$code" = "200" ]; then
-        printf '  200  %s\n' "$(basename "$a")"
-    else
-        printf '  %-4s %s   <-- NOT PUBLIC\n' "$code" "$(basename "$a")"
-        FAIL=1
-    fi
+    code="$(curl -sSLI -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || echo 000)"
+    if [ "$code" = "200" ]; then printf '  200  %s\n' "$(basename "$a")"
+    else printf '  %-4s %s   <-- NOT PUBLIC\n' "$code" "$(basename "$a")"; FAIL=1; fi
 done
-[ "$FAIL" = 0 ] || die "some assets are not publicly reachable — Homebrew and the curl install are broken until this is fixed"
+[ "$FAIL" = 0 ] || die "some assets are not reachable — Homebrew and the curl install are broken until this is fixed"
 
-# ---------------------------------------------------------------------- next --
+say "waiting for the frontpage to deploy"
+# The push triggers the workflow; Pages then lags it. Poll rather than guess.
+OK=0
+for _ in $(seq 1 20); do
+    if curl -sL "$SITE_URL" | grep -q -- "$VER"; then OK=1; break; fi
+    sleep 15
+done
+if [ "$OK" = 1 ]; then
+    echo "  the live page names $VER"
+else
+    printf '  the page still does not mention %s after 5 minutes.\n' "$VER" >&2
+    printf '  Check the Actions tab; the release itself is published and fine.\n' >&2
+fi
+
 say "published $TAG"
-cat <<EOF
-  Two things this script deliberately does NOT do, because both change what
-  other people see and neither is recoverable by re-running:
-
-    1. Update the Homebrew tap. dist/less-sheet.rb is written with this
-       release's real sha256 — copy it into your homebrew-tap repo and push.
-    2. Deploy the frontpage. See docs/RELEASE.md §7.4: it substitutes the
-       download URLs from this tag and refuses to publish with a placeholder
-       left in.
-EOF
+echo "  assets, tap and page are live. Install it somewhere you have not, and open a file."

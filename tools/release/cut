@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+#
+# Cut a release ON THIS MAC. Builds and verifies everything, stamps the version
+# across the release surface, commits and tags. Publishes NOTHING.
+#
+#   tools/release/cut 0.1.1
+#   tools/release/cut 0.1.1 --skip-gate      # only when the gate just passed
+#
+# WHY THIS IS TWO SCRIPTS AND NOT ONE. The Mac builds (it is the only machine
+# with the Swift toolchain, and it runs the Linux build in podman) and never
+# talks to GitHub. The Arch box talks to GitHub and cannot build the macOS app.
+# A single release script would have to pretend one machine does both. So: `cut`
+# here, `publish.sh` there, and two rsyncs between them.
+#
+# EVERYTHING THIS DOES IS LOCAL AND REVERSIBLE. Nothing is pushed, nothing is
+# uploaded. If it fails halfway, `git checkout VERSION && git checkout .` and
+# the tree is as it was.
+set -euo pipefail
+
+say()  { printf '\n== %s\n' "$1"; }
+die()  { printf 'error: %s\n' "$1" >&2; exit 1; }
+
+cd "$(git rev-parse --show-toplevel)"
+
+WANT="${1:-}"
+SKIP_GATE=0
+shift || true
+for a in "$@"; do
+    case "$a" in
+        --skip-gate) SKIP_GATE=1 ;;
+        *) die "unknown option '$a'" ;;
+    esac
+done
+
+case "$WANT" in
+    "")  die "usage: tools/release/cut <version>   e.g. tools/release/cut 0.1.1" ;;
+    [0-9]*.[0-9]*.[0-9]*) : ;;
+    *)   die "version must be MAJOR.MINOR.PATCH, got '$WANT'" ;;
+esac
+
+HAVE="$(cat VERSION)"
+TAG="v$WANT"
+RELEASE_REPO="${LESSSHEET_RELEASE_REPO:-te-x/less-sheet-site}"
+BASE="https://github.com/$RELEASE_REPO/releases/download/$TAG"
+
+[ "$HAVE" != "$WANT" ] || die "VERSION already says $WANT"
+# A dirty tree means the artifacts would not correspond to the commit they are
+# tagged against, and nothing downstream could ever detect that.
+[ -z "$(git status --porcelain)" ] || die "the working tree is dirty. Commit or stash first."
+git rev-parse -q --verify "refs/tags/$TAG" >/dev/null \
+    && die "tag $TAG already exists — a released version is immutable, pick a new number"
+
+echo "less-sheet — cutting $HAVE -> $WANT"
+echo "  release repo   $RELEASE_REPO"
+echo "  download base  $BASE"
+
+# ---------------------------------------------------------------------- gate --
+# Before touching anything, so a red gate costs nothing to recover from.
+if [ "$SKIP_GATE" = 1 ]; then
+    printf '\n  WARNING: --skip-gate. Shipping code whose gate has not run.\n' >&2
+else
+    say "gate (api integrity + backend + macOS + GTK)"
+    bash .aidev/gate.sh || die "the gate failed — nothing was changed"
+fi
+
+# --------------------------------------------------------------------- bump --
+say "bumping the single source"
+printf '%s\n' "$WANT" > VERSION
+echo "  VERSION: $HAVE -> $WANT"
+
+# -------------------------------------------------------------------- build --
+# make_release does not merely produce files: it unpacks each one and RUNS it.
+# The macOS app must emit its real rows-are-visible marker; the Linux binary
+# must start in a clean container carrying only the declared runtime deps.
+say "building + verifying every artifact"
+python3 tools/release/make_release --cask-base "$BASE"
+
+# -------------------------------------------------------------------- stamp --
+# The version also lives as a literal in files nothing can read VERSION from: a
+# static page's download URLs, and Flatpak manifests fetched by a stranger's
+# machine. stamp rewrites them and then proves none of the old one survived.
+say "stamping the release surface"
+python3 tools/release/stamp --from "$HAVE" --to "$WANT"
+
+# ------------------------------------------------------------------- commit --
+say "committing + tagging"
+git add -A
+git commit -q -m "release $WANT
+
+Artifacts built and verified by running. Version stamped across the release
+surface (download links, Flatpak manifests, metainfo changelog) and checked
+for survivors of $HAVE."
+git tag -a "$TAG" -m "less-sheet $WANT"
+echo "  $(git rev-parse --short HEAD)  tagged $TAG"
+
+# ---------------------------------------------------------------------- next --
+say "built $WANT — nothing has been published"
+cat <<EOF
+  dist/ is gitignored, so the artifacts do NOT travel with the repo. Both
+  transfers are needed, and the cask lives in dist/ too:
+
+    rsync -av dist/ user@linux-box:~/Documents/less-sheet-dist/
+    tools/xfer-clean user@linux-box:~/Documents/less-sheet
+
+  then, on the Arch box:
+
+    cd ~/Documents/less-sheet && tools/release/publish.sh
+EOF

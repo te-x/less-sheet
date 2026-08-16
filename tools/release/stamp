@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""Stamp a version across the release surface, then prove nothing was missed.
+
+    tools/release/stamp --from 0.1.0 --to 0.1.1
+
+The version is single-sourced in <repo>/VERSION for everything that READS it at
+build time — meson, the macOS Info.plist, the artifact names. This tool exists
+for everything that cannot read it: files that must carry a literal because they
+are consumed by something with no access to the repo. A download URL on a static
+page, a sha256 in a cask, a Flatpak manifest fetched by a stranger's machine.
+
+There are twenty-one such literals across three files, plus six digest/size
+pairs that change on every build. Editing them by hand is not slow, it is
+UNCHECKABLE: miss one and you ship a download that 404s for everyone except you,
+and nothing anywhere complains.
+
+So the substitution is the boring half. The half that matters is `verify()`,
+which greps the surface for the OLD version afterwards and fails if it survived.
+That turns "did I get them all?" from a question into an answer, the same way
+the __LESSSHEET_VERSION__ and <PLACEHOLDER> guards already do elsewhere.
+"""
+
+import argparse
+import datetime
+import os
+import re
+import sys
+
+# The RELEASE SURFACE: files whose version literals are LINKS AND DIGESTS. Every
+# occurrence must move, and none may survive.
+#
+# Deliberately not every file mentioning a version: docs/RELEASE.md and
+# packaging/homebrew/README.md use `0.1.0` as prose examples, and rewriting
+# those would corrupt documentation to satisfy a grep.
+SURFACE = (
+    "site/index.html",
+    "packaging/flatpak/com.lesssheet.LessSheet.yaml",
+    "packaging/flatpak/com.lesssheet.LessSheet.Bundle.yaml",
+)
+
+# The metainfo is APPEND-ONLY and is handled separately. Its <release> entries
+# are a changelog: 0.1.0 must still say 0.1.0 after we ship 0.1.1. Running the
+# surface rewrite over it would rename history rather than extend it, and the
+# "no old version survives" check would then demand history be deleted.
+METAINFO = "packaging/flatpak/com.lesssheet.LessSheet.metainfo.xml"
+
+
+def die(msg):
+    print("error: " + msg, file=sys.stderr)
+    raise SystemExit(1)
+
+
+def read(repo, rel):
+    path = os.path.join(repo, rel)
+    if not os.path.isfile(path):
+        die("%s is missing — it is part of the release surface" % rel)
+    with open(path) as fh:
+        return fh.read()
+
+
+def write(repo, rel, body):
+    with open(os.path.join(repo, rel), "w") as fh:
+        fh.write(body)
+
+
+def digests(repo):
+    """filename -> (sha256, size) for everything in this build."""
+    path = os.path.join(repo, "dist", "SHA256SUMS")
+    if not os.path.isfile(path):
+        die("dist/SHA256SUMS is missing — build the artifacts before stamping")
+    out = {}
+    with open(path) as fh:
+        for line in fh:
+            parts = line.split()
+            if len(parts) != 2:
+                continue
+            sha, name = parts
+            artifact = os.path.join(repo, "dist", name)
+            size = os.path.getsize(artifact) if os.path.isfile(artifact) else None
+            out[name] = (sha, size)
+    return out
+
+
+def stamp_payloads(body, have, want, resolved):
+    """Point each `url:` at the new artifact and refresh its sha256/size.
+
+    Keyed on the url line, not on position: the two manifests order their
+    sources differently, and a positional rewrite would put the x86_64 digest on
+    the aarch64 block — a failure that appears only on the other architecture,
+    which is to say never on the machine that made the mistake.
+    """
+    lines = body.split("\n")
+    for i, line in enumerate(lines):
+        m = re.match(r"^(\s*)url:\s*(\S*/)([^/\s]+\.tar\.gz)\s*$", line)
+        if not m:
+            continue
+        indent, prefix, old_name = m.groups()
+        new_name = old_name.replace(have, want)
+        if new_name not in resolved:
+            die("a manifest names %s but it was not built (absent from "
+                "SHA256SUMS)" % new_name)
+        sha, size = resolved[new_name]
+        lines[i] = "%surl: %s%s" % (indent, prefix, new_name)
+        # Only the two lines that follow, and only if they are what we expect.
+        # Never a search-forward, which would walk into the next source block.
+        for j in (i + 1, i + 2):
+            if j >= len(lines):
+                break
+            if re.match(r"^\s*sha256:", lines[j]):
+                lines[j] = "%ssha256: %s" % (indent, sha)
+            elif re.match(r"^\s*size:", lines[j]):
+                if size is None:
+                    die("%s is in SHA256SUMS but not on disk, so its size "
+                        "cannot be stamped" % new_name)
+                lines[j] = "%ssize: %d" % (indent, size)
+    return "\n".join(lines)
+
+
+def add_release_entry(repo, want, today):
+    """Prepend a <release> to the metainfo changelog. Never rewrites history."""
+    body = read(repo, METAINFO)
+    if 'version="%s"' % want in body:
+        print("  metainfo already lists %s, left alone" % want)
+        return
+    if "<releases>" not in body:
+        die("%s has no <releases> block to extend" % METAINFO)
+    entry = ('    <release version="%s" date="%s">\n'
+             '      <description>\n'
+             '        <p>Bug fixes.</p>\n'
+             '      </description>\n'
+             '    </release>\n' % (want, today))
+    write(repo, METAINFO, body.replace("<releases>\n", "<releases>\n" + entry, 1))
+    print("  added %s to %s" % (want, METAINFO))
+
+
+def verify(repo, have, want):
+    """The point of the tool: prove the old version is gone from the surface."""
+    stale = []
+    for rel in SURFACE:
+        body = read(repo, rel)
+        for n, line in enumerate(body.split("\n"), 1):
+            if have in line:
+                stale.append("%s:%d: %s" % (rel, n, line.strip()[:90]))
+        if want not in body:
+            die("%s never mentions %s — the rewrite did not reach it" % (rel, want))
+    if stale:
+        die("the previous version %s survived in the release surface:\n  %s\n\n"
+            "     Each of these is a link or a digest that would point at the "
+            "wrong release." % (have, "\n  ".join(stale)))
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--from", dest="have", required=True, help="version being replaced")
+    ap.add_argument("--to", dest="want", required=True, help="new version")
+    ap.add_argument("--repo", default=None)
+    ap.add_argument("--check-only", action="store_true",
+                    help="verify the surface without changing anything")
+    args = ap.parse_args()
+
+    repo = args.repo or os.path.dirname(os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__))))
+    for v in (args.have, args.want):
+        if not re.match(r"^\d+\.\d+\.\d+$", v):
+            die("version must be MAJOR.MINOR.PATCH, got '%s'" % v)
+
+    if args.check_only:
+        verify(repo, args.have, args.want)
+        print("release surface clean: no %s, and %s present in all %d files"
+              % (args.have, args.want, len(SURFACE)))
+        return
+
+    if args.have == args.want:
+        die("--from and --to are both %s; nothing to stamp" % args.want)
+
+    resolved = digests(repo)
+    for rel in SURFACE:
+        body = read(repo, rel)
+        if rel.endswith(".yaml"):
+            body = stamp_payloads(body, args.have, args.want, resolved)
+        body = body.replace(args.have, args.want)
+        write(repo, rel, body)
+        print("  stamped %s" % rel)
+
+    add_release_entry(repo, args.want, datetime.date.today().isoformat())
+    verify(repo, args.have, args.want)
+    print("verified: %s appears nowhere in the release surface" % args.have)
+
+
+if __name__ == "__main__":
+    main()
