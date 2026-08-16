@@ -258,6 +258,29 @@ def resolve_version(repo, override):
     return (override or root_ver or mac_ver or "0.0.0"), warn
 
 
+# Legal text is not decoration here. The Linux tarball ships a closed-source
+# binary linked against LGPL libraries, and docs/RELEASE.md 4a makes shipping the
+# notices half of what keeps that compliant — the other half being that GTK stays
+# dynamically linked. A template placeholder reaching a user is the same class of
+# bug as a surviving Info.plist version placeholder, so it gets the same guard.
+LEGAL_FILES = ("LICENSE", "THIRD-PARTY-NOTICES.md")
+LEGAL_PLACEHOLDER = re.compile(r"<[A-Z][A-Z /]{2,}>")
+
+
+def check_legal(repo):
+    """Both legal files must exist and carry no unfilled <PLACEHOLDER>."""
+    for name in LEGAL_FILES:
+        path = os.path.join(repo, name)
+        if not os.path.isfile(path):
+            die("%s is missing at the repo root, and every artifact ships it" % name)
+        with open(path) as fh:
+            holes = sorted(set(LEGAL_PLACEHOLDER.findall(fh.read())))
+        if holes:
+            die("%s still carries unfilled placeholders: %s\n"
+                "     Fill them in before packaging. A licence template that "
+                "reaches a user is worse than no licence at all." % (name, ", ".join(holes)))
+
+
 def newest_mtime(paths, exts=None):
     newest = 0.0
     for p in paths:
@@ -434,6 +457,10 @@ def build_macos(repo, out, version, do_verify, formats, notes):
         stage = tempfile.mkdtemp(prefix="ls-dmg-")
         try:
             shutil.copytree(app, os.path.join(stage, "less-sheet.app"), symlinks=True)
+            # Also visible in the mounted volume, next to the app being dragged.
+            # The authoritative copies are inside Contents/Resources (they have
+            # to be — a dmg is not installed, only its contents are).
+            shutil.copy(os.path.join(repo, "LICENSE"), os.path.join(stage, "LICENSE.txt"))
             must(["hdiutil", "create", "-quiet", "-srcfolder", stage,
                   "-volname", "less-sheet", "-fs", "HFS+",
                   "-format", "UDZO", "-imagekey", "zlib-level=9", dpath], "hdiutil create")
@@ -746,6 +773,10 @@ def build_linux(repo, out, version, arches, do_verify, notes):
             os.chmod(ish, 0o755)
             with open(os.path.join(payload, "README.txt"), "w") as fh:
                 fh.write(README_LINUX.format(version=version, arch=arch, glibc=glibc))
+            # The LGPL half of the compliance story: GTK stays dynamically
+            # linked AND the notices travel with the binary (RELEASE.md 4a).
+            for legal in LEGAL_FILES:
+                shutil.copy(os.path.join(repo, legal), os.path.join(payload, legal))
 
             os.makedirs(out, exist_ok=True)
             tpath = os.path.join(out, "less-sheet-%s-linux-%s.tar.gz" % (version, arch))
@@ -906,6 +937,7 @@ def main():
     args = ap.parse_args()
 
     repo = find_repo()
+    check_legal(repo)
     zig = check_zig()
     out = args.out or os.path.join(repo, "dist")
     version, vwarn = resolve_version(repo, args.version)

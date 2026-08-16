@@ -58,6 +58,18 @@ for res in "$bin_dir"/*.bundle; do
     [ -e "$res" ] && cp -R "$res" "$app/Contents/MacOS/" || true
 done
 
+# 4b) Legal text goes INSIDE the bundle, not beside it. A file sitting next to
+#     the .app in a zip or a dmg is gone the moment the user drags the app out,
+#     whereas Contents/Resources survives every distribution shape and the
+#     install itself. THIRD-PARTY-NOTICES.md says in its own first paragraph
+#     that it must ship with the application.
+#     This must happen BEFORE the seal in step 5 — see the warning there.
+for legal in LICENSE THIRD-PARTY-NOTICES.md; do
+    src="$macos_dir/../../$legal"
+    [ -f "$src" ] || { echo "assemble-app: $legal is missing at the repo root, and the bundle ships it" >&2; exit 1; }
+    cp "$src" "$app/Contents/Resources/$legal"
+done
+
 # 5) SEAL THE BUNDLE. This must be the LAST step: codesign hashes the bundle's
 # contents into Contents/_CodeSignature/CodeResources, so ANY write into the
 # bundle after this point (copying a resource, touching Info.plist, an editor
