@@ -508,7 +508,9 @@ brew install --cask less-sheet</code></pre>
           <div class="fn"><b>First launch needs one extra step.</b>
             This build is signed, but not notarized through Apple’s paid
             programme, so macOS refuses the first launch of anything it treats
-            as downloaded — the .dmg and the Homebrew install both. Open
+            as downloaded — the .dmg and the Homebrew install both. The dialog
+            claims Apple could not verify the app, and its highlighted button is
+            <b>Move to Trash</b> — press <b>Done</b> instead. Then open
             <span class="path">System Settings → Privacy &amp; Security</span>,
             find less-sheet near the bottom, and press <b>Open Anyway</b>.
             The <span class="path">curl</span> line is the exception: nothing
