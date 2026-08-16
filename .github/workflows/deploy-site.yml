@@ -1,0 +1,29 @@
+name: Deploy Landing Page to Public Site Repo
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - 'site/**' # Only runs when files inside the site/ directory change
+      - '.github/workflows/deploy-site.yml'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout private repository
+        uses: actions/checkout@v4
+
+      - name: Push site/ directory to public repository
+        uses: cpina/github-action-push-to-another-repository@main
+        env:
+          API_TOKEN_GITHUB: ${{ secrets.SITE_DEPLOY_TOKEN }}
+        with:
+          source-directory: 'site'
+          destination-github-username: 'te-x'
+          destination-repository-name: 'less-sheet-site'
+          user-email: 'te-x@users.noreply.github.com' # Replace with your GitHub commit email
+          target-branch: 'main'
+          commit-message: 'Update landing page from te-x/less-sheet@master'
