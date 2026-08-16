@@ -14,7 +14,11 @@ cask "less-sheet" do
   # Apple silicon only, and the app genuinely refuses to start below its floor
   # rather than starting and misbehaving, so these are real constraints.
   depends_on arch: :arm64
-  depends_on macos: ">= :tahoe" # macOS 26
+  # macOS 26. A bare symbol, NOT ">= :tahoe": the string-comparison form is
+  # deprecated and warns on every `brew tap`. It still means "or newer" —
+  # Homebrew parses this argument with comparator ">=" by default
+  # (Library/Homebrew/cask/dsl/depends_on.rb), so the floor is unchanged.
+  depends_on macos: :tahoe
 
   app "less-sheet.app"
 
