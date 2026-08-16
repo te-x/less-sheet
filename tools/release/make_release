@@ -682,10 +682,22 @@ def build_linux(repo, out, version, arches, do_verify, notes):
             stage = os.path.join(work, "src")
             os.makedirs(os.path.join(stage, ".core-linux", "lib"))
             gtk = os.path.join(repo, "apps", "gtk")
-            shutil.copy(os.path.join(gtk, "meson.build"), stage)
             for sub in ("include", "src", "data", "tests"):
                 shutil.copytree(os.path.join(gtk, sub), os.path.join(stage, sub),
                                 symlinks=False)
+            # Every TOP-LEVEL FILE, not a hand-listed pair. This staged only
+            # meson.build, so when `apps/gtk/VERSION` appeared — a symlink to the
+            # root VERSION, which meson reads as `project(version : files(...))`
+            # — the release build died at configure time with "File VERSION does
+            # not exist", while the gate stayed green because it builds in place
+            # where the symlink resolves. A copy that takes a SUBSET of a
+            # directory silently breaks the next file added to it; taking all of
+            # them cannot. shutil.copy follows symlinks, so VERSION arrives as
+            # content and does not need the tree above it.
+            for entry in sorted(os.listdir(gtk)):
+                src = os.path.join(gtk, entry)
+                if os.path.isfile(src):
+                    shutil.copy(src, os.path.join(stage, entry))
             shutil.copy(core_a, os.path.join(stage, ".core-linux", "lib"))
 
             # Pre-flight: the core archive must not leave compiler-rt helpers
