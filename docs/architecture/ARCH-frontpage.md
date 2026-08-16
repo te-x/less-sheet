@@ -8,6 +8,43 @@ Supersedes the 2026-07-15 landing page (`0354be9`) in place — same file, same 
 
 ---
 
+## Amendment — 2026-08-16 (publication decision; the author sign-off)
+
+the author decided on 2026-08-16 to publish, and the repositories now exist. The §1 non-goal
+**"Never publish this workspace"** is amended in place: it barred the git remote that publishing
+requires, and a signed document forbidding what the project is now doing is precisely what sends
+future roles to re-open a settled decision. Affected passages carry an *(amended 2026-08-16)* tag.
+
+**Now permitted.** One `origin` remote on this workspace, pointing at a **private** source
+repository. Publishing release artifacts and the built landing page to **public** repositories.
+
+**Still forbidden, unchanged and without exception.** Source of any kind — `backend/`, `apps/`,
+`api/`, `.aidev/`, `review/`, `docs/` — reaching a public repository. A leaked push is
+irreversible: GitHub retains forks and caches. Adding, retargeting or force-pushing a remote
+remains the author's action alone; no role does it.
+
+**The shape as built, which this records rather than proposes:**
+
+| repository | visibility | contents |
+| --- | --- | --- |
+| `te-x/less-sheet` | **private** | the workspace: source, `.aidev/`, `review/`, `docs/`, `site/` |
+| the site repo (target of `deploy-site.yml`) | public | the built landing page only; Pages serves it |
+| `homebrew-tap` | public | the cask — not yet created |
+
+The separation is enforced by machinery, not discipline: `.github/workflows/deploy-site.yml` runs
+on push to `master` and copies `site/` into the public site repo via
+`cpina/github-action-push-to-another-repository`, so **the page publishes without the source repo
+ever being public**. `master` is the sole branch and the default; `main` was deleted 2026-08-16.
+
+**Verified 2026-08-16: `te-x/less-sheet` is Private** (confirmed by the author). This is the check
+that matters — a public source repo is the exact irreversible failure this non-goal was written
+to prevent — and it must be re-confirmed before that repository's visibility is ever changed.
+Treat flipping it as a decision, not a setting.
+
+**Consequence for §9.1:** step (a) of its ordered list is done.
+
+---
+
 ## 1. Problem & scope
 
 The landing page is wrong in ways that precede taste: it names one platform when the product has
@@ -44,12 +81,14 @@ Scope: a full redesign of `site/index.html` and its screenshot assets, per the a
   Parquet (prioritised but not built), or accessibility (the GTK screen-reader pass is recorded
   as unverified). The page itself is still *built* accessibly (alt text, focus, contrast) — we
   simply claim nothing about the app.
-- **Never publish this workspace.** Hosting (§9.1) forces a public repo, and the code is closed:
-  the public repo carries ONLY the site, the release assets, and the issue tracker — never
-  source. This workspace has **no git remote today, and no role may add one or push it anywhere
-  public** — a leaked push is irreversible (GitHub retains forks and caches) and is the
-  highest-consequence action this feature could trigger. Creating the public repo, enabling
-  Pages, and pushing are the author's actions alone.
+- **Never publish SOURCE.** *(amended 2026-08-16 — see the Amendment above. This bullet
+  originally read "Never publish this workspace" and barred any remote at all.)* Hosting (§9.1)
+  forces a public repo, and the code is closed: the public repos carry ONLY the site, the release
+  assets, and the issue tracker — never source. This workspace may carry one `origin` pointing at
+  a **private** repo; **no role may add, retarget or force-push it, and no source may reach a
+  public repo** — a leaked push is irreversible (GitHub retains forks and caches) and is the
+  highest-consequence action this feature could trigger. Creating repositories, enabling Pages,
+  and pushing are the author's actions alone.
 
 ---
 
@@ -453,7 +492,7 @@ Each verifiable on the built page with grep, a browser, and devtools — no judg
 1. **Hosting and deploy** — **resolved (the author, 2026-07-30): GitHub Releases + GitHub Pages.**
    Releases provides stable, interstitial-free direct-download URLs and hosts `SHA256SUMS` as an
    asset; Pages serves the page from a public **site-only** repo — closed source stands, see the
-   §1 non-goal barring any public remote on this workspace. AC-8 clarification stands: download
+   §1 non-goal barring any source in a public repo *(amended 2026-08-16)*. AC-8 stands: download
    links are user-initiated navigations; the release origin does not count against the
    zero-third-party *resource* budget. **What publication still needs, in order:** (a) the author
    creates the public repo and enables Pages — his actions alone; (b) the release is uploaded
