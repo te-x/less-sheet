@@ -118,7 +118,7 @@ struct AmendmentContractGuardTests {
         // rebuild (no external ABI consumer). Updated through the change-authority
         // process. See docs/architecture/ARCH-security-hardening.md.
         expectEmptyDiff("api/lesssheet.h",
-                        baseline: "b949b3dc8166c977c40ce451a37436ae057bf3e6b392f19704abf2c1c5c54805")
+                        baseline: "8cbf6e020116635295c022a673186271e84d90dd6844be34769f54218fde0de9")
     }
 
     // AC23 — the public Swift search/layout contracts are byte-identical:
