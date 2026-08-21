@@ -6,7 +6,7 @@
 // cell with no step), a full page/document/line command set over the ONE shared
 // selection, minimal-reveal auto-scroll, keyboard-only single-cell copy, and an
 // Esc that clears the selection as its lowest-priority step. VoiceOver /
-// NSAccessibility is explicitly OUT of scope (the author-deferred).
+// NSAccessibility is explicitly OUT of scope (author-deferred).
 //
 // It pins the DETERMINISTIC, no-GUI heart the frontend (SheetTableView key
 // routing + NativeGridController clip scroll + SheetRowView outline paint, App

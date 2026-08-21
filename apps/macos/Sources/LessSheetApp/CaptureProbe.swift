@@ -72,7 +72,7 @@ enum CaptureProbe {
     /// Why it exists: landing DISMISSES the jump field, so a jump shot driven by
     /// `LESSSHEET_JUMP` alone photographs a grid parked at row 1500 with no
     /// control visible — a picture indistinguishable from the hero, which is
-    /// exactly what shipped in the first macOS set. the author caught it by looking.
+    /// exactly what shipped in the first macOS set. The author caught it by looking.
     /// Re-requesting focus reopens the field on the landed rows, the same state a
     /// user sees when they press ⌘J again, and the same workaround the GTK side
     /// already uses (Ctrl+G after the landing).

@@ -1,116 +1,21 @@
-less-sheet — End User License Agreement
-Version 1.0 · 2026-08-16
+MIT License
 
-This is an agreement between you and te-x ("we", "us"), covering the less-sheet
-application and everything distributed with it (the "Software").
+Copyright (c) 2026 te-x
 
-By installing or using the Software you accept this Agreement. If you do not
-accept it, do not install or use the Software and delete any copy you hold.
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
 
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
 
-1. LICENSE GRANTED
-
-We grant you a free of charge, worldwide, non-exclusive, non-transferable
-license to install and use the Software on any number of devices you own or
-control, for any purpose, including commercial use. No fee is payable, now or
-later, for the version you have.
-
-
-2. OWNERSHIP
-
-The Software is licensed, not sold. We retain all right, title and interest in
-it, including all intellectual property rights. The source code is not provided
-and no rights in it are granted. All rights not expressly granted here are
-reserved.
-
-
-3. WHAT YOU MAY NOT DO
-
-  (a) Sell, rent, lease, sublicense or otherwise charge anyone for the Software
-      or for access to it.
-  (b) Redistribute or rehost the installers or binaries. Link to the official
-      download page instead, so that people receive current, verified builds.
-  (c) Modify, adapt, translate, or create derivative works of the Software.
-  (d) Reverse engineer, decompile or disassemble the Software, or attempt to
-      derive its source code — EXCEPT to the extent that this restriction is
-      prohibited by applicable law, including any statutory right you may have
-      to decompile for interoperability. Where the law gives you such a right,
-      it prevails over this clause.
-  (e) Remove or alter any notice in the Software, including the
-      THIRD-PARTY-NOTICES file.
-  (f) Use the Software in breach of applicable law.
-
-
-4. THIRD-PARTY COMPONENTS
-
-The Software includes third-party components listed in the accompanying
-THIRD-PARTY-NOTICES file. Some are licensed under open source licenses,
-including the GNU Lesser General Public License.
-
-Those components are governed by their own licenses, not by this one. Where
-their terms grant you rights that this Agreement would otherwise restrict,
-THEIR TERMS PREVAIL for those components. In particular, nothing in Section 3
-restricts any right granted to you by the LGPL, including the right to reverse
-engineer for debugging your own modifications, and the right to modify and
-relink the covered libraries. On Linux those libraries are linked dynamically
-and are not bundled, precisely so that this right is real.
-
-
-5. YOUR DATA
-
-The Software runs entirely on your device. It does not transmit the files you
-open, does not collect usage data or telemetry, contains no analytics, makes no
-automatic update check, and does not contact us. The only network access it
-makes is to a URL you explicitly ask it to open.
-
-
-6. NO WARRANTY
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND. To the maximum
-extent permitted by law we disclaim all warranties, express or implied,
-including any implied warranties of merchantability, fitness for a particular
-purpose, and non-infringement. We do not warrant that the Software will be
-uninterrupted, error-free, or that it will read every file correctly.
-
-The Software is a viewer and does not modify the files you open, but you remain
-responsible for keeping backups of your data.
-
-Some jurisdictions do not allow the exclusion of implied warranties or the
-limitation of statutory consumer rights. Nothing here affects any mandatory
-right you have as a consumer.
-
-
-7. LIMITATION OF LIABILITY
-
-To the maximum extent permitted by law, we are not liable for any indirect,
-incidental, special, consequential or exemplary damages, or for any loss of
-profits, data, or business interruption, arising out of or relating to the
-Software, even if advised of the possibility.
-
-To the maximum extent permitted by law, our total aggregate liability arising
-out of or relating to the Software is limited to the amount you paid for it,
-which — the Software being free — is nothing.
-
-Nothing in this Agreement excludes or limits liability for death or personal
-injury caused by negligence, for fraud or fraudulent misrepresentation, or for
-any other liability that cannot lawfully be excluded.
-
-
-8. TERM AND TERMINATION
-
-This Agreement applies until terminated. It terminates automatically if you
-breach it. On termination you must stop using the Software and delete all
-copies. Sections 2, 3, 6 and 7 survive termination.
-
-
-9. THE WHOLE AGREEMENT
-
-This is the entire agreement between us regarding the Software and replaces any
-earlier understanding. If any provision is held unenforceable, the rest remains
-in force. A future release may ship an updated Agreement; the version
-accompanying a given release governs that release.
-
-
-10. CONTACT
-
-https://github.com/te-x
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

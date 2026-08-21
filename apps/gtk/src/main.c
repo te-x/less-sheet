@@ -3537,7 +3537,7 @@ install_jump_css (void)
  * The jump-to-row button glyph — a Cairo replication of the macOS
  * `JumpArrowGlyph` (OverlayView.swift): two small circles (a "here" and a
  * "there") joined by a right-bulging circular arc that arrows south-west into
- * the lower circle. the author finds this clearer than the stock
+ * the lower circle. The author finds this clearer than the stock
  * `go-jump-symbolic`. Design bbox x[19,56] y[7,93], mapped/centred into the
  * drawing area; the fixed-geometry angles and unit vectors are hardcoded so
  * the app needs no libm. Tinted with the widget's current foreground color

@@ -13,7 +13,7 @@ cc = meson.get_compiler('c')
 
 # GNOME stack. Minimum versions are the ARCH decision-7 floor — bumped
 # GTK 4.16 -> 4.20 / libadwaita 1.6 -> 1.8 by the gtk-a11y slice (ARCH-gtk-a11y
-# decision 1, the author-signed 2026-07-21): AdwShortcutsDialog (the native,
+# decision 1, author-signed 2026-07-21): AdwShortcutsDialog (the native,
 # non-deprecated shortcuts surface) needs libadwaita 1.8, whose GNOME-49-cycle
 # GTK is 4.20; both also carry the AdwStyleManager accent-color API and
 # gtk_accessible_announce. include_type:'system' emits -isystem for these

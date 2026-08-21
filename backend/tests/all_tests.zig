@@ -9030,7 +9030,7 @@ test "net_bug_jump_progress_evolves: a beyond-EOF net jump-scan reports byte-fro
 }
 
 test "net_open_head_small: a network open fetches AND indexes only the ~256 KiB net head, not the 4 MiB local budget (perf lock)" {
-    // the author's net-only perf decision: the network open head shrank 4 MiB -> 256 KiB
+    // The author's net-only perf decision: the network open head shrank 4 MiB -> 256 KiB
     // so a slow-link open (FETCH + INDEX) is ~4x faster ("row estimation is secondary
     // to speed"). This pins BOTH costs to the small head, for BOTH fill strategies.
     //

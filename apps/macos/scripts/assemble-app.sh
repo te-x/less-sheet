@@ -80,7 +80,7 @@ done
 # resources" while Contents/_CodeSignature did not exist, so macOS refused to
 # launch it and told the user the app was "damaged and can't be opened - move it
 # to the Trash". The app was never damaged; the bundle was just unsealed. This
-# bit the author on his own installed app (2026-08-05), and `syspolicy_check
+# bit the author on their own installed app (2026-08-05), and `syspolicy_check
 # distribution` grades the unsealed bundle a FATAL error:
 #   "Code has no resources but signature indicates they must be present."
 # Ad-hoc signing (identity "-") needs no certificate, no Apple account and no

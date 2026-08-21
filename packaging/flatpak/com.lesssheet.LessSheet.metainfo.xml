@@ -6,7 +6,7 @@
        two stated separately, and LicenseRef-proprietary is the SPDX-sanctioned
        way to say "not an open source licence" without inventing an id. -->
   <metadata_license>CC0-1.0</metadata_license>
-  <project_license>LicenseRef-proprietary</project_license>
+  <project_license>MIT</project_license>
 
   <name>less-sheet</name>
   <summary>Open huge CSV files instantly</summary>
