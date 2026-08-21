@@ -48,12 +48,12 @@
  * OUT (later slices, NOT frozen here): filter-to-matches (`ls_filter_*`),
  * streaming copy, Settings/column-config, dialect override, the deferred
  * "Where" predicate widget. The jump ENTRY widget and the progress UI are
- * display-dependent (the author's GUI pass) — but every signature the implementer
- * wires into main.c is frozen here, and every non-drawing decision (parse,
- * run/reject, progress fold, land/cancel) is unit-pinned under g_test. The
- * poll loop keeps ticking while the flow is `LSG_JUMP_FLOW_SCANNING`, ORed at
- * the widget with the frozen `lsg_window_poll_decide` (which this slice does
- * NOT modify).
+ * display-dependent (the author's GUI pass) — but every signature the
+ * implementer wires into main.c is frozen here, and every non-drawing decision
+ * (parse, run/reject, progress fold, land/cancel) is unit-pinned under g_test.
+ * The poll loop keeps ticking while the flow is `LSG_JUMP_FLOW_SCANNING`, ORed
+ * at the widget with the frozen `lsg_window_poll_decide` (which this slice
+ * does NOT modify).
  *
  * Contract role (frozen; the prototypes/structs ARE the signatures — compiled
  * with -Werror so any drift against a stub/caller fails compilation). Symbols

@@ -289,8 +289,9 @@ typedef struct
       *copy_op;       /* shared worker state (defined in the copy section) */
   guint copy_poll_id; /* main-thread progress/completion poll */
 
-  /* Reusable header-bar progress widget (the author's unified title-bar progress:
-   * determinate bar + inline cancel; other long ops can drive it later). */
+  /* Reusable header-bar progress widget (the author's unified title-bar
+   * progress: determinate bar + inline cancel; other long ops can drive it
+   * later). */
   GtkWidget *hp_box;
   GtkProgressBar *hp_bar;
   GtkButton *hp_cancel;

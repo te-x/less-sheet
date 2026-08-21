@@ -60,8 +60,8 @@
  * drive/outcome view-model and the core-backed job bridge, DISPLAY-AGNOSTIC.
  * OUT (main.c, NOT frozen here): the grid SELECTION marquee that produces the
  * rectangle; the clipboard hand-off (GdkClipboard) of the accumulated payload;
- * the PROGRESS DISPLAY location — the author's unified header/title-bar progress +
- * inline cancel — and the worker THREAD itself and its bounded
+ * the PROGRESS DISPLAY location — the author's unified header/title-bar
+ * progress + inline cancel — and the worker THREAD itself and its bounded
  * frontier-advance wait (the macOS `frontierPoll*` tunables live in the App
  * layer, un-frozen). Every signature the implementer wires into the worker is
  * frozen here; every non-drawing decision (fold, budget cut, cell-cap map,

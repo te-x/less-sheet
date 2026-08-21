@@ -22,8 +22,8 @@
  * The rendering that stays display/AT-dependent (key-event routing, the Cairo
  * accent outline, `gtk_accessible_announce`, the widget role/label wiring, the
  * AdwShortcutsDialog) lives in src/main.c and is verified by the container
- * smoke render + the author's human GNOME/Orca pass (ARCH-gtk-a11y H-A1..H-A5) —
- * NOT by this module. This header is the contract those call sites honor.
+ * smoke render + the author's human GNOME/Orca pass (ARCH-gtk-a11y H-A1..H-A5)
+ * — NOT by this module. This header is the contract those call sites honor.
  */
 #ifndef LSG_A11Y_H
 #define LSG_A11Y_H

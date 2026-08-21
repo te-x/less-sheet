@@ -30,8 +30,8 @@
  * notices, and the visible-window match-flag highlight mask. OUT (later
  * slices, NOT frozen here): jump-to-row, filter-to-matches (`ls_filter_*`),
  * streaming copy, Settings/column-config, dialect override. The find POPOVER
- * widget and the grid's highlight DRAWING are display-dependent (the author's GUI
- * pass) — but every signature the implementer wires into main.c is frozen
+ * widget and the grid's highlight DRAWING are display-dependent (the author's
+ * GUI pass) — but every signature the implementer wires into main.c is frozen
  * here, and every non-drawing decision (compose, count, nav, wrap, the
  * highlight MASK values) is unit-pinned under `g_test`.
  *
