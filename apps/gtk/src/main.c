@@ -240,9 +240,9 @@ typedef struct
   GtkDropDown *where_op;     /* operator glyph picker (= != < > <= >=) */
   GtkEditable *where_value;  /* the predicate value field */
   guint where_reject_id;     /* timeout clearing the value reject blink */
-  gboolean
-      where_columns_dirty; /* the column model needs a rebuild (new doc) */
-  gboolean where_ui_guard; /* suppress re-run on programmatic model swaps */
+  gboolean where_columns_dirty; /* the column model needs a rebuild */
+  guint32 where_columns_n;      /* column count the model was built for */
+  gboolean where_ui_guard;      /* suppress re-run on programmatic swaps */
 
   /* "Match case" checkbox: the ONE session-scoped case flag SHARED by both the
    * Text and Where modes (default OFF = ASCII case-insensitive). Read into
@@ -2809,6 +2809,12 @@ where_ensure_columns (App *app)
     return;
   app->where_columns_dirty = FALSE;
 
+  /* A rebuild for the SAME column set (a visibility change only re-tags the
+   * labels) keeps the user's chosen column; a document of a different shape
+   * starts over at the first one. */
+  guint keep = gtk_drop_down_get_selected (app->where_column);
+  gboolean same_shape = (app->where_columns_n == app->n_cols);
+
   GtkStringList *list = gtk_string_list_new (NULL);
   guint n = 0;
   LsgColumnLabel *labels = capture_all_labels (app, &n);
@@ -2839,11 +2845,14 @@ where_ensure_columns (App *app)
    * it does not spuriously re-run mid-rebuild. */
   app->where_ui_guard = TRUE;
   gtk_drop_down_set_model (app->where_column, G_LIST_MODEL (list));
-  guint sel = gtk_drop_down_get_selected (app->where_column);
-  if (app->n_cols > 0
-      && (sel == GTK_INVALID_LIST_POSITION || sel >= app->n_cols))
-    gtk_drop_down_set_selected (app->where_column, 0);
+  if (app->n_cols > 0)
+    {
+      gboolean usable = same_shape && keep != GTK_INVALID_LIST_POSITION
+                        && keep < app->n_cols;
+      gtk_drop_down_set_selected (app->where_column, usable ? keep : 0);
+    }
   app->where_ui_guard = FALSE;
+  app->where_columns_n = app->n_cols;
   g_object_unref (list);
 }
 
@@ -5853,6 +5862,9 @@ set_column_hidden (App *app, guint32 col, gboolean hidden)
       || col >= app->n_cols)
     return;
   app->col_settings[col].hidden = hidden;
+  /* The Where picker tags hidden columns "(hidden)", so its labels are now
+   * stale; the rebuild keeps the current selection. */
+  app->where_columns_dirty = TRUE;
   if (hidden)
     app->col_widths[col] = 0.0;
   else if (app->col_settings[col].has_manual_width)
@@ -6484,10 +6496,9 @@ columns_group_rebuild (App *app)
   LsgColumnDiscoveryMode mode = lsg_column_discovery_mode (app->n_cols);
   const char *status = NULL;
 
-  if (mode == LSG_COLUMN_DISCOVERY_SEARCH_ONLY)
-    gtk_widget_set_visible (app->prefs_columns_search, TRUE);
-  else
-    gtk_widget_set_visible (app->prefs_columns_search, FALSE);
+  if (app->prefs_columns_search != NULL)
+    gtk_widget_set_visible (app->prefs_columns_search,
+                            mode == LSG_COLUMN_DISCOVERY_SEARCH_ONLY);
 
   if (mode == LSG_COLUMN_DISCOVERY_EMPTY)
     {
