@@ -1,18 +1,15 @@
 /*
- * lsg_column.c — the COLUMN CONFIGURATION feature (lsg_column.h). Two layers,
- * mirroring the established GTK split (as in lsg_find.c / lsg_filter.c):
+ * lsg_column.c — column configuration, in two layers:
  *
- *   1. A PURE, display-free column VIEW-MODEL — discovery routing, `#N` /
- *      label-substring resolution (with the generic-name fallback) under a
- *      bounded retain+overflow accumulation, and the replay-vs-reset re-open
- *      decision. NEVER touches the core or a widget.
+ *   1. A pure view-model: discovery routing, `#N` and label-substring
+ *      resolution (with the generic-name fallback) under a bounded
+ *      retain-plus-overflow accumulation, and the replay-vs-reset decision a
+ *      re-open needs. Touches neither core nor widget.
  *
- *   2. The COLUMN CORE BRIDGE — the SINGLE place this frontend calls
- *      `ls_column_*`. It reaches the core handle through the non-frozen
- *      `struct _LsgDocument` seam (lsg_document_internal.h), exactly like the
- *      find / filter bridges, and marshals the two-pass variable-length copies
- *      (labels / sentinel / conflict example) into OWNED buffers, copying
- * every borrowed byte out immediately.
+ *   2. The column bridge — the SINGLE place this frontend calls `ls_column_*`.
+ *      It marshals the ABI's two-pass variable-length copies (labels, null
+ *      sentinel, conflict example) into OWNED buffers, copying every borrowed
+ *      byte out immediately.
  */
 #include "lsg_document_internal.h"
 #include <lsg_column.h>
@@ -23,7 +20,7 @@
 /* PURE VIEW-MODEL                                                           */
 /* ========================================================================= */
 
-/* ---- Discovery mode (F9) ------------------------------------------------ */
+/* ---- Discovery mode ----------------------------------------------------- */
 
 LsgColumnDiscoveryMode
 lsg_column_discovery_mode (guint32 column_count)
@@ -35,7 +32,7 @@ lsg_column_discovery_mode (guint32 column_count)
   return LSG_COLUMN_DISCOVERY_SEARCH_ONLY;
 }
 
-/* ---- `#N` direct address (F10) ------------------------------------------ */
+/* ---- `#N` direct address ------------------------------------------------ */
 
 LsgColumnDirectAddress
 lsg_column_resolve_direct_address (const char *query, guint32 column_count)
@@ -83,7 +80,7 @@ lsg_column_resolve_direct_address (const char *query, guint32 column_count)
   return out;
 }
 
-/* ---- Generic column names + label search (F10) -------------------------- */
+/* ---- Generic column names + label search -------------------------------- */
 
 char *
 lsg_column_generic_name (guint32 index)
@@ -175,7 +172,7 @@ lsg_column_match_accumulate (LsgColumnMatchAccumulation acc, const char *query,
   return acc;
 }
 
-/* ---- Per-session column settings + the re-open decision (F7) ------------ */
+/* ---- Per-session column settings + the re-open decision ----------------- */
 
 LsgColumnUserSettings
 lsg_column_user_settings_default (void)

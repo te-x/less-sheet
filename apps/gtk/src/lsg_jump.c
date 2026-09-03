@@ -1,25 +1,16 @@
 /*
- * lsg_jump.c — the GTK frontend's JUMP-TO-ROW feature (lsg_jump.h). Slice 3.
- * Two layers, mirroring the macOS split:
+ * lsg_jump.c — jump-to-row, in two layers:
  *
- *   1. The PURE jump view-model — a C port of the macOS `JumpControl`
- *      (ViewerLogic.swift) TOGETHER WITH the two reject decisions macOS keeps
- * in its app layer (`ViewerModel.submitJump` upfront out-of-range reject +
- *      `foldJump` after-scan short-land reject), lifted here so the grid's
- * jump behavior is gate-verifiable headlessly. A plain-value state machine
- * that NEVER touches the core: parse + validate the entered 1-based row,
- * decide run-vs-reject, fold the core jump-scan poll into a monotone progress
- *      display, and decide land / cancel-restore / reject.
+ *   1. A pure state machine that NEVER touches the core: parse and validate
+ *      the entered 1-based row, decide run-vs-reject, fold the core's
+ *      jump-scan poll into a monotone progress display, and decide
+ *      land / cancel-restore / reject.
  *
- *   2. The JUMP BRIDGE — a C port of the `CoreDocumentSession` jump methods
- *      (`startJump` / `cancelJump` / `jumpStatus`): the single place this
- *      frontend calls `ls_jump_start` / `ls_jump_cancel` / `ls_jump_poll`. It
- *      reaches the core handle through the non-frozen `struct _LsgDocument`
- * seam (Slice 2). Jump is poll/control-lane — lockless (the core is internally
- *      synchronized), exactly like the search bridge.
+ *   2. The jump bridge — the single place this frontend calls `ls_jump_*`,
+ *      reaching the core handle through the private `struct _LsgDocument`
+ *      seam. Lockless, like the search bridge: the core synchronizes it.
  *
- * The FRONTIER is the core's: the frontend owns no scanner — it starts/cancels
- * the core jump, polls its status, and drives the presentation.
+ * The FRONTIER is the core's: the frontend owns no scanner.
  */
 #include "lsg_document_internal.h"
 #include <lsg_jump.h>
@@ -27,7 +18,7 @@
 #include <lesssheet.h>
 
 /* ------------------------------------------------------------------------- */
-/* Pure view-model (port of JumpControl + the app-layer reject rules) */
+/* Pure view-model */
 /* ------------------------------------------------------------------------- */
 
 LsgJumpFlow
@@ -121,12 +112,11 @@ lsg_jump_resolve (LsgJumpFlow flow, LsgJumpStatus status, gboolean filtered)
     {
       guint64 r = status.landed_row;
 
-      /* UNFILTERED short land: the scan clamped past EOF (landed < target) —
-       * the target was past the last data row. Reject + re-anchor rather than
-       * land on the clamp (the after-scan out-of-range reject). Suppressed
-       * while filtered: `r` is a FILTERED index and `flow.target` an ORIGINAL
-       * row (not comparable) — a filtered jump lands (clamped to the last
-       * match). */
+      /* UNFILTERED short land: the scan clamped at EOF, so the target was past
+       * the last data row — reject and re-anchor rather than land on the
+       * clamp. Suppressed while filtered, where `r` is a FILTERED index and
+       * `flow.target` an ORIGINAL row: the two are not comparable, and a
+       * filtered jump lands on the last match instead. */
       if (!filtered && r < flow.target)
         {
           LsgJumpFlow rej = { 0 };
@@ -160,7 +150,7 @@ lsg_jump_cancel (LsgJumpFlow flow)
 }
 
 /* ------------------------------------------------------------------------- */
-/* Jump bridge (port of CoreDocumentSession jump methods) */
+/* Jump bridge */
 /* ------------------------------------------------------------------------- */
 
 void

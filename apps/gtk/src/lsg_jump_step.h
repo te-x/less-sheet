@@ -1,31 +1,22 @@
 /*
- * lsg_jump_step.h — PRIVATE (non-frozen) pure logic for ARROW-KEY STEPPING of
- * the jump field's row number, inside src/ (same role as
- * lsg_document_internal.h: an implementation-path seam, not part of the
- * contract).
+ * lsg_jump_step.h — private, pure logic for ARROW-KEY STEPPING of the jump
+ * field's row number.
  *
- * WHAT IT IS. With the jump field open, Up/Down step the 1-based row number in
- * the entry WITHOUT jumping (no scan, no landing, no viewport change — Enter
- * still submits, exactly as before). The DIRECTION IS INVERTED relative to a
- * stock stepper, deliberately (the author): the grid's row numbers GROW downward,
- * so "Down" means further DOWN the document (a HIGHER row number) and "Up"
- * means back toward row 1. This is the macOS frontend's behavior too and the
- * two must not drift.
+ * With the jump field open, Up/Down step the 1-based row number in the entry
+ * WITHOUT jumping: no scan, no landing, no viewport change — Enter still
+ * submits. The DIRECTION IS INVERTED relative to a stock stepper, on purpose:
+ * the grid's row numbers GROW downward, so "Down" means further down the
+ * document (a HIGHER number) and "Up" means back toward row 1. The macOS
+ * frontend behaves the same way and the two must not drift.
  *
- * WHY A HEADER AND NOT STATICS IN main.c. The whole decision — which key steps
- * which way, the wrap at both ends, the estimate fallback, the seed for an
- * empty field — is pure arithmetic over an entered string, so it is kept
- * display-free and exercisable on its own (the component's g_test suite lives
- * behind the frozen contract in include/ + tests/; this is the same shape
- * those modules have, ready to be promoted there when the contract next
- * opens). All `static inline`: each including TU gets its own copy and an
- * unused TU draws no warning.
+ * It is a header of `static inline` functions rather than statics in main.c so
+ * the whole decision — which key steps which way, the wrap at both ends, the
+ * estimate fallback, the seed for an empty field — stays display-free and
+ * exercisable on its own.
  *
- * ONE PARSER. The field's accepted syntax is NOT re-implemented here: the
- * stepper parses with the frozen `lsg_jump_parse` (digits only, 1-based, no
- * zero, no overflow) — the very function Enter/`lsg_jump_submit` uses — so
- * what counts as "a number in the field" can never drift between stepping and
- * submitting.
+ * ONE PARSER: the field's syntax is not re-implemented here. The stepper
+ * parses with `lsg_jump_parse`, the very function Enter uses, so "a number in
+ * the field" can never mean two different things.
  */
 #ifndef LSG_JUMP_STEP_H
 #define LSG_JUMP_STEP_H
@@ -75,32 +66,28 @@ lsg_jump_step_dir_for_keyval (guint keyval)
 /* ------------------------------------------------------------------------- */
 
 /*
- * A held arrow repeats at the DESKTOP's key-repeat rate (measured ~12.5/s
- * here, ~11/s on the author's Mac, and user-configurable on both), so a fixed step
- * of 1 makes holding useless past a nudge: row 1,000,000 would take a day.
- * Holding therefore ACCELERATES, on the ramp the author specified:
+ * A held arrow repeats at the DESKTOP's key-repeat rate (~12/s, and
+ * user-configurable), so a fixed step of 1 makes holding useless past a nudge.
+ * Holding therefore accelerates:
  *
  *   held < 1 s -> 1     held < 2 s -> 10     held < 3 s -> 100     else 1000
  *
- * KEYED OFF ELAPSED TIME, NOT OFF A REPEAT COUNT. The rungs are wall-clock
- * seconds since the FIRST press of the current hold, so the acceleration is
- * identical on GTK and macOS and under any repeat-rate setting; a count-based
- * ramp would accelerate at different rows per platform and per user.
+ * KEYED OFF ELAPSED TIME, NOT A REPEAT COUNT. The rungs are wall-clock seconds
+ * since the first press of the current hold, so the acceleration is identical
+ * on GTK and macOS and under any repeat-rate setting; a count-based ramp would
+ * accelerate at different rows per platform and per user.
  *
- * THE RAMP MUST GO COLD AGAIN, and it is defended THREE independent ways,
- * because a ramp left hot would turn the user's next single tap into a
- * 1000-row jump — the worst thing this feature could do:
+ * THE RAMP MUST GO COLD AGAIN — a ramp left hot turns the next single tap into
+ * a 1000-row jump — and three independent things make it:
  *
- *   1. KEY RELEASE resets it (the key controller reports releases).
+ *   1. A KEY RELEASE resets it.
  *   2. A GAP longer than `LSG_JUMP_STEP_RAMP_GAP_US` since the last step
- *      resets it, so a SWALLOWED OR MISSED RELEASE cannot leave it armed.
- *      The gap sits well above one repeat interval (300 ms vs ~80 ms), so
- *      it never fires mid-hold.
- *   3. A DIRECTION CHANGE resets it: you cannot hold both arrows, so the
- *      other arrow is by definition a new hold. (This third rule is mine,
- *      not in the spec — it closes the swallowed-release-then-flip hole.)
- *
- * Any of the three means the next press starts a fresh hold at step 1.
+ *      resets it, so a swallowed or missed release cannot leave it armed. The
+ *      gap sits well above one repeat interval (300 ms vs ~80 ms), so it never
+ *      fires mid-hold.
+ *   3. A DIRECTION CHANGE resets it: you cannot hold both arrows, so the other
+ *      arrow is by definition a new hold. This closes the
+ *      swallowed-release-then-flip hole.
  */
 
 /* The ONE knob for "the hold ended": no step within this long means cold. */
@@ -194,12 +181,12 @@ lsg_jump_step_ramp_press (LsgJumpStepRamp *ramp, LsgJumpStepDir dir,
  *
  * SNAPPING. A `step` above 1 does NOT add itself to the current value: it
  * moves to the NEXT MULTIPLE OF ITSELF in the direction of travel. That is
- * what makes the ramp the author approved read 20, 30, 40 … and 200, 300, 400 …
- * instead of the repeat-rate-dependent 12, 22, 32 — you land on 3000, never on
- * 2994. A value already sitting on a multiple advances a whole step (20 ->
- * 30). Snapping is always FORWARD in the direction of travel, so a step can
- * never move backwards: from 25 a step of 10 goes to 30 going LATER and to 20
- * going EARLIER.
+ * what makes a held arrow read 20, 30, 40 … and 200, 300, 400 … instead of the
+ * repeat-rate-dependent 12, 22, 32 — you land on 3000, never on 2994. A value
+ * already sitting on a multiple advances a whole step (20 -> 30). Snapping is
+ * always forward in the direction of travel, so a step can never move
+ * backwards: from 25 a step of 10 goes to 30 going LATER and to 20 going
+ * EARLIER.
  *
  * WRAP AND CLAMP, at EVERY step size — no step size can leap over a wrap. Both
  * ends are ONE rule: a step that would leave the document LANDS ON the end it
@@ -210,11 +197,9 @@ lsg_jump_step_ramp_press (LsgJumpStepRamp *ramp, LsgJumpStepDir dir,
  * number outside 1…`last_row`. With `step` 1 all of this reduces to exactly
  * the original ±1 behaviour (4999 -> 5000 -> 1).
  *
- * Every one of these rules is the macOS frontend's `JumpFieldStep.applied`
- * (Sources/LessSheetApp/JumpFieldStepping.swift), computed the same way — in
- * DISTANCES to the neighbouring multiple rather than absolute multiples, so
- * nothing overflows near G_MAXUINT64. This interaction must not drift between
- * the two frontends.
+ * Computed in DISTANCES to the neighbouring multiple rather than in absolute
+ * multiples, so nothing overflows near G_MAXUINT64. The macOS frontend
+ * computes it the same way; this interaction must not drift between the two.
  *
  * Returns a value >= 1; never 0, and never overflows at any `step`.
  */

@@ -1,30 +1,19 @@
 /*
- * lsg_filter.c — the GTK frontend's FILTER-TO-MATCHES feature (lsg_filter.h).
- * Slice 4. Two layers, mirroring the macOS split:
+ * lsg_filter.c — filter-to-matches, in two layers:
  *
- *   1. The PURE filter view-model — a C port of the macOS `FilterControl`
- *      (FilterLogic.swift) TOGETHER WITH the toggle app-state macOS keeps in
- *      `ViewerModel` (`filterSnapshot` / `isFiltered` / `filterDocumentRows` /
- *      `jumpRowCountInfo`, and the apply/clear transitions). A plain-value
- * state machine that NEVER touches the core: it captures the base document
- *      row-count M at apply (a RE-APPLY keeps the ORIGINAL M), folds the async
- *      filter-scan poll into the "Filtered — N of M rows" banner, and derives
- * the two composition facts the widget needs (the jump row-count hint + the
- *      `filtered` flag).
+ *   1. A pure state machine that NEVER touches the core: it captures the base
+ *      document row-count M at apply (a RE-APPLY keeps the ORIGINAL M), folds
+ *      the async filter-scan poll into the "Filtered — N of M rows" status,
+ *      and derives the two composition facts the widget needs.
  *
- *   2. The FILTER BRIDGE — a C port of the `CoreDocumentSession` filter
- * methods
- *      (`setFilter` / `clearFilter` / `filterStatus`): the single place this
- *      frontend calls `ls_filter_*`. It reaches the core handle through the
- *      non-frozen `struct _LsgDocument` seam and marshals the shared
- *      `LsgSearchRequest` into an `ls_search_request` exactly as the find
- * bridge does. Poll/control-lane — lockless (the core is internally
- * synchronized).
+ *   2. The filter bridge — the single place this frontend calls `ls_filter_*`,
+ *      marshalling the shared `LsgSearchRequest` through the same helper the
+ *      find bridge uses. Lockless: the core synchronizes it.
  *
  * A FILTER IS AN IN-PLACE VIEW MODE: while active the core presents ONLY the
- * matching rows in filtered coordinates, and every frozen slice-1 accessor
- * (window, cell, source-row gutter, row-count) already operates in them — so
- * this module changes NOTHING about how a window is drawn.
+ * matching rows, in filtered coordinates, and every accessor (window, cell,
+ * source-row gutter, row-count) already speaks them — so this module changes
+ * nothing about how a window is drawn.
  */
 #include "lsg_document_internal.h"
 #include <lsg_filter.h>
@@ -33,7 +22,7 @@
 #include <string.h>
 
 /* ------------------------------------------------------------------------- */
-/* Pure view-model (port of FilterControl + the macOS toggle state) */
+/* Pure view-model */
 /* ------------------------------------------------------------------------- */
 
 LsgFilterState
@@ -48,10 +37,9 @@ LsgFilterState
 lsg_filter_applied (LsgFilterState state, LsgRowCount document_rows,
                     LsgFilterSnapshot snapshot)
 {
-  /* First apply: capture the base M. Re-apply (already filtered): the passed
-   * count is the filtered m (base no longer knowable through the session) —
-   * keep the ORIGINAL M (mirrors macOS `isFiltered ? filterDocumentRows :
-   * rowCountInfo`). */
+  /* First apply: capture the base M. On a RE-apply the passed count is already
+   * the filtered m — the base is no longer knowable through the session — so
+   * keep the original M. */
   if (!state.active)
     state.document_rows = document_rows;
   state.active = TRUE;
@@ -127,7 +115,7 @@ lsg_filter_jump_rowcount (LsgFilterState state, LsgRowCount identity_rowcount)
 }
 
 /* ------------------------------------------------------------------------- */
-/* Filter bridge (port of CoreDocumentSession filter methods) */
+/* Filter bridge */
 /* ------------------------------------------------------------------------- */
 
 gboolean
@@ -135,8 +123,8 @@ lsg_document_filter_set (LsgDocument *doc, LsgSearchRequest request)
 {
   if (doc == NULL || doc->doc == NULL)
     return FALSE;
-  /* The shared marshaler (lsg_document_internal.h) — identical to the find
-   * bridge's, so the grammar/validation shape can never drift between them. */
+  /* The shared marshaler — identical to the find bridge's, so the two can
+   * never drift. */
   ls_search_request req = lsg_build_abi_request (request);
   return ls_filter_set (doc->doc, &req) ? TRUE : FALSE;
 }

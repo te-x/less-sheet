@@ -1,23 +1,17 @@
 /*
- * lsg_copy.c — the GTK frontend's STREAMING TSV COPY feature (lsg_copy.h).
- * Slice 5. Two layers, mirroring every prior GTK slice:
+ * lsg_copy.c — streaming TSV copy, in two layers:
  *
- *   1. The PURE copy view-model — a C port of the macOS
- * `DocumentModel.streamCopy` drive loop + `CopyOutcome` (ViewerModel.swift). A
- * plain-value state machine that NEVER touches the core, threads, or I/O: it
- * folds each core copy STEP into progress + outcome — MORE accumulation, the
- * frontend byte-budget cut, the core cell-cap map, the STALLED -> advance ->
- * resume orchestration WITH the filtered no-progress guard, and an explicit
- * user cancel.
+ *   1. A pure state machine that NEVER touches the core, threads, or I/O: it
+ *      folds each core copy STEP into progress and an outcome — MORE
+ *      accumulation, the frontend byte-budget cut, the core's cell-cap, the
+ *      STALLED -> advance -> resume orchestration with its no-progress guard,
+ *      and an explicit user cancel.
  *
- *   2. The COPY BRIDGE over the real core — a C port of
- * `CoreDocumentSession`'s `openCopy`/`copyStreamNext`/`copyStreamClose` +
- * `CoreCopyStream`. The single place this frontend calls `ls_copy_*`, reaching
- * the core handle + the control-lane lock through the non-frozen `struct
- * _LsgDocument` seam. Every `ls_copy_*` call is serialized with `ls_close`
- * through the session's `control_lock` (the CLOSE-GUARD — the macOS
- * `copyBufferLock`/`isClosed` equivalent), with the leaf-before-root ownership
- * rule (a job must not outlive its document) enforced by the caller (main.c).
+ *   2. The copy bridge — the single place this frontend calls `ls_copy_*`.
+ *      Every one of those calls is serialized against `ls_close` through the
+ *      session's `control_lock` (the CLOSE-GUARD) and re-checks the core
+ *      handle under it. Leaf before root — a job must not outlive its document
+ *      — is the caller's rule to keep.
  */
 #include "lsg_document_internal.h"
 #include <lsg_copy.h>
@@ -25,7 +19,7 @@
 #include <lesssheet.h>
 
 /* ------------------------------------------------------------------------- */
-/* Pure view-model (port of streamCopy's drive loop + CopyOutcome) */
+/* Pure view-model */
 /* ------------------------------------------------------------------------- */
 
 LsgCopyFlow
@@ -56,8 +50,8 @@ lsg_copy_fold (LsgCopyFlow flow, LsgCopyStep step)
   switch (step.kind)
     {
     case LSG_COPY_STEP_MORE:
-      /* A positive byte budget reached -> stop with a bounded blob (the macOS
-       * `.stoppedAtBudget` cut); otherwise keep streaming. */
+      /* A positive byte budget reached -> stop with a bounded blob; otherwise
+       * keep streaming. */
       if (flow.budget_bytes > 0 && flow.bytes_done >= flow.budget_bytes)
         {
           flow.kind = LSG_COPY_FLOW_DONE;
@@ -123,7 +117,7 @@ lsg_copy_progress_fraction (LsgCopyFlow flow)
 }
 
 /* ------------------------------------------------------------------------- */
-/* Copy bridge over the core (port of the CoreDocumentSession copy methods) */
+/* Copy bridge over the core */
 /* ------------------------------------------------------------------------- */
 
 /* One job wraps its `ls_copy_job` and remembers its document so every
@@ -205,9 +199,8 @@ lsg_document_copy_close (LsgCopyJob *job)
     return;
   if (job->job != NULL && job->doc != NULL)
     {
-      /* Serialize the release with a concurrent lsg_document_close (leaf
-       * before root: the document is still alive here per the ownership rule).
-       */
+      /* Serialize the release against a concurrent lsg_document_close; leaf
+       * before root means the document is still alive here. */
       g_mutex_lock (job->doc->control_lock);
       ls_copy_close (job->job);
       g_mutex_unlock (job->doc->control_lock);

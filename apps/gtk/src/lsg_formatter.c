@@ -1,11 +1,11 @@
 /*
- * lsg_formatter.c — the GTK frontend's display-free CELL FORMATTER engine
- * (lsg_formatter.h). The C analog of the macOS `ColumnDisplayFormatting`,
- * reproduced per ARCH decision 8 with GLib + the C-library locale, NOT ICU.
- * The exact-decimal losslessness macOS gets from Foundation
- * `Decimal.FormatStyle` is reproduced here in base-10 ARITHMETIC over digit
- * strings — never binary floating point — so a value formats to an EXACT round
- * trip or falls back to the raw spelling (UNAVAILABLE), never a rounded lie.
+ * lsg_formatter.c — the cell formatter, built on GLib and the C-library locale
+ * rather than ICU (which would cost tens of MB against a single-digit-MB app).
+ *
+ * Losslessness is therefore arithmetic, not a library: every decimal is
+ * computed in base 10 over digit strings, never binary floating point, so a
+ * value either formats to an EXACT round trip or falls back to the raw
+ * spelling — never a rounded lie.
  */
 #include <lsg_formatter.h>
 
@@ -17,8 +17,7 @@
 /* Small ASCII helpers (locale-independent, exactly the pinned v1 grammar) */
 /* ------------------------------------------------------------------------- */
 
-/* The numeric grammar's whitespace set: 0x09..0x0D and 0x20 (see HEADER RULE).
- */
+/* The numeric grammar's whitespace set: 0x09..0x0D and 0x20. */
 static gboolean
 is_ws (char c)
 {
@@ -695,19 +694,13 @@ lsg_format_integer (const char *raw, gboolean grouping, LsgLocaleGlyphs glyphs)
 }
 
 /* ------------------------------------------------------------------------- */
-/* Column-config format options + the type+options dispatcher (SEED)         */
-/*                                                                           */
-/* The slice-1 primitives above (kind gate, lossless decimal/integer, locale */
-/* glyphs) stay implemented (green). This growth adds the settings-driven    */
-/* dispatcher + date presets; the seed below always returns the raw spelling */
-/* so the new G9 tests are RED until the dispatcher is implemented.          */
+/* Column-config format options + the type+options dispatcher                */
 /* ------------------------------------------------------------------------- */
 
 LsgColumnFormatOptions
 lsg_column_format_options_auto (void)
 {
-  /* real: the Auto default — a zeroed options value (no grouping, source
-   * fraction length, Original preset). */
+  /* Auto: no grouping, the source's own fraction length, Original preset. */
   LsgColumnFormatOptions o = { FALSE, FALSE, 0, LSG_DATE_PRESET_ORIGINAL };
   return o;
 }
@@ -730,7 +723,7 @@ original (const char *raw)
 }
 
 /* ------------------------------------------------------------------------- */
-/* Date / datetime preset formatting via GDateTime (F14)                     */
+/* Date / datetime preset formatting via GDateTime                           */
 /* ------------------------------------------------------------------------- */
 
 /* Two ASCII digits at s[0..1] -> value (the caller has kind-gated the span).
@@ -756,8 +749,8 @@ build_datetime (const char *raw, gboolean zoned)
   int mm = two_digits (raw + 14);
   int ss = two_digits (raw + 17);
 
-  /* Skip an optional fractional-seconds run; the localized presets render at
-   * whole-second resolution (parity with the macOS presets). */
+  /* Skip an optional fractional-seconds run: the localized presets render at
+   * whole-second resolution. */
   gsize i = 19;
   gsize len = strlen (raw);
   if (i < len && raw[i] == '.')
@@ -819,7 +812,7 @@ format_datetime_preset (GDateTime *dt, gboolean zoned, LsgDatePreset preset)
 }
 
 /* ------------------------------------------------------------------------- */
-/* The type+options dispatcher (F14)                                         */
+/* The type+options dispatcher                                               */
 /* ------------------------------------------------------------------------- */
 
 LsgDisplay

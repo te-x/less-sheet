@@ -1,34 +1,20 @@
 /*
- * lsg_dialect.c — the dialect compose/validate view-model (lsg_dialect.h):
- * "the user overrode one dialect parameter; what ls_open_options does the
- * re-open get?". Fully implemented and shipped; tests/test_dialect.c pins
- * every rule below.
+ * lsg_dialect.c — "the user overrode one dialect parameter; what
+ * ls_open_options does the re-open get?".
  *
- * What lives here:
- *   - change builders: one per overridable parameter (separator, quote,
- *     quote-disabled, header, encoding).
- *   - compose (F1 + F2): CARRY-FORWARD — every parameter starts from its
- *     effective FORCED value, or LS_SNIFF / LS_ENCODING_AUTO so the re-open
- *     re-sniffs it. The change is then applied as ITS parameter's forced
- *     value and VALIDATED: byte domain, plus a separator/quote collision
- *     judged against the CARRIED FORCED byte only (equalling a merely
- *     sniffed byte is fine, the re-open re-sniffs around it). A rejection
- *     returns accepted = FALSE and no options.
- *   - custom-byte parse: exactly one byte in 0x01..0x7F, CR / LF excluded.
- *   - header shift (F5): the row re-anchor when the header toggles — -1
- *     turning it on, +1 turning it off, 0 when unchanged.
- *   - candidates + picker: the frozen separator / quote / encoding option
- *     lists, the picker's selection (the forced encoding, else Automatic)
- *     and the concrete detected encoding.
+ * The answer is CARRY-FORWARD: every parameter starts from its effective
+ * FORCED value, or from LS_SNIFF / LS_ENCODING_AUTO so the re-open re-sniffs
+ * it. The change is then applied as its own parameter's forced value and
+ * validated — byte domain, plus a separator/quote collision judged against the
+ * CARRIED FORCED byte only, because equalling a merely SNIFFED byte is fine
+ * (the re-open re-sniffs the other one around it).
  *
- * Pure + display-free: no core calls, no widgets, no allocation. Compiles
- * against the frozen header, so a signature drift fails the CONFORMANCE
- * build.
+ * Pure: no core calls, no widgets, no allocation.
  */
 #include <lsg_dialect.h>
 
 /* ------------------------------------------------------------------------- */
-/* Value builders — tests construct changes with these                       */
+/* Value builders                                                            */
 /* ------------------------------------------------------------------------- */
 
 LsgDialectChange
@@ -77,7 +63,7 @@ lsg_dialect_change_encoding (LsgEncoding encoding)
 }
 
 /* ------------------------------------------------------------------------- */
-/* Compose + validate (F1 carry-forward + F2 validation)                     */
+/* Compose + validate                                                        */
 /* ------------------------------------------------------------------------- */
 
 /* A forced separator/quote byte must be ASCII 0x01..0x7F and neither CR nor
@@ -111,10 +97,9 @@ lsg_dialect_compose (LsgDialect report, LsgDialectChange change)
   o.encoding
       = report.encoding_forced ? (int32_t)report.encoding : LS_ENCODING_AUTO;
 
-  /* Apply the change as the forced value of ITS parameter, validating (F2). A
-   * separator/quote collision is checked against the CARRIED FORCED byte of
-   * the other; equalling a merely SNIFFED byte is accepted (the re-open
-   * re-sniffs the other and excludes the conflict). */
+  /* Apply the change as the forced value of its own parameter, and validate.
+   * A separator/quote collision is judged against the CARRIED FORCED byte of
+   * the other one only. */
   switch (change.kind)
     {
     case LSG_DIALECT_CHANGE_SEPARATOR:
@@ -172,7 +157,7 @@ lsg_dialect_parse_custom_byte (const char *text, guint8 *out_byte)
 }
 
 /* ------------------------------------------------------------------------- */
-/* Header re-anchor shift (F5)                                               */
+/* Header re-anchor shift                                                    */
 /* ------------------------------------------------------------------------- */
 
 gint

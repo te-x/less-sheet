@@ -1,15 +1,11 @@
 /*
- * lsg_grid_geometry.c — the GTK frontend's display-free GRID GEOMETRY / WINDOW
- * MATH (lsg_grid_geometry.h). Pure arithmetic over plain numbers; the C analog
- * of the macOS `ColumnLayouting` + the NSTableView geometry that NSTableView
- * owned implicitly. Uniform row height => O(1) vertical geometry; the column
- * half walks only as far as the answer's last column (never a forced full
- * pass).
+ * lsg_grid_geometry.c — the grid's window math. Pure arithmetic over plain
+ * numbers. Uniform row height => O(1) vertical geometry; the column half walks
+ * only as far as the answer's last column, never a forced full pass.
  *
- * Deliberately uses NO <math.h> (floor/ceil): the frozen meson.build links
- * glib but not libm, and every value here is non-negative, so a
- * cast-to-integer IS floor and the ceil cases are handled by a multiply-back
- * boundary check.
+ * Deliberately uses NO <math.h>: the build links glib but not libm, and every
+ * value here is non-negative, so a cast-to-integer IS floor and the ceil cases
+ * are handled by a multiply-back boundary check.
  */
 #include <lesssheet.h> /* LS_WINDOW_MAX_ROWS (the row-window clamp) */
 #include <lsg_grid_geometry.h>

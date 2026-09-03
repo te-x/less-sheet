@@ -1,23 +1,16 @@
 /*
- * lsg_find.c — the GTK frontend's FIND feature (lsg_find.h). Slice 2. Two
- * layers, mirroring the macOS split:
+ * lsg_find.c — find, in two layers:
  *
- *   1. The PURE find view-model — a faithful C port of the macOS `FindControl`
- *      (Sources/LessSheetKit/FindLogic.swift): a plain-value state machine
- * that NEVER touches the core. It composes a request from the draft, folds
- *      search polls into the display (growing→final count, landings), and
- *      decides wrap / no-matches / stopped notices and next/prev anchors.
- *      Swift optionals are flattened to `has_*` gates.
+ *   1. A pure view-model that NEVER touches the core: it composes a request
+ *      from the draft, folds search polls into the display (growing then final
+ *      count, landings), and decides the wrap / no-matches notices and the
+ *      next/prev anchors.
  *
- *   2. The SEARCH BRIDGE — a C port of the `CoreDocumentSession` search
- * methods
- *      (`startSearch` / `navigateSearch` / `cancelSearch` / `searchStatus` /
- *      `windowMatchFlags`): the single place this frontend calls `ls_search_*`
- * / `ls_window_match_flags`. It reaches the core handle + window-lane lock
- *      through the non-frozen `struct _LsgDocument` seam. Search start/nav/
- *      cancel/poll are poll/control-lane (lockless — the core is internally
- *      synchronized); window-match-flags is window-lane (takes `window_lock`)
- *      and copies the borrowed mask out immediately (the copy-out discipline).
+ *   2. The search bridge — the single place this frontend calls `ls_search_*`
+ *      and `ls_window_match_flags`, reaching the core handle and the
+ *      window-lane lock through the private `struct _LsgDocument` seam.
+ *      Start/nav/cancel/poll are lockless (the core synchronizes them);
+ *      match-flags is window-lane and copies the borrowed mask out at once.
  *
  * The frontend owns NO matcher: every per-cell verdict comes from the core.
  */
@@ -56,9 +49,9 @@ lsg_search_nav_from_end (void)
 /* Pure helpers */
 /* ------------------------------------------------------------------------- */
 
-/* The pinned numeric grammar (verbatim the ABI HEADER RULE / macOS
- * NumericGrammar): sign? ( digits ('.' digits?)? | '.' digits ) (e sign?
- * digits)? over ASCII, after trimming ASCII whitespace (0x09..0x0D, 0x20). */
+/* The numeric grammar the ABI header pins, verbatim: sign? ( digits ('.'
+ * digits?)? | '.' digits ) (e sign? digits)? over ASCII, after trimming ASCII
+ * whitespace (0x09..0x0D, 0x20). */
 gboolean
 lsg_numeric_is_numeric (const char *text)
 {
@@ -111,7 +104,7 @@ lsg_numeric_is_numeric (const char *text)
 }
 
 /* ------------------------------------------------------------------------- */
-/* Pure view-model (port of FindControl) */
+/* Pure view-model */
 /* ------------------------------------------------------------------------- */
 
 LsgFindSession
@@ -146,9 +139,8 @@ lsg_find_submit (LsgFindSession session, const guint32 *visible_columns,
       out.outcome = LSG_FIND_RUN;
       out.request.kind = LSG_FIND_TEXT;
       out.request.value = draft.text;
-      /* The "Match case" checkbox marshals 1:1 into the request: one
-       * session bool shared by both modes, NEVER derived from the query
-       * (smart case is retired). */
+      /* One session flag shared by both modes, NEVER derived from the query
+       * text. */
       out.request.case_sensitive = draft.case_sensitive;
       /* scope NULL iff every column is visible; else the visible set is fixed
        * into the request (borrowed; the core treats it as a set). */
@@ -185,8 +177,7 @@ lsg_find_submit (LsgFindSession session, const guint32 *visible_columns,
   out.request.column = draft.column;
   out.request.op = draft.op;
   out.request.value = (draft.value != NULL) ? draft.value : "";
-  /* Same session bool as TEXT — governs EQ/NE folding; ordering ops ignore it.
-   */
+  /* Governs EQ/NE folding; the ordering operators ignore it. */
   out.request.case_sensitive = draft.case_sensitive;
   return out;
 }
@@ -242,14 +233,14 @@ lsg_find_resolved (LsgFindSession session, gboolean has_snapshot,
       d.position = snapshot.position;
     }
 
-  /* Notice derives PURELY from this snapshot (so a wrap notice self-clears
-   * when the wrap navigation lands as a FOUND poll). A CANCELLED phase from a
-   * POLL is NEVER "Stopped": on a network (http_range) document the core lands
-   * the first match AND RE-PARKS the scan at CANCELLED in the SAME poll by
-   * design (nfd_ac6), so mapping CANCELLED -> STOPPED here would mask the real
-   * "N of M" count. The STOPPED notice belongs ONLY to an explicit user Stop
-   * (`lsg_find_stopped`); the net-park outcome is pinned by
-   * /find/resolved-net-park-landing. */
+  /* The notice derives PURELY from this snapshot, so a wrap notice self-clears
+   * when the wrap navigation lands as a FOUND poll.
+   *
+   * A CANCELLED phase from a POLL is NEVER "Stopped". On a network
+   * (http_range) document the core lands the first match AND RE-PARKS the scan
+   * at CANCELLED in the same poll, by design — mapping CANCELLED to STOPPED
+   * here masked the real "N of M" count on every network find. STOPPED belongs
+   * only to an explicit user stop (`lsg_find_stopped`). */
   d.notice = LSG_FIND_NOTICE_NONE;
   if (snapshot.nav == LSG_SEARCH_NAV_EXHAUSTED)
     {
@@ -354,7 +345,7 @@ lsg_find_invalidated (LsgFindSession session)
 }
 
 /* ------------------------------------------------------------------------- */
-/* Search bridge (port of CoreDocumentSession search methods) */
+/* Search bridge */
 /* ------------------------------------------------------------------------- */
 
 gboolean
@@ -373,10 +364,10 @@ lsg_document_search_nav (LsgDocument *doc, LsgSearchNav nav)
 {
   if (doc == NULL || doc->doc == NULL)
     return;
-  /* Plain non-blocking nav (LsgSearchDir is pinned to ls_search_dir). The
-   * result is observed by polling — synchronously on the caller's next poll
-   * unfiltered, or over the ~100 ms tick loop (find_poll_fold) when the core
-   * has a transient under-a-filter nav lag. NEVER blocks the UI thread. */
+  /* Non-blocking (LsgSearchDir is pinned to ls_search_dir). The result is
+   * observed by polling — synchronously on the caller's next poll unfiltered,
+   * or over the ~100 ms tick loop when the core has a transient nav lag under
+   * a filter. NEVER blocks the UI thread. */
   ls_search_nav (doc->doc, nav.anchor, (ls_search_dir)nav.direction);
 }
 
@@ -449,8 +440,7 @@ lsg_document_window_match_flags (LsgDocument *doc, guint32 first_col,
     return out;
 
   /* Window lane: serialize with set_window / cell reads, then copy the
-   * borrowed mask out immediately (never held past the next set_window /
-   * close). */
+   * borrowed mask out at once — it is invalid past the next set_window. */
   g_mutex_lock (doc->window_lock);
   ls_str flags = ls_window_match_flags (doc->doc, first_col, col_count);
   if (flags.len > 0 && flags.ptr != NULL)

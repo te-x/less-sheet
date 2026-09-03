@@ -1,30 +1,21 @@
 /*
- * lsg_document.c — the GTK frontend's windowed DOCUMENT SESSION
- * (lsg_document.h). The C analog of the macOS
- * `DocumentSession`/`CoreDocumentSession`/`DocumentSessionOpening` layer: the
- * SINGLE place that wraps the core's two-lane `ls_*` access for the viewer.
+ * lsg_document.c — the windowed document session: the SINGLE place that wraps
+ * the core's two-lane `ls_*` access for the viewer.
  *
- * Ownership / validity (the eviction-safe borrow rule): every borrowed
- * `ls_str` is COPIED out immediately, invalid UTF-8 sanitized to U+FFFD at the
- * display boundary (`lsg_utf8_sanitize_dup`), so nothing a caller holds is
- * tied to the core's window eviction. `char *` returns are caller-owned
+ * OWNERSHIP. Every borrowed `ls_str` is COPIED out immediately, with invalid
+ * UTF-8 sanitized to U+FFFD at the display boundary, so nothing a caller holds
+ * is tied to the core's window eviction. `char *` returns are caller-owned
  * (g_free); an `LsgWindow` owns its copied cells until `lsg_window_free`.
  *
- * Threading (mirrors <lesssheet.h>): the poll/control-lane accessors delegate
- * to the core's internally-synchronized, any-thread-safe entry points; the
- * window lane (`set_window` + the WINDOW-lane `ls_header_cell` behind
- * `header_cell_dup`) is serialized by the session's `window_lock`; `close`
- * acquires both lane locks in a fixed order (window then control) before
- * releasing — the two-lock discipline the ARCH mandates so a later slice's
- * control-lane worker (copy/find/filter) can run concurrent with live
- * scrolling. In slice 1 the session holds no cached mutable state of its own,
- * so `control_lock` is reserved (acquired only by `close`).
+ * THREADING (mirrors <lesssheet.h>). Poll/control-lane accessors delegate to
+ * the core's internally-synchronized, any-thread entry points. The window lane
+ * (`set_window` plus `ls_header_cell` behind `header_cell_dup`) is serialized
+ * by `window_lock`. `close` takes both locks in a fixed order, window then
+ * control, so the copy worker on the control lane can run concurrent with live
+ * scrolling on the window lane without either racing a teardown.
  */
 #include "lsg_document_internal.h"
 #include <lsg_document.h>
-
-/* struct _LsgDocument is defined in lsg_document_internal.h (shared with the
- * sibling slice bridges, e.g. lsg_find.c). */
 
 struct _LsgWindow
 {
@@ -58,7 +49,7 @@ lsg_open_error_from_status (ls_status status)
     case LS_ERROR_INVALID_ARGUMENT:
       return LSG_OPEN_INVALID_ARGUMENT;
     default:
-      return LSG_OPEN_IO; /* total: safe fallback */
+      return LSG_OPEN_IO; /* every unmapped status still answers something */
     }
 }
 
@@ -256,9 +247,8 @@ lsg_document_set_window (LsgDocument *doc, guint64 first_row,
   guint32 end = (req_end > (guint64)ncols) ? ncols : (guint32)req_end;
   guint32 cc = (end > fc) ? (end - fc) : 0;
 
-  /* Materialize the row window (the core clamps row_count to
-   * LS_WINDOW_MAX_ROWS and never scans; the returned range starts at
-   * first_row). */
+  /* The core clamps row_count to LS_WINDOW_MAX_ROWS and never scans; the
+   * returned range starts at the requested first_row. */
   ls_row_range r = ls_window_set (doc->doc, first_row, row_count);
   guint32 rc = (r.row_count > (guint64)LS_WINDOW_MAX_ROWS)
                    ? LS_WINDOW_MAX_ROWS

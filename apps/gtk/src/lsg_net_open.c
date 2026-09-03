@@ -1,12 +1,9 @@
 /*
- * lsg_net_open.c — the GTK frontend's NETWORK OPEN drive + progress reducer
- * (lsg_net_open.h). The C analog of the macOS `DocumentSessionOpening.openURL`
- * drive plus the `NetworkOpenState` / `NetworkOpenError` /
- * `NetworkOpenProgress` reducer types. Wraps the core's async open-job idiom
- * (`ls_open_url_start` -> `ls_net_open_poll` -> `ls_net_open_release`) and
- * folds each raw snapshot into an owned, C-free `LsgNetProgress` for the
- * banner. On DONE the produced `ls_doc` is adopted into a normal
- * `LsgDocument`.
+ * lsg_net_open.c — the network-open drive + its progress reducer. Wraps the
+ * core's async open-job idiom (`ls_open_url_start` -> `ls_net_open_poll` ->
+ * `ls_net_open_release`) and folds each raw snapshot into an owned,
+ * core-free `LsgNetProgress`. On DONE the produced `ls_doc` is adopted into a
+ * normal `LsgDocument`.
  */
 #include "lsg_document_internal.h"
 #include <lsg_net_open.h>

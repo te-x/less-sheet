@@ -1,10 +1,10 @@
 /*
- * lsg_a11y.c — the display-free ACCESSIBILITY logic for the GTK frontend (the
- * gtk-a11y slice, ARCH-gtk-a11y.md Decision 2). Pure arithmetic over plain
- * numbers and byte-exact UTF-8 string building — no widgets, no display
- * server, no GTK — so the gate verifies the behavior headlessly. src/main.c
- * routes its key events, announcements, labels and shortcuts surface through
- * here.
+ * lsg_a11y.c — the display-free half of accessibility: the keyboard
+ * cursor/selection reducer, the announcement and grid-description builders,
+ * the one accelerator table, and the control-name table. Pure arithmetic and
+ * byte-exact UTF-8 building — no widgets, no display server, no GTK — so all
+ * of it is verifiable headlessly. main.c routes its key events, announcements,
+ * labels and shortcuts surface through here.
  *
  * See lsg_a11y.h for the pinned semantics of every function.
  */
@@ -185,13 +185,15 @@ lsg_a11y_grid_description (const char *name, guint cols, guint64 rows,
 const LsgA11yShortcut *
 lsg_a11y_shortcuts (guint *out_n)
 {
-  /* THE single source of truth. Each command appears exactly once; SCOPE_APP
-   * entries (and only those) carry a GAction name for
-   * gtk_application_set_accels_for_action. SCOPE_GRID (Copy / Select-All) live
-   * on the grid's own GtkShortcutController so they never hijack a focused
-   * GtkText; SCOPE_DISPLAY entries are shown in the surface but handled by the
-   * find popover / grid key controller (no accelerator registered anywhere).
-   */
+  /* THE single source of truth: the app accelerators, the shortcuts window,
+   * and the a11y surface all read this one table, and each command appears
+   * exactly once.
+   *
+   * Only SCOPE_APP entries carry a GAction name, and only those get an
+   * accelerator registered. SCOPE_GRID (Copy / Select-All) stay on the grid's
+   * own key controller so they never hijack a focused GtkText; SCOPE_DISPLAY
+   * entries are listed for the reader but handled by the find popover or the
+   * grid controller, with no accelerator registered anywhere. */
   static const LsgA11yShortcut table[] = {
     /* --- General --------------------------------------------------------- */
     { LSG_A11Y_CMD_OPEN, LSG_A11Y_GROUP_GENERAL, LSG_A11Y_SCOPE_APP,
@@ -239,7 +241,7 @@ lsg_a11y_shortcuts (guint *out_n)
   return table;
 }
 
-/* 4. Accessible names for the bare interactive controls ------------------- */
+/* 4. Accessible names for the icon-only controls -------------------------- */
 
 const char *
 lsg_a11y_control_name (LsgA11yControl control)
