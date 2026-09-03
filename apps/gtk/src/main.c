@@ -4106,6 +4106,23 @@ header_progress_hide (App *app)
 
 /* --- selection algebra (view rows + physical columns) --- */
 
+/* Order the two dragged corners and widen them for a whole-row selection. The
+ * ROW span of a whole-COLUMN selection is left to the caller: the marquee
+ * paints every row there is, while a copy has to name a bounded last row. */
+static void
+selection_corners (App *app, guint64 *r0, guint64 *r1, guint *c0, guint *c1)
+{
+  *r0 = MIN (app->sel_a_row, app->sel_b_row);
+  *r1 = MAX (app->sel_a_row, app->sel_b_row);
+  *c0 = MIN (app->sel_a_col, app->sel_b_col);
+  *c1 = MAX (app->sel_a_col, app->sel_b_col);
+  if (app->sel_mode == SEL_ROWS) /* whole rows -> all columns */
+    {
+      *c0 = 0;
+      *c1 = app->n_cols - 1;
+    }
+}
+
 /* Normalize the two selection corners (+ mode) into the half-open copy rect.
  */
 static LsgCopyRect
@@ -4115,17 +4132,10 @@ selection_rect (App *app)
   if (app->sel_mode == SEL_NONE || app->n_cols == 0)
     return r;
 
-  guint64 r0 = MIN (app->sel_a_row, app->sel_b_row);
-  guint64 r1 = MAX (app->sel_a_row, app->sel_b_row);
-  guint c0 = MIN (app->sel_a_col, app->sel_b_col);
-  guint c1 = MAX (app->sel_a_col, app->sel_b_col);
-
-  if (app->sel_mode == SEL_ROWS) /* whole rows -> all columns */
-    {
-      c0 = 0;
-      c1 = app->n_cols - 1;
-    }
-  if (app->sel_mode == SEL_COLS) /* whole columns -> all rows */
+  guint64 r0, r1;
+  guint c0, c1;
+  selection_corners (app, &r0, &r1, &c0, &c1);
+  if (app->sel_mode == SEL_COLS) /* whole columns -> every row we know of */
     {
       r0 = 0;
       r1 = (app->row_estimate > 0) ? app->row_estimate - 1 : 0;
@@ -4144,15 +4154,9 @@ selection_contains (App *app, guint64 row, guint col)
 {
   if (app->sel_mode == SEL_NONE || app->n_cols == 0)
     return FALSE;
-  guint64 r0 = MIN (app->sel_a_row, app->sel_b_row);
-  guint64 r1 = MAX (app->sel_a_row, app->sel_b_row);
-  guint c0 = MIN (app->sel_a_col, app->sel_b_col);
-  guint c1 = MAX (app->sel_a_col, app->sel_b_col);
-  if (app->sel_mode == SEL_ROWS)
-    {
-      c0 = 0;
-      c1 = app->n_cols - 1;
-    }
+  guint64 r0, r1;
+  guint c0, c1;
+  selection_corners (app, &r0, &r1, &c0, &c1);
   if (app->sel_mode == SEL_COLS)
     {
       r0 = 0;
@@ -4730,10 +4734,17 @@ on_window_destroy (GtkWidget *widget, gpointer data)
 /* re-open (F1); a network doc re-opens through the NETWORK funnel (F8). */
 /* ========================================================================= */
 
-/* Separator/quote dropdown item tags (object data on each radio + the item's
+/* Separator/quote dropdown item tags (object data on each row + the item's
  * forced byte). */
 #define DIALECT_KIND_SEP 0
 #define DIALECT_KIND_QUOTE 1
+
+/* The Parsing page's two combo rows list the frozen candidates in order, then
+ * the extra entries. Derived from the candidate counts so adding a candidate
+ * moves the extras with it. */
+#define PARSING_SEP_CUSTOM_INDEX LSG_DIALECT_SEPARATOR_CANDIDATE_COUNT
+#define PARSING_QUOTE_NONE_INDEX LSG_DIALECT_QUOTE_CANDIDATE_COUNT
+#define PARSING_QUOTE_CUSTOM_INDEX (LSG_DIALECT_QUOTE_CANDIDATE_COUNT + 1)
 
 /* Forward declarations for the settings region (callee-before-caller cycles).
  */
@@ -5174,7 +5185,7 @@ parsing_page_sync (App *app, LsgDialect d)
 
   if (app->prefs_sep_row != NULL)
     {
-      guint idx = 4; /* Custom… */
+      guint idx = PARSING_SEP_CUSTOM_INDEX;
       for (guint i = 0; i < LSG_DIALECT_SEPARATOR_CANDIDATE_COUNT; i++)
         if (seps[i] == d.separator)
           {
@@ -5191,9 +5202,9 @@ parsing_page_sync (App *app, LsgDialect d)
 
   if (app->prefs_quote_row != NULL)
     {
-      guint idx = 3; /* Custom… */
+      guint idx = PARSING_QUOTE_CUSTOM_INDEX;
       if (!d.has_quote)
-        idx = 2; /* None */
+        idx = PARSING_QUOTE_NONE_INDEX;
       else
         for (guint i = 0; i < LSG_DIALECT_QUOTE_CANDIDATE_COUNT; i++)
           if (quotes[i] == d.quote)
@@ -5562,7 +5573,7 @@ on_parsing_sep_selected (GObject *row, GParamSpec *pspec, gpointer data)
   if (app->dialect_ui_guard)
     return;
   guint idx = adw_combo_row_get_selected (ADW_COMBO_ROW (row));
-  if (idx == 4) /* Custom… */
+  if (idx == PARSING_SEP_CUSTOM_INDEX)
     {
       if (app->prefs_sep_custom != NULL)
         {
@@ -5585,9 +5596,9 @@ on_parsing_quote_selected (GObject *row, GParamSpec *pspec, gpointer data)
     return;
   guint idx = adw_combo_row_get_selected (ADW_COMBO_ROW (row));
   const guint8 *q = lsg_dialect_quote_candidates ();
-  if (idx == 2) /* None */
+  if (idx == PARSING_QUOTE_NONE_INDEX)
     dialect_apply_change (app, lsg_dialect_change_quote_none ());
-  else if (idx == 3) /* Custom… */
+  else if (idx == PARSING_QUOTE_CUSTOM_INDEX)
     {
       if (app->prefs_quote_custom != NULL)
         {
@@ -5744,6 +5755,27 @@ type_index_to_kind (guint idx)
     }
 }
 
+/* The core's type kinds, in ls_column_type_kind order — the ONE spelling the
+ * Settings page shows (the collapsed summary, the "Detected type" read-out).
+ */
+static const char *const COLUMN_KIND_NAMES[]
+    = { "Unknown", "Unsupported", "Text", "Boolean",
+        "Integer", "Decimal",     "Date", "Date & time" };
+
+/* The date presets, in LsgDatePreset order. NULL-terminated so the combo row
+ * can take the same array the summary reads. */
+static const char *const DATE_PRESET_NAMES[]
+    = { "Original", "Short", "Medium", "Long", NULL };
+#define DATE_PRESET_COUNT (G_N_ELEMENTS (DATE_PRESET_NAMES) - 1)
+
+static const char *
+column_kind_name (ls_column_type_kind kind)
+{
+  guint i = (guint)kind;
+  return (i < G_N_ELEMENTS (COLUMN_KIND_NAMES)) ? COLUMN_KIND_NAMES[i]
+                                                : "Unknown";
+}
+
 static guint
 kind_to_type_index (ls_column_type_kind kind)
 {
@@ -5797,21 +5829,16 @@ column_apply_type (App *app, guint32 col)
 static char *
 column_summary_dup (App *app, guint32 col)
 {
-  static const char *kn[]
-      = { "Unknown", "Unsupported", "Text", "Boolean",
-          "Integer", "Decimal",     "Date", "Date & time" };
-  static const char *dp[] = { "Original", "Short", "Medium", "Long" };
   LsgColumnUserSettings *s = &app->col_settings[col];
   ls_column_type_kind kind = s->has_override
                                  ? (ls_column_type_kind)s->override.kind
                                  : app->col_kind[col];
-  guint ki = (guint)kind;
   GString *g = g_string_new (NULL);
   if (s->has_override)
-    g_string_append_printf (g, "%s (forced)",
-                            (ki < G_N_ELEMENTS (kn)) ? kn[ki] : "Text");
-  else if (kind >= LS_COLUMN_TYPE_TEXT && ki < G_N_ELEMENTS (kn))
-    g_string_append (g, kn[ki]);
+    g_string_append_printf (g, "%s (forced)", column_kind_name (kind));
+  else if (kind >= LS_COLUMN_TYPE_TEXT
+           && (guint)kind < G_N_ELEMENTS (COLUMN_KIND_NAMES))
+    g_string_append (g, column_kind_name (kind));
   else
     g_string_append (g, "Auto");
   if (s->hidden)
@@ -5822,8 +5849,9 @@ column_summary_dup (App *app, guint32 col)
     g_string_append_printf (g, " · %d frac", s->format.fraction_digits);
   if ((kind == LS_COLUMN_TYPE_DATE || kind == LS_COLUMN_TYPE_DATETIME)
       && (guint)s->format.date_preset > 0
-      && (guint)s->format.date_preset < G_N_ELEMENTS (dp))
-    g_string_append_printf (g, " · %s", dp[(guint)s->format.date_preset]);
+      && (guint)s->format.date_preset < DATE_PRESET_COUNT)
+    g_string_append_printf (g, " · %s",
+                            DATE_PRESET_NAMES[(guint)s->format.date_preset]);
   if (s->has_null_sentinel)
     {
       if (s->null_sentinel_len > 0)
@@ -6228,15 +6256,8 @@ build_column_row (App *app, guint32 col)
   GtkWidget *guessed = adw_action_row_new ();
   adw_preferences_row_set_title (ADW_PREFERENCES_ROW (guessed),
                                  "Detected type");
-  {
-    static const char *kn[]
-        = { "Unknown", "Unsupported", "Text", "Boolean",
-            "Integer", "Decimal",     "Date", "Date & time" };
-    guint ki = (guint)app->col_kind[col];
-    adw_action_row_set_subtitle (ADW_ACTION_ROW (guessed),
-                                 (ki < G_N_ELEMENTS (kn)) ? kn[ki]
-                                                          : "Unknown");
-  }
+  adw_action_row_set_subtitle (ADW_ACTION_ROW (guessed),
+                               column_kind_name (app->col_kind[col]));
   g_object_set_data (G_OBJECT (exp), "row-detected",
                      guessed); /* async refresh */
   adw_expander_row_add_row (ADW_EXPANDER_ROW (exp), guessed);
@@ -6302,8 +6323,7 @@ build_column_row (App *app, guint32 col)
   /* Date preset (date / datetime only). */
   GtkWidget *dpreset = adw_combo_row_new ();
   adw_preferences_row_set_title (ADW_PREFERENCES_ROW (dpreset), "Date format");
-  const char *dp_items[] = { "Original", "Short", "Medium", "Long", NULL };
-  combo_set_items (dpreset, dp_items);
+  combo_set_items (dpreset, DATE_PRESET_NAMES);
   adw_combo_row_set_selected (ADW_COMBO_ROW (dpreset),
                               (guint)s->format.date_preset);
   g_object_set_data (G_OBJECT (dpreset), "lsg-col", GUINT_TO_POINTER (col));
@@ -6390,9 +6410,6 @@ columns_refresh_types (App *app)
       = g_object_get_data (G_OBJECT (app->prefs_columns_group), "lsg-rows");
   if (rows == NULL)
     return;
-  static const char *kn[]
-      = { "Unknown", "Unsupported", "Text", "Boolean",
-          "Integer", "Decimal",     "Date", "Date & time" };
   for (guint i = 0; i < rows->len; i++)
     {
       GtkWidget *exp = g_ptr_array_index (rows, i);
@@ -6400,16 +6417,11 @@ columns_refresh_types (App *app)
           = GPOINTER_TO_UINT (g_object_get_data (G_OBJECT (exp), "lsg-col"));
       if (col >= app->n_cols)
         continue;
-      column_cache_effective (app,
-                              col); /* re-read effective (inferred) kind */
+      column_cache_effective (app, col); /* re-read the inferred kind */
       GtkWidget *det = g_object_get_data (G_OBJECT (exp), "row-detected");
       if (det != NULL)
-        {
-          guint ki = (guint)app->col_kind[col];
-          adw_action_row_set_subtitle (ADW_ACTION_ROW (det),
-                                       (ki < G_N_ELEMENTS (kn)) ? kn[ki]
-                                                                : "Unknown");
-        }
+        adw_action_row_set_subtitle (ADW_ACTION_ROW (det),
+                                     column_kind_name (app->col_kind[col]));
       column_row_sync (app, exp, col); /* reveal kind-dependent format rows */
     }
   columns_refresh_summaries (app);
