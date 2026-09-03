@@ -4,9 +4,8 @@ import Foundation
 import LessSheetKit
 import Observation
 
-// DocumentModel — the overlay reveal/fade presentation, the cold-start timing
-// marker, the headless dump snapshot, and the off-main progress poll loop.
-// Pure code motion out of ViewerModel.swift (no behavior change).
+// The overlay popup state, the cold-start timing marker, the headless dump
+// hooks, and the off-main progress poll loop.
 
 extension DocumentModel {
 
@@ -80,10 +79,10 @@ extension DocumentModel {
 
     // MARK: - Dump snapshot (headless rendering of overlay/pill/progress states)
 
-    /// A detached, session-less model carrying this document's facts + current
-    /// window plus forced overlay state, for the `LESSSHEET_DUMP_FRAME` hook to
-    /// render specific presentation states off-screen. It never opens or pages
-    /// (no core session), so rendering it is side-effect-free.
+    /// A detached, session-less model carrying this document's facts, current
+    /// window and a forced overlay state, so the frame-dump hook can render a
+    /// specific presentation off-screen. It never opens or pages, so rendering
+    /// it is side-effect-free.
     static func dumpSnapshot(
         from live: DocumentModel,
         expandedPill: PillKind?,
@@ -113,21 +112,16 @@ extension DocumentModel {
         return snapshot
     }
 
-    /// Verification-only: page the live window to `startRow` before a headless
-    /// dump so a grid dump can exhibit larger row numbers / the widened gutter
-    /// (mirrors the `LESSSHEET_HIDE_COLS` pre-hide hook). Inert in normal use.
+    /// Verification-only: page the live window to `startRow` so a dump can show
+    /// larger row numbers and the widened gutter.
     func dumpMaterialize(startRow: UInt64) {
         firstVisibleRow = Int(min(startRow, UInt64(Int.max)))
         lastVisibleCount = 40
         materialize(start: startRow, count: 120)
     }
 
-    /// Verification-only (MatchFlagsFetchProbe): re-materialize the CURRENT window
-    /// with the SAME first row + row count, so the window geometry is byte-identical
-    /// but a new materialization occurred (the content epoch bumps). Proves a
-    /// same-geometry materialization still refetches the match-flags mask (AC5 /
-    /// Round-2 finding 1 — geometry alone must not gate the cache). Inert in normal
-    /// use. No-op with no session / empty window.
+    /// Verification-only: re-materialize the current window with an IDENTICAL
+    /// geometry, to prove the match-flags cache is not keyed on geometry alone.
     func rematerializeSameWindowForProbe() {
         guard session != nil, !window.rows.isEmpty else { return }
         materialize(start: window.firstRow, count: window.rows.count)
@@ -137,9 +131,9 @@ extension DocumentModel {
 
     func startPolling() {
         guard let session else { return }
-        // Hand the new task the old one and let it cancel + join before polling,
-        // so two poll loops never fold snapshots concurrently (the join happens
-        // off the main actor; the prior task exits within one poll interval).
+        // Hand the new task its predecessor to cancel and join before polling, so
+        // two poll loops never fold snapshots concurrently. The join happens off
+        // the main actor and costs at most one poll interval.
         let previous = pollTask
         pollTask = Task.detached(priority: .utility) { [weak self, session] in
             previous?.cancel()
@@ -162,8 +156,7 @@ extension DocumentModel {
         }
     }
 
-    /// One poll tick's snapshot (was a 7-parameter `applyPoll` call), built off
-    /// the main actor and handed to `applyPoll` on it — hence `Sendable`.
+    /// One poll tick, read off the main actor and folded on it.
     private struct PollSnapshot: Sendable {
         /// The session this tick polled. Two `open()` calls can overlap (each
         /// suspends on the opener), leaving the loser's poll loop briefly alive
@@ -179,10 +172,9 @@ extension DocumentModel {
         let columnProgress: Double?
     }
 
-    /// Fold one poll snapshot into state; returns whether polling should
-    /// continue (stops once the desired window is resolved and neither the
-    /// index, a jump, a search, nor a filter-scan is active, so idle documents
-    /// cost nothing).
+    /// Folds one poll snapshot into state and reports whether to keep polling —
+    /// which stops once the desired window is resolved and no scan of any kind is
+    /// running, so an idle document costs nothing.
     private func applyPoll(_ snapshot: PollSnapshot) -> Bool {
         guard let live = session, live === snapshot.session else { return false }
         rowCountInfo = snapshot.rowCount

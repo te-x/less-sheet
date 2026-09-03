@@ -4,9 +4,8 @@ import Foundation
 import LessSheetKit
 import Observation
 
-// DocumentModel — the local open funnel and dialect-change routing. The network
-// funnel + the shared session-adoption tail live in ViewerModel+Adopt.swift.
-// Pure code motion out of ViewerModel.swift (no behavior change).
+// The local open funnel and dialect-change routing. The network funnel and the
+// shared session-adoption tail live in ViewerModel+Adopt.swift.
 
 extension DocumentModel {
     // MARK: - Opening (single funnel)
@@ -75,13 +74,10 @@ extension DocumentModel {
         }
     }
 
-    /// Decides how a re-open (dialect change) should treat the PRIOR session's
-    /// column settings — shared by the local `open(path:)` and network
-    /// `openURL(_:)` funnels so a separator/quote/header/encoding change
-    /// behaves identically regardless of document kind. Returns nil when the
-    /// authored-settings replay itself failed (the caller must restore the
-    /// OLD session and abort the re-open, exactly as `open(path:)` did inline
-    /// before this was extracted).
+    /// How a dialect re-open should treat the prior session's column settings,
+    /// shared by both funnels so the behavior does not depend on document kind.
+    /// Returns nil when the settings replay itself failed, in which case the
+    /// caller must keep the old session and abandon the re-open.
     func resolveReopen(
         candidate: any DocumentSession, oldSession: (any DocumentSession)?, oldDialect: DialectReport,
         previous: ColumnVisibility?, authoredSettings: [Int: ColumnUserSettings]
@@ -140,23 +136,20 @@ extension DocumentModel {
         }
         let path = self.path
         let carried = self.visibility
-        // A header toggle preserves the viewport: record how the data-row index
-        // shifts so the grid can re-anchor to the same file record across the
-        // re-open (it captures its own exact top row from the live scroll, so we
-        // only pass the ±1 shift). A separator/quote change resets to the top.
+        // A header toggle preserves the viewport: the grid captures its own top
+        // row from the live scroll, so it only needs the ±1 record shift. Every
+        // other dialect change rests at the top.
         if case let .header(newValue) = change {
             pendingHeaderShift = (newValue == dialect.hasHeader) ? 0 : (newValue ? -1 : +1)
-            // The H button toggles with no popup or text of its own — surface
-            // what just changed (same vocabulary as the button's tooltip).
+            // The H button flips with no popup or text of its own, so the glyph
+            // swap alone is easy to miss.
             showDialectNotice(newValue ? "First row is now a header" : "First row is now data")
         } else {
             pendingHeaderShift = nil
         }
-        // A network document must re-open through the SAME (network) funnel:
-        // `path` holds its URL, not a filesystem path, so routing it through
-        // `open(path:)` would try to ls_open the URL string as a local file
-        // and silently fail back to the old session — this was a real bug
-        // (separator/quote/header changes on a network doc did nothing).
+        // A network document MUST re-open through the network funnel: `path`
+        // holds its URL, so the local funnel would try to open that string as a
+        // filesystem path and silently fall back to the old session.
         if currentOpenKind == .network {
             Task { await self.openURL(path, forcing: override, carrying: carried) }
         } else {
@@ -165,9 +158,8 @@ extension DocumentModel {
         return true
     }
 
-    /// Raises the brief dialect notice and schedules its auto-clear —
-    /// exactly `completeCopy`'s notice lifecycle (a fresh notice supersedes
-    /// a still-fading one by cancelling its task first).
+    /// Raises the brief dialect notice and schedules its auto-clear; a fresh
+    /// notice supersedes a still-fading one.
     private func showDialectNotice(_ text: String) {
         dialectNoticeTask?.cancel()
         dialectNotice = text
@@ -178,9 +170,8 @@ extension DocumentModel {
         }
     }
 
-    /// The grid reads (and clears) the pending header-toggle shift when it handles
-    /// a re-open, to decide whether to re-anchor the viewport (header toggle) or
-    /// rest at the top-left (every other open). Returns nil when there is none.
+    /// The grid reads and clears this on a re-open, to decide between
+    /// re-anchoring the viewport and resting at the top-left.
     func consumePendingHeaderShift() -> Int? {
         defer { pendingHeaderShift = nil }
         return pendingHeaderShift

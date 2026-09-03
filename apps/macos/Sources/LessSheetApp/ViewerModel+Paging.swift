@@ -4,17 +4,17 @@ import Foundation
 import LessSheetKit
 import Observation
 
-// DocumentModel — windowed paging (O(viewport)): the row + horizontal column
-// window materialization, the memoized layout-width cache, and the panel /
-// coordinated-inference plumbing. Pure code motion out of ViewerModel.swift.
+// Windowed paging: the row and horizontal column window materialization, the
+// memoized layout-width cache, and the coordinated column-inference plumbing.
+// Everything here is O(viewport), never O(file) or O(columnCount).
 
 extension DocumentModel {
     // MARK: - Windowed paging (O(viewport); UI-thread fast path)
 
-    /// The grid reports its visible row range on scroll/resize; we page the
-    /// core window (viewport + 2× scroll buffer) only when the range leaves a
-    /// comfort zone inside the current window. `setWindow` never scans, so this
-    /// stays on the main thread per the contract.
+    /// The grid reports its visible row range on scroll and resize; the core
+    /// window (viewport plus a scroll buffer each way) is re-paged only when that
+    /// range leaves a comfort zone inside the current one. `setWindow` never
+    /// scans, so this is allowed to stay on the main thread.
     func viewportChanged(firstVisibleRow: Int, visibleRowCount: Int) {
         guard columnCount > 0 else { return }
         self.firstVisibleRow = max(0, firstVisibleRow)
@@ -36,28 +36,18 @@ extension DocumentModel {
         let newCount = visibleCount + buffer * 2
         materialize(start: UInt64(newStart), count: newCount)
         if desiredWindow.isShort {
-            // A settled document's poll task may already have exited. Wake the
-            // coalesced driver for this changed request so its short prefix is
-            // retried at the normal cadence until it fills or reaches EOF.
+            // A settled document's poll task has already exited; the short prefix
+            // needs it back to retry this request until it fills or hits EOF.
             startPolling()
         }
     }
 
-    /// The grid reports its horizontal scroll clip (x-offset + viewport
-    /// width) so the column window can be (re)derived, newly-revealed columns
-    /// RE-FETCHED once the comfort zone of the last `setWindow(columns:)` call
-    /// is exhausted (ARCH-column-windowing round-2, "Horizontal-scroll
-    /// re-materialize" — see the coversLeft/coversRight check below, which
-    /// mirrors `viewportChanged`'s row-window one), and accurately measured —
-    /// the horizontal analog of `viewportChanged`'s row window. The widths
-    /// array fed to `ColumnLayouting.window` is the MEMOIZED
-    /// `cachedLayoutWidths` (rebuilt only on a width-batch change, never
-    /// here), so a scroll tick is genuinely O(1) setup + `window`'s own
-    /// O(window position) scan, plus an O(window) `setWindow(columns:)`
-    /// re-fetch only when the comfort zone ran out — never O(columnCount)
-    /// either way. A no-op once the window settles (unchanged from the last
-    /// report), so neither the fetch nor `growColumnWidthsToFitWindow`
-    /// re-touches a stable window.
+    /// The horizontal analog of `viewportChanged`: the grid reports its scroll
+    /// clip, the column window is re-derived from the MEMOIZED widths, and newly
+    /// revealed columns are re-fetched once the last fetch's comfort zone runs
+    /// out. A scroll tick therefore costs O(1) setup plus the window scan, and a
+    /// re-fetch only O(window) — never O(columnCount) either way. A no-op once
+    /// the window settles, so a stable window is never re-touched.
     func horizontalViewportChanged(viewportX: CGFloat, viewportWidth: CGFloat) {
         refreshLayoutWidthsIfNeeded()
         guard !cachedLayoutWidths.isEmpty else { return }
@@ -68,15 +58,10 @@ extension DocumentModel {
         guard win != columnWindow else { return }
         setColumnWindow(win)
 
-        // Re-materialize ONLY when the new window would spill past the LAST
-        // fetch (`window.firstColumn` .. its rows' width) beyond a
-        // `columnOverscan` comfort margin — a small scroll settles inside an
-        // already-fetched range with no extra core call; the moment it does
-        // not, re-issuing setWindow(columns:) over the SAME row range (via
-        // `materialize`) fetches the newly-revealed columns' real cells
-        // before they are drawn, and `materialize` itself re-runs
-        // `growColumnWidthsToFitWindow` against the refreshed cells — so this
-        // branch does not also call it directly.
+        // Re-materialize only when the new window would spill past the last
+        // fetch by more than the comfort margin. `materialize` re-runs the width
+        // grow against the refreshed cells itself, which is why that branch does
+        // not also call it.
         let target = absoluteColumnWindow()
         let guardCols = GridMetrics.columnOverscan
         let fetchedEnd = window.firstColumn + (window.rows.first?.count ?? 0)
@@ -90,33 +75,22 @@ extension DocumentModel {
         }
     }
 
-    /// The ABSOLUTE column range the CURRENT `columnWindow` spans — the
-    /// enclosing span of its in-window visible columns
-    /// (`windowColumns().first ..< .last + 1`). Identical to `columnWindow.
-    /// range` whenever no column is hidden (every existing fixture, and
-    /// wide_100k_cols); a hidden column strictly BETWEEN two in-window visible
-    /// ones is folded in too — `setWindow(columns:)` needs one contiguous
-    /// absolute range, and this is a cheap superset, never a fresh
-    /// `0..<columnCount` scan. Empty (`0..<0`) before any column window is
-    /// established (a fresh open) or when nothing is in view.
+    /// The ABSOLUTE column range the current window spans. `setWindow(columns:)`
+    /// needs one contiguous range, so a hidden column between two visible
+    /// in-window ones is folded in — a cheap superset, never a full scan.
     private func absoluteColumnWindow() -> Range<Int> {
         let cols = windowColumns()
         guard let first = cols.first, let last = cols.last else { return 0..<0 }
         return first..<(last + 1)
     }
 
-    /// The ABSOLUTE column range `materialize` asks the core to fetch: the
-    /// current column window (`absoluteColumnWindow`) padded by
-    /// `columnFetchBuffer` on each side and clamped to `0..<columnCount` — the
-    /// horizontal analog of `viewportChanged`'s buffered `newStart`/`newCount`
-    /// row request, so a horizontal scroll settles inside an already-fetched
-    /// range instead of re-materializing on every tick. Before the grid's
-    /// first geometry callback (`columnWindow` still empty — a fresh open)
-    /// falls back to the leftmost `initialColumnFetchCount` columns (see its
-    /// doc) rather than the whole document: `measureColumnWidths`'s head
-    /// sample reads exactly this fetch, which is what makes the session's
-    /// FIRST materialize — and every one after it — O(hundreds) of columns,
-    /// never O(columnCount) (ARCH-column-windowing round-2, AC7).
+    /// The ABSOLUTE column range `materialize` asks the core for: the current
+    /// window padded by `columnFetchBuffer` each side, so a horizontal scroll
+    /// settles inside an already-fetched range. Before the grid's first geometry
+    /// callback it falls back to the leftmost `initialColumnFetchCount` columns
+    /// rather than the whole document — the open-time width measurement reads
+    /// exactly this fetch, which is what keeps a session's first materialize
+    /// O(hundreds) of columns however wide the document is.
     private func columnFetchRange() -> Range<Int> {
         guard columnCount > 0 else { return 0..<0 }
         guard !columnWindow.isEmpty else {
@@ -127,35 +101,26 @@ extension DocumentModel {
         return max(0, target.lowerBound - buffer) ..< min(columnCount, target.upperBound + buffer)
     }
 
-    /// Rebuilds `cachedLayoutWidths` (render-order `Double` widths) and
-    /// `cachedTotalVisibleWidth` (their sum) TOGETHER, in one O(visible
-    /// columns) pass — but only when `layoutWidthsStale` is set (see
-    /// `markLayoutWidthsStale`); a no-op otherwise. The single shared pass
-    /// means a structural refresh (`totalVisibleWidth`) and a scroll-driven
-    /// window query (`horizontalViewportChanged`) never each pay their own
-    /// separate O(columnCount) traversal for the same underlying data.
+    /// Rebuilds the render-order widths and their sum together, in one pass,
+    /// and only when a width batch or the visibility actually changed — so a
+    /// structural refresh and a scroll-driven window query never each pay their
+    /// own traversal of the same data.
     func refreshLayoutWidthsIfNeeded() {
         guard layoutWidthsStale else { return }
         let cols = visibleColumns
-        // Hoisted to a LOCAL once: `columnWidths` is an `@Observable`-tracked
-        // property, and re-reading it from inside a 100k-iteration loop pays
-        // that tracking overhead 100k times over — measurably significant in
-        // a debug build, not merely theoretical (this loop's whole reason for
-        // existing is to pay that cost exactly ONCE per width batch).
+        // Both hoisted to locals once: `columnWidths` is @Observable-tracked, so
+        // re-reading it inside a 100k-iteration loop pays that tracking cost
+        // 100k times, and an empty manual map makes the check below one
+        // is-empty test rather than a hash lookup per column.
         let source = columnWidths
-        // Hoisted alongside `source` for the SAME reason (see above): an
-        // EMPTY manual map (the common case) makes the per-iteration check
-        // below one dictionary-is-empty test, not a hash + lookup, 100k times.
         let manual = manualColumnWidths
         var widths = [Double](repeating: 0, count: cols.count)
         var total: CGFloat = 0
         for index in 0..<cols.count {
             let column = cols[index]
             let auto = column < source.count ? source[column] : GridMetrics.minColumnWidth
-            // EFFECTIVE width (ARCH-select-copy AC5): a manual override wins,
-            // regardless of the auto baseline — this is what keeps
-            // `cachedLayoutWidths`/`cachedTotalVisibleWidth` (the column-
-            // window geometry + total-width inputs) honest about a resize.
+            // A manual override wins over the auto baseline, so the geometry and
+            // total-width inputs stay honest about a resize.
             let width = manual.isEmpty ? auto : (manual[column].map { CGFloat($0) } ?? auto)
             widths[index] = Double(width)
             total += width
@@ -165,42 +130,32 @@ extension DocumentModel {
         layoutWidthsStale = false
     }
 
-    /// Invalidates `cachedLayoutWidths` / `cachedTotalVisibleWidth` — call
-    /// after every `columnWidths` or `visibility` change (a width batch: a
-    /// fresh open's `measureColumnWidths`, or `growColumnWidthsToFitWindow`'s
-    /// monotone grow) so the next read rebuilds from the NEW values instead
-    /// of serving a stale cache.
+    /// Call after every width-batch or visibility change, so the next read
+    /// rebuilds instead of serving a stale cache.
     func markLayoutWidthsStale() {
         layoutWidthsStale = true
     }
 
     /// Materializes the row window AND the current horizontal column window
-    /// together (ARCH-column-windowing round-2, AC7): `columnFetchRange`
-    /// derives the ABSOLUTE column range from `columnWindow` (or the
-    /// open-time default before one exists), so this fetches O(visible
-    /// columns), never O(columnCount) — see `CoreDocumentSession.setWindow
-    /// (firstRow:rowCount:columns:)`. `window.firstColumn`/each row's width
-    /// then reflect that range; every consumer below indexes it
-    /// column-relative (absolute column `c` at slot `c - window.firstColumn`).
+    /// together, so the fetch is O(visible columns) rather than O(columnCount).
+    /// `window.firstColumn` then carries that range, and every consumer indexes
+    /// column-RELATIVE: absolute column `c` sits at slot `c - firstColumn`.
     func materialize(start: UInt64, count: Int) {
         guard let session else { return }
         desiredStart = start
         desiredCount = count
         let columns = columnFetchRange()
         window = session.setWindow(firstRow: start, rowCount: count, columns: columns)
-        // A fresh window materialization: the visible bytes just changed (even
-        // when the geometry happens to match the previous window — e.g. a
-        // same-dims document re-open lands here at firstRow 0). Bump the mask's
-        // content epoch so the next highlight refetches (AC5: one fetch per
-        // materialize), never serving the previous window's mask.
+        // The visible bytes just changed, even when the geometry happens to match
+        // the previous window, so the highlight mask must refetch.
         invalidateMatchFlags()
         refreshWindowLabels(columns: columns)
         growColumnWidthsToFitWindow()
     }
 
-    /// Refreshes only the buffered horizontal label window. The core ABI caps
-    /// a call at 1024 IDs, so unusually large viewports are split into bounded
-    /// batches while the retained cache remains O(the fetch window).
+    /// Refreshes only the buffered horizontal label window. The ABI caps a call
+    /// at `columnLabelSearchBatchMax` ids, so a very wide fetch is split into
+    /// bounded batches; the retained cache stays O(the fetch window).
     private func refreshWindowLabels(columns: Range<Int>) {
         guard let core = session as? CoreDocumentSession else { return }
         var labels: [Int: String] = [:]
@@ -230,8 +185,8 @@ extension DocumentModel {
         columnPresentationRevision += 1
     }
 
-    /// Declares the panel's layout-bounded viewport+overscan ID set. Label and
-    /// metadata copies happen off-main and replace the prior bounded cache.
+    /// Declares the panel's layout-bounded id set. The label and metadata copies
+    /// happen off-main and replace the prior bounded cache.
     func updatePanelViewport(_ ids: [UInt32]) {
         let bounded = Array(ids.prefix(columnLabelSearchBatchMax))
         guard bounded != panelInferenceIDs else { return }
@@ -282,11 +237,11 @@ extension DocumentModel {
         if !gridInferenceIDs.isEmpty { startPolling() }
     }
 
+    /// The one desired inference set, in priority order: the inspected column,
+    /// then the panel viewport, then the grid fills the remaining slots. Panel
+    /// rows are what the user is actively looking at and must never be starved
+    /// by a very wide grid window consuming the whole batch cap.
     func coordinatedInferenceIDs() -> [UInt32] {
-        // Panel rows are the actively inspected viewport and must never be
-        // starved by a very wide grid window consuming the ABI's 1024-ID cap.
-        // The selected inspector column is first, then panel viewport, then
-        // the grid fills the remaining bounded slots.
         var ids = panelSelectedColumn.map { [$0] } ?? []
         for id in panelInferenceIDs where !ids.contains(id) && ids.count < columnLabelSearchBatchMax {
             ids.append(id)

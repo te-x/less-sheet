@@ -4,23 +4,19 @@ import Foundation
 import LessSheetKit
 import Observation
 
-// DocumentModel — the monotone column-width grow over the current window, plus
-// the column-relative window cell/truncation/oversized accessors. Pure code
-// motion out of ViewerModel.swift (no behavior change).
+// The monotone column-width grow over the current window, and the
+// column-relative accessors into the materialized window.
 
 extension DocumentModel {
-    /// The DECIDED width behaviour (ARCH-column-windowing "Column-width
-    /// behaviour" / AC5b): grow — never shrink — each column CURRENTLY IN THE
-    /// HORIZONTAL WINDOW to fit its OWN content over the just-materialized
-    /// vertical row window, capped at maxColumnWidth, and merged through
-    /// `ColumnLayouting.grown` so the merge is provably independent and
-    /// monotone. Bounded to `columnWindow` — never `columnCount` — so this
-    /// stays cheap however wide the document is.
+    /// Grows — never shrinks — each column currently in the horizontal window to
+    /// fit its OWN content over the just-materialized rows, capped and merged
+    /// monotonically. Bounded to the window, never `columnCount`, so it stays
+    /// cheap however wide the document is.
     func growColumnWidthsToFitWindow() {
         guard columnCount > 0, !window.rows.isEmpty, columnWidths.count == columnCount else { return }
-        // Measure only the VISIBLE slice (~a viewport), not the whole buffered
-        // window — keeps this off the landing hot path (<100 ms budget); growth
-        // keeps up incrementally as further scrolls re-materialize.
+        // Only the VISIBLE slice, not the whole buffered window: this sits on the
+        // landing path, and growth keeps up incrementally as scrolling
+        // re-materializes.
         let start = Int(window.firstRow)
         let lowerRow = max(start, firstVisibleRow)
         let upperRow = min(start + window.rows.count, firstVisibleRow + max(lastVisibleCount, 1))
@@ -55,9 +51,8 @@ extension DocumentModel {
         cachedLayoutWidths = grownWidths   // stays in lockstep; no need to mark stale
     }
 
-    /// Loop-invariant context for `widthCandidate` (bundled to keep the helper
-    /// under the parameter-count bar): the visible-column list + its window base,
-    /// the visible row band, and the two fonts each measured cell is drawn in.
+    /// Loop-invariant context for `widthCandidate`: the visible-column list and
+    /// its window base, the visible row band, and the fonts the cells are drawn in.
     private struct WidthMeasureContext {
         let cols: [Int]
         let base: Int
@@ -68,26 +63,20 @@ extension DocumentModel {
         let headFont: NSFont
     }
 
-    /// The grown width CANDIDATE for the column at visible position `pos`, or
-    /// nil when it should not grow (a manual override, out of range, or already
-    /// wide enough). Extracted from `growColumnWidthsToFitWindow` so that method
-    /// stays under the cyclomatic-complexity bar; behavior is identical. A cell
-    /// the core already clipped — display-TRUNCATED, or any cell of an OVERSIZED
-    /// row — is excluded from the measurement (it isn't the cell's real content).
+    /// The grown width candidate for the column at visible position `pos`, or nil
+    /// when it should not grow. A cell the core already clipped — display
+    /// truncated, or any cell of an oversized row — is excluded: that is not the
+    /// cell's real content.
     private func widthCandidate(forPosition pos: Int, in context: WidthMeasureContext) -> Double? {
         let column = context.cols[pos]
         guard column < columnWidths.count else { return nil }
-        // A manually-resized column is FROZEN (ARCH-select-copy AC5: auto-grow
-        // never overrides a manual width) — skip measuring it so its auto
-        // baseline (and the effective-width cache) stay exactly as the user set
-        // them until they clear/auto-fit it.
+        // A manually-resized column is frozen: auto-grow never overrides it.
         guard manualColumnWidths[column] == nil else { return nil }
         let rel = column - context.base
-        // Always measure the header (its accurate semibold width): the open-time
-        // measurement already baked the header into every column's width, so for
-        // the initial window this is idempotent, while a column revealed LATER
-        // (past the open-time fetch range on a wide document) still gets its
-        // header width the moment it enters the window, monotone.
+        // Always measure the header. The open-time pass already baked it into
+        // every column, so this is idempotent for the initial window — but a
+        // column first revealed later still gets its header width the moment it
+        // enters the window.
         var width = Self.textWidth(columnLabel(column), context.headFont)
         for row in context.lowerRow..<context.upperRow {
             let idx = row - context.start
@@ -103,13 +92,10 @@ extension DocumentModel {
         return Double(capped)
     }
 
-    /// Cells for a data row, read from the currently materialized window —
-    /// COLUMN-RELATIVE to `window.firstColumn` (ARCH-column-windowing
-    /// round-2): slot `j` is absolute column `window.firstColumn + j`, NOT
-    /// absolute column `j` itself, whenever the window is narrower than
-    /// `columnCount`. Rows outside the window return `nil` (the grid renders
-    /// empty cells that fill in once the frontier advances and the window
-    /// re-materializes). Absolute-column callers go through `cellsAt`, below.
+    /// Cells for a data row, COLUMN-RELATIVE to `window.firstColumn`: slot `j` is
+    /// absolute column `firstColumn + j`, not absolute column `j`. Rows outside
+    /// the window return nil, and the grid renders empty cells that fill in once
+    /// the window catches up. Absolute-column callers use `cellsAt`.
     func cells(forRow row: Int) -> [String]? {
         let start = Int(window.firstRow)
         let idx = row - start
@@ -117,10 +103,8 @@ extension DocumentModel {
         return window.rows[idx]
     }
 
-    /// Per-cell display-truncation flags for a data row, PARALLEL to
-    /// `cells(forRow:)` (mirrors `RowWindow.truncated`, ARCH req. 13/20) —
-    /// same column-RELATIVE shape as `cells(forRow:)`. Rows outside the
-    /// window return `nil`, same rule as `cells(forRow:)`.
+    /// Display-truncation flags parallel to `cells(forRow:)`, in the same
+    /// column-relative shape and under the same window rule.
     func truncated(forRow row: Int) -> [Bool]? {
         let start = Int(window.firstRow)
         let idx = row - start
@@ -128,14 +112,10 @@ extension DocumentModel {
         return window.truncated[idx]
     }
 
-    /// Cells at ABSOLUTE `columns` of data row `row`, mapped through the
-    /// CURRENTLY FETCHED column window (`window.firstColumn`): absolute
-    /// column `c` reads slot `c - window.firstColumn` of `cells(forRow:)`,
-    /// empty-padded for a column outside the fetched range — not yet
-    /// materialized, or past the row's width — exactly like a not-yet-loaded
-    /// row (ARCH-column-windowing round-2). Shared by the eager, all-visible-
-    /// columns dump-grid helpers and the live grid's window-bound helpers
-    /// below; they differ only in which absolute columns they ask for.
+    /// Cells at ABSOLUTE `columns`, mapped through the fetched column window:
+    /// column `c` reads slot `c - window.firstColumn`, empty-padded for anything
+    /// outside that range. The eager and window-bound helpers differ only in
+    /// which absolute columns they ask for.
     func cellsAt(_ columns: [Int], forRow row: Int) -> [String] {
         guard let full = cells(forRow: row) else { return Array(repeating: "", count: columns.count) }
         let base = window.firstColumn
@@ -145,8 +125,7 @@ extension DocumentModel {
         }
     }
 
-    /// Truncation flags at ABSOLUTE `columns` of data row `row` — the
-    /// `truncated(forRow:)` analog of `cellsAt`.
+    /// Truncation flags at ABSOLUTE `columns` — the `cellsAt` analog.
     func truncatedAt(_ columns: [Int], forRow row: Int) -> [Bool] {
         guard let full = truncated(forRow: row) else { return Array(repeating: false, count: columns.count) }
         let base = window.firstColumn
@@ -156,12 +135,9 @@ extension DocumentModel {
         }
     }
 
-    /// Whether a data row is OVERSIZED (ARCH-huge-row-budget req. 3/7): its
-    /// SOURCE extent exceeded the core's per-row window scan cap, so it was
-    /// served as a bounded prefix (mirrors `RowWindow.oversized`). `false` for
-    /// rows outside the currently materialized window, same rule as
-    /// `cells(forRow:)` / `truncated(forRow:)` — the gutter simply shows no
-    /// marker until a re-window catches up, exactly like a blank row.
+    /// Whether a row's SOURCE extent exceeded the core's per-row scan cap, so it
+    /// was served as a bounded prefix. False outside the materialized window,
+    /// under the same rule as the accessors above.
     func rowOversized(forRow row: Int) -> Bool {
         let start = Int(window.firstRow)
         let idx = row - start
@@ -169,16 +145,10 @@ extension DocumentModel {
         return window.oversized[idx]
     }
 
-    /// Whether a data row's cells are already SERVABLE — the materialized
-    /// window has reached it — as opposed to being within the row-count
-    /// estimate but past the scan frontier (the case `cells(forRow:)` /
-    /// `visibleBodyCells(forRow:)` return `nil` / empty-padded for). The grid
-    /// uses this to distinguish "still loading" from a genuinely empty row —
-    /// both otherwise render identically empty — and draws a subtle loading
-    /// placeholder for the former instead of silently blank cells (PROJECT:
-    /// constant feedback, no silent stalls). Same window-membership rule as
-    /// `cells(forRow:)`; unrelated to filtering (a filtered window's `cells`
-    /// already reflect the filtered view under that same rule).
+    /// Whether a row's cells are SERVABLE yet, as opposed to inside the row-count
+    /// estimate but past what the window has materialized. The two otherwise
+    /// render identically empty, so this is the only thing that lets the grid draw
+    /// a loading placeholder rather than silently blank cells.
     func rowLoaded(forRow row: Int) -> Bool {
         cells(forRow: row) != nil
     }

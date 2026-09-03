@@ -4,26 +4,18 @@ import Foundation
 import LessSheetKit
 import Observation
 
-// DocumentModel — the pure index-space rectangular selection (ARCH-select-copy
-// AC1) and the manual column resize / double-click auto-fit width overrides
-// (AC5). Pure code motion out of ViewerModel.swift (no behavior change).
+// The index-space rectangular selection, and the manual resize / auto-fit width
+// overrides. The grid's event routing is the only caller.
 
 extension DocumentModel {
-    // MARK: - Selection (ARCH-select-copy AC1) — pure index-space state
-    // driven by `Selecting` (`SelectionModel`); the grid's mouse/keyboard/
-    // gutter/header event routing (NativeGridController) is the only caller.
-    // O(1) in the extent, so Cmd+A on the largest document is free.
-
-    /// The document's selectable extent RIGHT NOW: `rowCountInfo.count`
-    /// already reports the FILTERED count while a filter is active (the
-    /// same domain every other row index in this model uses), so a
-    /// selection is naturally scoped to the current view mode with no extra
-    /// branching here.
+    /// The selectable extent right now. `rowCountInfo.count` already reports the
+    /// FILTERED count while a filter is active — the same domain every other row
+    /// index in this model uses — so a selection is naturally scoped to the
+    /// current view mode with no branching here.
     private func selectionExtent() -> GridExtent {
         GridExtent(rowCount: rowCountInfo.count, columnCount: columnCount)
     }
 
-    /// A plain click.
     func selectCell(row: UInt64, column: Int) {
         selection = selectionModel.select(GridCell(row: row, column: column), in: selectionExtent())
     }
@@ -39,23 +31,17 @@ extension DocumentModel {
         selection = nil
     }
 
-    /// A drag or shift-click: anchor kept, active moves to the clicked cell.
-    /// Nothing selected yet: falls back to a plain click (there is no
-    /// anchor to extend from).
+    /// A drag or shift-click: the anchor stays, the active corner moves. With
+    /// nothing selected it falls back to a plain click.
     func extendSelection(toRow row: UInt64, column: Int) {
         guard let current = selection else { selectCell(row: row, column: column); return }
         selection = selectionModel.extend(current, to: GridCell(row: row, column: column), in: selectionExtent())
     }
 
-    /// Keyboard navigation (ARCH-macos-kbdnav FR1): the arrow / page / document
-    /// / line command set, plain or shift-extending, routed through the pure
-    /// `KeyboardNavigator` — which COMPOSES the SAME `selectionModel` geometry
-    /// (no duplicated clamp / anchor-active algebra). The grid supplies the
-    /// viewport-derived context (top visible row, leading visible column, page
-    /// size); the reducer owns seed-no-step, visible-column stepping, the
-    /// document/line targets, and clamping. With nothing selected ANY command
-    /// seeds a 1×1 cursor at the top-left visible cell (no step). Assigns only a
-    /// non-nil result, so an empty (nothing-selectable) extent is a no-op.
+    /// The arrow / page / document / line command set, plain or shift-extending.
+    /// The grid supplies the viewport-derived context; the reducer owns the
+    /// seeding, the visible-column stepping and the clamping, composing the SAME
+    /// selection geometry rather than duplicating it.
     func navigate(_ motion: NavigationMotion, extending: Bool,
                   topVisibleRow: UInt64, firstVisibleColumn: Int, pageRows: UInt64) {
         let context = NavigationContext(
@@ -67,7 +53,6 @@ extension DocumentModel {
         }
     }
 
-    /// A gutter click: the whole (capped) row.
     func selectWholeRow(_ row: UInt64) {
         selection = selectionModel.wholeRow(row, in: selectionExtent())
     }
@@ -78,7 +63,6 @@ extension DocumentModel {
         selection = selection == candidate ? nil : candidate
     }
 
-    /// A header click: the whole (capped) column.
     func selectWholeColumn(_ column: Int) {
         selection = selectionModel.wholeColumn(column, in: selectionExtent())
     }
@@ -89,10 +73,8 @@ extension DocumentModel {
         selection = selection == candidate ? nil : candidate
     }
 
-    /// A shift-click on the gutter (ARCH: whole-row EXTEND is "composed by
-    /// the frontend from extend(_:to:in:)"): keep the anchor, extend to the
-    /// clicked row spanning every column. Nothing selected yet: falls back
-    /// to a plain whole-row select.
+    /// Shift-click on the gutter: keep the anchor, extend to the clicked row
+    /// across every column.
     func extendSelectionToWholeRow(_ row: UInt64) {
         guard let current = selection else { selectWholeRow(row); return }
         let extent = selectionExtent()
@@ -100,8 +82,7 @@ extension DocumentModel {
         selection = selectionModel.extend(current, to: GridCell(row: row, column: extent.lastColumn), in: extent)
     }
 
-    /// A shift-click on the header — the whole-column analog of
-    /// `extendSelectionToWholeRow`.
+    /// Shift-click on the header — the whole-column analog.
     func extendSelectionToWholeColumn(_ column: Int) {
         guard let current = selection else { selectWholeColumn(column); return }
         let extent = selectionExtent()
@@ -109,15 +90,13 @@ extension DocumentModel {
         selection = selectionModel.extend(current, to: GridCell(row: extent.lastRow, column: column), in: extent)
     }
 
-    /// Cmd+A: the capped extent from the origin — O(1) for any document size.
+    /// Cmd+A: the whole extent, O(1) for any document size.
     func selectAll() {
         selection = selectionModel.selectAll(in: selectionExtent())
     }
 
-    /// Per-column selection-overlay state for a data row over the current
-    /// column WINDOW (ARCH AC1), O(window) — the selection analog of
-    /// `windowCellHighlights`; `SheetRowView.draw` reads this directly (no
-    /// per-cell model call on the draw path).
+    /// Per-column selection-overlay state for a data row, precomputed so the row
+    /// view's draw makes no per-cell model call.
     func windowSelectionMarks(forRow row: Int) -> [SelectionMark] {
         guard let selection else { return [] }
         let rect = selection.rect
@@ -137,24 +116,19 @@ extension DocumentModel {
         }
     }
 
-    // MARK: - Column resize + auto-fit (ARCH-select-copy AC5)
+    // MARK: - Column resize + auto-fit
 
-    /// The width actually drawn for absolute `column`: the manual override
-    /// if present, else the auto baseline — `ColumnSizing`'s "manual wins"
-    /// rule, O(1) (a single dictionary lookup).
+    /// The width actually drawn for an absolute column: the manual override if
+    /// present, else the auto baseline.
     func effectiveWidth(_ column: Int) -> CGFloat {
         if let manual = manualColumnWidths[column] { return CGFloat(manual) }
         return column < columnWidths.count ? columnWidths[column] : GridMetrics.minColumnWidth
     }
 
-    /// Drag-resize: `windowIndex` is a position in the CURRENT column window
-    /// (`windowWidths()`'s index space — exactly what the grid hit-tests the
-    /// trailing hairline against), so resolving the absolute column and its
-    /// cache slot is O(1) — no all-visible-columns search ("ride the
-    /// column-window offsets"). Sets an explicit manual width (floored at
-    /// `minColumnWidth`) that STICKS: `windowWidths()`/`totalVisibleWidth`
-    /// return it regardless of what auto-grow measures underneath from here
-    /// on (`growColumnWidthsToFitWindow` skips it).
+    /// Drag-resize. `windowIndex` is a position in the CURRENT column window —
+    /// exactly what the grid hit-tests the trailing hairline against — so
+    /// resolving the absolute column and its cache slot needs no search. The
+    /// manual width then sticks: auto-grow skips the column from here on.
     func resizeWindowColumn(_ windowIndex: Int, toWidth width: Double) {
         let cols = windowColumns()
         guard cols.indices.contains(windowIndex) else { return }
@@ -169,11 +143,9 @@ extension DocumentModel {
         syncEffectiveWidthCache(column: column, windowIndex: windowIndex, previous: previous)
     }
 
-    /// Double-click auto-fit: clears the manual override AND resets the
-    /// column's AUTO baseline to the exact fit over its VISIBLE window
-    /// content (O(visible rows), never O(rows)) — so it is back in auto
-    /// mode at the fitted width and can grow again as new content scrolls
-    /// in (`ColumnSizing.autoFit`'s contract).
+    /// Double-click auto-fit: clears the manual override AND resets the auto
+    /// baseline to the exact fit over the VISIBLE rows, so the column is back in
+    /// auto mode at that width and free to grow again as new content scrolls in.
     func autoFitWindowColumn(_ windowIndex: Int) {
         let cols = windowColumns()
         guard cols.indices.contains(windowIndex) else { return }
@@ -191,15 +163,10 @@ extension DocumentModel {
         syncEffectiveWidthCache(column: column, windowIndex: windowIndex, previous: previous)
     }
 
-    /// O(1) sync of the visible-position caches (`cachedLayoutWidths`/
-    /// `cachedTotalVisibleWidth` — otherwise rebuilt only on a STRUCTURAL
-    /// change, see `refreshLayoutWidthsIfNeeded`) after ONE column's
-    /// effective width changed, so a resize drag never pays that O(visible
-    /// columns) rebuild (ARCH AC5: "O(1) per resize... no all-column
-    /// relayout"). `windowIndex` maps to visible-position `columnWindow.
-    /// first + windowIndex` with no search, by construction of
-    /// `windowColumns()`. A no-op while the caches are already stale (a
-    /// pending full rebuild picks up the fresh value on its own).
+    /// Patches the width caches for ONE changed column, so a resize drag never
+    /// pays the full rebuild. `windowIndex` maps to its visible position with no
+    /// search, by construction of `windowColumns()`. A no-op while the caches are
+    /// already stale — the pending rebuild picks up the fresh value itself.
     private func syncEffectiveWidthCache(column: Int, windowIndex: Int, previous: CGFloat) {
         guard !layoutWidthsStale else { return }
         let updated = effectiveWidth(column)
@@ -211,12 +178,11 @@ extension DocumentModel {
         cachedTotalVisibleWidth += updated - previous
     }
 
-    /// The measured pixel widths — header + each VISIBLE row's cell,
-    /// O(visible rows) — for absolute `column` (`ColumnSizing.autoFit`'s
-    /// `contentWidths` input; padding pre-added per the contract doc).
-    /// Mirrors `growColumnWidthsToFitWindow`'s own measurement (same fonts/
-    /// padding/oversized-row and truncated-cell exclusions) so a double-click
-    /// and the passive auto-grow agree on what "fits."
+    /// The measured pixel widths — the header plus each VISIBLE row's cell — for
+    /// one absolute column, padding included. Mirrors `growColumnWidthsToFitWindow`
+    /// exactly (same fonts, same padding, same oversized and truncated
+    /// exclusions), so a double-click and the passive auto-grow agree on what
+    /// "fits".
     func measuredContentWidths(forColumn column: Int) -> [Double] {
         let bodyFont = NSFont.monospacedSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
         let headFont = NSFont.systemFont(ofSize: NSFont.systemFontSize, weight: .semibold)

@@ -4,17 +4,15 @@ import Foundation
 import LessSheetKit
 import Observation
 
-// The presentation model for one viewer window. Owns the live windowed
-// `DocumentSession`, pages row windows as the user scrolls (O(viewport)),
-// polls index/jump progress OFF the main actor, drives the jump flow, holds
-// hidden-column and dialect override state, and the floating overlay's
-// reveal/fade presentation state. Every open — panel, launch, CLI, drag,
-// dialect re-open — funnels through `open(path:forcing:)`.
+// The presentation model for the viewer window: owns the live windowed
+// `DocumentSession`, pages row windows as the user scrolls, polls progress off
+// the main actor, and holds every piece of session-only document state. Every
+// open — panel, launch, CLI, drag, dialect re-open — funnels through
+// `open(path:forcing:)` or its network twin.
 //
-// This file holds ONLY the stored state + nested types + init. The behavior is
-// split across `ViewerModel+*.swift` extensions (opening, paging, grid, copy,
-// find, filter, columns, jump, lifecycle) — the members those extensions share
-// are `internal` (a type's implementation cannot be `private` across files).
+// This file holds only the stored state, the nested types and init; the
+// behavior lives in the `ViewerModel+*.swift` extensions, which is why the
+// members they share are `internal` rather than `private`.
 
 struct PanelColumnLabel {
     let text: String
@@ -47,24 +45,23 @@ final class DocumentModel {
 
     // Document facts (constant for the open session).
     var path: String = ""
-    /// Whether the current document was opened locally or over the network
-    /// (ARCH-network-source): keys the cold-start marker policy (AC10) and the
-    /// window title (the URL is shown as-is, no filename extraction — req 11).
+    /// Keys the cold-start marker policy (a network open emits none) and the
+    /// window title (a URL is shown as-is, with no filename extraction).
     var currentOpenKind: DocumentOpenKind = .local
-    /// The last network-open failure (for the affordance); cleared on a new open.
+    /// The last network-open failure; cleared on a new open.
     var networkOpenError: NetworkOpenError?
-    /// Live progress of an in-flight network open (nil when none). Drives the
-    /// always-visible progress affordance (req 10 / AC9); no 500 ms delay gate.
+    /// Live progress of an in-flight network open. Drives an ALWAYS-visible
+    /// affordance: network latency is unpredictable even for a small file, so
+    /// this one is deliberately not behind the delayed-progress gate.
     var networkOpenProgress: NetworkOpenProgress?
-    /// The in-flight network open's cancel signal (nil when none); `cancelNetworkOpen()`
-    /// fires it. Not `@Observable`-visible state on its own (the affordance reads
-    /// `networkOpenProgress`); only `openURL`/`cancelNetworkOpen` touch it.
+    /// The in-flight network open's cancel signal, touched only by `openURL` and
+    /// `cancelNetworkOpen`.
     var networkCancelToken: NetworkOpenCancelToken?
     var columnCount = 0
     var headerCells: [String]?
-    /// Bounded label cache for the core-backed grid fetch. Unlike the legacy
-    /// protocol property, this never grows with the document: every horizontal
-    /// re-materialize replaces it with exactly that buffered column window.
+    /// Bounded label cache for the grid fetch: every horizontal re-materialize
+    /// replaces it with exactly that buffered column window, so it never grows
+    /// with the document.
     var windowColumnLabels: [Int: String] = [:]
     var windowTruncatedLabels: Set<Int> = []
     var windowColumnMetadata: [Int: ColumnMetadata] = [:]
@@ -92,14 +89,11 @@ final class DocumentModel {
         separatorForced: false, quoteForced: false, headerForced: false
     )
     var columnWidths: [CGFloat] = []      // per ORIGINAL column index
-    /// The current horizontal column window (ARCH-column-windowing) — the
-    /// column analog of `window` (`RowWindow`): the contiguous run of columns
-    /// the live grid's measure/fetch/draw stays bounded to, reported by the
-    /// grid from its horizontal scroll clip (see `horizontalViewportChanged`).
-    /// Indices are positions into `visibleColumns` (render order), matching
-    /// what `ColumnLayouting.window(widths:...)` was given. Empty until the
-    /// grid reports its first real viewport (fresh open, before any layout).
-    /// Assign only through `setColumnWindow` — it keeps `cachedWindowColumns`
+    /// The column analog of `window`: the contiguous run of columns the live
+    /// grid's measure/fetch/draw stays bounded to, reported by the grid from its
+    /// horizontal scroll clip. Indices are positions into `visibleColumns`
+    /// (render order). Empty until the grid reports its first real viewport.
+    /// Assign only through `setColumnWindow`, which keeps `cachedWindowColumns`
     /// in lockstep.
     private(set) var columnWindow = ColumnWindow(first: 0, count: 0, firstX: 0)
     /// `columnWindow`'s slice of `visibleColumns`, as ABSOLUTE indices in render
@@ -117,109 +111,84 @@ final class DocumentModel {
     var sessionLocale = Locale.current
     var jumpFlow: JumpFlow = .idle
 
-    // Selection + copy (ARCH-select-copy AC1-4): the live rectangular
-    // selection (index space; nil = nothing selected) and a brief post-copy
-    // status line (ARCH AC2: "a subtle notice"). Both session-scoped, reset
-    // on every (re-)open like the find/filter state below.
+    // The live rectangular selection (index space) and a brief post-copy notice.
+    // Session-scoped, reset on every (re-)open like the find/filter state below.
     var selection: Selection?
     var copyNotice: String?
 
-    /// A brief, auto-fading "what changed" notice for immediate dialect
-    /// toggles — the header button flips with no popup, so the glyph swap
-    /// alone is easy to miss. Mirrors `copyNotice`'s lifecycle (set on the
-    /// action, cleared by its own task after a readable beat).
+    /// A brief "what changed" notice for the header toggle, which flips with no
+    /// popup of its own — the glyph swap alone is easy to miss.
     var dialectNotice: String?
     @ObservationIgnored var dialectNoticeTask: Task<Void, Never>?
 
-    // Find (search) session state: the editable draft + the active search's
-    // display (highlights render exactly while `display.request` is non-nil).
-    // The draft survives Esc / dialect re-open (query-retained semantics).
+    // The editable find draft plus the active search's display; highlights
+    // render exactly while `display.request` is non-nil. The draft survives Esc
+    // and a dialect re-open, so re-running is one Enter.
     var findSession: FindSession = FindControl().initial()
 
-    // Filter (filtered-views) state: the active filter's poll snapshot, or nil
-    // for the identity view (ARCH-filtered-views reqs. 10-18).
-    // `filterDocumentRows` captures M — the base (unfiltered) row-count
-    // knowledge from the identity view at the moment filtering began — held
-    // fixed while filtered, since the session's own `rowCount()` reports the
-    // filtered m from then on.
+    // The active filter's poll snapshot, or nil for the identity view.
+    // `filterDocumentRows` captures the base document row count at the moment
+    // filtering began and holds it fixed, since the session's own `rowCount()`
+    // reports the FILTERED count from then on.
     var filterSnapshot: FilterSnapshot?
     var filterDocumentRows: RowCountInfo?
 
     // A row the grid should bring into view (jump landing / cancel restore),
     // consumed and cleared by the grid once applied.
     var pendingScrollRow: UInt64?
-    /// Direct AppKit hand-off for jump/find landings. SwiftUI observation is
-    /// still the state bridge of record (`pendingScrollRow`), but an update can
-    /// legitimately be coalesced while the representable is attaching to its
-    /// window. The native controller installs this weak callback so every
-    /// landing also schedules a post-layout apply; no request is lost merely
-    /// because there was no subsequent observable mutation.
+    /// Direct AppKit hand-off for landings. `pendingScrollRow` is still the
+    /// state bridge of record, but SwiftUI can legitimately coalesce an update
+    /// while the representable is attaching to its window; the grid installs
+    /// this so no landing is lost merely because no further observable mutation
+    /// followed it.
     @ObservationIgnored var viewportLandingHandler: ((UInt64) -> Void)?
 
     // Overlay presentation state.
     var expandedPill: PillKind?
     var jumpFieldActive = false
-    /// The jump field's 1-based row text — model-side (like the find field's
-    /// `findSession.draft`) because ↑/↓ step it against document knowledge the
-    /// view does not own (row count / top visible row; see `stepJumpField`).
-    /// Survives closing the popup, exactly as the typed text always has; a
-    /// SUCCESSFUL submit clears it.
+    /// The jump field's 1-based row text. Model-side, not view-side, because
+    /// ↑/↓ step it against document knowledge the view does not own. Survives
+    /// closing the popup; a SUCCESSFUL submit clears it.
     var jumpFieldText = ""
-    /// Hold-to-accelerate state for the jump field's ↑/↓ (`stepJumpField`). Pure
-    /// control state — no view observes it — so it stays out of observation.
+    /// Hold-to-accelerate state for the jump field's ↑/↓. Pure control state.
     @ObservationIgnored var jumpFieldRamp = JumpFieldRamp()
     var findFieldActive = false
     var settingsOpen = false
-    /// Bumped by the ⌘J command to ask the overlay to reveal + focus the jump
-    /// field (the keyboard reveal path).
+    /// Bumped by ⌘J to open and focus the jump field.
     var jumpFocusRequests = 0
-    /// Bumped whenever a jump is REJECTED (target past the last row, or invalid
-    /// input): the jump field re-arms and the overlay blinks/shakes it (item 4).
+    /// Bumped whenever a jump is rejected (target past the last row, or invalid
+    /// input): the field re-arms and blinks/shakes.
     var jumpRejections = 0
-    /// Bumped by ⌘F to reveal the overlay + focus the find field.
+    /// Bumped by ⌘F to open and focus the find field.
     var findFocusRequests = 0
-    /// Bumped whenever a find submit is REJECTED (ordering predicate with a
-    /// non-numeric value): the value field blinks red + shakes (Reduce Motion =
-    /// blink only), reusing the jump rejection components.
+    /// Bumped whenever a find submit is rejected (an ordering predicate with a
+    /// non-numeric value): the value field blinks and shakes.
     var findRejections = 0
 
-    // MARK: Collaborators (pure view-model logic; pinned by frozen tests)
+    // MARK: Collaborators (the pure logic in LessSheetKit)
 
     let opener: any DocumentSessionOpening
     let visibilityManager = ColumnVisibilityManager()
-    /// The pure horizontal column-window geometry + width-growth algebra
-    /// (ARCH-column-windowing); see `horizontalViewportChanged` /
-    /// `growColumnWidthsToFitWindow`.
     let columnLayout = ColumnLayout()
     let jumpControl = JumpControl()
     let composer = DialectComposer()
     let findControl = FindControl()
     let filterControl = FilterControl()
     let windowPoll = WindowPoll()
-    /// The pure selection geometry and column-width algebra (ARCH-select-copy)
-    /// — same layering as the collaborators above. TSV copy framing now lives in
-    /// the core (ARCH-thin-frontend-shared-core Phase 2): `copySelection` streams
-    /// it off `DocumentSession.openCopy` instead of a frontend `TSVCopyBuilder`.
     let selectionModel = SelectionModel()
     let columnSizer = ColumnSizer()
     /// The direction of the outstanding search navigation (drives the wrap
     /// notice's start/end choice when a poll reports exhaustion).
     var searchNavDirection: SearchDirection = .forward
-    /// Genuine-user-Cancel latch (the Stop affordance → `cancelFind`). Set true
-    /// there, honored in `foldSearch`, cleared on the next fresh search /
-    /// navigation (submitFind / stepFind) and on any find-session reset
-    /// (closeFind / filter enter-exit / new document).
+    /// Latches a GENUINE user Cancel, so `foldSearch` can keep saying "Stopped".
     ///
-    /// WHY it exists: the core's `ls_search_cancel` only nils a PENDING
-    /// `NAV_SEARCHING`; an already-landed `NAV_FOUND` PERSISTS (api/lesssheet.h
-    /// 191-193, 764-767). So after a user cancel with a match landed (the
-    /// common case — submitFind navigates `.fromTop`), the next ~100ms poll
-    /// carries `phase=.cancelled, nav=.found`. `FindControl.resolved` folds
-    /// THAT (correctly, for a network net-park — api nfd_ac6) as the count with
-    /// notice=nil, which would CLOBBER the "Stopped" `cancelFind` set. The latch
-    /// re-asserts "Stopped" across that follow-up fold. A net-park never sets
-    /// the latch (no user stop), so its count path is untouched. Not observed
-    /// by any view — pure control state.
+    /// `ls_search_cancel` only clears a pending navigation; an already-landed
+    /// match persists. After a user cancel with a match landed — the common case
+    /// — the next poll therefore carries a cancelled phase AND a found nav,
+    /// which `FindControl.resolved` correctly folds as a count with no notice
+    /// (that shape is a SUCCESS on a network document). Without this latch that
+    /// fold would immediately clobber "Stopped". Cleared by the next fresh
+    /// search or navigation, and by any find-session reset.
     @ObservationIgnored var userStopped = false
 
     var session: (any DocumentSession)?
@@ -231,61 +200,37 @@ final class DocumentModel {
     @ObservationIgnored var openRequestSequence = 0
     var markedGeneration = -1
     var firstVisibleRow = 0
-    /// `visibilityManager.visibleColumns(visibility)`, memoized: kept in
-    /// lockstep by `setVisibility` (the ONLY place `visibility` is assigned)
-    /// so every read is O(1) — this list is read many times per frame (every
-    /// visible row's cells/truncation/highlights, the header labels, the
-    /// widths) and a fresh `0..<columnCount` filter on each of those reads
-    /// would itself be the O(total-columns) cost this slice removes, on a
-    /// wide document with nothing hidden (ARCH-column-windowing).
+    /// `visibleColumns`, memoized. Read many times per frame — every visible
+    /// row's cells, truncation flags and highlights, the header labels, the
+    /// widths — so a fresh `0..<columnCount` filter per read would itself be the
+    /// O(total columns) per-frame cost the column window exists to remove.
     var cachedVisibleColumns: [Int] = []
-    /// `visibleColumns.map { Double(columnWidths[$0]) }`, plus its sum, both
-    /// memoized together and rebuilt ONLY when `markLayoutWidthsStale` is
-    /// called — after a width batch changes (open, or a monotone grow) or
-    /// `visibility` changes — never per scroll tick. ARCH-column-windowing
-    /// calls for exactly this ("rebuilt only when a width batch changes, off
-    /// the per-frame path"): converting/summing 100k `CGFloat`s is measurably
-    /// NOT free in a debug build (tens of ms, closure/array overhead), so
-    /// recomputing either on every call would silently reintroduce an
-    /// O(columnCount) per-frame cost this whole slice exists to remove.
+    /// The render-order widths and their sum, rebuilt together ONLY when
+    /// `markLayoutWidthsStale` says a width batch or the visibility changed —
+    /// never per scroll tick. Converting and summing 100k CGFloats is not free.
     var cachedLayoutWidths: [Double] = []
     var cachedTotalVisibleWidth: CGFloat = 0
     var layoutWidthsStale = true
-    /// The per-window MATCH-FLAGS mask (ARCH-thin-frontend-shared-core Phase 1):
-    /// the highlight verdicts computed by the CORE (`ls_window_match_flags` via
-    /// `DocumentSession.windowMatchFlags`) instead of a frontend matcher — one
-    /// flag byte per materialized cell (1 = the cell matches the active
-    /// find/predicate request, 0 = not; row-major, stride == the fetched column
-    /// width). Fetched ONCE whenever the window geometry or the active request
-    /// changes (`ensureMatchFlagsFresh`), then indexed per cell by every repaint
-    /// (`matchFlag`) — O(viewport), with NO per-cell FFI and NO per-frame
-    /// matching. `@ObservationIgnored`: a derived cache, not observable state —
-    /// views observe `window` / `findSession.display`, and those changes are
-    /// exactly what invalidate the mask below.
+    /// The core's per-cell highlight verdicts for the materialized window: one
+    /// byte per cell, row-major with stride == the fetched column width. Fetched
+    /// once per window-or-request change and then indexed per cell by every
+    /// repaint, so a repaint costs no FFI and no matching. A derived cache, not
+    /// observable state — views observe `window` and `findSession.display`, and
+    /// those are exactly what invalidate it.
     @ObservationIgnored var matchFlagsMask: [UInt8] = []
     @ObservationIgnored var matchFlagsKey: MatchFlagsCacheKey?
-    /// Cumulative count of REAL `windowMatchFlags` ABI fetches (a cache miss in
-    /// `ensureMatchFlagsFresh` that actually hit the core — NOT cache hits, NOT
-    /// the empty no-search branch). Pure instrumentation for `MatchFlagsFetchProbe`
-    /// (the AC5 fetch-cadence lock). `@ObservationIgnored`: never observed.
+    /// Counts REAL mask fetches (cache misses that hit the core), for the probe
+    /// that locks the one-fetch-per-materialize cadence.
     @ObservationIgnored var matchFlagsFetchCount = 0
-    /// Monotonic CONTENT/materialization epoch — the mask cache's window-content
-    /// identity. Window GEOMETRY + request do NOT uniquely determine the visible
-    /// bytes (they also depend on which document/dialect/filter is open), so the
-    /// mask key alone could serve one document's mask over another's rows after a
-    /// same-geometry re-open (or a filter set/clear). This counter is bumped on
-    /// EVERY materialization (`materialize`) and on every content-swap that can
-    /// keep an identical geometry — `adoptSession` (new document) and both filter
-    /// paths (`applyFindAsFilter` / `clearFilter`). `@ObservationIgnored`: pure
-    /// cache-invalidation state, never observed.
+    /// Monotonic content epoch. Window geometry plus request do NOT uniquely
+    /// identify the visible bytes — they also depend on which document, dialect
+    /// and filter is open — so without this a same-geometry re-open or a filter
+    /// toggle would serve the previous content's mask over the new rows.
     @ObservationIgnored var matchFlagsContentGen = 0
 
-    /// Identity of a cached match-flags mask: the materialized window geometry it
-    /// was fetched for, PLUS the active request, PLUS the content epoch
-    /// (`matchFlagsContentGen`) — the last is what distinguishes two windows that
-    /// share a geometry+request but hold different bytes (a same-dims re-open, a
-    /// filter set/clear). A change in any field means the mask must be refetched
-    /// (Equatable is auto-synthesized).
+    /// The identity of a cached mask: the window geometry it was fetched for,
+    /// the active request, and the content epoch that separates two windows
+    /// sharing a geometry but holding different bytes.
     struct MatchFlagsCacheKey: Equatable {
         var contentGen: Int
         var firstRow: UInt64
@@ -295,8 +240,8 @@ final class DocumentModel {
         var request: SearchRequest?
     }
 
-    /// Bumps the match-flags content epoch (see `matchFlagsContentGen`). Called
-    /// wherever the visible bytes may change under a possibly-unchanged geometry.
+    /// Call wherever the visible bytes may change under a possibly-unchanged
+    /// window geometry.
     func invalidateMatchFlags() {
         matchFlagsContentGen &+= 1
     }
@@ -308,64 +253,47 @@ final class DocumentModel {
         refreshWindowColumnsCache()
     }
 
-    /// Rebuilds `cachedWindowColumns` from the two inputs that define it —
-    /// `columnWindow` and `visibleColumns`, each with exactly one assigning
-    /// setter. Every row the grid configures asks for this list several times
-    /// per scroll tick, so re-slicing it per call is the one allocation worth
-    /// removing from that path.
+    /// Rebuilds the memoized window slice from its two inputs. Every row the
+    /// grid configures asks for this list several times per scroll tick, so
+    /// re-slicing it per call is an allocation worth removing from that path.
     func refreshWindowColumnsCache() {
         let cols = cachedVisibleColumns
         let clamped = columnWindow.range.clamped(to: 0..<cols.count)
         cachedWindowColumns = clamped.isEmpty ? [] : Array(cols[clamped])
     }
-    /// Set on a header on/off re-open (consumed by the grid): how a data-row
-    /// index shifts across the re-derivation so the viewport can re-anchor to the
-    /// SAME file record. +1 when the header turns OFF (the former header record
-    /// becomes data row 0, pushing every data row down one), −1 when it turns ON
-    /// (the first data row is absorbed as the header), 0 for a no-op. `nil` for a
-    /// fresh open or a separator/quote change (those rest at the top as before).
+    /// How a data-row index shifts across a header on/off re-open, so the
+    /// viewport can re-anchor to the same file record: +1 when the header turns
+    /// off (the former header becomes data row 0), −1 when it turns on. `nil` for
+    /// a fresh open or a separator/quote change, which rest at the top.
     var pendingHeaderShift: Int?
     var lastVisibleCount = 1
     var desiredStart: UInt64 = 0
     var desiredCount = 0
     var pollTask: Task<Void, Never>?
     var wrapNavTask: Task<Void, Never>?
-    /// Whether a copy build is currently running off-main. Verification
-    /// (`SelectCopyProbe`) polls for a SPECIFIC copy's completion without racing
-    /// a stale `copyNotice` left over from a PRIOR copy.
     var copyInFlight = false
     var copyNoticeTask: Task<Void, Never>?
-    /// The off-main copy build (ARCH-select-copy round 2, findings 2/3):
-    /// stored so a fresh ⌘C, Esc, or the "Copying…" notice's Cancel button
-    /// can cancel a running one (`cancelCopy`) rather than leaving it to
-    /// finish unseen.
+    /// The off-main copy build, stored so a fresh ⌘C, Esc, or the notice's Cancel
+    /// button can stop a running one rather than leave it to finish unseen.
     var copyTask: Task<Void, Never>?
-    /// Manual column-width overrides (ARCH-select-copy AC5), keyed by ABSOLUTE
-    /// column index — session-scoped, reset on every (re-)open. Layered over
-    /// the AUTO baseline (`columnWidths`) via `ColumnSizing.effectiveWidths`
-    /// wherever a width is read for drawing/layout; `growColumnWidthsToFitWindow`
-    /// skips an overridden column so auto-grow never fights it.
+    /// Manual column-width overrides, keyed by ABSOLUTE column index and layered
+    /// over the auto baseline wherever a width is read. Auto-grow skips an
+    /// overridden column, so the two never fight.
     var manualColumnWidths: [Int: Double] = [:]
-    /// ARCH-stream-copy AC8/AC9: ONE shared gate + clock driving the "subtle
-    /// progress after ~500 ms" affordance for every long op this model tracks
-    /// (copy / jump-scan / filter-scan) — see `copyProgress` /
-    /// `jumpProgressIndication` / `filterProgressIndication`. One instance means
-    /// one shared threshold band the whole app reads consistently.
+    /// ONE gate and clock for every long operation this model tracks (copy,
+    /// jump-scan, filter-scan), so the whole app shares one threshold band.
     let progressGate = DelayedProgressGate()
     let progressClock = ContinuousClock()
     var copyStartedAt: ContinuousClock.Instant?
     var jumpScanStartedAt: ContinuousClock.Instant?
     var filterScanStartedAt: ContinuousClock.Instant?
-    /// Bumped on every `copySelection()` call — lets the delayed-reveal task
-    /// tell "am I still THIS copy?" apart from the shared `copyInFlight` flag,
-    /// which is true for ANY in-flight copy: a rapid supersede (⌘C again before
-    /// the threshold) would otherwise let a stale task, woken at the OLD copy's
-    /// threshold, reveal progress for the NEW copy using the old elapsed.
+    /// Lets the delayed-reveal task ask "am I still THIS copy?", which
+    /// `copyInFlight` cannot answer — it is true for any in-flight copy, so a
+    /// rapid ⌘C before the threshold would let a stale task reveal progress for
+    /// the new copy using the old copy's elapsed time.
     var copyGeneration = 0
-    /// COPY's live delayed-progress indication (AC8): hidden until the
-    /// running copy passes the shared threshold, then visible with cancel;
-    /// cleared by `completeCopy`/`cancelCopy`. Recomputed once, at the
-    /// threshold tick in `copySelection`.
+    /// Hidden until the running copy passes the shared threshold, then visible
+    /// with cancel; cleared when the copy completes or is cancelled.
     var copyProgress: ProgressIndication = .hidden
 
     init(opener: any DocumentSessionOpening = CoreSessionOpener()) {

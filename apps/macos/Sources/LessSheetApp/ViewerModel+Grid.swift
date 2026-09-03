@@ -4,26 +4,21 @@ import Foundation
 import LessSheetKit
 import Observation
 
-// DocumentModel — the row-number gutter, the eager (dump) grid helpers, and the
-// window-bound live-grid helpers (cells / widths / labels / alignments /
-// highl' presentations over the horizontal column window). Pure code motion.
+// The row-number gutter, the eager dump-grid helpers, and their window-bound
+// counterparts that the live grid draws from.
 
 extension DocumentModel {
     // MARK: - Row-number gutter (fixed leftmost column; 1-based)
 
-    /// Width of the fixed row-number gutter, sized to fit the largest 1-based
-    /// row number currently in view (ARCH: "width fits the largest visible
-    /// number"). Stable per digit count — it only steps when the visible range
-    /// crosses a power-of-ten — and never below a 2-digit floor. Uses tabular
-    /// digits so the width is exact.
+    /// Sized to the largest 1-based row number currently in view, so it steps
+    /// only when the visible range crosses a power of ten. Tabular digits make
+    /// the measurement exact.
     func rowNumberColumnWidth() -> CGFloat {
         let maxVisible: Int
         if isFiltered {
-            // Original row numbers are non-contiguous under a filter (ARCH
-            // criterion 13): size for the largest POSSIBLE original number —
-            // the captured document row count — so the gutter width stays
-            // stable across a scroll instead of re-deriving it from each
-            // visible row's source mapping.
+            // Original row numbers are non-contiguous under a filter, so size for
+            // the largest POSSIBLE one. Re-deriving it from each visible row's
+            // source mapping would make the gutter width change as you scroll.
             let documentRows = filterDocumentRows?.count ?? rowCountInfo.count
             maxVisible = Int(min(documentRows, UInt64(Int.max)))
         } else {
@@ -34,12 +29,10 @@ extension DocumentModel {
         return Self.rowNumberWidth(digits: Self.rowNumberDigits(forMaxNumber: maxVisible))
     }
 
-    /// The row-number gutter's value for row `row` (ARCH criteria 13/17): the
-    /// row's ORIGINAL (unfiltered) data-row number while a filter is active —
-    /// forwarded verbatim from the core's `sourceRow`, never recomputed — else
-    /// the row's own identity index. `nil` while filtered and the row is not
-    /// currently servable (outside the materialized window) — the gutter
-    /// leaves such a row blank until a re-window catches up, exactly like its
+    /// The gutter's value for a row: its ORIGINAL data-row number while a filter
+    /// is active, forwarded verbatim from the core and never recomputed, else its
+    /// own index. `nil` when filtered and the row is not currently servable — the
+    /// gutter leaves it blank until a re-window catches up, exactly like its
     /// cells.
     func gutterRow(forRow row: Int) -> UInt64? {
         guard isFiltered else { return UInt64(row) }
@@ -57,15 +50,13 @@ extension DocumentModel {
             + GridMetrics.oversizedMarkerReserve
     }
 
-    // MARK: - Grid view helpers (the EAGER, all-visible-columns dump grid;
-    // ARCH-headless-dump / FrameDump). The dump renders small, already-loaded
-    // fixtures off the cold-open path, so an O(visible columns) pass here is
-    // fine — it is NOT what the live grid draws; see the window-bound
-    // counterparts below for that (ARCH-column-windowing).
+    // MARK: - Eager, all-visible-columns helpers (the dump grid)
+    //
+    // The dump renders small, already-loaded fixtures off the cold-open path, so
+    // an O(visible columns) pass is fine here. This is NOT what the live grid
+    // draws — see the window-bound counterparts below.
 
-    /// Frozen widths of the visible columns, in render order — EFFECTIVE
-    /// widths (ARCH-select-copy AC5: a manual override wins over the auto
-    /// baseline), see `effectiveWidths(for:)`.
+    /// Effective widths of the visible columns, in render order.
     func visibleWidths() -> [CGFloat] {
         effectiveWidths(for: visibleColumns)
     }
@@ -75,43 +66,36 @@ extension DocumentModel {
         visibleColumns.map { columnLabel($0) }
     }
 
-    /// Visible-column cells for a data row, empty-padded while not yet loaded
-    /// (or, on a wide document, not yet in the fetched column range — see
-    /// `cellsAt`).
+    /// Visible-column cells for a data row, empty-padded while not yet loaded or
+    /// not yet in the fetched column range.
     func visibleBodyCells(forRow row: Int) -> [String] {
         cellsAt(visibleColumns, forRow: row)
     }
 
-    /// Visible-column truncation flags for a data row (ARCH req. 13/20),
-    /// false-padded while not yet loaded — same shape as `visibleBodyCells`.
-    /// Driven entirely by the core's per-cell flag; never re-measures cells.
+    /// Visible-column truncation flags, parallel to `visibleBodyCells`. Driven
+    /// entirely by the core's per-cell flag; never re-measured here.
     func visibleBodyTruncated(forRow row: Int) -> [Bool] {
         truncatedAt(visibleColumns, forRow: row)
     }
 
-    // MARK: - Horizontal column window (the LIVE grid; ARCH-column-windowing)
+    // MARK: - Horizontal column window (the LIVE grid)
     //
-    // The window-bound counterparts of the helpers above: every one is O(the
-    // horizontal column window), NEVER O(columnCount), so `NativeGridController`
-    // can call them on every scroll/materialize tick even on a 100k-column
-    // document. Each slices `windowColumns()` — itself an O(window) slice of the
-    // memoized `visibleColumns` — so none of these ever re-filters `0..<columnCount`.
+    // The window-bound counterparts: every one is O(the column window), never
+    // O(columnCount), so the grid can call them on every scroll tick even on a
+    // 100k-column document.
 
     /// The current column window's ABSOLUTE column indices, in render order.
     func windowColumns() -> [Int] { cachedWindowColumns }
 
-    /// Widths of the current column window, in render order — what the live
-    /// grid draws (`NativeGridController.widths`); EFFECTIVE widths, see
-    /// `effectiveWidths(for:)`.
+    /// Effective widths of the current column window, in render order — exactly
+    /// what the live grid draws.
     func windowWidths() -> [CGFloat] {
         effectiveWidths(for: windowColumns())
     }
 
-    /// `columns`' EFFECTIVE widths (`ColumnSizing.effectiveWidths`, "manual
-    /// wins" — ARCH-select-copy AC5): builds a COLUMNS-local `auto`/`manual`
-    /// pair so the contract call stays O(columns.count) — a window or the
-    /// visible-columns list, never O(columnCount) beyond what the caller
-    /// already asked for — then folds them through the contract.
+    /// `columns`' effective widths, manual override winning. Builds a
+    /// columns-local auto/manual pair so the call stays O(columns.count) rather
+    /// than O(columnCount).
     private func effectiveWidths(for columns: [Int]) -> [CGFloat] {
         guard !columns.isEmpty else { return [] }
         let auto = columns.map {
@@ -136,16 +120,13 @@ extension DocumentModel {
         windowColumns().map { windowTruncatedLabels.contains($0) }
     }
 
-    /// Absolute column indices of the current column window, in render
-    /// order — PARALLEL to `windowWidths()`/`windowHeaderLabels()`: the
-    /// click→cell mapping's column half (ARCH-select-copy). Position `i`
-    /// here is the SAME absolute column `windowWidths()[i]` is the width of.
+    /// The click-to-cell mapping's column half: position `i` here is the same
+    /// absolute column `windowWidths()[i]` is the width of.
     func windowAbsoluteColumns() -> [Int] {
         windowColumns()
     }
 
-    /// Column-window cells for a data row, empty-padded while not yet loaded
-    /// — the window-bound analog of `visibleBodyCells`.
+    /// Column-window cells for a data row, empty-padded while not yet loaded.
     func windowBodyCells(forRow row: Int) -> [String] {
         windowCellPresentations(forRow: row).map(\.text)
     }
@@ -177,9 +158,8 @@ extension DocumentModel {
         }
     }
 
-    /// Targeted counterpart used by a direct column-config redraw. It reads
-    /// and formats one logical column only, preserving the same raw/truncated/
-    /// oversized/null/conflict rules as the vector helper above.
+    /// One column only, under exactly the same raw/truncated/oversized/null/
+    /// conflict rules as the vector helper above.
     func windowCellPresentation(forRow row: Int, column: Int) -> WindowCellPresentation {
         let source = cellsAt([column], forRow: row).first ?? ""
         let isTruncated = truncatedAt([column], forRow: row).first ?? false
@@ -233,21 +213,15 @@ extension DocumentModel {
         )
     }
 
-    /// Column-window truncation flags for a data row — the window-bound
-    /// analog of `visibleBodyTruncated`.
+    /// Column-window truncation flags for a data row.
     func windowBodyTruncated(forRow row: Int) -> [Bool] {
         truncatedAt(windowColumns(), forRow: row)
     }
 
-    /// Sum of every VISIBLE column's width — the document's total horizontal
-    /// content extent, independent of the window (drives the live grid's
-    /// scrollable table-column width / filler-column count —
-    /// `NativeGridController.refreshColumnWidth`). Memoized alongside
-    /// `cachedLayoutWidths` (see `refreshLayoutWidthsIfNeeded`); meant to be
-    /// read only on a structural change (open, hidden-column toggle, a
-    /// width-batch change) via `refreshLayoutMetrics`, never per scroll tick
-    /// — though it costs nothing extra even then, once the shared cache is
-    /// warm.
+    /// The document's total horizontal content extent — every VISIBLE column,
+    /// independent of the window — which drives the scrollable column width and
+    /// the filler count. Memoized alongside `cachedLayoutWidths`, so reading it
+    /// costs nothing once that cache is warm.
     var totalVisibleWidth: CGFloat {
         refreshLayoutWidthsIfNeeded()
         return cachedTotalVisibleWidth

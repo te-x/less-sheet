@@ -4,17 +4,17 @@ import Foundation
 import LessSheetKit
 import Observation
 
-// DocumentModel — column visibility (hidden-column reflow), the Settings panel
-// lifecycle + inspector edits (override / null-sentinel / format / width), and
-// the targeted column-configuration redraw log. Pure code motion.
+// Column visibility, the Settings panel lifecycle and its inspector edits, and
+// the targeted column-configuration redraw log.
+//
+// Every mutator here can originate in the SEPARATE, key Settings window, where
+// the @Observable -> updateNSView -> apply() bridge does not reliably re-fire —
+// so each one ends with an explicit `NativeGridController.live?.apply()`.
+// Without it the grid keeps the stale text or width until a click or a scroll.
+// The poke is idempotent and O(viewport).
 
 extension DocumentModel {
-    // MARK: - Column visibility (pure model; grid reflows)
-
-    /// The ascending indices of the non-hidden columns, in render order —
-    /// `visibilityManager.visibleColumns(visibility)`, memoized (see
-    /// `cachedVisibleColumns`). Semantics UNCHANGED (find/filter column
-    /// scoping keeps reading exactly this); only the cost of a read changed.
+    /// The ascending indices of the non-hidden columns, in render order.
     var visibleColumns: [Int] { cachedVisibleColumns }
 
     func canHide(_ column: Int) -> Bool { visibilityManager.canHide(visibility, column: column) }
@@ -24,9 +24,6 @@ extension DocumentModel {
         var settings = columnUserSettings[column] ?? .default
         settings.hidden = visibility.isHidden(column)
         storeColumnSettings(settings, column: column)
-        // See the matching poke + comment in `refreshAfterColumnConfiguration`:
-        // a visibility edit from the Settings window hits the same unreliable
-        // cross-window SwiftUI bridge.
         NativeGridController.live?.apply()
     }
 
@@ -141,12 +138,6 @@ extension DocumentModel {
         markLayoutWidthsStale()
         columnWidthRevision += 1
         columnPanelRevision += 1
-        // Cross-window poke (same bridge as toggleColumn / showAllColumns /
-        // refreshAfterColumnConfiguration): this width edit originates in the
-        // separate (key) Settings window, where the @Observable -> updateNSView
-        // -> apply() bridge does not reliably re-fire, so the grid would keep its
-        // stale width until a click/scroll. apply()'s columnWidthRevision branch
-        // handles the reflow; it just needs invoking. Idempotent and O(viewport).
         NativeGridController.live?.apply()
     }
 
@@ -164,12 +155,6 @@ extension DocumentModel {
         markLayoutWidthsStale()
         columnWidthRevision += 1
         columnPanelRevision += 1
-        // Cross-window poke (same bridge as toggleColumn / showAllColumns /
-        // refreshAfterColumnConfiguration): auto-fit invoked from the separate
-        // (key) Settings window would otherwise leave the grid at its stale
-        // width until a click/scroll (the @Observable -> updateNSView bridge does
-        // not reliably re-fire cross-window). apply()'s columnWidthRevision branch
-        // does the reflow. Idempotent and O(viewport).
         NativeGridController.live?.apply()
     }
 
@@ -211,22 +196,13 @@ extension DocumentModel {
         if remeasure { remeasureConfiguredColumn(column) }
         requestColumnConfigurationRedraw([column])
         startPolling()
-        // The revision bump above is an `@Observable` write meant to reach the
-        // grid via GridView.body -> updateNSView -> apply(). That SwiftUI bridge
-        // does NOT reliably re-fire when the mutation originates in the separate
-        // (key) Settings window: apply() went uncalled after the edit, so
-        // already-visible rows kept their stale formatted text until something
-        // else (e.g. a scroll that recycles the row) forced a fresh pull. Poke
-        // the live controller directly — the same explicit bridge every other
-        // cross-window mutation in this app already uses (jump / find / header
-        // toggle). apply() is idempotent and O(viewport).
         NativeGridController.live?.apply()
     }
 
-    /// Bounded revision log for targeted logical-column redraws. A consumer
-    /// that falls more than 32 batches behind receives `nil` and must perform
-    /// a conservative global refresh; the normal direct-edit path carries one
-    /// column from the inspector to the grid without an all-window revision.
+    /// A bounded revision log for targeted column redraws: a consumer that falls
+    /// more than 32 batches behind gets `nil` and must refresh globally, while the
+    /// normal direct edit carries one column to the grid with no all-window
+    /// revision at all.
     func requestColumnConfigurationRedraw(_ columns: Set<Int>) {
         guard !columns.isEmpty else { return }
         columnConfigurationRevision += 1
@@ -272,18 +248,16 @@ extension DocumentModel {
         }
     }
 
-    /// Assigns `visibility` and its memoized `visibleColumns` in lockstep —
-    /// the ONLY place `visibility` is set, so the cache can never drift from
-    /// it (ARCH-column-windowing).
+    /// The ONLY place `visibility` is set, so its memoized derivations can never
+    /// drift from it.
     func setVisibility(_ newValue: ColumnVisibility) {
         visibility = newValue
         cachedVisibleColumns = visibilityManager.visibleColumns(newValue)
         refreshWindowColumnsCache()
-        markLayoutWidthsStale()   // the render-order widths depend on visibleColumns too
+        markLayoutWidthsStale()
     }
 
-    /// The label for a column (effective header name, else generic A/B/C…),
-    /// used by the grid header and the Settings checkboxes.
+    /// The effective header name, or the generic A/B/C… name.
     func columnLabel(_ column: Int) -> String {
         if let label = windowColumnLabels[column], !label.isEmpty { return label }
         if let headerCells, column < headerCells.count, !headerCells[column].isEmpty {
