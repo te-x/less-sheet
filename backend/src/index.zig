@@ -302,11 +302,7 @@ pub fn workerMain(doc: *Document) void {
             const advanced = doc.reader.physicalBytes(doc.source, doc.frontier_pos);
             doc.unlock();
 
-            if (doc.mapping != null and advanced > released + madvise_release_chunk and advanced > madvise_keepback) {
-                const rel_end = advanced - madvise_keepback;
-                madviseDontNeed(doc, released, rel_end);
-                released = rel_end;
-            }
+            releaseBehind(doc, advanced, &released);
             doc.lock();
             continue;
         }
@@ -351,11 +347,7 @@ pub fn workerMain(doc: *Document) void {
             const advanced = doc.reader.physicalBytes(doc.source, doc.frontier_pos);
             doc.unlock();
 
-            if (doc.mapping != null and advanced > released + madvise_release_chunk and advanced > madvise_keepback) {
-                const rel_end = advanced - madvise_keepback;
-                madviseDontNeed(doc, released, rel_end);
-                released = rel_end;
-            }
+            releaseBehind(doc, advanced, &released);
             doc.lock();
             continue;
         }
@@ -424,11 +416,7 @@ pub fn workerMain(doc: *Document) void {
             const advanced = doc.reader.physicalBytes(doc.source, doc.frontier_pos);
             doc.unlock();
 
-            if (doc.mapping != null and advanced > released + madvise_release_chunk and advanced > madvise_keepback) {
-                const rel_end = advanced - madvise_keepback;
-                madviseDontNeed(doc, released, rel_end);
-                released = rel_end;
-            }
+            releaseBehind(doc, advanced, &released);
             doc.lock();
             continue;
         }
@@ -509,12 +497,7 @@ pub fn workerMain(doc: *Document) void {
         const advanced = doc.reader.physicalBytes(doc.source, doc.frontier_pos);
         doc.unlock();
 
-        // Release pages far behind the frontier (bounded resident memory).
-        if (doc.mapping != null and advanced > released + madvise_release_chunk and advanced > madvise_keepback) {
-            const rel_end = advanced - madvise_keepback;
-            madviseDontNeed(doc, released, rel_end);
-            released = rel_end;
-        }
+        releaseBehind(doc, advanced, &released);
         if (stalled_await) sysio.sleepMs(net_source.stall_backoff_ms);
 
         doc.lock();
@@ -545,6 +528,14 @@ fn scanChunk(doc: *Document, start_pos: Pos, start_row: u64) ChunkResult {
         pos = batch.next;
         row += batch.rows;
         if (batch.eof) return .{ .end_pos = pos, .end_row = row, .eof = true, .checkpoint = null };
+        // `scanRows` may stop SHORT of `target` without reaching EOF (a network
+        // short/withheld read, or a row whose lookahead is not committable). Only
+        // a row ON the interval boundary may become a checkpoint: nav/search/
+        // filter address `checkpoints[b]` as block `b`'s first row, so an entry at
+        // an off-interval row silently shifts every later block lookup. Dropping
+        // it costs nothing — the frontier still advances, and the next chunk
+        // reaches the boundary and appends there.
+        if (row % checkpoint_interval != 0) return .{ .end_pos = pos, .end_row = row, .eof = false, .checkpoint = null };
         return .{ .end_pos = pos, .end_row = row, .eof = false, .checkpoint = .{ .row = row, .pos = pos } };
     }
     while (row < target) {
@@ -594,13 +585,24 @@ fn updateJump(doc: *Document) void {
         } else {
             // Unknown-length stream (no byte total) / no rows yet: the original
             // row ratio (safe fallback; no test pins those to a high value).
-            const span = doc.jump_target - doc.jump_start_rows;
+            const span = doc.jump_target -| doc.jump_start_rows;
             if (span > 0) {
-                const p = @as(f64, @floatFromInt(doc.frontier_rows - doc.jump_start_rows)) / @as(f64, @floatFromInt(span));
+                const p = @as(f64, @floatFromInt(doc.frontier_rows -| doc.jump_start_rows)) / @as(f64, @floatFromInt(span));
                 if (p > doc.jump_progress) doc.jump_progress = p;
             }
         }
     }
+}
+
+/// Drop the pages well behind the frontier once enough fresh ground was covered,
+/// so a multi-GB scan keeps resident memory O(madvise_release_chunk) rather than
+/// O(file). `released` is the high-water this worker has already dropped up to.
+fn releaseBehind(doc: *Document, advanced: u64, released: *u64) void {
+    if (doc.mapping == null) return;
+    if (advanced <= released.* + madvise_release_chunk or advanced <= madvise_keepback) return;
+    const rel_end = advanced - madvise_keepback;
+    madviseDontNeed(doc, released.*, rel_end);
+    released.* = rel_end;
 }
 
 fn madviseDontNeed(doc: *Document, start_physical: u64, end_physical: u64) void {
@@ -639,8 +641,10 @@ pub fn rowCount(d: *Document) api.RowCount {
     // (see reader.zig's module doc).
     const start_bytes = d.reader.physicalBytes(d.source, d.data_start);
     const frontier_bytes = d.reader.physicalBytes(d.source, d.frontier_pos);
-    const scanned_data = frontier_bytes - start_bytes;
-    const total_data = d.content_len - start_bytes;
+    // Saturating: `content_len` is a logical extent while `start_bytes` is
+    // physical, so on a tiny BOM-prefixed document they can cross.
+    const scanned_data = frontier_bytes -| start_bytes;
+    const total_data = d.content_len -| start_bytes;
     var count: u64 = 0;
     if (d.frontier_rows == 0 or scanned_data == 0) {
         count = if (total_data > 0) 1 else 0;

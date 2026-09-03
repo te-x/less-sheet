@@ -496,42 +496,39 @@ fn navJobCurrentLocked(doc: *Document, nav_gen: u64, search_gen: u64, filter_gen
 }
 
 fn locateFilteredIndexJob(doc: *Document, nav_gen: u64, search_gen: u64, filter_gen: u64, fctx: MatchCtx, idx: u64) ?nav.SourceLoc {
-    dlock: {
-        doc.lock();
-        if (!navJobCurrentLocked(doc, nav_gen, search_gen, filter_gen)) {
-            doc.unlock();
-            return null;
-        }
-        var cum: u64 = 0;
-        var b: usize = 0;
-        while (b < doc.filter_block_counts.items.len) : (b += 1) {
-            const count = doc.filter_block_counts.items[b];
-            if (cum + count > idx) break;
-            cum += count;
-        }
-        if (b >= doc.filter_block_counts.items.len or b >= doc.checkpoints.items.len) {
-            doc.unlock();
-            return null;
-        }
-        const cp = doc.checkpoints.items[b];
-        const hi = @min((@as(u64, @intCast(b)) + 1) * checkpoint_interval, doc.filter_rows);
-        const need = idx - cum;
+    doc.lock();
+    if (!navJobCurrentLocked(doc, nav_gen, search_gen, filter_gen)) {
         doc.unlock();
+        return null;
+    }
+    var cum: u64 = 0;
+    var b: usize = 0;
+    while (b < doc.filter_block_counts.items.len) : (b += 1) {
+        const count = doc.filter_block_counts.items[b];
+        if (cum + count > idx) break;
+        cum += count;
+    }
+    if (b >= doc.filter_block_counts.items.len or b >= doc.checkpoints.items.len) {
+        doc.unlock();
+        return null;
+    }
+    const cp = doc.checkpoints.items[b];
+    const hi = @min((@as(u64, @intCast(b)) + 1) * checkpoint_interval, doc.filter_rows);
+    const need = idx - cum;
+    doc.unlock();
 
-        var pos = cp.pos;
-        var row = cp.row;
-        var seen: u64 = 0;
-        while (row < hi and !doc.reader.atEnd(doc.source, pos)) : (row += 1) {
-            if (doc.stop_atomic.load(.monotonic)) return null;
-            const row_pos = pos;
-            const res = @import("reader.zig").readerMatchRow(doc.reader, doc.source, pos, fctx, null, .{});
-            if (res.matched_col != null) {
-                if (seen == need) return .{ .row = row, .pos = row_pos };
-                seen += 1;
-            }
-            pos = res.next;
+    var pos = cp.pos;
+    var row = cp.row;
+    var seen: u64 = 0;
+    while (row < hi and !doc.reader.atEnd(doc.source, pos)) : (row += 1) {
+        if (doc.stop_atomic.load(.monotonic)) return null;
+        const row_pos = pos;
+        const res = @import("reader.zig").readerMatchRow(doc.reader, doc.source, pos, fctx, null, .{});
+        if (res.matched_col != null) {
+            if (seen == need) return .{ .row = row, .pos = row_pos };
+            seen += 1;
         }
-        break :dlock;
+        pos = res.next;
     }
     return null;
 }
@@ -561,7 +558,9 @@ fn findSearchMatchJob(doc: *Document, nav_gen: u64, search_gen: u64, filter_gen:
         var b: u64 = bound / checkpoint_interval;
         while (true) : (b += 1) {
             doc.lock();
-            if (!navJobCurrentLocked(doc, nav_gen, search_gen, filter_gen) or b >= doc.block_counts.items.len) {
+            if (!navJobCurrentLocked(doc, nav_gen, search_gen, filter_gen) or
+                b >= doc.block_counts.items.len or b >= doc.checkpoints.items.len)
+            {
                 doc.unlock();
                 return null;
             }
@@ -577,16 +576,20 @@ fn findSearchMatchJob(doc: *Document, nav_gen: u64, search_gen: u64, filter_gen:
 
     if (bound == 0) return null;
     doc.lock();
-    if (!navJobCurrentLocked(doc, nav_gen, search_gen, filter_gen) or doc.block_counts.items.len == 0) {
+    // Both lists are indexed by block below, so the cursor must fit BOTH.
+    const blocks = @min(doc.block_counts.items.len, doc.checkpoints.items.len);
+    if (!navJobCurrentLocked(doc, nav_gen, search_gen, filter_gen) or blocks == 0) {
         doc.unlock();
         return null;
     }
     var b: u64 = (bound - 1) / checkpoint_interval;
-    if (b >= doc.block_counts.items.len) b = doc.block_counts.items.len - 1;
+    if (b >= blocks) b = blocks - 1;
     doc.unlock();
     while (true) {
         doc.lock();
-        if (!navJobCurrentLocked(doc, nav_gen, search_gen, filter_gen)) {
+        if (!navJobCurrentLocked(doc, nav_gen, search_gen, filter_gen) or
+            b >= doc.block_counts.items.len or b >= doc.checkpoints.items.len)
+        {
             doc.unlock();
             return null;
         }
