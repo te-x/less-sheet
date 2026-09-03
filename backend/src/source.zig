@@ -893,7 +893,12 @@ pub const Gzip = struct {
         self.lock();
         const expected = (@as(u64, self.checkpoints.items.len) + 1) * checkpoint_interval;
         self.unlock();
-        if (s.logical != expected) return;
+        // `>=`, not `==`: `discardTo` produces in `chunk_bytes` steps toward an
+        // arbitrary target, so a skip can land PAST the boundary. An equality test
+        // then never matches again for the rest of the document — one overstep and
+        // every later checkpoint is lost, so every behind-frontier landing replays
+        // from byte 0 instead of from within one interval.
+        if (s.logical < expected) return;
         const cp = self.gpa.create(Checkpoint) catch {
             s.terminal = .damaged;
             return;
@@ -1101,10 +1106,6 @@ pub const Source = union(enum) {
             .gzip => unreachable,
             .http_range => unreachable, // http_range reads via the streaming Cursor, never a direct slice
         };
-    }
-
-    pub fn isGzip(self: Source) bool {
-        return self == .gzip;
     }
 
     pub fn knownEnd(self: Source) ?u64 {
@@ -1343,6 +1344,13 @@ pub const Cursor = struct {
         return hr.ensureSlice(internal, end_logical - self.logical);
     }
 
+    /// Whether the look buffer already holds the byte at the cursor. The stream is
+    /// immutable, so a filled look window is never stale: it always describes
+    /// exactly [look_start, look_start + look_len).
+    fn lookHolds(self: *const Cursor) bool {
+        return self.look_len > 0 and self.logical >= self.look_start and self.logical < self.look_start + self.look_len;
+    }
+
     pub fn peek(self: *Cursor, n: usize) []const u8 {
         if (self.source.? == .http_range) return self.peekHttp(n);
         const max_n = @min(n, self.look.len);
@@ -1351,7 +1359,7 @@ pub const Cursor = struct {
         // A previous peek may have crossed a lane-buffer boundary. Preserve
         // its unconsumed suffix: advancing the inflater replaced lane_buf,
         // but advancing the Cursor by one byte did not consume all lookahead.
-        if (self.look_len > 0 and self.logical >= self.look_start and self.logical < self.look_start + self.look_len) {
+        if (self.lookHolds()) {
             const offset: usize = @intCast(self.logical - self.look_start);
             got = @min(max_n, self.look_len - offset);
             std.mem.copyForwards(u8, self.look[0..got], self.look[offset..][0..got]);
@@ -1569,14 +1577,36 @@ pub const Cursor = struct {
             .gzip => |g| blk: {
                 const internal = self.logical + g.bom_len;
                 const lane: usize = self.lane;
-                _ = g.byteAtLane(lane, internal) orelse break :blk &.{};
                 const public_lim = self.limit orelse std.math.maxInt(u64);
-                var result: []const u8 = if (internal < g.head.items.len)
-                    g.head.items[@intCast(internal)..@intCast(@min(@as(u64, g.head.items.len), public_lim +| g.bom_len))]
-                else if (internal >= g.op_start[lane] and internal < g.op_start[lane] + g.op_len[lane])
-                    g.lane_buf[lane][@intCast(internal - g.op_start[lane])..@intCast(@min(@as(u64, g.op_len[lane]), public_lim +| g.bom_len - g.op_start[lane]))]
-                else
-                    &.{};
+                var result: []const u8 = &.{};
+                if (internal >= g.head.items.len and internal < g.op_start[lane] and self.lookHolds()) {
+                    // THE CURSOR IS BEHIND ITS OWN LANE WINDOW, and asking
+                    // `byteAtLane` for that byte would REWIND the inflate session:
+                    // a `peek` reads `max_lookahead` bytes from `logical`, so its
+                    // last byte can fall in the NEXT op window — producing that
+                    // window and dropping the one that held `logical`. The replay
+                    // then restarts from the previous checkpoint, i.e. up to a
+                    // whole 32 MiB interval of re-inflation, and it happens at a
+                    // fair share of window boundaries: measured 558 MB of skip-
+                    // inflation while scanning a 50 MB document (12x), which was
+                    // ~90% of a gzip search/filter scan's wall clock.
+                    //
+                    // The bytes are still in the cursor's own look buffer, so
+                    // serve the short span from there; the next advance lands
+                    // inside the new window. `peek` preserves its unconsumed
+                    // suffix for exactly this reason — `span` has to as well.
+                    const off: usize = @intCast(self.logical - self.look_start);
+                    result = self.look[off..self.look_len];
+                    if (public_lim < self.logical +| result.len) result = result[0..@intCast(public_lim - self.logical)];
+                } else {
+                    _ = g.byteAtLane(lane, internal) orelse break :blk &.{};
+                    result = if (internal < g.head.items.len)
+                        g.head.items[@intCast(internal)..@intCast(@min(@as(u64, g.head.items.len), public_lim +| g.bom_len))]
+                    else if (internal >= g.op_start[lane] and internal < g.op_start[lane] + g.op_len[lane])
+                        g.lane_buf[lane][@intCast(internal - g.op_start[lane])..@intCast(@min(@as(u64, g.op_len[lane]), public_lim +| g.bom_len - g.op_start[lane]))]
+                    else
+                        &.{};
+                }
                 const forced = g.force_chunk.load(.acquire);
                 if (forced > 0 and result.len > forced) result = result[0..@intCast(forced)];
                 break :blk result;
