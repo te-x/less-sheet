@@ -176,7 +176,12 @@ extension CoreDocumentSession {
         ls_filter_clear(doc)
     }
 
+    /// Guarded like `jumpStatus`: an orphaned copy task calls this from
+    /// `advanceFrontier` after `close()` may already have freed `doc`.
     public func filterStatus() -> FilterSnapshot? {
+        copyBufferLock.lock()
+        defer { copyBufferLock.unlock() }
+        guard !isClosed else { return nil }
         let status = ls_filter_poll(doc)
         let phase: FilterScanPhase
         switch status.state.rawValue {

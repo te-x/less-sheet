@@ -23,6 +23,8 @@ extension DocumentModel {
     func openURL(
         _ url: String, forcing override: DialectOverride = .sniffAll, carrying previous: ColumnVisibility? = nil
     ) async {
+        openRequestSequence += 1
+        let request = openRequestSequence
         await stopPolling()
         cancelCopy()
         let oldSession = session
@@ -41,6 +43,7 @@ extension DocumentModel {
         networkCancelToken = token
         do {
             let candidate = try await fetchNetworkCandidate(url: url, forcing: override, token: token)
+            guard request == openRequestSequence else { candidate.close(); return }
             networkOpenProgress = nil
             networkCancelToken = nil
             guard let resolved = resolveReopen(
@@ -58,7 +61,7 @@ extension DocumentModel {
                 authoredSettings: authoredSettings, authoredManualWidths: authoredManualWidths
             ))
         } catch {
-            // `openURL` is a typed throw (NetworkOpenError only).
+            guard request == openRequestSequence else { return }
             networkOpenProgress = nil
             networkCancelToken = nil
             if previous != nil, oldSession != nil {

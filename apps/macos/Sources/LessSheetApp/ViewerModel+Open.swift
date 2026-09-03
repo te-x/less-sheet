@@ -17,13 +17,13 @@ extension DocumentModel {
     func open(
         path: String, forcing override: DialectOverride = .sniffAll, carrying previous: ColumnVisibility? = nil
     ) async {
+        openRequestSequence += 1
+        let request = openRequestSequence
         await stopPolling()
-        // Cancel any in-flight copy against the OLD handle BEFORE closing it
-        // (round-4 UAF fix): an orphaned copy build keeps calling
-        // `session.copyCell` from a detached Task after `cancelCopy` merely
-        // asks it to stop, so the handle must still be open while that ask
-        // lands — closing first left a window where the orphaned build could
-        // call `ls_cell_copy` on an already-freed `doc`.
+        // Cancel the in-flight copy against the OLD handle BEFORE it closes: an
+        // orphaned copy build keeps calling into the session from a detached
+        // task after `cancelCopy` merely asks it to stop, so the handle must
+        // still be open while that ask lands.
         cancelCopy()
         let oldSession = session
         let oldDialect = dialect
@@ -32,6 +32,7 @@ extension DocumentModel {
 
         do {
             let candidate = try await opener.open(path: path, forcing: override)
+            guard request == openRequestSequence else { candidate.close(); return }
             guard let resolved = resolveReopen(
                 candidate: candidate, oldSession: oldSession, oldDialect: oldDialect,
                 previous: previous, authoredSettings: authoredSettings
@@ -47,6 +48,7 @@ extension DocumentModel {
                 authoredSettings: authoredSettings, authoredManualWidths: authoredManualWidths
             ))
         } catch {
+            guard request == openRequestSequence else { return }
             if previous != nil, oldSession != nil {
                 self.session = oldSession
                 startPolling()
@@ -182,11 +184,5 @@ extension DocumentModel {
     func consumePendingHeaderShift() -> Int? {
         defer { pendingHeaderShift = nil }
         return pendingHeaderShift
-    }
-
-    func closeDocument() {
-        // cancelCopy() BEFORE close() — same round-4 UAF fix as `open()`: an
-        // orphaned copy must stop touching the handle before it's freed.
-        Task { await stopPolling(); cancelCopy(); session?.close(); session = nil }
     }
 }

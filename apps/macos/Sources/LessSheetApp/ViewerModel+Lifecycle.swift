@@ -153,6 +153,7 @@ extension DocumentModel {
                 let columns = (session as? CoreDocumentSession)?.columnInferenceState()
                 let columnProgress = (session as? CoreDocumentSession)?.columnInferenceProgress()
                 let keepGoing = await self?.applyPoll(PollSnapshot(
+                    session: session,
                     rowCount: rowCount, progress: progress, jump: jump, search: search,
                     filter: filter, columns: columns, columnProgress: columnProgress)) ?? false
                 if !keepGoing { break }
@@ -164,6 +165,11 @@ extension DocumentModel {
     /// One poll tick's snapshot (was a 7-parameter `applyPoll` call), built off
     /// the main actor and handed to `applyPoll` on it — hence `Sendable`.
     private struct PollSnapshot: Sendable {
+        /// The session this tick polled. Two `open()` calls can overlap (each
+        /// suspends on the opener), leaving the loser's poll loop briefly alive
+        /// on a session the model has already replaced; folding its snapshot
+        /// would show the previous document's row count and progress.
+        let session: any DocumentSession
         let rowCount: RowCountInfo
         let progress: ScanProgress
         let jump: JumpStatus
@@ -178,6 +184,7 @@ extension DocumentModel {
     /// index, a jump, a search, nor a filter-scan is active, so idle documents
     /// cost nothing).
     private func applyPoll(_ snapshot: PollSnapshot) -> Bool {
+        guard let live = session, live === snapshot.session else { return false }
         rowCountInfo = snapshot.rowCount
         indexProgress = snapshot.progress
         filterSnapshot = snapshot.filter

@@ -178,12 +178,14 @@ extension DocumentModel {
     /// the frontier or after `frontierPollMaxTicks` polls, whichever comes
     /// first; cancellable (checked every tick).
     nonisolated private static func advanceFrontier(session: any DocumentSession, to target: UInt64) async {
-        // FINDING 1: `target` (the selection's bottom) is a VIEW row. Under a
-        // FILTER, startJump(to:) targets an ORIGINAL data row (api/lesssheet.h
-        // "JUMP under a filter"), so a filtered view index is the wrong target and
-        // cannot correctly pre-advance the filter frontier — skip the pre-pass and
-        // let `streamCopy` stop cleanly at the frontier if the selection outruns it
-        // (its no-progress guard). The IDENTITY view is unaffected (view == original).
+        // A cancel that lands before the task is first scheduled must stop it
+        // here, not one core call later.
+        guard !Task.isCancelled else { return }
+        // `target` (the selection's bottom) is a VIEW row, but `startJump(to:)`
+        // targets an ORIGINAL data row while a filter is active (api/lesssheet.h
+        // "JUMP under a filter"), so under a filter the pre-pass cannot advance the
+        // right frontier — skip it and let `streamCopy` stop cleanly at the frontier
+        // via its no-progress guard. The identity view is unaffected.
         guard session.filterStatus() == nil else { return }
         session.startJump(to: target)
         if case .done = session.jumpStatus() { return }

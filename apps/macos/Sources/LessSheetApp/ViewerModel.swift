@@ -218,6 +218,12 @@ final class DocumentModel {
     @ObservationIgnored var userStopped = false
 
     var session: (any DocumentSession)?
+    /// Claimed by every `open` / `openURL` call before it suspends on the
+    /// opener. Two opens can overlap (a second dialect change while the first
+    /// is still opening); the one whose claim no longer matches has been
+    /// superseded and must drop its candidate instead of adopting it over the
+    /// winner. Pure control state — no view reads it.
+    @ObservationIgnored var openRequestSequence = 0
     var markedGeneration = -1
     var firstVisibleRow = 0
     /// `visibilityManager.visibleColumns(visibility)`, memoized: kept in
