@@ -1090,11 +1090,12 @@ grid_draw (GtkDrawingArea *area, cairo_t *cr, int width, int height,
   GdkRGBA line = fg;
   line.alpha = 0.15;
 
-  /* Find highlights use the live system accent (Adwaita), never a hardcoded
-   * color: subtle for in-scope matches, strong for the current match. */
+  /* The live system accent (Adwaita), never a hardcoded color: find highlights
+   * (subtle in scope, strong on the current match) and the keyboard cursor's
+   * focus ring both draw from it. Fetched ONCE per frame — it allocates. */
   GdkRGBA accent = { 0, 0, 0, 0 };
   gboolean have_accent = FALSE;
-  if (app->find.display.active)
+  if (app->find.display.active || app->sel_mode != SEL_NONE)
     {
       GdkRGBA *a = adw_style_manager_get_accent_color_rgba (
           adw_style_manager_get_default ());
@@ -1214,17 +1215,11 @@ grid_draw (GtkDrawingArea *area, cairo_t *cr, int width, int height,
     }
   cairo_stroke (cr);
 
-  /* Accent focus outline on the active cell (keyboard cursor), resolved from
-   * the GNOME theme accent — NO literal color constant (G6/G7), tracks
-   * light/dark + live accent changes. Drawn last so it sits atop the marquee,
-   * any find highlight, and the cell text. */
+  /* Focus ring on the active cell (the keyboard cursor). Drawn last so it sits
+   * atop the marquee, any find highlight, and the cell text. */
   if (have_cursor && cur_w > 0.0)
     {
-      GdkRGBA *ac = adw_style_manager_get_accent_color_rgba (
-          adw_style_manager_get_default ());
-      GdkRGBA outline = (ac != NULL) ? *ac : fg;
-      if (ac != NULL)
-        gdk_rgba_free (ac);
+      GdkRGBA outline = have_accent ? accent : fg;
       gdk_cairo_set_source_rgba (cr, &outline);
       cairo_set_line_width (cr, 2.0);
       cairo_rectangle (cr, cur_x + 1.0, cur_y + 1.0, cur_w - 2.0, row_h - 2.0);
@@ -1250,16 +1245,16 @@ grid_draw (GtkDrawingArea *area, cairo_t *cr, int width, int height,
           = header_h + (double)((gint64)(view_row - top)) * row_h - pixel_off;
       if (y + row_h < header_h || y > (double)height)
         continue;
+      /* A stack buffer, not g_strdup_printf: this runs once per visible row
+       * per frame. 20 digits + the ellipsis + NUL fits comfortably. */
+      char label[32];
       guint64 src = lsg_window_source_row (app->win, ri);
-      char *label;
       if (src == LSG_NO_ROW)
-        label = g_strdup ("");
-      else if (lsg_window_row_oversized (app->win, ri))
-        label = g_strdup_printf ("%" G_GUINT64_FORMAT "…", src + 1);
+        label[0] = '\0';
       else
-        label = g_strdup_printf ("%" G_GUINT64_FORMAT, src + 1);
+        g_snprintf (label, sizeof label, "%" G_GUINT64_FORMAT "%s", src + 1,
+                    lsg_window_row_oversized (app->win, ri) ? "…" : "");
       draw_text (cr, layout, label, pad, y, gutter - 2.0 * pad, row_h, line_h);
-      g_free (label);
     }
   pango_layout_set_font_description (layout,
                                      app->font_desc); /* back to data cells */
