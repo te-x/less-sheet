@@ -1,20 +1,9 @@
 import Contracts
 
-// GREEN (implementer) — the pure keyboard-navigation logic (ARCH-macos-kbdnav).
-// Implementer-owned and NON-frozen (Sources/LessSheetKit); each type CONFORMS
-// to its frozen `Contracts` protocol and implements the real algebra the
-// doc-comments specify. The App (SheetTableView key routing, NativeGridController
-// clip scroll, SheetRowView outline paint, handleEscape dispatch) routes through
-// these; none of this touches a frozen path.
-//
-//   KeyboardNavigator ... the target-cell reducer over the ONE shared selection,
-//     COMPOSING the injected `Selecting` (`select` / `extend(_:to:in:)`) — it
-//     never re-implements the clamp or the anchor/active algebra.
-//   RevealScroller ...... the byte-exact minimal-reveal clamp on each axis.
-//   EscapeResolver ...... the Esc precedence truth table (dismiss > cancel >
-//     clear > none).
+// The pure keyboard-navigation algebra behind the grid's key routing, clip
+// scroll and Esc dispatch. Semantics live in the `Contracts` protocols.
 
-// MARK: - KeyboardNavigating (FR1)
+// MARK: - Target cell
 
 /// The target-cell reducer over the ONE shared selection. Holds a `Selecting`
 /// (default `SelectionModel`) and produces every result through it, so there is
@@ -28,24 +17,21 @@ public struct KeyboardNavigator: KeyboardNavigating {
 
     public func navigate(from selection: Selection?, _ motion: NavigationMotion,
                          extending: Bool, in context: NavigationContext) -> Selection? {
-        // Empty extent OR no visible columns → nothing is selectable, so every
-        // command (plain or extending, from nil or a stale selection) is a
-        // no-op, matching the frozen `Selecting` producing-ops.
+        // Nothing selectable: every command is a no-op.
         guard !context.extent.isEmpty, !context.visibleColumns.isEmpty else { return nil }
 
-        // SEED (no step): the first command with nothing selected places a 1×1
-        // cursor at the top-left visible cell and applies NO step (Q1) — the
-        // extending variants seed too (there is no anchor to extend from yet).
+        // The first command with nothing selected SEEDS a 1×1 cursor at the
+        // top-left visible cell and applies no step — the extending variants
+        // seed too, since there is no anchor to extend from yet.
         guard let current = selection else {
             return selecting.select(
                 GridCell(row: context.topVisibleRow, column: context.firstVisibleColumn),
                 in: context.extent)
         }
 
-        // Resolve the active corner onto a VISIBLE column FIRST, so the result
-        // always has a visible active column (never an invisible cursor); a
-        // hidden active column — reachable only via Cmd+A / whole-row select —
-        // snaps to the nearest visible column at or below it, else the first.
+        // Resolve the active corner onto a visible column first, so the result
+        // never leaves an invisible cursor. A hidden active column is reachable
+        // only via Cmd+A / whole-row select.
         let activeRow = min(current.active.row, context.extent.lastRow)
         let activeColumn = Self.resolvedVisibleColumn(current.active.column, in: context.visibleColumns)
         let target = Self.target(motion, row: activeRow, column: activeColumn, in: context)
@@ -107,7 +93,7 @@ public struct KeyboardNavigator: KeyboardNavigating {
     }
 }
 
-// MARK: - RevealScrolling (FR2)
+// MARK: - Minimal reveal
 
 /// The minimal-reveal auto-scroll math — one 1-D `landOn`-style clamp per axis,
 /// each independent, no move when the cell is already fully visible.
@@ -150,9 +136,9 @@ public struct RevealScroller: RevealScrolling {
     }
 }
 
-// MARK: - EscapeResolving (FR3)
+// MARK: - Escape precedence
 
-/// The Esc-precedence resolver — one pure truth table in strict priority order.
+/// One pure truth table in strict priority order.
 public struct EscapeResolver: EscapeResolving {
     public init() {}
 

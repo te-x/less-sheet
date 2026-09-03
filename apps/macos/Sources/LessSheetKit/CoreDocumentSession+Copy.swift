@@ -2,27 +2,15 @@ import CLessSheet
 import Contracts
 import Foundation
 
-// MARK: - Copy bridge (select-copy; ARCH-select-copy AC3) — ls_cell_copy.
-// Poll/control lane (api/lesssheet.h THREADING): safe from ANY thread at
-// any time, concurrently with the window lane's `lock` — it neither reads
-// nor evicts the materialized window. UNLIKE setWindow/sourceRow, this
-// deliberately does NOT take `lock`: that is exactly what lets a background
-// copy worker fill a `CopyBudget`-bounded selection while the UI keeps
-// scrolling (ls_window_set / ls_cell) undisturbed (AC4).
-//
-// Split out of CoreDocumentSession.swift as a same-module extension (pure
-// code motion) so the primary type body stays within budget; it reaches the
-// session's `internal` doc/copyBufferLock/isClosed/copyBuffer members.
+// The copy bridge. Poll/control lane: it neither reads nor evicts the
+// materialized window, so it deliberately does NOT take the window lane's
+// `lock` — that is what lets a background copy run while the UI keeps
+// scrolling. It takes `copyBufferLock` instead, which is what `close()` also
+// holds (see that lock's doc).
 extension CoreDocumentSession {
-    /// OVERRIDES the RED default (`DocumentSession`'s `.noCell`-for-everything
-    /// extension): fills a `maxBytes` buffer via `ls_cell_copy` and maps
-    /// `ls_copy_result` to `CopiedCell` — `.served` with the decoded UTF-8 text
-    /// (and the core's `truncated` flag), `.pending` past the scan frontier,
-    /// `.noCell` for an out-of-range column/row. `maxBytes <= 0` (or a column
-    /// outside `UInt32`'s domain, never a valid column) copies nothing rather
-    /// than allocate/convert — the core itself would report exactly this for
-    /// an out-of-range column, so this is a graceful shortcut, not new
-    /// behavior.
+    /// Copies one cell LOSSLESSLY (up to `maxBytes`), not the display-capped
+    /// bytes `ls_cell` serves: `.served` with the text and the core's truncation
+    /// flag, `.pending` past the scan frontier, `.noCell` out of range.
     public func copyCell(row: UInt64, column: Int, maxBytes: Int) -> CopiedCell {
         guard let col = UInt32(exactly: column) else {
             return CopiedCell(status: .noCell, text: "", truncated: false)
@@ -30,23 +18,9 @@ extension CoreDocumentSession {
         let capacity = max(maxBytes, 0)
         copyBufferLock.lock()
         defer { copyBufferLock.unlock() }
-        // RACE GUARD (round-4: fixes a confirmed use-after-free). `close()`
-        // takes this SAME lock around `isClosed = true; ls_close(doc)`, so
-        // this check and the `ls_cell_copy` call below can never interleave
-        // with a concurrent/prior close — an orphaned copy build (its
-        // synchronous loop has no cancellation checkpoint of its own; see
-        // `cancelCopy`'s doc in ViewerModel) can no longer touch a freed
-        // `doc`, satisfying the ABI rule "ls_cell_copy ... NOT concurrently
-        // with ls_open/ls_close". Deliberately NOT the window-lane `lock`:
-        // that would serialize copy against setWindow/sourceRow too, which
-        // would regress AC4 (copy runs concurrently with scrolling).
         guard !isClosed else {
             return CopiedCell(status: .noCell, text: "", truncated: false)
         }
-        // Grow-only reuse (see the property doc): a call with a SMALLER cap
-        // than the buffer's current size must still pass ITS OWN `capacity`
-        // as `buf_len` below (never the buffer's larger true size), so a
-        // per-cell cap change between calls still truncates correctly.
         if copyBuffer.count < capacity {
             copyBuffer = [UInt8](repeating: 0, count: capacity)
         }
@@ -66,22 +40,17 @@ extension CoreDocumentSession {
         }
     }
 
-    // MARK: - Streaming copy bridge (ARCH-thin-frontend-shared-core Phase 2) —
-    // ls_copy_open / ls_copy_next / ls_copy_close. The CORE frames the TSV
-    // (TAB/LF, spreadsheet quoting, single-cell raw, lossless cells), so this
-    // replaces the O(document) per-cell ls_cell_copy loop the deleted
-    // TSVCopyBuilder drove: no per-cell FFI, no main-thread stall (the sweep
-    // rides the in-core O(1) forward copy cursor). Same poll/control-lane +
-    // copyBufferLock discipline as copyCell above.
+    // MARK: - Streaming copy
+    //
+    // The CORE frames the TSV, so nothing here knows about quoting or
+    // separators, and the sweep rides its O(1) forward copy cursor instead of a
+    // per-cell FFI loop.
 
-    /// OVERRIDES the RED default (`DocumentSession`'s nil): opens a pull-model
-    /// streaming TSV copy of `rect`. Converts the INCLUSIVE `SelectionRect` to a
-    /// HALF-OPEN `ls_copy_rect` (row_count = bottom-top+1, col_count =
-    /// right-left+1; a negative/oversized column clamps and the core then reports
-    /// the empty job). Returns a `CoreCopyStream` wrapping the `ls_copy_job`, or
-    /// nil only when the handle couldn't be allocated (or the session is closed).
-    /// The core validates an empty / out-of-range rect into a job that steps DONE
-    /// with 0 bytes, so a degenerate selection is not an error here.
+    /// Opens a pull-model streaming TSV copy of `rect`, converting the INCLUSIVE
+    /// selection to the ABI's half-open rect. Returns nil only when the handle
+    /// could not be allocated or the session is closed — the core turns an empty
+    /// or out-of-range rect into a job that steps DONE with 0 bytes, so a
+    /// degenerate selection is not an error.
     public func openCopy(_ rect: SelectionRect) -> (any CopyStreaming)? {
         let low = max(rect.left, 0)
         let high = max(rect.right, low)
@@ -98,12 +67,8 @@ extension CoreDocumentSession {
         return CoreCopyStream(session: self, job: job)
     }
 
-    /// One `ls_copy_next` pull for a `CoreCopyStream` (poll/control lane; guarded
-    /// by `copyBufferLock` + `isClosed`, exactly like `copyCell`, so an orphaned
-    /// copy task cannot call into a freed `doc` after `close()`). Allocates a
-    /// fresh `maxChunkBytes` buffer, copies out the framed bytes, maps the step.
-    /// A closed session yields a `.done` step with no bytes (the drive loop then
-    /// stops + closes). `buf` is NULL only when `maxChunkBytes <= 0`.
+    /// One `ls_copy_next` pull. A closed session yields a `.done` step with no
+    /// bytes, which stops the drive loop.
     func copyStreamNext(_ job: OpaquePointer, maxChunkBytes: Int) -> CopyStep {
         let cap = max(maxChunkBytes, 0)
         copyBufferLock.lock()
@@ -136,11 +101,10 @@ extension CoreDocumentSession {
                         stalledRow: progress.stalled_row, budgetCapped: progress.budget_capped)
     }
 
-    /// Release a `CoreCopyStream`'s job (`ls_copy_close`). Takes `copyBufferLock`
-    /// like `copyStreamNext` / `close()`; the job holds no background thread and
-    /// its own storage is freed through the process-global core allocator, so
-    /// this is safe whether or not the session has been closed. Idempotency is
-    /// enforced by `CoreCopyStream` itself (its own once-flag).
+    /// Releases a `CoreCopyStream`'s job. The job holds no background thread and
+    /// its storage is freed through the process-global core allocator, so this is
+    /// safe whether or not the session is closed; `CoreCopyStream` makes it
+    /// exactly-once.
     func copyStreamClose(_ job: OpaquePointer) {
         copyBufferLock.lock()
         defer { copyBufferLock.unlock() }
@@ -148,19 +112,12 @@ extension CoreDocumentSession {
     }
 }
 
-/// A live streaming TSV copy job (`CopyStreaming`) over the core's `ls_copy_*`
-/// handle — vended by `CoreDocumentSession.openCopy(_:)`. Delegates `next` /
-/// `close` to the owning session's guarded bridge methods (`copyStreamNext` /
-/// `copyStreamClose`), which take the session's `copyBufferLock` and check
-/// `isClosed` — the SAME UAF discipline `copyCell` uses — so an orphaned copy
-/// task can never call `ls_copy_next` into a freed `doc`.
+/// A live streaming TSV copy job, vended by `CoreDocumentSession.openCopy(_:)`.
+/// Single-consumer: one `next` at a time, closed once.
 ///
-/// Holding a strong reference to the session keeps the core handle alive for the
-/// job's lifetime (an explicit `session.close()` still wins: it flips `isClosed`
-/// under the lock, after which `next` returns a `.done` step with no bytes and
-/// the drive loop stops). SINGLE-CONSUMER: the frontend drives one `next` at a
-/// time on its copy task and `close`s once (the `once` flag + `deinit` safety net
-/// make `ls_copy_close` exactly-once regardless).
+/// The strong session reference keeps the core handle alive for the job's
+/// lifetime; an explicit `session.close()` still wins, after which `next`
+/// returns a `.done` step with no bytes and the drive loop stops.
 public final class CoreCopyStream: CopyStreaming, @unchecked Sendable {
     private let session: CoreDocumentSession
     private let job: OpaquePointer

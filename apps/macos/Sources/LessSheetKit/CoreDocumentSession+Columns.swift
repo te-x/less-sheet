@@ -2,16 +2,12 @@ import CLessSheet
 import Contracts
 import Foundation
 
-// MARK: - Column metadata bridge (labels / inference / overrides).
-// Split out of CoreDocumentSession.swift as a same-module extension (pure code
-// motion) so the primary type body stays within budget; reaches the session's
-// `internal` doc/copyBufferLock/isClosed members and the `internal static` ABI
-// mappers in CoreDocumentSession+ABIMapping.swift. All calls stay on the
-// poll/control lane under `copyBufferLock`, exactly as before.
+// The column-metadata bridge: labels, inference and per-column overrides. All
+// poll/control lane, all guarded by `copyBufferLock` + `isClosed`.
 extension CoreDocumentSession {
-    /// Copies a bounded caller-selected label batch through the additive ABI.
-    /// No borrowed core string escapes this method; missing/empty labels are
-    /// represented by nil and truncation remains attached to the byte identity.
+    /// Copies a bounded caller-selected label batch. No borrowed core string
+    /// escapes; a missing or empty label is nil, and truncation stays attached
+    /// to the byte identity.
     public func columnLabels(_ ids: [UInt32]) -> [ColumnHeaderIdentity?] {
         guard ids.count <= Int(LS_COLUMN_BATCH_MAX) else { return [] }
         copyBufferLock.lock()
@@ -62,8 +58,8 @@ extension CoreDocumentSession {
         }
     }
 
-    /// Replaces the core's sparse inference set. The caller coordinates grid
-    /// and panel IDs before calling, so the worker sees one desired set.
+    /// Replaces the core's sparse inference set. The caller unions the grid and
+    /// panel IDs first, so the worker only ever sees one desired set.
     public func requestColumnInference(_ ids: [UInt32]) -> Bool {
         guard !ids.isEmpty, ids.count <= Int(LS_COLUMN_BATCH_MAX) else { return false }
         copyBufferLock.lock()
@@ -87,8 +83,7 @@ extension CoreDocumentSession {
         return (active, status.metadata_generation)
     }
 
-    /// Current finite inference progress for panel accessibility/presentation;
-    /// nil when no inference job is active.
+    /// Finite inference progress, or nil when no job is active.
     public func columnInferenceProgress() -> Double? {
         copyBufferLock.lock()
         defer { copyBufferLock.unlock() }
@@ -102,7 +97,7 @@ extension CoreDocumentSession {
         return active ? min(max(status.progress, 0), 1) : nil
     }
 
-    /// Coherently snapshots a bounded metadata batch into Swift value types.
+    /// Snapshots a bounded metadata batch coherently, as owned value types.
     public func columnMetadata(_ ids: [UInt32]) -> [ColumnMetadata] {
         guard ids.count <= Int(LS_COLUMN_BATCH_MAX) else { return [] }
         copyBufferLock.lock()

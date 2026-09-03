@@ -1,31 +1,21 @@
 import Contracts
 
-// Real implementation (ARCH-column-windowing) — replaces the RED seed that
-// reproduced today's un-windowed frontend (whole-range `window`, no-op
-// `grown`). `ColumnLayout` is a pure, stateless struct: every call rebuilds
-// whatever it needs from its arguments alone (no AppKit, no cached state —
-// see the contract's LAYERING note), so the App wires it in wherever a fresh
-// window or a fresh width merge is needed (ViewerModel.horizontalViewportChanged
-// / growColumnWidthsToFitWindow) without owning any lifecycle of its own.
+/// The horizontal column-window geometry and width-merge algebra. Stateless:
+/// every call rebuilds what it needs from its arguments alone, so the model can
+/// wire it in wherever a fresh window or width merge is needed without owning
+/// any lifecycle of its own.
 public struct ColumnLayout: ColumnLayouting {
     public init() {}
 
     // MARK: - window
 
-    /// Single forward scan accumulating the running x-offset, stopping the
-    /// instant the last intersecting column is found — so the work done is
-    /// bounded by THE ANSWER's position (`lastHit`, at most `widths.count`),
-    /// never a fixed full pass over the whole array. A cold-open (`viewportX
-    /// == 0`, every first paint) or any scroll near the front of a wide
-    /// document touches only a HANDFUL of columns, independent of
-    /// `widths.count` (ARCH AC2); a scroll deep into the document costs
-    /// O(that position) — never worse than a full `widths.count` pass would
-    /// be, and far better whenever the position isn't near the very end
-    /// (ARCH AC3). (An index structure giving true O(log n) for an
-    /// ARBITRARY position would need to persist across calls — this contract
-    /// is a stateless pure function of whatever `widths` it is handed each
-    /// time, so a fresh scan per call is what "cheap arithmetic, never text
-    /// layout" means here; see the contract's LAYERING note.)
+    /// A single forward scan accumulating the running x-offset, stopping the
+    /// instant the last intersecting column is found — so the work is bounded by
+    /// the ANSWER's position, never a full pass over `widths`. A cold open
+    /// (`viewportX == 0`) or any scroll near the front of a wide document touches
+    /// a handful of columns whatever `widths.count` is. A true O(log n) lookup
+    /// for an arbitrary position would need an index persisted across calls, and
+    /// this contract is a pure function of the widths it is handed each time.
     public func window(widths: [Double], viewportX: Double, viewportWidth: Double, overscan: Int) -> ColumnWindow {
         let count = widths.count
         guard count > 0 else { return ColumnWindow(first: 0, count: 0, firstX: 0) }
@@ -43,31 +33,27 @@ public struct ColumnLayout: ColumnLayouting {
             offset += widths[index] > 0 ? widths[index] : 0
             if firstHit < 0 {
                 guard offset > lowerBound else { continue }
-                // The first column reaching past `lowerBound`: since it is the FIRST
-                // such column, the PREVIOUS one's end (== this one's start)
-                // is <= lowerBound < upperBound, so this column always also qualifies
-                // for `lastHit` below — the window is never empty once found.
+                // The FIRST column reaching past `lowerBound` also always
+                // qualifies for `lastHit` below (its start is <= lowerBound <
+                // upperBound), so the window is never empty once found.
                 firstHit = index
                 firstHitX = start
             }
             if start < upperBound {
                 lastHit = index
             } else {
-                break   // every later column starts even later — done
+                break   // every later column starts even later
             }
         }
-        // No column's end ever passed `lowerBound`: the viewport starts at/past the
-        // end of all content (contract: "a viewport intersecting no column
-        // yields an empty window at firstX 0").
+        // The viewport starts at or past the end of all content.
         guard firstHit >= 0 else { return ColumnWindow(first: 0, count: 0, firstX: 0) }
 
         let pad = max(0, overscan)
         let first = max(0, firstHit - pad)
         let last = min(count - 1, lastHit + pad)
-        // `firstX` must be the EXACT prefix sum at `first`, which sits at
-        // most `pad` columns before `firstHit` once overscan pulls it left —
-        // walk back that (small, overscan-bounded) span from the already-
-        // known `firstHitX` rather than re-summing from 0.
+        // `firstX` must be the exact prefix sum at `first`, which overscan puts
+        // at most `pad` columns before `firstHit` — walk back that bounded span
+        // rather than re-summing from 0.
         var firstX = firstHitX
         var back = firstHit - 1
         while back >= first {
@@ -79,13 +65,11 @@ public struct ColumnLayout: ColumnLayouting {
 
     // MARK: - grown
 
-    /// Per-column, monotone max-merge (see the contract doc): only the columns
-    /// named in `candidates` are ever touched, each raised to
-    /// `max(current[c], candidates[c])`; every other column is returned
-    /// byte-identical to `current`. Independence + monotonicity together are
-    /// exactly what makes a horizontal scroll unable to churn an established
-    /// width — re-measuring a column over the SAME vertical row window always
-    /// yields the SAME candidate, so merging it again is a no-op.
+    /// Per-column, monotone max-merge: only the named columns are touched, each
+    /// raised to `max(current[c], candidates[c])`. Independence plus monotonicity
+    /// is what makes a horizontal scroll unable to churn an established width —
+    /// re-measuring a column over the same row window yields the same candidate,
+    /// so merging it again is a no-op.
     public func grown(_ current: [Double], mergingCandidates candidates: [Int: Double]) -> [Double] {
         guard !candidates.isEmpty else { return current }
         var result = current

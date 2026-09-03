@@ -1,14 +1,11 @@
 import Contracts
 
-// Viewer-ui pure view-model logic (implementer-owned; conformances pinned by
-// the frozen tests, semantics pinned in Sources/Contracts). No I/O, no core
-// calls, no main-actor assumptions — these are value transforms the UI drives.
+// Pure view-model transforms the UI drives: no I/O, no core calls, no
+// main-actor assumptions. Semantics live in the `Contracts` protocols.
 
-/// Implements `ColumnVisibilityManaging` (see its pinned semantics).
-///
-/// Hiding is pure presentation over the core's fixed column set: a value is a
-/// column count plus the set of hidden indices, with the invariant that at
-/// least one column stays visible whenever there is any column at all.
+/// Column hiding, pure presentation over the core's fixed column set: a column
+/// count plus the hidden indices, with the invariant that at least one column
+/// stays visible whenever there is any column at all.
 public struct ColumnVisibilityManager: ColumnVisibilityManaging {
     public init() {}
 
@@ -49,11 +46,8 @@ public struct ColumnVisibilityManager: ColumnVisibilityManaging {
     }
 }
 
-/// Implements `JumpControlling` (see its pinned semantics).
-///
-/// Pure parsing of the 1-based digits-only row field plus the state machine
-/// that folds `DocumentSession.jumpStatus()` polls into what the control shows
-/// and remembers the pre-jump viewport for cancel-restore.
+/// Parses the 1-based digits-only row field and folds `jumpStatus()` polls into
+/// what the control shows, remembering the pre-jump viewport for cancel-restore.
 public struct JumpControl: JumpControlling {
     public init() {}
 
@@ -76,12 +70,12 @@ public struct JumpControl: JumpControlling {
         guard case let .scanning(target, preJumpFirstRow, progress) = flow else { return flow }
         switch status {
         case let .scanning(polled):
-            // Display progress never regresses.
+            // Displayed progress never regresses.
             return .scanning(target: target, preJumpFirstRow: preJumpFirstRow, progress: max(progress, polled))
         case let .done(landedRow):
             return .landed(row: landedRow)
         case .idle:
-            // An idle poll never resets a live scan by itself (cancel does).
+            // An idle poll never resets a live scan by itself; cancel does.
             return flow
         }
     }
@@ -92,12 +86,10 @@ public struct JumpControl: JumpControlling {
     }
 }
 
-/// Implements `DialectComposing` (see its pinned semantics).
-///
-/// Turns one overlay-control / Settings selection into the next open's override: carry
-/// forward every already-forced parameter as forced, leave sniffed parameters
-/// to be re-sniffed, then force the changed parameter — rejecting bytes out of
-/// the ASCII domain or colliding with a *carried forced* value of the other.
+/// Turns one dialect selection into the next open's override: carry every
+/// already-forced parameter forward as forced, leave sniffed parameters to be
+/// re-sniffed, then force the changed one — rejecting bytes outside the ASCII
+/// domain or colliding with a *carried forced* value of the other.
 public struct DialectComposer: DialectComposing {
     public init() {}
 
@@ -129,17 +121,13 @@ public struct DialectComposer: DialectComposing {
                                    header: isOn ? .forcedOn : .forcedOff, encoding: carried.encoding)
 
         case let .encoding(chosen):
-            // An encoding change never fails and never touches the dialect
-            // bytes — it only sets `encoding` to the chosen override
-            // (`.automatic` included, which re-detects on the re-open).
+            // Never fails and never touches the dialect bytes; `.automatic`
+            // re-detects on the re-open.
             return DialectOverride(separator: carried.separator, quote: carried.quote,
                                    header: carried.header, encoding: chosen)
         }
     }
 
-    /// The four dialect parameters carried forward into the next open: each
-    /// already-forced parameter stays pinned as its forced value, each sniffed
-    /// parameter re-sniffs (encoding uses `.automatic` for the re-detect).
     private struct CarriedOverrides {
         let separator: SeparatorOverride
         let quote: QuoteOverride
@@ -162,8 +150,8 @@ public struct DialectComposer: DialectComposing {
         return CarriedOverrides(separator: separator, quote: quote, header: header, encoding: encoding)
     }
 
-    /// A separator/quote byte is a single ASCII byte in 0x01...0x7F that is
-    /// neither CR nor LF (mirrors the `api/lesssheet.h` field domain).
+    /// A single ASCII byte in 0x01...0x7F that is neither CR nor LF — the
+    /// separator/quote domain `api/lesssheet.h` pins.
     static func isValidDialectByte(_ byte: UInt8) -> Bool {
         (0x01...0x7F).contains(byte) && byte != 0x0A && byte != 0x0D
     }

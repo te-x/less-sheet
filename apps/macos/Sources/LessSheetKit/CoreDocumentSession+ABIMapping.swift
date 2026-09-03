@@ -2,12 +2,7 @@ import CLessSheet
 import Contracts
 import Foundation
 
-// MARK: - ABI mapping
-// Pure value mappers between the Contracts value types and the C ABI structs.
-// Split out of CoreDocumentSession.swift as a same-module extension (pure code
-// motion); `internal static` (not `private`) so both the primary type file and
-// the +Copy / +Columns extension files can reach them. None touch instance
-// state — they are stateless conversions.
+// Stateless value mappers between the Contracts types and the C ABI structs.
 extension CoreDocumentSession {
     static func abiSeparator(_ separator: SeparatorOverride) -> Int32 {
         switch separator {
@@ -32,7 +27,6 @@ extension CoreDocumentSession {
         }
     }
 
-    /// The encoding override as its ABI value (LS_ENCODING_AUTO + concretes).
     static func abiEncodingOption(_ encoding: EncodingOverride) -> Int32 {
         switch encoding {
         case .automatic: Int32(LS_ENCODING_AUTO)
@@ -44,13 +38,12 @@ extension CoreDocumentSession {
         }
     }
 
-    /// The reported resolved encoding (ls_dialect.encoding: a concrete uint8
-    /// enum value, never LS_ENCODING_AUTO) as its Swift `TextEncoding`.
+    /// The RESOLVED encoding the core reports — always a concrete value, never
+    /// LS_ENCODING_AUTO.
     static func abiEncoding(_ raw: UInt8) -> TextEncoding {
         TextEncoding(rawValue: raw) ?? .utf8
     }
 
-    /// The predicate operator as its ABI enum (raw values pinned in the header).
     static func abiOp(_ comparison: SearchOperator) -> ls_search_op {
         switch comparison {
         case .equals: LS_SEARCH_OP_EQ
@@ -117,11 +110,8 @@ extension CoreDocumentSession {
         return value
     }
 
-    /// Copies borrowed core bytes into an owned String, decoding lossily so
-    /// invalid UTF-8 becomes U+FFFD rather than being dropped. The core's UTF-8
-    /// path passes raw, un-validated file bytes (`api/lesssheet.h` "Option A"),
-    /// so this substitution is the ABI-mandated display-boundary obligation —
-    /// see `String(lossyUTF8:)`. The empty borrow (`len == 0`) copies to "".
+    /// Copies borrowed core bytes into an owned String — see `String(lossyUTF8:)`
+    /// for why the decode is lossy rather than failable.
     static func copyCell(_ str: ls_str) -> String {
         guard str.len > 0, let ptr = str.ptr else { return "" }
         return String(lossyUTF8: UnsafeBufferPointer(start: ptr, count: str.len))

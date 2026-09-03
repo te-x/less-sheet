@@ -1,7 +1,7 @@
 import Contracts
 import Foundation
 
-/// The fixed, type-derived alignment used by both the grid and the column
+/// The fixed, type-derived alignment shared by the grid and the column
 /// inspector. Conflict decoration is deliberately orthogonal to alignment.
 public struct ColumnAlignmentRules: ColumnAligning {
     public init() {}

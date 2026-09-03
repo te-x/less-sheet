@@ -1,19 +1,10 @@
 import Contracts
 
-// find-seek view-model (implementer-owned; conformances pinned by the frozen
-// tests, semantics pinned in Sources/Contracts/FindControl.swift and
-// api/lesssheet.h).
-//
-// FindControl is a PURE value state machine: it never touches the core — it
-// composes requests from the draft, folds search polls into the display, and
-// decides wrap/no-matches/stopped notices. Viewport highlight VERDICTS are no
-// longer computed here: thin-frontend-shared-core Phase 1 moved them into the
-// core (ls_window_match_flags → DocumentSession.windowMatchFlags), deleting the
-// former frontend `CellMatcher` duplicate. NumericGrammar (in
-// Sources/Contracts/FindControl.swift) stays — FindControl.submit validates an
-// ordering value with it.
-
-/// Implements `FindControlling` (see its pinned semantics).
+/// The find state machine: composes requests from the draft, folds search polls
+/// into the display, and decides the wrap / no-matches / stopped notices. A pure
+/// value transform; the core owns the per-cell highlight verdicts
+/// (`DocumentSession.windowMatchFlags`). Semantics live in
+/// `Contracts/FindControl.swift`.
 public struct FindControl: FindControlling {
     public init() {}
 
@@ -36,21 +27,18 @@ public struct FindControl: FindControlling {
         let draft = session.draft
         switch draft.mode {
         case .text:
-            // The empty query means "no search" — ignored, never an error.
+            // An empty query means "no search" — ignored, never an error.
             guard !draft.text.isEmpty else { return .ignored }
-            // scope nil iff every column is visible; else the ASCENDING visible
-            // set is fixed into the request (hidden-column changes re-scope from
-            // the next run).
+            // A concrete scope is fixed into the request, so a hidden-column
+            // change only re-scopes from the next run.
             let scope: [Int]? = (visibleColumns.count == columnCount) ? nil : visibleColumns.sorted()
-            // The ONE shared "Match case" draft bool threads 1:1 into the composed
-            // request's `caseSensitive` (shared by Text and Where; see FindDraft).
             return .run(.text(query: draft.text, scope: scope, caseSensitive: draft.caseSensitive))
         case .predicate:
-            // A column outside the document rejects (blink + shake), before any
-            // core call. Hidden columns are legal targets (the picker marks them).
+            // Hidden columns are legal targets (the picker marks them); a column
+            // outside the document is not.
             guard (0..<columnCount).contains(draft.column) else { return .rejected }
-            // Ordering operators need a numeric value; the empty value fails too.
-            // = / ≠ accept ANY value (the empty one matches empty cells).
+            // Ordering operators need a number; = and ≠ accept any value, the
+            // empty one included (it matches empty cells).
             if draft.comparison.isOrdering, !NumericGrammar.isNumeric(draft.value) { return .rejected }
             return .run(.predicate(
                 column: draft.column, comparison: draft.comparison,
@@ -79,24 +67,23 @@ public struct FindControl: FindControlling {
         with snapshot: SearchSnapshot?,
         navDirection: SearchDirection
     ) -> FindSession {
-        // A nil (idle) poll, or a session with no active display request (closed
-        // / cleared), never resurrects or resets a display.
+        // A nil (idle) poll, or a session with no active display request, never
+        // resurrects or resets a display.
         guard let snapshot, let request = session.display.request else { return session }
         let old = session.display
 
-        // Count: max fold (never regress on a stale poll); totalIsFinal latches.
+        // Max folds so a stale poll can never regress the count or the progress;
+        // totalIsFinal latches.
         let total = max(old.total, snapshot.total)
         let totalIsFinal = old.totalIsFinal || snapshot.totalIsFinal
 
-        // Progress: max fold while scanning; the % display ends on done/cancelled.
         let progress: Double?
         switch snapshot.phase {
         case let .scanning(polled): progress = max(old.progress ?? 0, polled)
         case .done, .cancelled: progress = nil
         }
 
-        // Landing: a .found nav sets current + its exact position; kept on
-        // non-found polls (the old landing holds until the next one lands).
+        // A landing holds until the next one lands.
         var current = old.current
         var position = old.position
         var landedThisPoll = false
@@ -106,30 +93,24 @@ public struct FindControl: FindControlling {
             landedThisPoll = true
         }
 
-        // Notice derives PURELY from this snapshot (so a wrap notice self-clears
-        // when the wrap navigation lands as a .found poll).
+        // The notice derives purely from THIS snapshot, so a wrap notice
+        // self-clears once the wrap navigation lands as a .found poll.
         var notice: FindNotice?
         if case .exhausted = snapshot.nav {
             if snapshot.total == 0, snapshot.totalIsFinal {
-                // Zero matches anywhere (scan complete): plainly "No matches",
-                // and the (never-set) landing stays cleared.
                 notice = .noMatches
                 current = nil
                 position = nil
             } else {
-                // Exhausted a direction with matches known (or still scanning):
-                // wrap, keeping the current landing until the wrap lands.
                 notice = (navDirection == .forward) ? .wrappedToStart : .wrappedToEnd
             }
         } else if case .cancelled = snapshot.phase, !landedThisPoll {
-            // On an http_range document the core navigates to the first match
-            // and then RE-PARKS the scan at LS_SEARCH_CANCELLED in the SAME
-            // poll (api nfd_ac6 — it never runs a background network scan). So
-            // a SUCCESSFUL network find poll carries BOTH a .found landing and
-            // a cancelled phase; that is a "n of m" success, never "Stopped".
-            // Only a cancelled poll that landed NOTHING is a genuine phase-stop
-            // here — the count folds through when a match landed. (The
-            // user-invoked stop is the separate `stopped()` method, unaffected.)
+            // A network document never scans in the background: the core
+            // navigates to the next match and re-parks the scan as CANCELLED in
+            // the SAME poll, so a successful network find carries both a .found
+            // landing and a cancelled phase. That is an "n of m" success. Only a
+            // cancelled poll that landed nothing is a genuine stop. (A
+            // user-invoked stop goes through `stopped()` instead.)
             notice = .stopped
         }
 
@@ -155,12 +136,12 @@ public struct FindControl: FindControlling {
         }
         switch direction {
         case .forward:
-            // next = first match at-or-after current.row + 1 (saturating).
             let anchor = current.row == .max ? UInt64.max : current.row + 1
             return SearchNav(anchor: anchor, direction: .forward)
         case .backward:
-            // previous = last match STRICTLY before current.row (no decrement;
-            // previous-from-row-0 exhausts core-side into the wrap).
+            // Anchor on the current row, not one before it: the core treats
+            // backward as strictly-before, and previous-from-row-0 exhausts
+            // there into the wrap.
             return SearchNav(anchor: current.row, direction: .backward)
         }
     }
@@ -174,8 +155,6 @@ public struct FindControl: FindControlling {
     }
 
     public func stopped(_ session: FindSession) -> FindSession {
-        // The scan-cancel affordance: keep everything known so far, end the
-        // progress UI, and state "Stopped". No-op when nothing is active.
         guard session.display.request != nil else { return session }
         let display = session.display
         return FindSession(
@@ -192,15 +171,14 @@ public struct FindControl: FindControlling {
         )
     }
 
+    /// Esc: highlights off, counts gone — the draft is retained so re-running is
+    /// one Enter.
     public func closed(_ session: FindSession) -> FindSession {
-        // Esc: highlights off, counts gone — but the DRAFT is retained so
-        // re-running is one Enter.
         FindSession(draft: session.draft, display: initial().display)
     }
 
+    /// A dialect re-open or a new document clears results exactly like Esc.
     public func invalidated(_ session: FindSession) -> FindSession {
-        // Dialect re-open / new document identity clears results exactly like
-        // Esc, and retains the typed query.
         closed(session)
     }
 }

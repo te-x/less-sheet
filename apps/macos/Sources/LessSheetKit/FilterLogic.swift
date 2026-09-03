@@ -1,15 +1,8 @@
 import Contracts
 
-// filtered-views view-model (implementer-owned; conformance pinned by the
-// frozen tests, semantics pinned in Sources/Contracts/FilterControl.swift and
-// api/lesssheet.h FILTERED VIEWS).
-//
-// FilterControl is a PURE value transform — like FindControl, it never
-// touches the core: it just maps one filter poll (+ the app-tracked document
-// row count) into the banner's display fields.
-
-/// Implements `FilterControlling` (see its pinned semantics — the
-/// "Filtered — N of M rows" banner state machine).
+/// Maps one filter poll plus the app-tracked document row count into the
+/// "Filtered — N of M rows" banner. A pure value transform; it never touches
+/// the core. Semantics live in `Contracts/FilterControl.swift`.
 public struct FilterControl: FilterControlling {
     public init() {}
 
@@ -25,8 +18,9 @@ public struct FilterControl: FilterControlling {
             progress = nil
             matchingIsFinal = true
         case let .cancelled(frozen):
-            // The scan paused on slot contention; the filter MODE persists, so
-            // the banner keeps showing its frozen progress (not final).
+            // The scan paused (slot contention, or a network document that never
+            // scans in the background). The filter MODE persists, so the banner
+            // holds the frozen progress rather than reading as final.
             progress = frozen
             matchingIsFinal = false
         }

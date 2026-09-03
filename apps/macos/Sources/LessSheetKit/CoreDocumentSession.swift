@@ -14,15 +14,11 @@ import Foundation
 public struct CoreSessionOpener: DocumentSessionOpening {
     public init() {}
 
-    /// A dedicated background queue for the core's O(head) open. Keeps the
-    /// blocking `ls_open` (up to LS_OPEN_HEAD_MAX_BYTES of file I/O) off the
-    /// calling actor so a main-actor caller's run loop is never blocked during
-    /// cold start — structurally, not by relying on a nonisolated-async
-    /// executor default that a future language mode could change.
+    /// A dedicated queue for the core's O(head) open. Keeps the blocking
+    /// `ls_open` off the calling actor STRUCTURALLY, rather than relying on a
+    /// nonisolated-async executor default a future language mode could change.
     private static let openQueue = DispatchQueue(label: "less-sheet.core-open", qos: .userInitiated)
 
-    /// The concrete continuation both open overloads resume; named so the
-    /// `withCheckedThrowingContinuation` closure parameter stays on one line.
     private typealias SessionContinuation = CheckedContinuation<CoreDocumentSession, any Error>
 
     public func open(
@@ -41,36 +37,25 @@ public struct CoreSessionOpener: DocumentSessionOpening {
         } catch let error as DocumentOpenError {
             throw error
         } catch {
-            // Unreachable: CoreDocumentSession.init throws only DocumentOpenError.
-            throw DocumentOpenError.ioFailure
+            throw DocumentOpenError.ioFailure   // unreachable: init is a typed throw
         }
     }
 
-    /// OVERRIDES the RED default: drives the core's async open-job
-    /// (`ls_open_url_start` -> poll `ls_net_open_poll` -> `ls_net_open_release`),
-    /// mapping `ls_net_status` -> `NetworkOpenError` on failure (a non-http/https
-    /// scheme is rejected SYNCHRONOUSLY by the core with `.invalidArgument`, no
-    /// network). Honors Task cancellation (cancels the fetch, throws
-    /// `.cancelled`). Returns the live session once the open is DONE. A thin
-    /// wrapper over `openURL(_:forcing:onProgress:cancelToken:)` with a no-op
-    /// progress callback and a throwaway token — this is the frozen protocol
-    /// requirement `DocumentSessionOpening` pins; callers that want the
-    /// always-visible progress affordance + an explicit Cancel button (ARCH
-    /// req 10 / AC9) use the tracking overload below instead.
+    /// The protocol's plain network open — a thin wrapper over the tracking
+    /// overload with a no-op progress callback. Callers that want the live
+    /// progress affordance and an explicit Cancel button use that one instead.
     public func openURL(
         _ url: String, forcing override: DialectOverride
     ) async throws(NetworkOpenError) -> any DocumentSession {
         try await openURL(url, forcing: override, onProgress: { _ in }, cancelToken: NetworkOpenCancelToken())
     }
 
-    /// Tracking variant (LessSheetKit-only; not part of the frozen protocol):
-    /// identical open-job drive as above, but invokes `onProgress` with a live
-    /// snapshot on every poll tick (not just at start/terminal) — this is what
-    /// lets the UI show a real, incrementally-updating percentage/byte counter
-    /// (ARCH AC9 / round-2 review finding 1) — and honors `cancelToken`
-    /// explicitly (a plain dispatch-queue background op has no ambient Swift
-    /// Task to observe `Task.isCancelled` on, so a caller-owned token is the
-    /// only reliable cancel signal here).
+    /// Drives the core's async open-job, reporting a live snapshot on every poll
+    /// tick so the UI can show a real, incrementally-updating counter.
+    ///
+    /// `cancelToken` is explicit because this runs on a dispatch queue with no
+    /// ambient Swift Task to observe `Task.isCancelled` on; a caller-owned token
+    /// is the only reliable cancel signal here (Task cancellation also fires it).
     public func openURL(
         _ url: String,
         forcing override: DialectOverride,
@@ -101,12 +86,8 @@ public struct CoreSessionOpener: DocumentSessionOpening {
     }
 }
 
-/// Explicit, thread-safe cancel signal for an in-flight `openURL` (LessSheetKit
-/// / App only — not part of the frozen `Contracts` surface). The tracking
-/// `openURL(...)` overload polls `isCancelled` between core polls and, once
-/// true, calls `ls_net_open_cancel` on the job — this is the backing state for
-/// the UI's explicit Cancel button (round-2 review finding 1); Swift Task
-/// cancellation ALSO sets it via `withTaskCancellationHandler`.
+/// Thread-safe cancel signal for an in-flight `openURL`, polled between core
+/// polls. Backs the UI's Cancel button; Swift Task cancellation also fires it.
 public final class NetworkOpenCancelToken: @unchecked Sendable {
     private let lock = NSLock()
     private var flag = false
@@ -128,54 +109,36 @@ public final class NetworkOpenCancelToken: @unchecked Sendable {
 
 /// One live core document. See `DocumentSession` for the full contract.
 public final class CoreDocumentSession: DocumentSession, @unchecked Sendable {
-    // `doc` / `lock` / `isClosed` / `copyBufferLock` / `copyBuffer` are
-    // `internal` (not `private`) so the cohesive method groups split into
-    // same-module extension files (`+Window`, `+Search`, `+Copy`, `+Columns`,
-    // `+ABIMapping`) can reach them; still not part of the public API surface.
+    // These are `internal`, not `private`, so the cohesive method groups split
+    // into same-module extensions (`+Window`, `+Search`, `+Copy`, `+Columns`,
+    // `+ABIMapping`) can reach them. Not public API either way.
     let doc: OpaquePointer
     let lock = NSLock()
     var isClosed = false
-    /// A REUSED scratch buffer for `copyCell` (select-copy), grown on demand
-    /// and never shrunk — guarded by its OWN lock, distinct from the window
-    /// lane's `lock` above (copyCell is poll/control-lane and must stay
-    /// independent of it; see `copyCell`'s doc). A large copy calls
-    /// `copyCell` per cell (potentially millions of times for a big
-    /// selection); allocating + zero-filling a fresh `perCellMaxBytes`
-    /// (~1 MiB) buffer on EVERY call would dominate the whole build's cost
-    /// for no reason, since the SAME cap is used call after call within one
-    /// copy — reusing the backing storage (while still passing THIS call's
-    /// own `maxBytes` as the core's `buf_len`, so a smaller cap still
-    /// truncates correctly even with a larger buffer sitting behind it)
-    /// turns that into a one-time allocation per session.
-    ///
-    /// ROUND-4/5 UAF FIX: this lock ALSO now serializes every core call an
-    /// orphaned copy task can make — `copyCell`, and (round 5) `startJump`/
-    /// `jumpStatus` (the `advanceFrontier` pre-pass BEFORE the fetch loop) —
-    /// against `close()`'s {set `isClosed`; call `ls_close`}; see each
-    /// method's doc comment. `close()` takes this lock too (never the window
-    /// lane's `lock` alone), so an orphaned copy build (uncancellable
-    /// mid-loop) can no longer race a concurrent or prior `close()` onto a
-    /// freed `doc` through ANY of its three core calls. Window ops
-    /// (`setWindow`/`sourceRow`, guarded only by `lock`) are untouched by
-    /// this, so copy still runs fully concurrent with scrolling (AC4).
+    /// Guards every poll/control-lane call an ORPHANED background task can still
+    /// make — the copy stream, and the jump primitives its frontier pre-pass
+    /// uses — against `close()`'s {set `isClosed`; `ls_close`}, which takes this
+    /// same lock. That is what stops a copy the app has merely ASKED to stop
+    /// from reaching a freed `doc`. Deliberately NOT the window lane's `lock`,
+    /// so a copy still runs fully concurrent with scrolling.
     let copyBufferLock = NSLock()
+    /// A scratch buffer for `copyCell`, grown on demand and never shrunk. A large
+    /// copy calls it per cell, and allocating plus zero-filling a fresh ~1 MiB
+    /// buffer every time would dominate the whole build; the call still passes
+    /// ITS OWN `maxBytes` as `buf_len`, so a smaller cap truncates correctly
+    /// behind a larger buffer.
     var copyBuffer: [UInt8] = []
 
     public let columnCount: Int
     public let dialect: DialectReport
-    /// Compatibility view required by the frozen `DocumentSession` contract.
-    /// The live app uses `columnLabels(_:)` instead, so opening a wide document
-    /// never allocates one Swift String per header. Callers that explicitly ask
-    /// for this legacy property receive a caller-owned, batched snapshot.
+    /// Required by the `DocumentSession` contract, but never used by the live
+    /// app — it reads `columnLabels(_:)` instead, so opening a wide document
+    /// never allocates one Swift String per header.
     public var headerCells: [String]? {
         guard dialect.hasHeader else { return nil }
         lock.lock()
         defer { lock.unlock() }
         guard !isClosed else { return [] }
-        // This legacy compatibility accessor is intentionally eager only when
-        // explicitly invoked (the app never invokes it for a core session).
-        // Keep it on the established window-lane primitive so older cores and
-        // the frozen pre-column-config bridge tests retain their behavior.
         return (0..<columnCount).map { Self.copyCell(ls_header_cell(doc, UInt32($0))) }
     }
 
@@ -209,10 +172,8 @@ public final class CoreDocumentSession: DocumentSession, @unchecked Sendable {
         )
     }
 
-    /// Adopt an already-open core handle (the DONE doc a network open-job
-    /// produced via `ls_open_url_start`). Reads the same fixed-at-open facts as
-    /// the path initializer; the doc then follows the normal `ls_close`
-    /// lifecycle exactly like a local open.
+    /// Adopts the already-open handle a network open-job produced. From here the
+    /// doc follows the normal `ls_close` lifecycle, exactly like a local open.
     private init(adopting doc: OpaquePointer) {
         self.doc = doc
         columnCount = Int(ls_column_count(doc))
@@ -255,9 +216,6 @@ public final class CoreDocumentSession: DocumentSession, @unchecked Sendable {
                 ls_net_open_cancel(job)
             }
             let snapshot = ls_net_open_poll(job)
-            // ARCH AC9 / round-2 review finding 1: report a LIVE snapshot every
-            // tick (not only start/terminal) so the always-visible progress
-            // affordance shows real, incrementally-updating bytes/percentage.
             onProgress(NetworkOpenProgress(
                 abiState: Int32(snapshot.state.rawValue), progress: snapshot.progress,
                 bytesFetched: snapshot.bytes_fetched, bytesTotal: snapshot.bytes_total,
@@ -293,11 +251,9 @@ public final class CoreDocumentSession: DocumentSession, @unchecked Sendable {
     public func close() {
         lock.lock()
         defer { lock.unlock() }
-        // ROUND-4 UAF FIX: also take `copyBufferLock` — the SAME lock
-        // `copyCell` holds across its own {check isClosed; call
-        // ls_cell_copy} — so setting `isClosed` and calling `ls_close` here
-        // can never interleave with that. No other method takes both locks,
-        // so this fixed acquisition order can't deadlock.
+        // Both lanes, so neither a window op nor an orphaned copy can be inside
+        // a core call while `ls_close` runs. This is the ONLY method that takes
+        // both locks, so the order cannot deadlock.
         copyBufferLock.lock()
         defer { copyBufferLock.unlock() }
         guard !isClosed else { return }

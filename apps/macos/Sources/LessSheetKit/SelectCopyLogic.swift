@@ -1,22 +1,17 @@
 import Contracts
 
-// GREEN (implementer) — the pure select-copy logic (ARCH-select-copy),
-// implementer-owned and NON-frozen (Sources/LessSheetKit). Each type CONFORMS
-// to its frozen Contracts protocol and implements the real algebra the
-// doc-comments specify; the App (NativeGrid event handling + ViewerModel
-// selection/copy/width state) routes through these. None of this touches a
-// frozen path.
+// The pure selection and column-width algebra behind the grid's event handling
+// and the model's selection/copy/width state. Semantics live in the `Contracts`
+// protocols.
 
-// MARK: - Selecting (AC1)
+// MARK: - Selection
 
-/// The rectangular-selection algebra (`Selecting`): every operation is O(1) in
-/// the extent — two corner indices in, two corner indices out, no
-/// materialization — so Cmd+A on a 100M×100k document is free. Producing
-/// operations (`select`/`wholeRow`/`wholeColumn`/`selectAll`) return nil only
-/// for an empty extent; transition operations (`extend`/`move`) re-clamp BOTH
-/// corners of the incoming selection into the CURRENT extent first (a filter
-/// may have shrunk it since the selection was made), so they always return a
-/// valid selection.
+/// The rectangular-selection algebra: every operation is O(1) in the extent —
+/// two corner indices in, two corner indices out, no materialization — so Cmd+A
+/// on a 100M×100k document is free. Producing operations return nil only for an
+/// empty extent; transition operations re-clamp BOTH incoming corners into the
+/// CURRENT extent first, since a filter may have shrunk it since the selection
+/// was made.
 public struct SelectionModel: Selecting {
     public init() {}
 
@@ -61,9 +56,8 @@ public struct SelectionModel: Selecting {
                          active: GridCell(row: extent.lastRow, column: extent.lastColumn))
     }
 
-    /// `cell` moved one step in `direction`, saturating at 0 (up/left) or the
-    /// extent's last row/column (down/right) — a step past an edge stays on
-    /// the edge (never under/overflows the UInt64 row / Int column).
+    /// `cell` moved one step in `direction`, saturating at the extent's edges so
+    /// the UInt64 row and Int column can never under/overflow.
     private static func stepped(_ cell: GridCell, _ direction: SelectionDirection, in extent: GridExtent) -> GridCell {
         switch direction {
         case .upward:
@@ -79,25 +73,12 @@ public struct SelectionModel: Selecting {
     }
 }
 
-// MARK: - Streaming copy (ARCH-thin-frontend-shared-core Phase 2)
-//
-// The former `TSVCopyBuilder` (a `CopyBuilding` conformer driving a per-cell
-// `CopyCellFetch`) is DELETED: TSV framing (TAB/LF, spreadsheet quoting,
-// single-cell raw, lossless cells, the cell-count cap) now lives ONCE in the
-// core (`ls_copy_*`), streamed by `CoreDocumentSession.openCopy` and driven by
-// `DocumentModel.streamCopy`. The `CopyBuilding` protocol + `CopyCellFetch`
-// typealias were removed from `Contracts/CopyBuilder.swift` (DECISION-2); the
-// retained `CopyBudget` / `CopyReport` / `CopyOutcome` / `CopiedCell` /
-// `CopyCellStatus` / `SelectionRect` are still used by the streaming drive and
-// the `copyCell` / `ls_cell_copy` lossless single-cell read.
+// MARK: - Column widths
 
-// MARK: - ColumnSizing (AC5)
-
-/// The column-width algebra (`ColumnSizing`): a manual override wins over the
-/// auto baseline at every width read, regardless of how far auto-grow raised
-/// it; `resized`/`cleared` are pure map edits; `autoFit` is the clamped
-/// max-content fit over whatever the frontend measured for the visible
-/// window. See the protocol doc-comment for the full pinned semantics.
+/// A manual override wins over the auto baseline at every width read, regardless
+/// of how far auto-grow raised it; `resized`/`cleared` are pure map edits;
+/// `autoFit` is the clamped max-content fit over whatever the frontend measured
+/// for the visible window.
 public struct ColumnSizer: ColumnSizing {
     public init() {}
 
