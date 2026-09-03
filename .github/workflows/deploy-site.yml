@@ -1,33 +1,48 @@
-name: Deploy Landing Page to Public Site Repo
+name: Deploy landing page to GitHub Pages
+
+# The landing page is served from THIS repository's Pages site
+# (https://te-x.github.io/less-sheet/), built from site/ on every push that touches
+# it. No second repository, no deploy token: the job authenticates with the
+# workflow's own OIDC token. Pages must be set to "GitHub Actions" as its source
+# once, in the repository settings (and the repository must be public on a Free
+# plan for Pages to serve at all).
 
 on:
   push:
     branches:
       - master
     paths:
-      - 'site/**' # Only runs when files inside the site/ directory change
+      - 'site/**'
       - '.github/workflows/deploy-site.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: true
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
-
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - name: Checkout private repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Push site/ directory to public repository
-        uses: cpina/github-action-push-to-another-repository@main
-        env:
-          API_TOKEN_GITHUB: ${{ secrets.SITE_DEPLOY_TOKEN }}
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload site/ as the Pages artifact
+        uses: actions/upload-pages-artifact@v3
         with:
-          source-directory: 'site'
-          destination-github-username: 'te-x'
-          destination-repository-name: 'less-sheet-site'
-          # The destination repo is PUBLIC, and this address is stamped as the
-          # commit author on every deploy. A real address here publishes it.
-          # github.com noreply is undeliverable by design, which is the point.
-          user-name: 'te-x'
-          user-email: 'te-x@users.noreply.github.com'
-          target-branch: 'main'
-          commit-message: 'Update landing page from te-x/less-sheet@master'
+          path: site
+
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4

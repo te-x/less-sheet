@@ -8,9 +8,9 @@
 #   tools/release/publish.sh --dry-run        # every check, no pushes
 #
 # Configure once (or export in your shell):
-#   LESSSHEET_RELEASE_REPO=te-x/less-sheet-site   # PUBLIC repo: downloads + page
+#   LESSSHEET_RELEASE_REPO=te-x/less-sheet        # releases live on the main repo
 #   LESSSHEET_TAP_DIR=$HOME/Documents/homebrew-tap
-#   LESSSHEET_SITE_URL=https://te-x.github.io/less-sheet-site/
+#   LESSSHEET_SITE_URL=https://te-x.github.io/less-sheet/
 #
 # THIS SCRIPT DOES NOT BUILD THE APP. `tools/release/cut` does that on the Mac,
 # which is the only machine with the Swift toolchain. This one assumes dist/
@@ -40,16 +40,16 @@ for a in "$@"; do
     esac
 done
 
-RELEASE_REPO="${LESSSHEET_RELEASE_REPO:-te-x/less-sheet-site}"
+RELEASE_REPO="${LESSSHEET_RELEASE_REPO:-te-x/less-sheet}"
 TAP_DIR="${LESSSHEET_TAP_DIR:-$HOME/Documents/homebrew-tap}"
-SITE_URL="${LESSSHEET_SITE_URL:-https://te-x.github.io/less-sheet-site/}"
+SITE_URL="${LESSSHEET_SITE_URL:-https://te-x.github.io/less-sheet/}"
 FLATPAK_DIR="packaging/flatpak"
 
 # ---------------------------------------------------------------- preflight --
 command -v gh >/dev/null || die "gh not found (pacman -S github-cli)"
 gh auth status >/dev/null 2>&1 || die "gh is not logged in — run: gh auth login"
 git remote get-url origin >/dev/null 2>&1 \
-    || die "no 'origin' remote. xfer-clean sets it; re-run the transfer."
+    || die "no 'origin' remote. Clone this repository from GitHub (git clone), do not copy it."
 
 VER="$(cat VERSION)"
 TAG="v$VER"

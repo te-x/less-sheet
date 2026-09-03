@@ -40,7 +40,7 @@ esac
 
 HAVE="$(cat VERSION)"
 TAG="v$WANT"
-RELEASE_REPO="${LESSSHEET_RELEASE_REPO:-te-x/less-sheet-site}"
+RELEASE_REPO="${LESSSHEET_RELEASE_REPO:-te-x/less-sheet}"
 BASE="https://github.com/$RELEASE_REPO/releases/download/$TAG"
 
 [ "$HAVE" != "$WANT" ] || die "VERSION already says $WANT"
@@ -96,13 +96,14 @@ echo "  $(git rev-parse --short HEAD)  tagged $TAG"
 # ---------------------------------------------------------------------- next --
 say "built $WANT — nothing has been published"
 cat <<EOF
-  dist/ is gitignored, so the artifacts do NOT travel with the repo. Both
-  transfers are needed, and the cask lives in dist/ too:
+  dist/ is gitignored, so the artifacts do NOT travel with the repo. Push the
+  release commit + tag, then move dist/ (the cask lives in it too) to the Linux
+  box that publishes:
 
-    rsync -av dist/ user@linux-box:~/Documents/less-sheet-dist/
-    tools/xfer-clean user@linux-box:~/Documents/less-sheet
+    git push origin master --tags
+    rsync -av dist/ <linux-box>:~/less-sheet-dist/
 
-  then, on the Arch box:
+  then, on the Linux box (a plain clone of the repository, pulled to this tag):
 
-    cd ~/Documents/less-sheet && tools/release/publish.sh
+    cd ~/less-sheet && git pull --tags && tools/release/publish.sh
 EOF

@@ -43,8 +43,8 @@
     <name>te-x</name>
   </developer>
 
-  <url type="homepage">https://te-x.github.io/less-sheet-site/</url>
-  <url type="bugtracker">https://github.com/te-x/less-sheet-site/issues</url>
+  <url type="homepage">https://te-x.github.io/less-sheet/</url>
+  <url type="bugtracker">https://github.com/te-x/less-sheet/issues</url>
 
   <content_rating type="oars-1.1" />
 
@@ -56,11 +56,11 @@
   <screenshots>
     <screenshot type="default">
       <caption>Filtering a large CSV without loading it</caption>
-      <image>https://te-x.github.io/less-sheet-site/assets/shots/shot-filter-linux-light.webp</image>
+      <image>https://te-x.github.io/less-sheet/assets/shots/shot-filter-linux-light.webp</image>
     </screenshot>
     <screenshot>
       <caption>Choosing the separator and quoting for a file</caption>
-      <image>https://te-x.github.io/less-sheet-site/assets/shots/shot-dialect-linux-dark.webp</image>
+      <image>https://te-x.github.io/less-sheet/assets/shots/shot-dialect-linux-dark.webp</image>
     </screenshot>
   </screenshots>
 

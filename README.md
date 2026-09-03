@@ -6,7 +6,7 @@ C ABI, with native frontends for macOS (Swift 6 / AppKit) and Linux
 are on screen in well under 500 ms regardless of file size, for local files
 and for files streamed over HTTP(S).
 
-Website, screenshots and downloads: <https://te-x.github.io/less-sheet-site/>
+Website, screenshots and downloads: <https://te-x.github.io/less-sheet/>
 
 ## Layout
 

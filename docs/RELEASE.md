@@ -12,7 +12,7 @@
 > - **The version is single-sourced** to `VERSION` at the workspace root (§1). The GTK build reads it; the macOS bundle and `tools/release/make_release` still hold their own copies and are the last two consumers to convert — §1 specifies exactly how.
 > - **The GTK app-id is `com.lesssheet.LessSheet`** (the author's decision), matching what §4b proposes. It was `dev.lesssheet.Gtk`; the id, the embedded icon's filename, the GResource path and the `icon-name` lookup were renamed together and the icon was re-verified as resolving.
 >
-> Still open: macOS ships **ad-hoc signed, not notarized** (no Apple Developer account — §3a is now measured, not predicted). EULA not yet written (§6).
+> Still open: macOS ships **ad-hoc signed, not notarized** (no Apple Developer account — §3a is now measured, not predicted). The licence is MIT (`LICENSE`; the v0.1.0 EULA is preserved at `docs/EULA-v0.1.0.md`).
 
 ---
 
@@ -142,7 +142,7 @@ libadwaita 1.8.6 normally. Emulation is a viable route.
 
 To produce the x86_64 tarball natively in minutes on an x86_64 Linux box instead, do there what
 the script does in the container — the recipe is identical because the staging layout is the same
-one `tools/gtk/run_gtk_on` already uses:
+one `make_release` stages:
 
 ```
 # on the Mac: cross-build the core for the target and copy the tree over
@@ -152,8 +152,8 @@ cd backend && zig build -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseSafe --prefi
 meson setup build --buildtype=release && meson compile -C build && strip build/less-sheet-gtk
 ```
 Then package `less-sheet-gtk` + the `.desktop` + the icon + `install.sh` exactly as the script
-does. Requires GTK4 ≥ 4.20 + libadwaita ≥ 1.8 + meson/ninja/gcc on that box (`run_gtk_on`'s
-install block installs precisely this set, and carries the same floors).
+does. Requires GTK4 ≥ 4.20 + libadwaita ≥ 1.8 + meson/ninja/gcc on that box (the same floors
+`apps/gtk/.ci/Dockerfile` pins).
 
 For distribution, §4's Flatpak is still the better answer for Linux than any tarball.
 
@@ -214,7 +214,7 @@ xcrun stapler staple "$APP"
 ## 4. Publish v1 — Linux (Flatpak → Flathub)
 
 ### 4a. LGPL note (why Flatpak)
-GTK4/libadwaita/GLib are LGPL and **dynamically linked** (`dependency()` in `meson.build`). Flatpak provides them from the `org.gnome.Platform` runtime (dynamic, swappable) — which inherently satisfies LGPL's relink requirement, so a **closed-source app is compliant** as long as we ship the notices (`THIRD-PARTY-NOTICES.md`) and don't statically bundle GTK. (AppImage would bundle GTK and make LGPL compliance manual — that's why Flatpak is chosen.)
+GTK4/libadwaita/GLib are LGPL and **dynamically linked** (`dependency()` in `meson.build`). Flatpak provides them from the `org.gnome.Platform` runtime (dynamic, swappable) — which inherently satisfies LGPL's relink requirement, so **the app is compliant** as long as we ship the notices (`THIRD-PARTY-NOTICES.md`) and don't statically bundle GTK. (AppImage would bundle GTK and make LGPL compliance manual — that's why Flatpak is chosen.)
 
 ### 4b. The app-id (settled 2026-08-05)
 The app-id is **`com.lesssheet.LessSheet`** (the author's decision; aligns with the macOS
@@ -256,20 +256,21 @@ flatpak build-bundle repo less-sheet.flatpak com.lesssheet.LessSheet       # sel
 
 ## 5. Shipping updates — two commands
 
-A bugfix release is two scripts and two transfers. Everything below §5 describes
+A bugfix release is two scripts, one push and one rsync. Everything below §5 describes
 what they do; you should not need to perform those steps by hand.
 
 ```sh
 # on the Mac — builds, verifies, stamps, commits, tags. Publishes nothing.
 tools/release/cut 0.1.1
+git push origin master --tags
 
-# both transfers: dist/ is gitignored, so artifacts do NOT travel with the repo
-rsync -av dist/ user@linux-box:~/Documents/less-sheet-dist/
-tools/xfer-clean user@linux-box:~/Documents/less-sheet
+# dist/ is gitignored, so the artifacts do NOT travel with the repo
+rsync -av dist/ <linux-box>:~/less-sheet-dist/
 
-# on the Arch box — pushes, releases, builds the Flatpak bundle, updates the
-# tap, deploys the page, and verifies all of it logged out
-cd ~/Documents/less-sheet && tools/release/publish.sh
+# on the Linux box (a plain clone of the repository) — releases, builds the
+# Flatpak bundle, updates the tap, and verifies all of it logged out. The page
+# deploys itself from the push (.github/workflows/deploy-site.yml).
+cd ~/less-sheet && git pull --tags && tools/release/publish.sh
 ```
 
 **Why two scripts.** The Mac is the only machine with the Swift toolchain (and it
@@ -307,183 +308,98 @@ Keep a `CHANGELOG.md` (recommended) so release notes are single-sourced.
 ## 6. Files that must ship / live in the repo
 
 - **`THIRD-PARTY-NOTICES.md`** — the LGPL notices for GTK4/libadwaita/GLib + the MIT notice for the Zig standard library. **Drafted** (companion to this doc); keep it current as deps change.
-- **`LICENSE` / EULA** — the terms for the free, closed-source tool. **Not written — your call + legal review.** A minimal "free to use, provided as-is, no warranty, no reverse-engineering" grant is typical; the orchestrator can draft a starter template on request, but you own the final legal text.
+- **`LICENSE`** — MIT, copyright te-x. The macOS bundle ships it in `Contents/Resources`; the Flatpak metainfo declares it. The v0.1.0 EULA that preceded it is preserved at `docs/EULA-v0.1.0.md` for the record.
 - **`com.lesssheet.LessSheet.metainfo.xml`** (AppStream) + `.desktop` — required for Flathub; needed for Linux desktop integration.
 
 ---
 
-## 7. GitHub: closed source, public downloads — a walkthrough
+## 7. GitHub: one public repository — a walkthrough
 
-**Goal:** keep the code private, while binaries, the frontpage, and a feedback
-channel are all public. Follow this once, top to bottom.
+Everything lives in **`te-x/less-sheet`**: the source, the Releases (every download URL), the Issues,
+and the landing page (GitHub Pages, deployed from `site/` by `.github/workflows/deploy-site.yml`).
+Two small satellites: **`te-x/homebrew-tap`** holds the cask (§7.5), and **`te-x/less-sheet-site`**
+exists only to forward the old page address — see `tools/release/site-redirect/README.md`.
 
-### 7.0 Do this first: amend the architecture decision
+### 7.1 Why one repository, and why public
 
-`docs/architecture` records the signed non-goal **"Never publish this
-workspace"**, and the orchestrator works under a standing rule never to add a git
-remote here. Everything below adds one.
+Repository visibility is **one switch that governs Releases, Issues and Pages together**. A private
+repository serves release assets from temporary *authenticated* URLs (`brew` and the `curl` one-liner
+cannot authenticate, so both install routes in §3a break by construction), lets only collaborators file
+issues, and on a Free account does not publish Pages at all — GitHub's own wording: *"If the account that
+owns the repository uses GitHub Free or GitHub Free for organizations, the repository must be public."*
 
-That decision is yours to change, but change it **deliberately**: amend the ARCH
-doc and sign it, the same way the security amendment was handled. Nothing in §7
-should be executed while the doc still says the opposite — a runbook that
-contradicts a signed decision is how a project ends up not knowing what it
-decided.
+The source is MIT, so there is nothing a second repository would protect, and one repository means one
+place for downloads, bug reports and the page: the name a user sees in a download URL is the repository
+they can read. The whole development record — `.aidev/`, `review/`, `docs/architecture/` — is published
+with it, on purpose; write those files knowing that.
 
-### 7.1 Why this needs two repositories
+### 7.2 Settings, once
 
-Repository visibility is **one switch that governs four things**. Make a repo
-private and its Releases, Issues, and Pages all go private with it:
+- Visibility **public**. **Settings → Pages → Source: GitHub Actions** — the workflow deploys `site/` on
+  every push that touches it (and on manual dispatch). The page appears at
+  `https://te-x.github.io/less-sheet/`.
+- **Issues on; Wikis and Projects off**, so feedback has exactly one place to land.
+- The tap repository must be public too: `brew` fetches it unauthenticated.
 
-- **Release assets** are then served from temporary *authenticated* URLs.
-  `brew` cannot authenticate, and neither can the `curl` one-liner, so both
-  install routes in §3a break by construction.
-- **Issues** can only be filed by people with repo access.
-- **Pages** will not publish at all on a Free account. GitHub's own wording:
-  *"If the account that owns the repository uses GitHub Free or GitHub Free for
-  organizations, the repository must be public."* (Paid tiers can serve Pages
-  from a private repo, so a single private repo is possible on Pro — but the
-  release-asset problem above remains, so it does not actually save you a repo.)
+### 7.3 A release — build locally, publish by script
 
-So:
-
-| repository        | visibility  | what lives there                                   |
-| ----------------- | ----------- | -------------------------------------------------- |
-| `less-sheet-dev`  | **private** | all source, `.aidev/`, `review/`, `docs/`, the site |
-| `less-sheet`      | **public**  | Releases, Issues, Pages. **No source.**             |
-| `homebrew-tap`    | **public**  | the cask (see `packaging/homebrew/README.md`)       |
-
-The public repo gets the good name, because that is what users see in a download
-URL and in a bug report.
-
-### 7.2 Create the repositories
-
-```sh
-# 1. the private one, from this workspace
-gh repo create <you>/less-sheet-dev --private --source=. --remote=origin --push
-
-# 2. the public face — created EMPTY, it never receives source
-gh repo create <you>/less-sheet --public --description "less-sheet — downloads and issues"
-```
-
-Give the public repo a `README.md` that says what it is ("this is where
-less-sheet is released and where you report problems; the source is not public")
-and nothing else. Then, in its settings, **turn off Wikis and Projects** and
-leave **Issues on**; on the *private* repo, turn Issues **off**, so there is one
-place feedback can land and no split tracker.
-
-### 7.3 First release — build locally, publish by hand
-
-This is the recommended path, and §7.6 explains why it is not CI.
-
-```sh
-# build + verify every artifact by RUNNING it, and write SHA256SUMS
-python3 tools/release/make_release --cask-base \
-  "https://github.com/<you>/less-sheet/releases/download/v$(cat VERSION)"
-
-# publish into the PUBLIC repo (note --repo: you are standing in the private one)
-gh release create "v$(cat VERSION)" --repo <you>/less-sheet \
-   --title "less-sheet $(cat VERSION)" --notes-file <(printf '...changelog...\n') \
-   dist/less-sheet-*-macos-arm64.dmg \
-   dist/less-sheet-*-macos-arm64.tar.gz \
-   dist/less-sheet-*-macos-arm64.zip \
-   dist/less-sheet-*-linux-*.tar.gz \
-   dist/SHA256SUMS
-```
-
-**Then prove the URLs are public**, because this is the failure that silently
-breaks Homebrew and the one-liner for everyone but you:
+`tools/release/cut` on the Mac, `tools/release/publish.sh` on the Linux box (§5). What `publish.sh`
+does, in order: pushes the release commit and tag, runs `gh release create vX.Y.Z --repo te-x/less-sheet`
+with the macOS dmg/tar.gz/zip, the Linux tarballs and `SHA256SUMS`, builds and uploads the Flatpak
+bundle, updates the tap, then **proves the URLs are public** — the failure that silently breaks Homebrew
+and the one-liner for everyone but you:
 
 ```sh
 curl -fsSLI -o /dev/null -w '%{http_code}\n' \
-  "https://github.com/<you>/less-sheet/releases/download/v$(cat VERSION)/SHA256SUMS"
-# 200 = public. 404 while logged out = the release or the repo is still private.
+  "https://github.com/te-x/less-sheet/releases/download/v$(cat VERSION)/SHA256SUMS"
+# 200 = public. 404 while logged out = the release is still a draft, or the repo is private.
 ```
 
-Check it **logged out** (a private browser window, or `curl` with no
-credentials). A logged-in check passes even when the asset is private.
+Check it **logged out** (a private browser window, or `curl` with no credentials). A logged-in check
+passes even when the asset is private.
 
-### 7.4 The frontpage on Pages
+### 7.4 The landing page on Pages
 
-`site/index.html` stays in the **private** repo — one source of truth. Deploying
-is a copy into the public repo, and the copy is where the placeholders get
-filled:
-
-```sh
-VER=$(cat VERSION)
-BASE="https://github.com/<you>/less-sheet/releases/download/v$VER"
-
-mkdir -p /tmp/pagesite && cp -R site/* /tmp/pagesite/
-
-# order matters only in that DOWNLOAD_BASE is substituted with a string that
-# itself contains the version — written as `v$VER`, not `vVERSION`, so the
-# second pass cannot rewrite it twice.
-sed -i '' -e "s|DOWNLOAD_BASE|$BASE|g" -e "s|VERSION|$VER|g" \
-          -e "s|TAP_OWNER|<you>|g" \
-          -e "s|RELEASES_URL|https://github.com/<you>/less-sheet/releases|g" \
-          -e '/class="draft"/d' /tmp/pagesite/index.html
-
-# The draft banner is only true while the placeholders are unfilled, so the same
-# pass that fills them deletes it. This is the check that it worked — and that no
-# placeholder survived, which would otherwise ship as a dead link.
-grep -nE 'LINKS NOT LIVE|DOWNLOAD_BASE|TAP_OWNER|RELEASES_URL' /tmp/pagesite/index.html \
-  && { echo "placeholder or draft banner survived — do not publish"; exit 1; }
-echo "page is clean"
-```
-
-Commit `/tmp/pagesite` into the public repo (root, or a `docs/` folder), then
-**Settings → Pages → Source: Deploy from a branch**, pick the branch and folder.
-The site appears at `https://<you>.github.io/less-sheet/`; a custom domain goes
-in the same screen plus a `CNAME` file.
-
-Substituting at deploy time rather than editing the page by hand is the point:
-the version and every download URL derive from the tag, so the page cannot ship
-pointing at a release that does not exist (§1's rule — never hand-typed).
+`site/index.html` is the page, committed with its real download URLs (they point at this repository's
+Releases; `tools/release/stamp` moves the version across the page, the manifests and the cask together,
+then proves nothing was missed — §1's rule, never hand-typed). The workflow uploads `site/` as the Pages
+artifact and deploys it; there is no copy step and no deploy token. A custom domain would go in the Pages
+settings plus a `CNAME` file in `site/`.
 
 ### 7.5 The Homebrew tap
 
-Full steps are in `packaging/homebrew/README.md`. Two things that matter here:
-the tap repo must be **public** (brew fetches it unauthenticated), and the cask's
-`sha256` must come from `dist/SHA256SUMS` via `make_release --cask-base`, never
-typed. A wrong digest still installs fine for you — your Homebrew has the file
-cached — and fails for every user after you.
+Full steps are in `packaging/homebrew/README.md`. Two things that matter here: the tap repo must be
+**public** (brew fetches it unauthenticated), and the cask's `sha256` must come from `dist/SHA256SUMS`
+via `make_release --cask-base`, never typed. A wrong digest still installs fine for you — your Homebrew
+has the file cached — and fails for every user after you.
 
 ### 7.6 If you later want CI to build
 
-Not first, and here is the honest reason: `make_release` already builds **and
-verifies by running** — macOS launches the unpacked app headlessly and requires
-the real rows-are-visible marker, and Linux runs inside a clean `fedora:43`
-container carrying only the declared runtime deps, which proves the binary works
-on a machine that never built it. A GitHub runner does not check anything
-stronger.
+Not first, and here is the honest reason: `make_release` already builds **and verifies by running** —
+macOS launches the unpacked app headlessly and requires the real rows-are-visible marker, and Linux runs
+inside a clean `fedora:43` container carrying only the declared runtime deps, which proves the binary
+works on a machine that never built it. A GitHub runner does not check anything stronger.
 
-The cost is real: private repos bill Actions minutes, and **macOS runners bill at
-a 10× multiplier**, so a Free plan's 2,000 minutes is roughly 200 macOS minutes a
-month. When you do add CI, add the **Linux** leg first — 1× multiplier, and it is
-the platform you cannot conveniently build on the Mac anyway.
-
-A CI job in the private repo publishing into the public repo needs a
-**fine-grained personal access token**: repository access limited to
-`<you>/less-sheet` only, permission **Contents: Read and write** (releases live
-under Contents). Store it as a secret in the *private* repo — never in the public
-one, which anyone can fork.
+A public repository's Actions minutes are free, so cost is not the argument it was; correctness is. When
+you do add CI, add the **Linux** leg first — it is the platform you cannot conveniently build on the Mac
+anyway. A release job in this repository needs no personal token: the workflow's own `GITHUB_TOKEN` with
+`contents: write` can create releases and upload assets.
 
 ### 7.7 Things that will bite
 
-- **A private release asset is not a download link.** If `curl` on the release
-  URL returns 404 while logged out, Homebrew and the one-liner are broken for
-  everyone, and you will not notice, because you are logged in.
-- **Pages needs a public repo on Free** (quoted above). Do not discover this
-  after writing the deploy script.
-- **The private repo carries `.aidev/`, `review/` and `docs/architecture`** —
-  the whole development process, including every review record. That is fine
-  while it is private. Read it as "what would be exposed" before ever flipping
-  that repo's visibility, and treat flipping it as a decision, not a setting.
-- **Closed source + LGPL: you are compliant today, do not break it.** GTK and
-  libadwaita are LGPL, which requires that a user can relink. The Linux build
-  satisfies that by linking the *system* libraries — "no bundled GTK" is in the
-  release README. If bundling GTK is ever proposed to simplify distribution,
-  that is the change that turns a compliant closed-source binary into a licence
-  problem. §4a has the longer note.
+- **A draft or private release asset is not a download link.** If `curl` on the release URL returns 404
+  while logged out, Homebrew and the one-liner are broken for everyone, and you will not notice, because
+  you are logged in.
+- **Pages needs a public repo on Free** (quoted above). The old address forwards only once the new page
+  is live — flip `less-sheet-site` to the redirect files *after* `https://te-x.github.io/less-sheet/`
+  answers, not before.
+- **Old direct download links cannot be forwarded.** GitHub Pages has no HTTP redirects, and release
+  URLs are not Pages. Links to `github.com/te-x/less-sheet-site/releases/...` keep working only while
+  that repository still carries the release; the page itself points at this repository.
+- **LGPL: stay compliant.** GTK and libadwaita are LGPL and **dynamically linked** — the Linux build
+  uses the *system* libraries ("no bundled GTK" is in the release README) and the Flatpak takes them
+  from the `org.gnome.Platform` runtime. Bundling GTK into the binary to simplify distribution would be
+  the change that creates a licence problem. §4a has the longer note.
 
 ---
 
@@ -494,11 +410,11 @@ one, which anyone can fork.
 - [ ] Update `make_release`'s `GTK_APP_ID` to the new id before any Linux artifact ships (§4b).
 - [ ] Security hardening #41 landed (publish the hardened build).
 - [ ] macOS: Apple Developer account → switch from unsigned (§3a) to signed+notarized (§3b).
-- [ ] Write the EULA/LICENSE (§6) + legal review.
+- [x] Licence: MIT (`LICENSE`); the v0.1.0 EULA preserved at `docs/EULA-v0.1.0.md` (§6).
 - [ ] Draft + Linux-test the Flatpak manifest (§4c); add metainfo + .desktop.
 - [ ] Decide Flathub vs self-host (§4d).
-- [ ] **Amend + sign the ARCH non-goal "Never publish this workspace"** before adding any git remote (§7.0).
-- [ ] Create the private source repo + the public downloads/issues repo (§7.1–7.2).
+- [x] The ARCH non-goal "Never publish this workspace" was amended; the workspace has a remote and is published in full (§7.1).
+- [ ] One public repository: visibility public, Pages from GitHub Actions, Issues on (§7.2); `less-sheet-site` reduced to the forwarding files (`tools/release/site-redirect/`).
 - [ ] First release published, and the asset URL verified **logged out** (§7.3).
-- [ ] Pages serving the frontpage with the placeholders substituted at deploy (§7.4).
+- [ ] Pages serving `site/` from this repository via the workflow; the old address forwards (§7.4, §7.7).
 - [ ] Homebrew tap published, digest taken from `SHA256SUMS` (§7.5).

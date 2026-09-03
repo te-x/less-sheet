@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>less-sheet has moved</title>
+  <!-- Deep links into the old site (assets, anchors) land here because the files
+       are gone. Forward them to the same path under the new site; fall back to
+       the new front page if scripting is off. -->
+  <meta http-equiv="refresh" content="0; url=https://te-x.github.io/less-sheet/">
+  <link rel="canonical" href="https://te-x.github.io/less-sheet/">
+  <meta name="robots" content="noindex">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <script>
+    var rest = location.pathname.replace(/^\/less-sheet-site\/?/, "");
+    location.replace("https://te-x.github.io/less-sheet/" + rest + location.search + location.hash);
+  </script>
+  <style>
+    body { font: 16px/1.5 system-ui, sans-serif; margin: 15vh auto; max-width: 36em; padding: 0 1.5em; color: #222; }
+    a { color: #0a58ca; }
+  </style>
+</head>
+<body>
+  <p>less-sheet has moved to
+    <a href="https://te-x.github.io/less-sheet/">te-x.github.io/less-sheet</a>.
+    You are being forwarded there.</p>
+</body>
+</html>
