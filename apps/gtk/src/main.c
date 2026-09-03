@@ -455,18 +455,20 @@ find_clear_mask (App *app)
   app->mask.cols = 0;
 }
 
-/* Poll the active search, fold it into the display, refresh the mask + labels,
- * and scroll to a new landing. Defined with the other find helpers below; the
- * poll loop (grid_poll_tick) calls it. */
-static void find_poll_fold (App *app);
+/* Poll the active search, fold it into the display, refresh the labels, and
+ * scroll to a new landing. Returns TRUE when the grid needs re-materializing
+ * (the highlight mask tracks the scan). Called only by grid_poll_tick, which
+ * coalesces the repaint. */
+static gboolean find_poll_fold (App *app);
 
 /* Poll the core jump slot, fold it, and act on land/reject. Defined with the
  * jump helpers below; the poll loop calls it while a jump is scanning. */
 static void jump_poll_fold (App *app);
 
-/* Poll the core filter slot, fold it, and refresh the subtitle + grid. Defined
- * with the filter helpers below; the poll loop calls it while filtered. */
-static void filter_poll_fold (App *app);
+/* Poll the core filter slot, fold it, and refresh the subtitle. Returns TRUE
+ * when the grid needs re-materializing. Called only by grid_poll_tick, which
+ * coalesces the repaint. */
+static gboolean filter_poll_fold (App *app);
 
 /* Network demand-drive: on an http_range doc, fetch the frontier to
  * `target_row` via ls_jump_start so a subsequent window materialize serves
@@ -474,7 +476,7 @@ static void filter_poll_fold (App *app);
  * helpers; called from the scroll handler, the filter-apply, and the poll
  * loop. */
 static void net_drive_begin (App *app, guint64 target_row);
-static void net_drive_poll (App *app);
+static gboolean net_drive_poll (App *app);
 
 /* Streaming copy (slice 5): start a copy of the current selection; stop+join
  * the worker before any document teardown (leaf-before-root). Defined in the
@@ -880,6 +882,18 @@ grid_materialize (App *app)
   grid_update_a11y_description (app);
 }
 
+/* Materialize the visible window and schedule the repaint that shows it — the
+ * ONE place those two are paired, so no caller can mutate the view and forget
+ * the draw (a mutation with no scroll never gets one on its own). */
+static void
+grid_repaint (App *app)
+{
+  if (app->area == NULL)
+    return;
+  grid_materialize (app);
+  gtk_widget_queue_draw (GTK_WIDGET (app->area));
+}
+
 /* The header-bar subtitle is the ONE passive-status line (single source of
  * truth): the "Filtered — N of M rows" status when a filter owns the view,
  * otherwise the document's row count. Everything is re-derived from `app`
@@ -952,13 +966,12 @@ grid_poll_tick (gpointer data)
       grid_update_vadjustment (app);
     }
 
+  /* The folds below only REQUEST a repaint; the tick materializes at most
+   * once, so a find + filter + net-drive tick costs one window fetch, not
+   * three. */
   LsgWindowPollInputs in = { app->window_short, prog.complete };
   LsgWindowPollDecision d = lsg_window_poll_decide (in);
-  if (d.reissue_window)
-    {
-      grid_materialize (app);
-      gtk_widget_queue_draw (GTK_WIDGET (app->area));
-    }
+  gboolean repaint = d.reissue_window;
 
   update_title_subtitle (app);
 
@@ -968,7 +981,7 @@ grid_poll_tick (gpointer data)
   gboolean keep = d.continue_polling;
   if (app->find.display.active)
     {
-      find_poll_fold (app);
+      repaint |= find_poll_fold (app);
       keep = TRUE;
     }
 
@@ -988,7 +1001,7 @@ grid_poll_tick (gpointer data)
    * SCANNING`. */
   if (app->filter.active)
     {
-      filter_poll_fold (app);
+      repaint |= filter_poll_fold (app);
       if (!app->filter.snapshot.total_exact)
         keep = TRUE;
     }
@@ -996,10 +1009,13 @@ grid_poll_tick (gpointer data)
   /* Keep ticking while a network fetch-drive is in flight (net-park). */
   if (app->net_drive_active)
     {
-      net_drive_poll (app);
+      repaint |= net_drive_poll (app);
       if (app->net_drive_active)
         keep = TRUE;
     }
+
+  if (repaint)
+    grid_repaint (app);
 
   if (!keep)
     {
@@ -1465,8 +1481,7 @@ open_document (App *app, LsgDocument *doc, const char *title,
   update_title_subtitle (app);
 
   gtk_stack_set_visible_child_name (app->stack, "grid");
-  grid_materialize (app);
-  gtk_widget_queue_draw (GTK_WIDGET (app->area));
+  grid_repaint (app);
   filter_sync_ui (app); /* the reset cleared any prior filter (F6) */
 
   /* Reflect the (possibly re-sniffed) dialect into the header-bar quick
@@ -2062,8 +2077,7 @@ grid_cursor_apply (App *app, LsgA11yCursorCommand command, gboolean extend)
   if (r.should_reveal)
     a11y_reveal_cell (app, r.reveal.row, r.reveal.col);
 
-  grid_materialize (app);
-  gtk_widget_queue_draw (GTK_WIDGET (app->area));
+  grid_repaint (app);
   copy_update_affordance (app);
 
   /* Announcements (FR3): plain move / seed -> the landing cell (LOW); extend /
@@ -2215,8 +2229,7 @@ on_adjustment_changed (GtkAdjustment *adj, gpointer data)
   App *app = data;
   if (app->doc == NULL)
     return;
-  grid_materialize (app);
-  gtk_widget_queue_draw (GTK_WIDGET (app->area));
+  grid_repaint (app);
   /* Net-park: a scroll landing beyond the fetched frontier comes back SHORT (a
    * bare ls_window_set fetched nothing) — drive the fetch to the top row so
    * the target rows appear. Identity view: cur_top_row is an original row.
@@ -2249,8 +2262,7 @@ on_area_resize (GtkDrawingArea *area, int width, int height, gpointer data)
     return;
   grid_update_vadjustment (app);
   grid_update_hadjustment (app);
-  grid_materialize (app);
-  gtk_widget_queue_draw (GTK_WIDGET (app->area));
+  grid_repaint (app);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -2464,16 +2476,14 @@ find_run_query (App *app)
       app->find = lsg_find_closed (app->find);
     }
 
-  grid_materialize (app); /* refresh (or clear) the highlight mask */
   find_update_labels (app);
-  filter_update_toggle_sensitivity (
-      app); /* canApplyFilter follows the query */
-  gtk_widget_queue_draw (GTK_WIDGET (app->area));
-  capture_note_find_run (app); /* a query was (re)issued — see the hook */
+  filter_update_toggle_sensitivity (app);
+  grid_repaint (app); /* refresh (or clear) the highlight mask */
+  capture_note_find_run (app);
 }
 
 /* Forward-declared above; folds one search poll into the display. */
-static void
+static gboolean
 find_poll_fold (App *app)
 {
   LsgSearchSnapshot snap;
@@ -2512,13 +2522,11 @@ find_poll_fold (App *app)
   if (landed)
     scroll_to_match (app, app->find.display.current.row);
 
-  grid_materialize (app); /* refresh the highlight mask as the scan advances */
   find_update_labels (app);
-  gtk_widget_queue_draw (GTK_WIDGET (app->area));
 
   /* Find-navigation landing (MEDIUM): "Match n of m, row R" — the same n/m the
-   * status shows, R the landing's gutter row number (read off the now-
-   * materialized window). Only on a NEW landing, never on plain scan ticks. */
+   * status shows, R the landing's gutter row number. Only on a NEW landing,
+   * never on plain scan ticks. */
   if (landed)
     a11y_announce (
         app,
@@ -2526,6 +2534,7 @@ find_poll_fold (App *app)
             app->find.display.position, app->find.display.total,
             a11y_gutter_for_view_row (app, app->find.display.current.row)),
         GTK_ACCESSIBLE_ANNOUNCEMENT_PRIORITY_MEDIUM);
+  return TRUE; /* the highlight mask tracks the advancing scan */
 }
 
 static void
@@ -2617,8 +2626,7 @@ on_find_popover_closed (GtkPopover *popover, gpointer data)
   find_update_labels (app);
   if (app->doc != NULL)
     {
-      grid_materialize (app);
-      gtk_widget_queue_draw (GTK_WIDGET (app->area));
+      grid_repaint (app);
     }
 }
 
@@ -3163,23 +3171,23 @@ net_drive_begin (App *app, guint64 target_row)
   lsg_document_jump_start (app->doc, target_row);
   /* Fold the immediate poll (a behind-frontier / small fetch completes at
    * once); otherwise the ~100 ms tick keeps folding until DONE. */
-  net_drive_poll (app);
+  if (net_drive_poll (app))
+    grid_repaint (app);
   if (app->net_drive_active)
     ensure_poll (app);
 }
 
-static void
+/* Returns TRUE when the drive just completed — the target rows are fetched
+ * and the grid needs re-materializing. */
+static gboolean
 net_drive_poll (App *app)
 {
   if (!app->net_drive_active || app->doc == NULL)
-    return;
-  LsgJumpStatus st = lsg_document_jump_poll (app->doc);
-  if (st.state == LSG_JUMP_DONE)
-    {
-      app->net_drive_active = FALSE;
-      grid_materialize (app); /* the target rows are now fetched */
-      gtk_widget_queue_draw (GTK_WIDGET (app->area));
-    }
+    return FALSE;
+  if (lsg_document_jump_poll (app->doc).state != LSG_JUMP_DONE)
+    return FALSE;
+  app->net_drive_active = FALSE;
+  return TRUE;
 }
 
 /*
@@ -3789,8 +3797,7 @@ filter_rebuild_grid (App *app, guint64 first_row)
   grid_update_gutter (app);
   grid_update_vadjustment (app);
   scroll_to_first_row (app, first_row); /* fires materialize + repaint */
-  grid_materialize (app);
-  gtk_widget_queue_draw (GTK_WIDGET (app->area));
+  grid_repaint (app);
 }
 
 /* Apply the CURRENT find draft as a filter (routes the same request Find would
@@ -3911,29 +3918,22 @@ on_filter_clear_clicked (GtkButton *button, gpointer data)
   do_clear_filter ((App *)data);
 }
 
-/* Forward-declared above; fold one filter poll into the subtitle + grid. */
-static void
+/* Forward-declared above; fold one filter poll into the subtitle. */
+static gboolean
 filter_poll_fold (App *app)
 {
   if (app->doc == NULL || !app->filter.active)
-    return;
+    return FALSE;
   LsgFilterSnapshot snap;
   gboolean has = lsg_document_filter_poll (app->doc, &snap);
   app->filter = lsg_filter_resolved (app->filter, has, snap);
   update_title_subtitle (app);
-  /* The filtered row count m grows as the scan advances AND jumps to its
-   * final value on the SCANNING->DONE transition; the poll STOPS right after
-   * total_exact latches (grid_poll_tick keeps ticking only while
-   * !total_exact), so the DONE fold is the LAST chance to paint the completed
-   * set. A phase==SCANNING guard here dropped that final repaint: a fast
-   * local scan finishing before the first ~100 ms tick left the grid frozen
-   * on the near-empty apply-time window until a manual click forced a redraw.
-   * Re-materialize on EVERY fold (O(viewport), matcher-independent) so both
-   * the widening view and the final batch paint with no click — the GTK
-   * analog of the macOS REPAINT-FAMILY rule (a mutation with no scroll defers
-   * its draw -> drive a synchronous repaint). */
-  grid_materialize (app);
-  gtk_widget_queue_draw (GTK_WIDGET (app->area));
+  /* EVERY fold asks for the repaint, including the one that observes DONE.
+   * The tick stops as soon as total_exact latches, so the DONE fold is the
+   * LAST chance to paint the completed set; gating this on phase==SCANNING
+   * once left a fast local scan frozen on the near-empty apply-time window
+   * until a click forced a redraw. */
+  return TRUE;
 }
 
 static void
@@ -4899,8 +4899,7 @@ settings_reopen_apply (App *app)
     {
       guint64 row = app->reopen_top_view;
       scroll_to_first_row (app, row);
-      grid_materialize (app);
-      gtk_widget_queue_draw (GTK_WIDGET (app->area));
+      grid_repaint (app);
       if (app->is_network)
         net_drive_begin (app, row); /* F8: net funnel drives the landing */
       settings_toast (app, app->reopen_header_now ? "First row is now a header"
@@ -4968,8 +4967,7 @@ settings_reopen_apply (App *app)
                   || !lsg_column_format_options_is_auto (s.format))
                 column_cache_effective (app, i);
             }
-          grid_materialize (app);
-          gtk_widget_queue_draw (GTK_WIDGET (app->area));
+          grid_repaint (app);
         }
       else
         {
@@ -5634,15 +5632,6 @@ build_parsing_page (App *app)
 
 /* -------- Columns page --------------------------------------------------- */
 
-/* Repaint the grid after a column mutation (F13 — the GTK REPAINT-FAMILY
- * analog: a synchronous poke, never wait for scroll). */
-static void
-column_repaint (App *app)
-{
-  grid_materialize (app);
-  gtk_widget_queue_draw (GTK_WIDGET (app->area));
-}
-
 /* Map a type combo index to a kind (0 == Auto). */
 static ls_column_type_kind
 type_index_to_kind (guint idx)
@@ -5820,7 +5809,7 @@ on_col_visibility (GtkCheckButton *check, gpointer data)
     {
       set_column_hidden (app, col, !gtk_check_button_get_active (check));
       grid_update_hadjustment (app); /* total width changed */
-      column_repaint (app); /* F13 synchronous poke — hide/show live */
+      grid_repaint (app); /* F13 synchronous poke — hide/show live */
       columns_refresh_summaries (app);
     }
 }
@@ -5855,7 +5844,7 @@ on_col_type (GObject *row, GParamSpec *pspec, gpointer data)
       = gtk_widget_get_ancestor (GTK_WIDGET (row), ADW_TYPE_EXPANDER_ROW);
   if (expander != NULL)
     column_row_sync (app, expander, col);
-  column_repaint (app);
+  grid_repaint (app);
 }
 
 static void
@@ -5876,7 +5865,7 @@ on_col_datetime_sem (GObject *row, GParamSpec *pspec, gpointer data)
       = (idx == 1) ? LS_COLUMN_DATETIME_ZONED : LS_COLUMN_DATETIME_NAIVE;
   s->override = lsg_column_override_type (LS_COLUMN_TYPE_DATETIME, sem);
   column_apply_type (app, col);
-  column_repaint (app);
+  grid_repaint (app);
 }
 
 static void
@@ -5891,7 +5880,7 @@ on_col_grouping (GObject *row, GParamSpec *pspec, gpointer data)
     {
       app->col_settings[col].format.grouping
           = adw_switch_row_get_active (ADW_SWITCH_ROW (row));
-      column_repaint (app);
+      grid_repaint (app);
     }
 }
 
@@ -5907,7 +5896,7 @@ on_col_has_fraction (GObject *row, GParamSpec *pspec, gpointer data)
     {
       app->col_settings[col].format.has_fraction_digits
           = adw_switch_row_get_active (ADW_SWITCH_ROW (row));
-      column_repaint (app);
+      grid_repaint (app);
     }
 }
 
@@ -5924,7 +5913,7 @@ on_col_fraction_value (GtkAdjustment *adj, gpointer data)
     {
       app->col_settings[col].format.fraction_digits
           = (gint)gtk_adjustment_get_value (adj);
-      column_repaint (app);
+      grid_repaint (app);
     }
 }
 
@@ -5940,7 +5929,7 @@ on_col_date_preset (GObject *row, GParamSpec *pspec, gpointer data)
     {
       app->col_settings[col].format.date_preset
           = (LsgDatePreset)adw_combo_row_get_selected (ADW_COMBO_ROW (row));
-      column_repaint (app);
+      grid_repaint (app);
     }
 }
 
@@ -5968,7 +5957,7 @@ on_col_null_enabled (GObject *row, GParamSpec *pspec, gpointer data)
       lsg_document_column_null_sentinel_clear (app->doc, col);
     }
   column_cache_effective (app, col);
-  column_repaint (app);
+  grid_repaint (app);
 }
 
 static void
@@ -5989,7 +5978,7 @@ on_col_null_value_apply (GtkWidget *entry, gpointer data)
   lsg_document_column_null_sentinel_set (app->doc, col,
                                          len ? s->null_sentinel : NULL, len);
   column_cache_effective (app, col);
-  column_repaint (app);
+  grid_repaint (app);
 }
 
 static void
@@ -6007,7 +5996,7 @@ on_col_width_value (GtkAdjustment *adj, gpointer data)
       app->col_settings[col].manual_width = gtk_adjustment_get_value (adj);
       app->col_widths[col] = gtk_adjustment_get_value (adj);
       grid_update_hadjustment (app);
-      column_repaint (app);
+      grid_repaint (app);
     }
 }
 
@@ -6026,7 +6015,7 @@ on_col_reset (GtkButton *btn, gpointer data)
    * widened column shrinks back (Finding 3). */
   sample_one_column_width (app, col);
   grid_update_hadjustment (app);
-  column_repaint (app);
+  grid_repaint (app);
   columns_group_rebuild (app); /* re-reflect every control from the reset */
 }
 
@@ -6356,7 +6345,7 @@ prefs_infer_poll_cb (gpointer data)
     {
       app->prefs_infer_gen = st.metadata_generation;
       columns_refresh_types (app);
-      column_repaint (app); /* typed cell formatting for displayed columns */
+      grid_repaint (app); /* typed cell formatting for displayed columns */
     }
   if (app->prefs_infer_row != NULL)
     {
@@ -6558,7 +6547,7 @@ on_show_all_columns (GtkButton *btn, gpointer data)
     if (app->col_settings[c].hidden)
       set_column_hidden (app, c, FALSE); /* restore width + clear hidden */
   grid_update_hadjustment (app);         /* total width changed */
-  column_repaint (app);
+  grid_repaint (app);
   columns_group_rebuild (app);
 }
 
