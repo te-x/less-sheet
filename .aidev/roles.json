@@ -2,7 +2,7 @@
   "schema": 1,
   "roles": {
     "architect":   {"runner": "claude-native", "model": "claude-fable-5", "transport": "native", "settings": {"effort": "high"},   "skills": [],      "skill_sources": {}},
-    "planner":     {"runner": "claude-native", "model": "claude-opus-5",  "transport": "native", "settings": {"effort": "max"},    "skills": ["tdd"], "skill_sources": {}},
+    "planner":     {"runner": "claude-native", "model": "claude-opus-5",  "transport": "native", "settings": {"effort": "max"},    "skills": ["tdd"], "skill_sources": {"tdd": ".claude/skills/tdd/SKILL.md"}},
     "implementer": {"runner": "claude-native", "model": "claude-opus-5",  "transport": "native", "settings": {"effort": "medium"}, "skills": [],      "skill_sources": {}},
     "reviewer":    {"runner": "claude-native", "model": "claude-opus-5",  "transport": "native", "settings": {"effort": "high"},   "skills": [],      "skill_sources": {}}
   }

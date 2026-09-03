@@ -68,6 +68,8 @@ workspace runs the aidev pipeline (roles + deterministic gate). The harness is v
   (designs live with the user → signed ARCH doc), **planner** (freezes the contract: types + signatures +
   tests, and commits it — git arms the anti-tamper gate), **implementer** (fills bodies; may not touch
   frozen paths or `.aidev/*` except `CHANGE-REQUEST.md`), **reviewer** (independent verdict, never edits).
+  The planner preloads the `tdd` skill, vendored at `.claude/skills/tdd/` (MIT, see
+  `.claude/skills/THIRD-PARTY-SKILLS.md`), so no skill has to be installed either.
 - New feature: `/aidev:feature <name + description>` then `/aidev:build <name>`. The orchestrator itself
   runs `bash .aidev/gate.sh` to accept success — never take a role's word for it.
 - Contract change = a two-key `.aidev/CHANGE-REQUEST.md` (implementer + reviewer) adjudicated by the

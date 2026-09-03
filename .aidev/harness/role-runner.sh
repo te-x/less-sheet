@@ -342,7 +342,10 @@ validate_native_skill_bindings() {
     fi
     if [ -n "$expected_project" ] && [ "$path" = "$expected_project" ]; then
       personal="$HOME/.claude/skills/$ref/SKILL.md"
-      if [ -f "$personal" ] && [ "$(canonical_file "$personal")" != "$path" ]; then
+      # A personal copy that is byte-identical to the project copy is not an ambiguity: both resolve to
+      # the same skill text, so a vendored skill keeps working on a machine that also has it installed.
+      if [ -f "$personal" ] && [ "$(canonical_file "$personal")" != "$path" ] \
+         && ! diff -rq "$(dirname "$(canonical_file "$personal")")" "$(dirname "$path")" >/dev/null 2>&1; then
         die "role skill '$ref' selects the project copy, but Claude Code resolves the personal copy first; rename one skill or select/install the intended source under ~/.claude/skills"
       fi
       continue
