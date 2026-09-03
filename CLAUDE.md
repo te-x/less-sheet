@@ -38,8 +38,9 @@ workflow reference live at `~/.claude/aidev/README.md`.
   to ReleaseFast.
 - **macOS** (`cd apps/macos`): `swift build -Xswiftc -warnings-as-errors` · `swift test` ·
   `swiftlint lint --strict Sources` (zero violations, nothing relaxed). App bundle:
-  `bash apps/macos/scripts/assemble-app.sh` — the only thing that refreshes the `.app` (installed copy:
-  `/Applications/less-sheet.app`). SwiftPM does not track the Zig `.a`: after rebuilding the backend,
+  `bash apps/macos/scripts/assemble-app.sh` — the only thing that refreshes the `.app`; the user runs
+  the assembled bundle, so reassemble after a frontend change before asking for a visual check. SwiftPM
+  does not track the Zig `.a`: after rebuilding the backend,
   delete `.build/*/{debug,release}/LessSheet` (the gate does) or you test a stale link.
 - **GTK** (`cd apps/gtk`): the gate cross-builds the core to `.core-linux/` (glibc, arch-matched), then
   `meson setup build && meson compile -C build && meson test -C build` inside `less-sheet-gtk-ci:fedora43`
