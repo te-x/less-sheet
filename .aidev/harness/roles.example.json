@@ -1,0 +1,37 @@
+{
+  "schema": 1,
+  "roles": {
+    "architect": {
+      "runner": "claude-native",
+      "transport": "native",
+      "model": "opus",
+      "settings": { "effort": "max" },
+      "skills": [],
+      "skill_sources": {}
+    },
+    "planner": {
+      "runner": "claude-native",
+      "transport": "native",
+      "model": "opus",
+      "settings": { "effort": "max" },
+      "skills": [],
+      "skill_sources": {}
+    },
+    "implementer": {
+      "runner": "claude-native",
+      "transport": "native",
+      "model": "sonnet",
+      "settings": {},
+      "skills": [],
+      "skill_sources": {}
+    },
+    "reviewer": {
+      "runner": "claude-native",
+      "transport": "resume",
+      "model": "",
+      "settings": { "reasoning_effort": "high" },
+      "skills": [],
+      "skill_sources": {}
+    }
+  }
+}

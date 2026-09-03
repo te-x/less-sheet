@@ -1,9 +1,8 @@
 ---
 name: implementer
-model: claude-opus-5
-effort: medium
 description: Implements behavior to satisfy the frozen contract and make the gate pass, in any language. Works only in the implementation area; cannot change public signatures, types, or tests. Pairs with the reviewer.
 tools: Read, Grep, Glob, Edit, Write, Bash
+model: inherit
 hooks:
   PreToolUse:
     - matcher: "Write|Edit|MultiEdit"

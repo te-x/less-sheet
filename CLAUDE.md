@@ -5,8 +5,9 @@ behind a frozen C ABI, two native frontends (macOS, GNOME). Open is O(viewport),
 
 Read `docs/architecture/PROJECT.md` (the project brief) before designing or planning anything. Every
 signed design lives in `docs/architecture/ARCH-*.md`; every build cell's verdict in `review/`. This
-workspace runs the aidev pipeline (roles + deterministic gate); its user-level harness and full
-workflow reference live at `~/.claude/aidev/README.md`.
+workspace runs the aidev pipeline (roles + deterministic gate). The harness is vendored in
+`.aidev/harness/` (full workflow reference: `.aidev/harness/README.md`; the fixed invariants:
+`.aidev/harness/ORCHESTRATOR.md`), so a fresh clone needs nothing installed beyond the toolchain.
 
 ## Map
 - `api/` — the frozen, language-neutral C header (`lesssheet.h`): the cross-component contract.
@@ -56,9 +57,9 @@ workflow reference live at `~/.claude/aidev/README.md`.
   `bash apps/gtk/.aidev/gate.sh apps/gtk`.
 - Root gate (api/ + docs/architecture + harness integrity, then every component gate): `bash .aidev/gate.sh`.
   Run it at every cell boundary; a green component gate says nothing about the root's protected surface.
-- `.aidev/gate.sh` and `.aidev/freeze.sh` are thin wrappers that exec the user-level harness at
-  `~/.claude/aidev/`. Without the harness, run the per-component commands above by hand; the frozen-path
-  rules below still apply.
+- `.aidev/gate.sh` and `.aidev/freeze.sh` (root and per component) are thin wrappers that exec the
+  vendored harness in `.aidev/harness/`. The harness itself is a protected path: implementers may not
+  edit it, and the gate fails on uncommitted changes to it. `.aidev/harness/VENDORED.md` says how to update it.
 - A green gate is necessary, not sufficient: reviewers have caught real bugs (an invalid-UTF-8 data-loss
   path, a hang the tests could not express) that a green gate missed. Look at the output and the image.
 
