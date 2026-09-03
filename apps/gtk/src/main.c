@@ -337,11 +337,11 @@ typedef struct
    * one post-open re-anchor + column replay/reset). */
   gboolean reopen_pending;
   gboolean reopen_header_change; /* the change was a header on/off */
-  gboolean reopen_header_now;    /* the new header state (for the F3 toast) */
-  guint64 reopen_top_view;       /* top DATA-row index before the re-open (F5:
-                                  * a header toggle keeps this same index — no
-                                  * ±1 shift; at top (0) this reveals the
-                                  * former-header row as data row 0) */
+  gboolean reopen_header_now;    /* the new header state, for the toast */
+  guint64 reopen_top_view;       /* top DATA-row index before the re-open: a
+                                  * header toggle keeps the SAME index, no ±1
+                                  * shift, so at the top it reveals the former
+                                  * header row as data row 0 */
   guint32 reopen_old_count;
   LsgColumnUserSettings *reopen_snapshot; /* OWNED; reopen_old_count entries */
   LsgColumnLabel *reopen_old_labels;      /* OWNED old identities; or NULL */
@@ -526,7 +526,7 @@ static void open_jump (App *app);
  * the network re-open. */
 static void dialect_sync_quick_controls (App *app); /* sync header/sep/quote */
 static void
-settings_reopen_apply (App *app); /* F5 re-anchor + F7 replay/reset */
+settings_reopen_apply (App *app); /* re-anchor + column replay/reset */
 static void column_cache_effective (App *app, guint32 col); /* fmt kind/sem */
 static void reopen_state_clear (App *app); /* drop a pending dialect re-open */
 
@@ -5838,7 +5838,7 @@ on_col_visibility (GtkCheckButton *check, gpointer data)
     {
       set_column_hidden (app, col, !gtk_check_button_get_active (check));
       grid_update_hadjustment (app); /* total width changed */
-      grid_repaint (app); /* F13 synchronous poke — hide/show live */
+      grid_repaint (app);            /* hide/show has no scroll to ride on */
       columns_refresh_summaries (app);
     }
 }
