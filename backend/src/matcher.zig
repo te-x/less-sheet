@@ -624,11 +624,6 @@ pub const StreamCell = struct {
     }
 };
 
-pub fn streamSupported(ctx: MatchCtx) bool {
-    _ = ctx;
-    return true;
-}
-
 /// ASCII-case-aware byte equality for the predicate EQ/NE match: byte-exact when
 /// `!q.fold`; when folding, ASCII letters compare case-folded while every byte
 /// >= 0x80 stays exact (asciiLower is identity outside 'A'..'Z' — and `q.folded`

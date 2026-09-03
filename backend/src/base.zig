@@ -521,20 +521,9 @@ pub const Document = struct {
     // asserts the counter did REAL work, e.g. `> 0 and <= bound`) -- mirroring
     // stream-copy's `copy_advances == 0` RED seed. Read/reset only via the
     // Zig-level seams in contracts/api.zig (gz* -> root.zig), NEVER the C ABI.
-    gz_physical_in: u64 = 0, // AC5/6/7: compressed input consumed at open
-    gz_inflated_out: u64 = 0, // AC5/6/7: inflated output produced at open
-    gz_replay_landed: bool = false, // AC15: a behind-frontier landing occurred
-    gz_replay_restored_logical: u64 = 0, // AC15: restored checkpoint's logical offset
-    gz_replay_inflated: u64 = 0, // AC15: inflated bytes replayed for that landing
-    gz_resident_bytes: u64 = 0, // AC17: gzip-specific resident state (bound 16 MiB)
-    gz_ckpt_present: bool = false, // AC17/21: a checkpoint spill file exists
-    gz_ckpt_bytes: u64 = 0, // AC17: its size (bound 0.25% of inflated + overhead)
-    gz_ckpt_mode: u32 = 0, // AC17/21: its permission bits (must be 0o600)
-    gz_ckpt_unlinked: bool = false, // AC17/21: already unlinked while open
-    gz_ckpt_fail_after: u64 = std.math.maxInt(u64), // AC18: inject store failure after N ops
-    gz_force_chunk_bytes: u64 = 0, // AC12: force cursor spans to <=N bytes (0 == natural)
-    gz_match_resident_bytes: u64 = 0, // AC13: peak per-row matcher residency
-    gz_cache_copy_bytes: u64 = 0, // AC20: bytes copied THROUGH a cache (0 for mmap)
+    gz_physical_in: u64 = 0, // compressed input consumed at open
+    gz_inflated_out: u64 = 0, // inflated output produced at open
+    gz_match_resident_bytes: u64 = 0, // peak per-row matcher residency
 
     // The worker's active FILTER/SEARCH gzip cursor.  It deliberately stays
     // leased across 2048-row commit boundaries so unrelated replay cursors
@@ -587,17 +576,7 @@ pub const Document = struct {
     // frontier advances only on concrete demand (viewport jump / search nav /
     // filter demand). Set in open.buildDocument, keyed strictly on source kind.
     net: bool = false,
-    net_range_mode: u8 = 0, // AC3/AC4: 0 unknown, 1 random-access, 2 sequential-fallback
-    net_fetch_count: u64 = 0, // AC6/AC13: network fetches issued by this doc's Source
-    net_resident_bytes: u64 = 0, // AC15: network Source resident RAM (bound 16 MiB)
-    net_spool_present: bool = false, // AC14: a private spool file exists
-    net_spool_bytes: u64 = 0, // AC14: its size
-    net_spool_mode: u32 = 0, // AC14: its permission bits (must be 0o600)
-    net_spool_unlinked: bool = false, // AC14: already unlinked while open
-    // AC6 test control: cap the resident RAM cache to N bytes (0 == evict all);
-    // maxInt == no cap (the default / natural behavior, mirroring the
-    // gz_ckpt_fail_after "maxInt == never" idiom).
-    net_force_cache_bytes: u64 = std.math.maxInt(u64),
+    net_range_mode: u8 = 0, // 0 unknown, 1 random-access, 2 sequential-fallback
 
     // ARCH-column-config: entirely empty at open. Dynamic storage remains
     // sparse and is first allocated only by an explicit column request or

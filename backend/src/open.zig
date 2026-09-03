@@ -175,7 +175,6 @@ pub fn buildDocument(
         .gzip => |g| {
             doc.gz_physical_in = g.open_physical;
             doc.gz_inflated_out = g.open_inflated;
-            doc.gz_resident_bytes = g.residentBytes();
         },
         else => {},
     };

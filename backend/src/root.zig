@@ -763,73 +763,52 @@ pub fn gzOpenBudget(doc: *const api.Doc) api.OpenBudget {
     const d = asDoc(doc);
     return .{ .physical_in = d.gz_physical_in, .inflated_out = d.gz_inflated_out };
 }
-/// See contracts/api.zig `gzReplayStats` (AC15).
+/// See contracts/api.zig `gzReplayStats`.
 pub fn gzReplayStats(doc: *const api.Doc) api.ReplayStats {
     const d = asDoc(doc);
-    if (d.source == .gzip) {
-        const g = d.source.gzip;
-        g.lock();
-        defer g.unlock();
-        return .{ .landed = g.replay_landed, .restored_checkpoint_logical = g.replay_restored, .inflated_replay = g.replay_inflated };
-    }
-    return .{
-        .landed = d.gz_replay_landed,
-        .restored_checkpoint_logical = d.gz_replay_restored_logical,
-        .inflated_replay = d.gz_replay_inflated,
-    };
+    if (d.source != .gzip) return .{ .landed = false, .restored_checkpoint_logical = 0, .inflated_replay = 0 };
+    const g = d.source.gzip;
+    g.lock();
+    defer g.unlock();
+    return .{ .landed = g.replay_landed, .restored_checkpoint_logical = g.replay_restored, .inflated_replay = g.replay_inflated };
 }
 /// See contracts/api.zig `gzReplayStatsReset`.
 pub fn gzReplayStatsReset(doc: *api.Doc) void {
     const d = asDocMut(doc);
-    if (d.source == .gzip) {
-        const g = d.source.gzip;
-        g.lock();
-        defer g.unlock();
-        g.replay_landed = false;
-        g.replay_restored = 0;
-        g.replay_inflated = 0;
-    }
-    d.gz_replay_landed = false;
-    d.gz_replay_restored_logical = 0;
-    d.gz_replay_inflated = 0;
+    if (d.source != .gzip) return;
+    const g = d.source.gzip;
+    g.lock();
+    defer g.unlock();
+    g.replay_landed = false;
+    g.replay_restored = 0;
+    g.replay_inflated = 0;
 }
-/// See contracts/api.zig `gzResidentBytes` (AC17).
+/// See contracts/api.zig `gzResidentBytes`.
 pub fn gzResidentBytes(doc: *const api.Doc) u64 {
     const d = asDoc(doc);
-    if (d.source == .gzip) {
-        const g = d.source.gzip;
-        g.lock();
-        defer g.unlock();
-        return g.residentBytes();
-    }
-    return 0;
+    if (d.source != .gzip) return 0;
+    const g = d.source.gzip;
+    g.lock();
+    defer g.unlock();
+    return g.residentBytes();
 }
-/// See contracts/api.zig `gzCheckpointStore` (AC17/AC21).
+/// See contracts/api.zig `gzCheckpointStore`.
 pub fn gzCheckpointStore(doc: *const api.Doc) api.CheckpointStore {
     const d = asDoc(doc);
-    if (d.source == .gzip) {
-        const g = d.source.gzip;
-        g.lock();
-        defer g.unlock();
-        return .{ .present = g.spill_fd != null, .bytes = g.spill_bytes, .mode = if (g.spill_fd != null) 0o600 else 0, .unlinked = g.spill_fd != null };
-    }
-    return .{
-        .present = d.gz_ckpt_present,
-        .bytes = d.gz_ckpt_bytes,
-        .mode = d.gz_ckpt_mode,
-        .unlinked = d.gz_ckpt_unlinked,
-    };
+    if (d.source != .gzip) return .{ .present = false, .bytes = 0, .mode = 0, .unlinked = false };
+    const g = d.source.gzip;
+    g.lock();
+    defer g.unlock();
+    return .{ .present = g.spill_fd != null, .bytes = g.spill_bytes, .mode = if (g.spill_fd != null) 0o600 else 0, .unlinked = g.spill_fd != null };
 }
-/// See contracts/api.zig `gzCheckpointStoreFailAfter` (AC18).
+/// See contracts/api.zig `gzCheckpointStoreFailAfter`.
 pub fn gzCheckpointStoreFailAfter(doc: *api.Doc, ops: u64) void {
     const d = asDocMut(doc);
-    d.gz_ckpt_fail_after = ops;
     if (d.source == .gzip) d.source.gzip.spill_fail_after.store(ops, .release);
 }
-/// See contracts/api.zig `gzForceChunkBytes` (AC12).
+/// See contracts/api.zig `gzForceChunkBytes`.
 pub fn gzForceChunkBytes(doc: *api.Doc, n: u64) void {
     const d = asDocMut(doc);
-    d.gz_force_chunk_bytes = n;
     if (d.source == .gzip) d.source.gzip.force_chunk.store(n, .release);
 }
 /// See contracts/api.zig `gzStreamMatcherResidentBytes` (AC13).
@@ -840,9 +819,12 @@ pub fn gzStreamMatcherResidentBytes(doc: *const api.Doc) u64 {
 pub fn gzStreamMatcherResidentReset(doc: *api.Doc) void {
     asDocMut(doc).gz_match_resident_bytes = 0;
 }
-/// See contracts/api.zig `gzCacheCopyBytes` (AC20 regression proxy).
+/// See contracts/api.zig `gzCacheCopyBytes`. Always zero: the mmap and gzip
+/// Sources both hand the lexer DIRECT spans (the mapping, the open-head buffer,
+/// a lane buffer), so no read ever copies a byte through an intermediate cache.
 pub fn gzCacheCopyBytes(doc: *const api.Doc) u64 {
-    return asDoc(doc).gz_cache_copy_bytes;
+    _ = doc;
+    return 0;
 }
 /// See contracts/api.zig `gzSnapshotProbe` (AC14). SEED: the inflate-checkpoint
 /// snapshot adapter is not built yet -> report "no snapshot taken, not
@@ -1123,46 +1105,33 @@ pub fn openUrlStartFake(fixture: *const api.NetFixture, url: [*]const u8, url_le
 pub fn netRangeMode(doc: *const api.Doc) api.NetRangeMode {
     return @enumFromInt(asDoc(doc).net_range_mode);
 }
-/// See contracts/api.zig `netFetchCount` (AC6/AC13). Reads live off the
-/// http_range provider (whether the Source IS the http_range or a gzip composed
-/// over it, TD4); a non-network document reports 0.
+/// See contracts/api.zig `netFetchCount`. Reads live off the http_range provider
+/// (whether the Source IS the http_range or a gzip composed over it); a
+/// non-network document reports 0.
 pub fn netFetchCount(doc: *const api.Doc) u64 {
-    const d = asDoc(doc);
-    if (source_mod.netProviderOf(d.source)) |hr| {
-        hr.lock();
-        defer hr.unlock();
-        return hr.fetch_count;
-    }
-    return d.net_fetch_count;
+    const hr = source_mod.netProviderOf(asDoc(doc).source) orelse return 0;
+    hr.lock();
+    defer hr.unlock();
+    return hr.fetch_count;
 }
-/// See contracts/api.zig `netResidentBytes` (AC15).
+/// See contracts/api.zig `netResidentBytes`.
 pub fn netResidentBytes(doc: *const api.Doc) u64 {
-    const d = asDoc(doc);
-    if (source_mod.netProviderOf(d.source)) |hr| {
-        hr.lock();
-        defer hr.unlock();
-        return hr.resident_bytes;
-    }
-    return d.net_resident_bytes;
+    const hr = source_mod.netProviderOf(asDoc(doc).source) orelse return 0;
+    hr.lock();
+    defer hr.unlock();
+    return hr.resident_bytes;
 }
-/// See contracts/api.zig `netSpoolStore` (AC14).
+/// See contracts/api.zig `netSpoolStore`.
 pub fn netSpoolStore(doc: *const api.Doc) api.NetSpoolStore {
-    const d = asDoc(doc);
-    if (source_mod.netProviderOf(d.source)) |hr| {
-        hr.lock();
-        defer hr.unlock();
-        return .{ .present = hr.spool_fd != null, .bytes = hr.spool_bytes, .mode = if (hr.spool_fd != null) 0o600 else 0, .unlinked = hr.spool_fd != null };
-    }
-    return .{ .present = d.net_spool_present, .bytes = d.net_spool_bytes, .mode = d.net_spool_mode, .unlinked = d.net_spool_unlinked };
+    const hr = source_mod.netProviderOf(asDoc(doc).source) orelse
+        return .{ .present = false, .bytes = 0, .mode = 0, .unlinked = false };
+    hr.lock();
+    defer hr.unlock();
+    return .{ .present = hr.spool_fd != null, .bytes = hr.spool_bytes, .mode = if (hr.spool_fd != null) 0o600 else 0, .unlinked = hr.spool_fd != null };
 }
-/// See contracts/api.zig `netForceCacheBytes` (AC6).
+/// See contracts/api.zig `netForceCacheBytes`.
 pub fn netForceCacheBytes(doc: *api.Doc, n: u64) void {
-    const d = asDocMut(doc);
-    if (source_mod.netProviderOf(d.source)) |hr| {
-        hr.setCacheCap(n);
-        return;
-    }
-    d.net_force_cache_bytes = n;
+    if (source_mod.netProviderOf(asDocMut(doc).source)) |hr| hr.setCacheCap(n);
 }
 /// See contracts/api.zig `netJobProbe` (AC8).
 pub fn netJobProbe(job: *const api.NetOpenJob) api.NetJobProbe {

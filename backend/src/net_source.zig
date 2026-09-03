@@ -1172,12 +1172,6 @@ pub const HttpRange = struct {
         return @min(@min(self.total, want), self.presentExtent());
     }
 
-    pub fn byteAt(self: *HttpRange, internal: u64) ?u8 {
-        const s = self.ensureSlice(internal, 1);
-        if (s.len == 0) return null;
-        return s[0];
-    }
-
     pub fn openHead(self: *const HttpRange) []const u8 {
         if (self.spool.len == 0) return &.{};
         return self.spool[0..@intCast(self.head_len)];
