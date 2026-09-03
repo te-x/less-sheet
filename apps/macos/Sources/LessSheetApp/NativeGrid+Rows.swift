@@ -9,21 +9,13 @@ extension NativeGridController {
     @objc func clipBoundsChanged() {
         let clip = scroll.contentView
 
-        // Gate the scroll-driven column fit on REAL viewport movement. The
-        // row-window paging (`viewportChanged`), the horizontal column window
-        // (`refreshColumnWindow`), and the table/filler width
-        // (`refreshColumnWidth`) are a pure function of the visible-window
-        // identity below — so a clip-bounds tick that moves none of it (a
-        // top/bottom/side elastic bounce, whose whole travel is past a hard
-        // edge) must not re-derive them: that re-derivation is the only thing
-        // that could churn an established column width (the reported
-        // "columns resize on first interaction" when already at the top). The
-        // overscroll bail makes the same point explicitly for the in-flight
-        // bounce: while the viewport is pinned past an edge it cannot reveal
-        // new rows/columns, so the fit is deferred to the settling tick that
-        // lands back in range. The downstream window/width guards are no-ops on
-        // an unchanged window too, but gating here keeps the bounce from ever
-        // reaching `growColumnWidthsToFitWindow` in the first place.
+        // Gate the fit on REAL viewport movement. Everything below is a pure
+        // function of this identity, so a tick that moves none of it — an
+        // elastic bounce whose whole travel is past a hard edge — must not
+        // re-derive it: that is the only thing that can churn an established
+        // column width. While the viewport is pinned past an edge it cannot
+        // reveal new rows or columns either, so the fit waits for the settling
+        // tick that lands back in range.
         let visible = table.rows(in: table.visibleRect)
         let over = overscrollAxes()
         let identity = GridFitViewport(top: currentTopDataRow(), length: visible.length,
@@ -37,47 +29,31 @@ extension NativeGridController {
 
         if fitViewport {
             lastFitViewport = identity
-            // Page the core window to the visible span (O(1) setWindow off the
-            // scroll path; hysteresis lives in the model).
+            // The hysteresis that decides whether this actually re-pages lives
+            // in the model.
             if visible.length > 0 {
                 let first = min(visible.location, max(0, dataRowCount - 1))
                 model.viewportChanged(firstVisibleRow: first, visibleRowCount: visible.length)
             }
         }
 
-        // The row-number gutter may widen when bigger numbers scroll in — a
-        // full relayout (frames + column/filler width) when it does. Runs
-        // regardless of the fit gate above: a gutter change IS a real geometry
-        // change, and `layoutContainer` re-derives the window/width itself.
+        // The gutter widens when bigger numbers scroll in. Runs regardless of the
+        // fit gate: a gutter change IS a real geometry change.
         let measuredGutterWidth = model.rowNumberColumnWidth()
         if abs(measuredGutterWidth - gutterWidth) > 0.5 {
             gutterWidth = measuredGutterWidth
             layoutContainer()
         }
         if fitViewport {
-            // The clip's OWN width can also change independent of the gutter —
-            // e.g. a vertical scroller inserting/removing itself as the
-            // row-count estimate crosses its need threshold (this can settle a
-            // tick AFTER `layoutContainer` last read
-            // `scroll.contentView.bounds.width`, since that read races the
-            // scroller's own internal tile — PROVEN by LESSSHEET_LOG_COLWIDTH: a
-            // "layout" reading can show `colwidth` matching a since-shrunk
-            // `viewport` one tick later; that width change moves `identity.width`
-            // above, so this branch runs). Re-sync the column/filler width to
-            // the FRESH, now-settled clip width (cheap: O(visibleColumns)) so a
-            // stale, too-wide `column.width` can never linger and force a
-            // spurious horizontal scroller (or hide a genuine one) —
-            // `layoutContainer` already covers this when the gutter branch above
-            // ran; harmless to re-run.
-            //
-            // Re-derive the horizontal column window for the CURRENT scroll x,
-            // so a horizontal drag/fling reveals newly-in-window columns
-            // (measured, fetched, drawn) exactly like `viewportChanged` does for
-            // a vertical one — O(window), never O(columnCount)
-            // (ARCH-column-windowing); a no-op once the window and widths
-            // settle. Already re-derived by `layoutContainer` when the gutter
-            // branch above ran; harmless (cheap) to re-run against the settled
-            // clip.
+            // Re-derive against the now-settled clip. The clip's OWN width can
+            // change independently of the gutter — a vertical scroller inserting
+            // itself as the row-count estimate crosses its threshold — and that
+            // settles a tick AFTER `layoutContainer` last read the width, since
+            // that read races the scroller's own tile. Re-syncing here is what
+            // stops a stale, too-wide column width from forcing a spurious
+            // horizontal scroller (or hiding a genuine one), and gives a
+            // horizontal fling the same newly-revealed-column treatment a
+            // vertical scroll already gets.
             refreshColumnWindow()
             refreshColumnWidth(site: "scroll")
         }
@@ -86,19 +62,16 @@ extension NativeGridController {
         header.needsDisplay = true
         gutter.needsDisplay = true
 
-        // Flush a row-count-estimate reload `apply()` deferred while this same
-        // clip was mid an elastic overscroll bounce (see `syncRowCountEstimate`):
-        // EVERY scroll tick lands here, including the bounce's settling one, so
-        // this is how a deferred reload gets applied the instant it is safe
-        // again, without waiting for the next poll-driven `apply()`.
+        // Every scroll tick lands here, the settling one included, so this is how
+        // a reload deferred during an elastic bounce gets applied the instant it
+        // is safe again.
         syncRowCountEstimate()
 
-        // Reconfigure the visible rows from the CURRENT window on every scroll,
-        // not only when the window identity changes. During a fast fling a row
-        // view is configured empty while the window lags; when the fling settles
-        // inside a window that already covers those rows, no window-change refresh
-        // fires — so without this they stay blank until recycled by another
-        // scroll (the reported gaps). configure is O(viewport); cheap per tick.
+        // On EVERY scroll, not only when the window identity changes: during a
+        // fast fling a row view is configured empty while the window lags, and if
+        // the fling then settles inside a window that already covers those rows,
+        // no window-change refresh fires and they stay blank until some later
+        // scroll recycles them.
         refreshVisibleRows()
 
         ScrollProbe.note(clip.bounds.origin)        // inert unless LESSSHEET_LOG_OFFSET
@@ -107,17 +80,11 @@ extension NativeGridController {
 
     // MARK: Row refresh (data / highlights)
 
-    /// Forces the grid's already-marked-dirty viewport (rows, header, gutter)
-    /// to draw synchronously, without waiting for the next event in this
-    /// window. A column-config or visibility mutation arrives from the SEPARATE
-    /// (key) Settings window; SwiftUI observation still re-runs `GridView.body`
-    /// -> `apply()` promptly on the main actor, and the branches above mark the
-    /// affected cells/columns needsDisplay — but AppKit only flushes that draw
-    /// for a non-key window on its next event (the reported "instant in the
-    /// header, but the data waits for a click"). `displayIfNeeded` repaints just
-    /// what is dirty in the visible viewport (O(viewport), never a full-file
-    /// rescan) and is a no-op when nothing is dirty, so the config path is
-    /// instant while the scroll path — which never calls this — pays nothing.
+    /// Draws the already-dirty viewport synchronously, without waiting for this
+    /// window's next event. A Settings-window edit marks cells `needsDisplay`,
+    /// but AppKit flushes that for a NON-KEY window only on its next event — so
+    /// the header would update instantly while the data waited for a click.
+    /// A no-op when nothing is dirty, and the scroll path never calls it.
     func flushGridDisplay() {
         table.displayIfNeeded()
         header.displayIfNeeded()
@@ -125,12 +92,10 @@ extension NativeGridController {
     }
 
     func refreshVisibleRows() {
-        // Reconfigure EVERY live row view, not just those in the current
-        // visibleRect: after a fast fling a row view can be created empty (the
-        // viewport outran the window), then sit just off the visible rect when
-        // the window catches up — so a visibleRect-only refresh leaves stale
-        // gaps that only fill when the row is recycled by another scroll.
-        // enumerateAvailableRowViews covers the whole live pool.
+        // EVERY live row view, not just those in the current visible rect: after
+        // a fling a row created empty can sit just off it when the window catches
+        // up, and a visible-rect-only refresh would leave that gap until some
+        // later scroll recycled it.
         table.enumerateAvailableRowViews { rowView, row in
             if let sheetRow = rowView as? SheetRowView {
                 self.configure(sheetRow, row: row)
@@ -140,11 +105,10 @@ extension NativeGridController {
         gutter.needsDisplay = true
     }
 
-    /// Recomputes only the configured logical column in each recycled row and
-    /// invalidates only that subcolumn's rectangle. There is one physical
-    /// NSTableColumn, so NSTableView's column-index reload API would reload the
-    /// whole custom row; this is the equivalent targeted path for our packed
-    /// logical columns.
+    /// Recomputes only the configured column in each recycled row, and
+    /// invalidates only that sub-column's rectangle. There is one physical
+    /// `NSTableColumn`, so AppKit's own column-index reload would repaint the
+    /// whole row; this is the equivalent targeted path.
     func refreshConfiguredColumns(_ columns: Set<Int>) {
         let targets = absoluteColumns.enumerated().filter { columns.contains($0.element) }
         guard !targets.isEmpty else { return }
@@ -168,10 +132,10 @@ extension NativeGridController {
         }
     }
 
-    /// A one-column width remeasure can shift following pixels, but it does
-    /// not require recomputing their cell presentations. Refresh geometry,
-    /// update only the configured column's arrays, and invalidate the shifted
-    /// suffix. A rare horizontal-window boundary change falls back globally.
+    /// A one-column width change shifts the pixels after it without changing
+    /// their content, so only the geometry is refreshed and only the shifted
+    /// suffix invalidated. A horizontal-window boundary change falls back to a
+    /// full reload.
     func refreshConfiguredColumnWidths(_ columns: Set<Int>) {
         let oldColumns = absoluteColumns
         let oldFirstX = columnFirstX
@@ -187,11 +151,9 @@ extension NativeGridController {
         }
         refreshConfiguredColumns(columns)
 
-        // An upstream off-window width changes the exact prefix-sum origin
-        // while leaving the visible IDs untouched. In that case every visible
-        // cell moved, so repaint the shifted viewport (presentations remain
-        // reusable). Otherwise invalidate only from the first changed visible
-        // width; the common in-window edit therefore stays a suffix repaint.
+        // An off-window width change moves the prefix-sum origin while leaving
+        // the visible ids untouched, so every visible cell shifted. Otherwise
+        // only the suffix from the first changed width needs repainting.
         if columnFirstX != oldFirstX {
             invalidateVisibleGeometry()
         } else if let firstChangedWidth = widths.indices.first(where: {
@@ -234,16 +196,10 @@ extension NativeGridController {
         rowView.controller = self
         if row < dataRowCount {
             rowView.isFiller = false
-            // Not-yet-servable (within the estimated range but past the
-            // materialized scan frontier): `windowBodyCells` already empty-
-            // pads it exactly like a genuinely empty row, so this flag is
-            // what lets the row view tell the two apart and draw a loading
-            // placeholder instead of silently blank cells (PROJECT: constant
-            // feedback, no silent stalls).
+            // A not-yet-servable row is empty-padded exactly like a genuinely
+            // empty one, so this flag is the only thing that lets the row view
+            // draw a loading placeholder rather than silently blank cells.
             rowView.pending = !model.rowLoaded(forRow: row)
-            // Column-WINDOW bound (ARCH-column-windowing) — O(window), never
-            // O(columnCount): the live grid only ever needs the columns it is
-            // about to draw, unlike the eager dump grid (FrameDump).
             let presentations = model.windowCellPresentations(forRow: row)
             rowView.cells = presentations.map(\.text)
             rowView.formatUnavailable = presentations.map(\.formatUnavailable)

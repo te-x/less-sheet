@@ -1,23 +1,18 @@
-// Keyboard cell-navigation wiring (ARCH-macos-kbdnav): the SheetTableView key
-// overrides that route the arrow / page / document / line key set through the
-// pure `KeyboardNavigator`, plus the controller hand-off that applies the new
-// selection and the minimal-reveal auto-scroll (`RevealScroller`). The geometry
-// itself is gate-tested in LessSheetKit; this file is the display-dependent
-// residue verified by the H1/H4 human GUI pass.
+// Keyboard cell navigation: the key overrides that route the arrow, page,
+// document and line commands through the pure navigator, and the hand-off that
+// applies the result and scrolls the minimum needed. The geometry itself is
+// gate-tested in LessSheetKit; this file is the display-dependent residue.
 import AppKit
 import Contracts
 import LessSheetKit
 
 // MARK: - SheetTableView key routing (interpretKeyEvents -> NavigationMotion)
 
-/// Every physical navigation key AppKit's key-binding table can fire maps here
-/// onto exactly one `NavigationMotion`, plain or shift-extending; the ONE pure
-/// `KeyboardNavigator` (via `controller.navigate`) owns the geometry, so the
-/// selector each key actually resolves to is a routing detail, not a
-/// correctness risk (ARCH Decision 4). Home/End and Cmd+↑/↓ share the document
-/// start/end target (macOS routes Home/End to the `scrollTo…` selectors and
-/// Cmd+arrows to the `moveTo…` selectors — both are bound); Cmd+←/→ map to the
-/// line start/end. The exact physical-key routing is an H1 human-GUI-pass item.
+/// Every navigation key AppKit's binding table can fire maps onto exactly one
+/// motion. The pure navigator owns the geometry, so which selector a given
+/// physical key resolves to is a routing detail rather than a correctness risk —
+/// which is why both the `scrollTo…` and `moveTo…` families are bound for the
+/// document and line targets.
 extension SheetTableView {
     override func moveUp(_ sender: Any?) { controller?.navigate(.upward, extending: false) }
     override func moveDown(_ sender: Any?) { controller?.navigate(.down, extending: false) }
@@ -61,12 +56,9 @@ extension SheetTableView {
 // MARK: - Controller hand-off (pure reducer -> selection + minimal reveal)
 
 extension NativeGridController {
-    /// A keyboard navigation command (ARCH-macos-kbdnav FR1/FR2): assemble the
-    /// viewport-derived context the model needs (top visible row, leading
-    /// visible column, page size), let the pure `KeyboardNavigator` produce the
-    /// new selection on the model, repaint the marks, then auto-scroll the
-    /// MINIMUM needed to keep the active cell visible via `RevealScroller`. With
-    /// nothing selected the reducer seeds the top-left visible cell with no step.
+    /// Assembles the viewport-derived context, lets the pure navigator produce
+    /// the new selection, repaints, then scrolls the MINIMUM needed to keep the
+    /// active cell visible.
     func navigate(_ motion: NavigationMotion, extending: Bool) {
         model.navigate(motion, extending: extending,
                        topVisibleRow: UInt64(currentTopDataRow()),
@@ -76,9 +68,8 @@ extension NativeGridController {
         revealActiveCell()
     }
 
-    /// Data rows per Page Up/Down step — the SINGLE source for the page knob
-    /// (ARCH NFR): the unobscured data height (viewport minus the glass band
-    /// inset) over `rowHeight`, at least one row.
+    /// The single source for the page step: the UNOBSCURED data height, i.e. the
+    /// viewport minus the band inset, over the row height.
     func pageRows() -> UInt64 {
         let clip = scroll.contentView
         let viewportHeight = max(clip.bounds.height, scroll.bounds.height)
@@ -86,11 +77,9 @@ extension NativeGridController {
         return UInt64(max(1, Int(usable / NativeGrid.rowHeight)))
     }
 
-    /// Scroll the MINIMUM needed to bring the active cell fully into view
-    /// (ARCH-macos-kbdnav FR2), reusing the existing clip-scroll path — a no-op
-    /// when the cell is already visible on both axes. The pure `RevealScroller`
-    /// owns the clamp math (gate-tested); this only assembles the per-axis
-    /// viewport descriptors from the live grid geometry and applies the result.
+    /// A no-op when the active cell is already visible on both axes. The pure
+    /// reveal scroller owns the clamp math; this only assembles the per-axis
+    /// descriptors from the live geometry and applies the result.
     func revealActiveCell() {
         guard let active = model.selection?.active else { return }
         let clip = scroll.contentView
@@ -109,12 +98,10 @@ extension NativeGridController {
         scroll.reflectScrolledClipView(clip)
     }
 
-    /// The horizontal reveal descriptor for `column`: its content-x is the
-    /// prefix sum of the visible-column widths (the SAME content space the clip
-    /// scrolls in — mirrors `configureColumnFromHeaderForProbe`'s reveal), its
-    /// width the column's own. O(visible columns) — sanctioned on a discrete
-    /// keypress (ARCH NFR). Falls back to a no-move descriptor if the active
-    /// column is not resolvable (never for a visible active column).
+    /// The column's content-x is the prefix sum of the visible-column widths —
+    /// the same content space the clip scrolls in. O(visible columns), which is
+    /// fine on a discrete keypress. Falls back to a no-move descriptor for a
+    /// column that cannot be resolved, which a visible active column always can.
     private func horizontalReveal(forColumn column: Int, clip: NSClipView) -> HorizontalReveal {
         let originX = Double(clip.bounds.origin.x)
         let viewportWidth = Double(clip.bounds.width)

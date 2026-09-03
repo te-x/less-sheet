@@ -13,66 +13,48 @@ private struct RowPalette {
     let grid: NSColor
 }
 
-/// One data (or filler) row. Draws every visible-column cell, its per-column
-/// right hairline, the filler-column hairlines out to the right edge, and a
-/// full-width bottom hairline — the spreadsheet fill, one view per row (recycled
-/// by NSTableView). Tabular numerals; semantic colors (dark mode automatic);
-/// find highlights subtle/strong; the ARCH-select-copy selection overlay reuses
-/// the SAME accent-fill/border language (`selectionMarks`, below). Header/filler
-/// rows never carry highlights or selection marks.
+/// One data or filler row: every visible-column cell, its trailing hairline, the
+/// filler hairlines out to the right edge, and a full-width bottom hairline —
+/// the spreadsheet fill, one recycled view per row.
 final class SheetRowView: NSTableRowView {
     weak var controller: NativeGridController?
     var cells: [String] = []
-    /// Display-only warning states parallel to `cells`. They never alter raw
-    /// copy/find/filter values; the row paints and exposes them accessibly.
+    /// Display-only warning states parallel to `cells`. They never alter the raw
+    /// values copy, find and filter see.
     var formatUnavailable: [Bool] = []
     var conflicts: [Bool] = []
     var accessibilityWarnings: [Int: String] = [:]
-    /// Per-cell display-truncation flags, PARALLEL to `cells` (ARCH req. 13/20;
-    /// mirrors `RowWindow.truncated`). Drives `drawTruncationMarker` only — the
-    /// core's flag is rendered as-is, never re-derived from measured text.
+    /// The core's per-cell truncation flags, rendered as given and never
+    /// re-derived from measured text.
     var truncated: [Bool] = []
     var highlights: [SheetCellHighlight] = []
-    /// Selection-overlay state per visible column (ARCH-select-copy AC1),
-    /// PARALLEL to `cells`/`highlights` — precomputed by the model
-    /// (`DocumentModel.windowSelectionMarks`), never derived here: `draw`
-    /// stays a flat, O(visible columns) per-frame read, exactly like the
-    /// find-highlight fill it reuses.
+    /// Precomputed by the model, never derived here, so `draw` stays a flat
+    /// per-column read.
     var selectionMarks: [SelectionMark] = []
     var isFiller = false
-    /// A data row within the estimated range but NOT YET SERVABLE — past the
-    /// materialized scan frontier (`DocumentModel.cells(forRow:)` returned
-    /// `nil`) — as opposed to a genuinely empty row. `cells` is already
-    /// empty-padded identically for both, so this is the ONLY signal that
-    /// distinguishes "still loading" from "loaded and blank": it drives a
-    /// subtle placeholder bar per empty cell instead of rendering nothing.
-    /// Always false for filler rows (past EOF is not a loading state).
+    /// A row inside the estimated range but not yet servable, as opposed to a
+    /// genuinely empty one. `cells` is empty-padded identically for both, so this
+    /// is the ONLY thing that separates "still loading" from "loaded and blank".
+    /// Always false past EOF, which is not a loading state.
     var pending = false
 
     override var isFlipped: Bool { true }
     override var isEmphasized: Bool { get { false } set {} }   // never draw selection emphasis
     override func drawSelection(in dirtyRect: NSRect) {}       // pure viewer
 
-    // Data cells: SF Mono (fully monospaced) so the file's content reads like the
-    // raw file and columns line up. MUST match the width-measurement font in
-    // DocumentModel (measureColumnWidths / growColumnWidthsToFitWindow) or the
-    // columns would be sized for the wrong glyphs.
+    // Fully monospaced, so the content reads like the raw file and columns line
+    // up. MUST match the width-measurement font in the model, or columns would be
+    // sized for the wrong glyphs.
     private static let font = NSFont.monospacedSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
 
     override func draw(_ dirtyRect: NSRect) {
-        // Launch-measurement ground truth: the first REAL data row to actually
-        // paint. Inert without LESSSHEET_LAUNCH_PHASES.
-        //
-        // All three conditions are load-bearing. `isFiller` excludes the rows
-        // past EOF, and `cells.isEmpty` a row with nothing to draw — but
-        // `pending` is the one that is easy to get wrong: a not-yet-servable row
-        // is populated (`NativeGrid+Rows` sets `pending` AND `cells` together)
-        // and draws a LOADING PLACEHOLDER, so without this it could stamp
-        // "rows are on screen" for a grid showing no data. It cannot happen at
-        // launch today — `establishInitialWindow` materializes the first
-        // screenful synchronously before `phase` becomes `.document` — but a
-        // measurement instrument that is only accidentally correct will report
-        // the wrong number the moment that changes.
+        // The launch measurement's ground truth: the first REAL data row to
+        // paint. All three conditions are load-bearing, and `pending` is the easy
+        // one to get wrong — a not-yet-servable row is populated and draws a
+        // LOADING PLACEHOLDER, so without it this could stamp "rows are on
+        // screen" for a grid showing none. That cannot happen at launch today,
+        // but an instrument that is only accidentally correct reports the wrong
+        // number the moment it changes.
         if !isFiller, !pending, !cells.isEmpty { LaunchTiming.phaseOnce("first_row_pixels") }
         NSColor.textBackgroundColor.setFill()
         bounds.fill()
@@ -80,16 +62,14 @@ final class SheetRowView: NSTableRowView {
         let height = bounds.height
         let grid = NSColor.gridColor
         let accent = NSColor.controlAccentColor
-        // Selection reads as a MUTED GRAY marquee (deliberately quieter than the
-        // accent), so a selected cell and an accent find-highlight are distinct
-        // by BOTH colour and geometry. Tunable — this one colour drives both the
-        // selection wash and its marquee (find highlights stay on `accent`).
+        // Selection is a MUTED GRAY marquee, deliberately quieter than the
+        // accent, so a selected cell and a find highlight stay distinct by both
+        // colour and geometry. This one colour drives both the wash and the
+        // marquee.
         let palette = RowPalette(accent: accent, selection: NSColor.systemGray, grid: grid)
-        // `controller.widths` is only the current horizontal column WINDOW
-        // (ARCH-column-windowing); start at its exact prefix-sum offset so an
-        // in-window column lands at the SAME x a full, unwindowed draw would
-        // give it (0 for a viewport-fitting file — ARCH AC4 — and the real
-        // scrolled-to offset otherwise).
+        // `widths` is only the current column WINDOW, so start at its exact
+        // prefix-sum offset: an in-window column then lands at the same x a full
+        // unwindowed draw would give it.
         var cursorX: CGFloat = controller.columnFirstX
 
         for (columnIndex, width) in controller.widths.enumerated() {
@@ -109,17 +89,14 @@ final class SheetRowView: NSTableRowView {
                width: dirtyRect.width, height: NativeGrid.hairline).fill()
     }
 
-    /// Paints one visible column's cell in the SAME layered order the former
-    /// single-method `draw` used: find-highlight background, selection wash,
-    /// text/placeholder + warning markers, current-match border, selection
-    /// marquee, and the column's trailing hairline (ARCH-select-copy AC1: a cell
-    /// can be both matched AND selected).
+    /// One cell, layered: find-highlight background, selection wash, text or
+    /// placeholder plus warning markers, current-match border, selection marquee,
+    /// trailing hairline. A cell can be both matched and selected.
     private func drawColumn(_ index: Int, in cell: NSRect, controller: NativeGridController,
                             palette: RowPalette) {
         let highlight = index < highlights.count ? highlights[index] : .none
         SheetRowView.drawHighlightBackground(highlight, in: cell, accent: palette.accent)
-        // ARCH-select-copy AC1: the selection overlay keeps its muted-gray fill +
-        // marquee border, layered on top of (never instead of) a find highlight.
+        // Layered on top of a find highlight, never instead of it.
         let mark = index < selectionMarks.count ? selectionMarks[index] : .none
         if mark.isSelected {
             palette.selection.withAlphaComponent(0.12).setFill()
@@ -127,8 +104,6 @@ final class SheetRowView: NSTableRowView {
         }
         drawCellContent(index, in: cell, controller: controller)
         if highlight == .strong {
-            // The current match's border: full-strength accent over the chip,
-            // so it reads apart from the subtle matches.
             palette.accent.setStroke()
             let chipPath = SheetRowView.highlightChipPath(in: cell)
             chipPath.lineWidth = FindHighlightStyle.borderWidth
@@ -137,8 +112,6 @@ final class SheetRowView: NSTableRowView {
         if mark.isSelected {
             SheetRowView.drawSelectionBorder(mark, in: cell, color: palette.selection)
         }
-        // ARCH-macos-kbdnav FR4: the active corner (keyboard OR mouse cursor)
-        // gets an accent focus outline drawn ATOP the muted-gray marquee.
         if mark.isActive {
             SheetRowView.drawActiveOutline(in: cell, color: palette.accent)
         }
@@ -147,9 +120,8 @@ final class SheetRowView: NSTableRowView {
                width: NativeGrid.hairline, height: cell.height).fill()
     }
 
-    /// The find-highlight chip fill for a cell (accent, rounded + inset chips —
-    /// distinct from a SELECTED cell by BOTH colour and geometry). `.none` paints
-    /// nothing.
+    /// Accent, rounded and inset — distinct from a selected cell by both colour
+    /// and geometry.
     static func drawHighlightBackground(_ highlight: SheetCellHighlight, in cell: NSRect, accent: NSColor) {
         switch highlight {
         case .subtle:
@@ -163,8 +135,8 @@ final class SheetRowView: NSTableRowView {
         }
     }
 
-    /// The cell's text (aligned) or, for a not-yet-servable empty cell, the
-    /// loading placeholder — then any truncation / format / conflict markers.
+    /// The cell's text, or the loading placeholder for a not-yet-servable empty
+    /// one, then any warning markers.
     private func drawCellContent(_ index: Int, in cell: NSRect, controller: NativeGridController) {
         if index < cells.count, !cells[index].isEmpty {
             SheetRowView.drawText(cells[index], in: cell.insetBy(dx: GridMetrics.cellHPadding, dy: 0),
@@ -176,7 +148,7 @@ final class SheetRowView: NSTableRowView {
         drawWarningMarkers(index, in: cell)
     }
 
-    /// The horizontal text alignment for a visible column (defaults to leading).
+    /// Defaults to leading.
     private func textAlignment(_ index: Int, controller: NativeGridController) -> NSTextAlignment {
         switch index < controller.columnAlignments.count ? controller.columnAlignments[index] : .leading {
         case .leading: return .left
@@ -185,8 +157,8 @@ final class SheetRowView: NSTableRowView {
         }
     }
 
-    /// Truncation dot + format-unavailable / type-conflict glyphs for a cell
-    /// (independent; the conflict glyph shifts left of a present format glyph).
+    /// The three warning glyphs; the conflict one shifts left of a present
+    /// format glyph.
     private func drawWarningMarkers(_ index: Int, in cell: NSRect) {
         if index < truncated.count, truncated[index] {
             SheetRowView.drawTruncationMarker(in: cell)
@@ -202,13 +174,9 @@ final class SheetRowView: NSTableRowView {
         }
     }
 
-    /// A truncated cell's indicator (ARCH req. 13/20): a subtle dot inset from
-    /// the column's trailing hairline. AppKit's own `.byTruncatingTail` already
-    /// ends an overflowing cell in "…" when it is wider than the column — this
-    /// marker is the ADDITIONAL cue that the CORE cut the underlying data at the
-    /// 4 KiB display cap (`RowWindow.truncated`), distinct from ordinary
-    /// column-width overflow (which can happen to any cell, truncated or not).
-    /// Purely presentational: driven by the flag as given, never a re-measure.
+    /// A subtle dot inset from the trailing hairline. The tail "…" already means
+    /// "wider than the column"; this is the separate cue that the CORE cut the
+    /// underlying data at its display cap.
     static func drawTruncationMarker(in cell: NSRect) {
         let diameter: CGFloat = 5
         let margin: CGFloat = 3   // clearance from the column's trailing hairline
@@ -218,7 +186,7 @@ final class SheetRowView: NSTableRowView {
         NSBezierPath(ovalIn: dot).fill()
     }
 
-    /// Non-colour-only warning glyph used for formatting fallback/conflicts.
+    /// A glyph, not a colour alone, so the warning survives colour blindness.
     static func drawStatusMarker(symbol: String, description: String, in cell: NSRect, trailingSlot: Int) {
         guard cell.width >= 22,
               let image = NSImage(systemSymbolName: symbol, accessibilityDescription: description) else { return }
@@ -230,9 +198,7 @@ final class SheetRowView: NSTableRowView {
                    respectFlipped: true, hints: nil)
     }
 
-    /// The rounded, inset find-highlight chip for one cell — the ONE geometry
-    /// both the subtle/strong fills and the current-match border stroke use,
-    /// mirroring `FindHighlightStyle` exactly as the SwiftUI dump path does.
+    /// The ONE chip geometry both fills and the current-match border use.
     static func highlightChipPath(in cell: NSRect) -> NSBezierPath {
         NSBezierPath(
             roundedRect: cell.insetBy(dx: FindHighlightStyle.inset, dy: FindHighlightStyle.inset),
@@ -240,15 +206,10 @@ final class SheetRowView: NSTableRowView {
         )
     }
 
-    /// The selection RANGE border (ARCH-select-copy AC1): strokes only the
-    /// side(s) of `cell` that sit on the selection rect's OUTER edge (an
-    /// interior selected cell gets the accent fill only, drawn above — no
-    /// stroke), so a multi-cell selection reads as one continuous outlined
-    /// range rather than a grid of individually-boxed cells. A confident 2 pt
-    /// marquee (the Numbers look) in a muted gray — square caps so the per-cell
-    /// segments join seamlessly at range corners; the find highlights use the
-    /// accent and read as rounded INSET chips, so matched vs selected stay
-    /// distinct by both colour and geometry.
+    /// Strokes only the sides of `cell` that sit on the selection's OUTER edge,
+    /// so a multi-cell selection reads as one continuous outline rather than a
+    /// grid of boxed cells. Square caps, so the per-cell segments join seamlessly
+    /// at the corners.
     static func drawSelectionBorder(_ mark: SelectionMark, in cell: NSRect, color: NSColor) {
         color.setStroke()
         let rect = cell.insetBy(dx: 1.0, dy: 1.0)
@@ -270,15 +231,10 @@ final class SheetRowView: NSTableRowView {
         path.stroke()
     }
 
-    /// The active-cell focus outline (ARCH-macos-kbdnav FR4): a full-cell SQUARE
-    /// outline resolved from the system accent (`controlAccentColor` — no
-    /// hardcoded color, tracks light/dark + live accent changes), stroked atop
-    /// the muted-gray selection marquee to mark the active corner (keyboard or
-    /// mouse cursor). Its 1 pt inset matches the marquee's, so on a bare 1×1
-    /// cursor it coincides with the marquee cell; its full square (all four
-    /// sides) distinguishes it from both the marquee (outer-edge segments only)
-    /// and the rounded, inset find-highlight chips. `activeOutlineWidth` /
-    /// `activeOutlineInset` are the single source for the two metrics.
+    /// The active corner's focus outline, stroked atop the marquee. Its inset
+    /// matches the marquee's, so on a bare 1×1 cursor the two coincide; drawing
+    /// all four sides is what distinguishes it from the marquee's outer-edge
+    /// segments and from the rounded find chips.
     static let activeOutlineWidth: CGFloat = 2
     static let activeOutlineInset: CGFloat = 1
     static func drawActiveOutline(in cell: NSRect, color: NSColor) {
@@ -289,15 +245,11 @@ final class SheetRowView: NSTableRowView {
         path.stroke()
     }
 
-    /// The "still loading" placeholder for a not-yet-servable cell (`pending`
-    /// — new request: a subtle, native-consistent affordance so scrolling
-    /// ahead of the scan frontier reads as "loading", never as silently-empty
-    /// data). One flat, low-alpha rounded bar approximating a redacted line
-    /// of text — the same idea as SwiftUI's `.redacted(reason: .placeholder)`,
-    /// hand-drawn here since this view paints its own cells. Deliberately
-    /// STATIC — no shimmer/animation — so it costs exactly one extra fill per
-    /// empty cell on the scroll path (same order of cost as the highlight
-    /// fills above) and never schedules a redraw loop of its own.
+    /// So scrolling ahead of the scan frontier reads as "loading", never as
+    /// silently empty data. One flat, low-alpha rounded bar — the redacted-line
+    /// idea, hand-drawn since this view paints its own cells. Deliberately
+    /// STATIC: no shimmer, so it costs one extra fill per empty cell on the
+    /// scroll path and never schedules a redraw loop.
     static func drawPendingPlaceholder(in cell: NSRect) {
         let inset = cell.insetBy(dx: GridMetrics.cellHPadding, dy: 0)
         guard inset.width > 4, inset.height > 4 else { return }

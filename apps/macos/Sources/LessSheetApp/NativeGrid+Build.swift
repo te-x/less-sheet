@@ -41,14 +41,11 @@ extension NativeGridController {
         scroll.scrollerInsets = NSEdgeInsets(top: -NativeGrid.contentInsetTop, left: 0, bottom: 0, right: 0)
     }
 
-    /// The table: one full-width column; every cell + hairline + highlight is
-    /// drawn by the row view (fastest, pixel control), uniform row height =>
-    /// O(1) geometry at any row count. NSTableView's OWN row selection/
-    /// column-resize machinery stays off (selectionHighlightStyle .none,
-    /// allowsColumnResizing false, etc.) — ARCH-select-copy's rectangular
-    /// CELL selection + resize are hand-built (SheetTableView / GridHeaderView)
-    /// since AppKit has no native equivalent for either; row hit-testing
-    /// (`row(at:)`) and first-responder/event routing ARE reused (framework).
+    /// One full-width column, every cell and hairline drawn by the row view, and
+    /// a uniform row height so geometry stays O(1) at any row count.
+    /// NSTableView's own row-selection and column-resize machinery is off:
+    /// rectangular CELL selection and resize are hand-built, since AppKit has no
+    /// equivalent for either. Row hit-testing and event routing are reused.
     private func configureDataTable() {
         column.width = 400
         column.resizingMask = []
@@ -72,8 +69,8 @@ extension NativeGridController {
         scroll.documentView = table
     }
 
-    /// Configure the chrome subviews and stack them (scroll, gutter, band,
-    /// header) so numbers/data frost under the band and titles stay legible.
+    /// Stacks the chrome so numbers and data frost under the band while the
+    /// header titles stay legible above it.
     private func assembleViewTree() {
         header.controller = self
         header.clipsToBounds = true
@@ -89,8 +86,8 @@ extension NativeGridController {
         container.addSubview(header)    // in front of the band: titles legible
     }
 
-    /// Seed the change-detection caches from the current model so the first
-    /// `apply()` only reacts to genuine post-build changes.
+    /// Seeds the change-detection caches, so the first `apply()` reacts only to
+    /// genuine post-build changes.
     private func captureInitialModelState() {
         lastOpenGeneration = model.openGeneration
         lastVisibleColumns = model.visibleColumns
@@ -101,7 +98,7 @@ extension NativeGridController {
         lastIsFiltered = model.isFiltered
     }
 
-    /// Watch scroll for paging, gutter/header sync, and layout logging.
+    /// Watch the scroll clip for paging, gutter/header sync and layout logging.
     private func observeClipBounds() {
         let clip = scroll.contentView
         clip.postsBoundsChangedNotifications = true
@@ -111,43 +108,25 @@ extension NativeGridController {
         )
     }
 
-    /// Arm the headless verification/dump hooks (all inert unless their
-    /// respective LESSSHEET_* environment switches are set).
+    /// Arms the headless verification hooks. All inert unless their respective
+    /// `LESSSHEET_*` variables are set. They exist because none of these states —
+    /// a held elastic bounce, a row-count estimate collapsing under a parked
+    /// viewport, a viewport sitting past the scan frontier — can be reached
+    /// without a real gesture, and a synthetic input event would need a macOS
+    /// permission prompt.
     private func installVerificationHooks() {
-        // Verification: headless proxy for a HELD elastic overscroll bounce
-        // (no synthetic input events, no TCC prompt) — see EstimateReloadProbe.
-        // Inert unless LESSSHEET_SIMULATE_OVERSCROLL is set.
         EstimateReloadProbe.armIfRequested(on: self)
-
-        // Verification: headless proxy for "the user scrolled the live
-        // scrollbar to the current (possibly wildly over-estimated) end and
-        // let go" — the estimate-COLLAPSE repro. No scroll-to-position probe
-        // exists, so this parks the clip directly, then watches the REAL
-        // background indexer and logs whether the viewport re-anchors instead
-        // of staying stranded. Inert unless LESSSHEET_SIMULATE_ESTIMATE_COLLAPSE
-        // is set; see EstimateCollapseProbe.
         EstimateCollapseProbe.armIfRequested(on: self)
 
-        // Verification-only: force the live grid's scroll position to a
-        // specific row BEFORE the capture below, so a not-yet-servable
-        // region (rows within the estimate but past the scan frontier — the
-        // loading-placeholder case, see `SheetRowView.pending`) can be
-        // screenshotted without a live scroll gesture (no scroll-to-position
-        // probe exists; mirrors `EstimateCollapseProbe`'s direct
-        // `clip.scroll(to:)` technique). Composes with the ordinary
-        // LESSSHEET_DUMP_FRAME / LESSSHEET_DUMP_EXIT capture below — no
-        // bespoke path or termination of its own. Inert unless
-        // LESSSHEET_LIVE_SCROLL_ROW is set.
         if let rowStr = ProcessInfo.processInfo.environment["LESSSHEET_LIVE_SCROLL_ROW"], let row = Int(rowStr) {
             let targetY = CGFloat(row) * NativeGrid.rowHeight - NativeGrid.contentInsetTop
             scroll.contentView.scroll(to: NSPoint(x: 0, y: targetY))
             scroll.reflectScrolledClipView(scroll.contentView)
         }
 
-        // Verification: the plain grid-content dump captures the LIVE table
-        // (cacheDisplay) once it is built + sized — deterministic, unlike the
-        // first-paint .task which races this makeNSView. Probe / overlay / find
-        // / settings scenes are handled elsewhere (they skip this path).
+        // The plain grid dump captures the LIVE table once it is built and
+        // sized — deterministic, unlike the first-paint `.task`, which races
+        // `makeNSView`. Overlay, find and settings scenes skip this path.
         if let path = FrameDump.liveGridInitialDumpPath {
             DispatchQueue.main.async { [weak self] in
                 guard self != nil else { return }
@@ -156,12 +135,10 @@ extension NativeGridController {
             }
         }
 
-        // ARCH-select-copy: make the data table first responder once it is
-        // actually in a window, so Cmd+A / Cmd+C / arrow-key selection work the
-        // moment a document opens, with no preceding click required. Deferred
-        // (the container isn't attached to a window yet at this point in
-        // makeNSView) and one-shot — a later re-open does NOT repeat this, so
-        // it never steals focus from a field the user is actively using.
+        // Make the table first responder once it is actually in a window, so
+        // Cmd+A, Cmd+C and arrow-key selection work the moment a document opens.
+        // Deferred (nothing is attached yet here) and one-shot, so a later
+        // re-open never steals focus from a field the user is typing in.
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.container.window?.makeFirstResponder(self.table)
