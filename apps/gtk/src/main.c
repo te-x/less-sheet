@@ -4018,6 +4018,7 @@ struct _CopyOp
   GByteArray *blob; /* worker-owned; read by main after join */
   LsgCopyOutcome outcome;
   guint64 rows_done;
+  guint64 bytes_done;
 };
 
 /* --- reusable header-bar progress: a determinate bar + inline cancel. Hidden
@@ -4270,6 +4271,7 @@ copy_worker (gpointer data)
   op->blob = blob;
   op->outcome = flow.outcome;
   op->rows_done = flow.rows_done;
+  op->bytes_done = flow.bytes_done;
   op->progress = lsg_copy_progress_fraction (flow);
   op->finished = TRUE;
   g_mutex_unlock (&op->lock);
@@ -4294,6 +4296,37 @@ copy_dispose (App *app)
       g_mutex_clear (&op->lock);
       g_free (op);
       app->copy_op = NULL;
+    }
+}
+
+/*
+ * What was ACTUALLY copied, in the user's words. A copy that hit the byte
+ * budget, the core's cell cap, or the scan frontier delivers LESS than the
+ * selection, and saying only "Copied N rows" would present a truncated
+ * clipboard as a complete one. Same wording as the macOS frontend's notice.
+ */
+static char *
+copy_notice_dup (const struct _CopyOp *op)
+{
+  switch (op->outcome)
+    {
+    case LSG_COPY_OUTCOME_BUDGET:
+    case LSG_COPY_OUTCOME_CELL_CAP:
+      {
+        guint64 mb = op->bytes_done / (1024 * 1024);
+        return g_strdup_printf ("Copied the first ~%" G_GUINT64_FORMAT
+                                " MB — %" G_GUINT64_FORMAT " rows",
+                                (mb > 0) ? mb : 1, op->rows_done);
+      }
+    case LSG_COPY_OUTCOME_FRONTIER:
+      return g_strdup_printf ("Copied %" G_GUINT64_FORMAT
+                              " row%s so far — still loading the rest",
+                              op->rows_done, (op->rows_done == 1) ? "" : "s");
+    default:
+      return (op->rows_done <= 1)
+                 ? g_strdup ("Copied")
+                 : g_strdup_printf ("Copied %" G_GUINT64_FORMAT " rows",
+                                    op->rows_done);
     }
 }
 
@@ -4330,16 +4363,13 @@ copy_tick (gpointer data)
       guint8 nul = 0;
       g_byte_array_append (op->blob, &nul, 1);
       gdk_clipboard_set_text (clip, (const char *)op->blob->data);
-      if (app->title_status != NULL)
-        {
-          char *note = g_strdup_printf ("Copied %" G_GUINT64_FORMAT " rows",
-                                        op->rows_done);
-          title_set_status (app, note);
-          /* Copy completion (MEDIUM): announce the same copy-complete text. */
-          a11y_announce (app, g_strdup (note),
-                         GTK_ACCESSIBLE_ANNOUNCEMENT_PRIORITY_MEDIUM);
-          g_free (note);
-        }
+      /* A toast, not the header subtitle: the subtitle is the document's
+       * standing row-count / filter line, and overwriting it left a stale
+       * "Copied …" sitting there for the rest of the session on a document
+       * whose poll had already stopped. */
+      char *note = copy_notice_dup (op);
+      settings_toast (app, note);
+      a11y_announce (app, note, GTK_ACCESSIBLE_ANNOUNCEMENT_PRIORITY_MEDIUM);
     }
   header_progress_hide (app);
   copy_dispose (app);
