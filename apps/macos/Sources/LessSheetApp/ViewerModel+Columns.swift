@@ -115,13 +115,17 @@ extension DocumentModel {
         panelMetadata[column] ?? windowColumnMetadata[column]
     }
 
+    /// Whether any materialized cell of `column` fell back to its raw spelling
+    /// because Foundation could not represent it exactly. Read from SwiftUI
+    /// bodies (the inspector's Status section, every panel row), so it walks ONE
+    /// column, and answers without touching a cell at all under the default
+    /// `.auto` format — which can only ever produce the original spelling.
     func panelColumnHasFormatUnavailable(_ column: Int) -> Bool {
-        let columns = windowColumns()
-        guard let offset = columns.firstIndex(of: column) else { return false }
+        guard userSettings(for: column).format != .auto, windowColumns().contains(column) else { return false }
         let start = Int(window.firstRow)
-        for row in start..<(start + window.rows.count) {
-            let presentations = windowCellPresentations(forRow: row)
-            if offset < presentations.count, presentations[offset].formatUnavailable { return true }
+        for row in start..<(start + window.rows.count)
+        where windowCellPresentation(forRow: row, column: column).formatUnavailable {
+            return true
         }
         return false
     }
@@ -274,6 +278,7 @@ extension DocumentModel {
     func setVisibility(_ newValue: ColumnVisibility) {
         visibility = newValue
         cachedVisibleColumns = visibilityManager.visibleColumns(newValue)
+        refreshWindowColumnsCache()
         markLayoutWidthsStale()   // the render-order widths depend on visibleColumns too
     }
 

@@ -229,7 +229,9 @@ extension DocumentModel {
         guard lowerRow < upperRow else { return widths }
         let rel = column - window.firstColumn
         guard rel >= 0 else { return widths }
-        let visibleOffset = windowColumns().firstIndex(of: column)
+        // Off-window columns have no presentation to format; they are measured
+        // from the raw window cell.
+        let inWindow = windowColumns().contains(column)
 
         for viewRow in lowerRow..<upperRow {
             let idx = viewRow - start
@@ -237,13 +239,9 @@ extension DocumentModel {
             let row = window.rows[idx]
             guard rel < row.count else { continue }
             if idx < window.truncated.count, rel < window.truncated[idx].count, window.truncated[idx][rel] { continue }
-            let displayed: String
-            if let visibleOffset {
-                let presentation = windowCellPresentations(forRow: viewRow)
-                displayed = visibleOffset < presentation.count ? presentation[visibleOffset].text : row[rel]
-            } else {
-                displayed = row[rel]
-            }
+            let displayed = inWindow
+                ? windowCellPresentation(forRow: viewRow, column: column).text
+                : row[rel]
             widths.append(Double(Self.textWidth(displayed, bodyFont) + padding))
         }
         return widths

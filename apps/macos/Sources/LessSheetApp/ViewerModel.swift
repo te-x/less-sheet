@@ -99,7 +99,12 @@ final class DocumentModel {
     /// Indices are positions into `visibleColumns` (render order), matching
     /// what `ColumnLayouting.window(widths:...)` was given. Empty until the
     /// grid reports its first real viewport (fresh open, before any layout).
-    var columnWindow = ColumnWindow(first: 0, count: 0, firstX: 0)
+    /// Assign only through `setColumnWindow` — it keeps `cachedWindowColumns`
+    /// in lockstep.
+    private(set) var columnWindow = ColumnWindow(first: 0, count: 0, firstX: 0)
+    /// `columnWindow`'s slice of `visibleColumns`, as ABSOLUTE indices in render
+    /// order — memoized, rebuilt only by `setColumnWindow` / `setVisibility`.
+    @ObservationIgnored var cachedWindowColumns: [Int] = []
 
     // Windowed data + progress knowledge.
     var window = RowWindow(firstRow: 0, rows: [])
@@ -294,6 +299,24 @@ final class DocumentModel {
     /// wherever the visible bytes may change under a possibly-unchanged geometry.
     func invalidateMatchFlags() {
         matchFlagsContentGen &+= 1
+    }
+
+    /// The ONLY place `columnWindow` is set, so its memoized slice
+    /// (`windowColumns()`) can never drift from it.
+    func setColumnWindow(_ newValue: ColumnWindow) {
+        columnWindow = newValue
+        refreshWindowColumnsCache()
+    }
+
+    /// Rebuilds `cachedWindowColumns` from the two inputs that define it —
+    /// `columnWindow` and `visibleColumns`, each with exactly one assigning
+    /// setter. Every row the grid configures asks for this list several times
+    /// per scroll tick, so re-slicing it per call is the one allocation worth
+    /// removing from that path.
+    func refreshWindowColumnsCache() {
+        let cols = cachedVisibleColumns
+        let clamped = columnWindow.range.clamped(to: 0..<cols.count)
+        cachedWindowColumns = clamped.isEmpty ? [] : Array(cols[clamped])
     }
     /// Set on a header on/off re-open (consumed by the grid): how a data-row
     /// index shifts across the re-derivation so the viewport can re-anchor to the

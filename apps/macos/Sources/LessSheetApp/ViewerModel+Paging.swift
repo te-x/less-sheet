@@ -66,7 +66,7 @@ extension DocumentModel {
             overscan: GridMetrics.columnOverscan
         )
         guard win != columnWindow else { return }
-        columnWindow = win
+        setColumnWindow(win)
 
         // Re-materialize ONLY when the new window would spill past the LAST
         // fetch (`window.firstColumn` .. its rows' width) beyond a

@@ -98,13 +98,7 @@ extension DocumentModel {
     // memoized `visibleColumns` — so none of these ever re-filters `0..<columnCount`.
 
     /// The current column window's ABSOLUTE column indices, in render order.
-    func windowColumns() -> [Int] {
-        let cols = visibleColumns
-        guard !cols.isEmpty else { return [] }
-        let clamped = columnWindow.range.clamped(to: 0..<cols.count)
-        guard !clamped.isEmpty else { return [] }
-        return Array(cols[clamped])
-    }
+    func windowColumns() -> [Int] { cachedWindowColumns }
 
     /// Widths of the current column window, in render order — what the live
     /// grid draws (`NativeGridController.widths`); EFFECTIVE widths, see

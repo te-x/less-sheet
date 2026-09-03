@@ -62,30 +62,34 @@ extension DocumentModel {
             ))
         } catch {
             guard request == openRequestSequence else { return }
-            networkOpenProgress = nil
-            networkCancelToken = nil
-            if previous != nil, oldSession != nil {
-                // Mirror open(path:)'s carry-over failure handling: keep the
-                // old session alive rather than tearing down a working
-                // document just because a dialect re-open over the network
-                // failed (transient network error, server hiccup, etc.).
-                self.session = oldSession
-                self.currentOpenKind = .network
-                startPolling()
-                return
-            }
-            networkOpenError = error
-            oldSession?.close()
-            self.session = nil
-            // The network taxonomy has no DocumentOpenError analogue; surface the
-            // fact through the failure panel with a stable code, the distinct
-            // detail via `networkOpenError` — `ContentView` renders a
-            // `NetworkErrorPanel` from it instead of the generic one (AC7 /
-            // round-2 review finding 2: each of the 7 cases gets its own text).
-            self.phase = .failure(.ioFailure, path: url)
+            failNetworkOpen(error, url: url, previous: previous, oldSession: oldSession)
         }
         openGeneration += 1
         NativeGridController.live?.apply()
+    }
+
+    /// A network open that threw. A dialect re-open keeps the working document
+    /// rather than tearing it down over a transient network error, mirroring
+    /// `open(path:)`'s carry-over branch; a first open surfaces the failure
+    /// panel. `phase` is `DocumentOpenError`-typed (frozen) and the network
+    /// taxonomy has no analogue, so the distinct detail rides in
+    /// `networkOpenError`, which `ContentView` renders as a `NetworkErrorPanel`.
+    private func failNetworkOpen(
+        _ error: NetworkOpenError, url: String,
+        previous: ColumnVisibility?, oldSession: (any DocumentSession)?
+    ) {
+        networkOpenProgress = nil
+        networkCancelToken = nil
+        if previous != nil, let oldSession {
+            self.session = oldSession
+            self.currentOpenKind = .network
+            startPolling()
+            return
+        }
+        networkOpenError = error
+        oldSession?.close()
+        self.session = nil
+        self.phase = .failure(.ioFailure, path: url)
     }
 
     /// Drives the core's network open-job: the tracking overload (live progress
@@ -207,7 +211,7 @@ extension DocumentModel {
         // The horizontal window is a function of the widths this open is
         // about to establish; it resets here and the grid re-derives it
         // from its (possibly unchanged) viewport on the next layout pass.
-        self.columnWindow = ColumnWindow(first: 0, count: 0, firstX: 0)
+        setColumnWindow(ColumnWindow(first: 0, count: 0, firstX: 0))
         establishInitialWindow(session: session)
         self.setJumpFlow(.idle)
         resetFindFilterSelectionState()
