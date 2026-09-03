@@ -1,5 +1,5 @@
 # aidev profile — polyglot workspace ROOT (components have their own nested .aidev/)
-LANG_NAME="workspace (Zig core + Swift/macOS frontend)"
+LANG_NAME="workspace (Zig core + Swift/macOS and C/GTK4 frontends)"
 # The language-NEUTRAL cross-component contract (C headers, .proto, OpenAPI): frozen for EVERYONE.
 FROZEN_PATHS=( "api" )
 # Architecture (ARCH docs + PROJECT.md) is owned here at the workspace root.

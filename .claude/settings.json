@@ -8,7 +8,13 @@
       "Bash(bash backend/.aidev/gate.sh:*)",
       "Bash(bash backend/.aidev/freeze.sh:*)",
       "Bash(bash apps/macos/.aidev/gate.sh:*)",
-      "Bash(bash apps/macos/.aidev/freeze.sh:*)"
+      "Bash(bash apps/macos/.aidev/freeze.sh:*)",
+      "Bash(bash apps/gtk/.aidev/gate.sh:*)",
+      "Bash(bash apps/gtk/.aidev/freeze.sh:*)",
+      "Bash(bash ~/.claude/aidev/gate.sh:*)",
+      "Bash(bash ~/.claude/aidev/freeze.sh:*)",
+      "Bash(bash ~/.claude/aidev/role-runner.sh:*)",
+      "Bash(bash ~/.claude/aidev/set-models.sh:*)"
     ]
   }
 }
