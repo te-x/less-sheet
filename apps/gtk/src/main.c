@@ -161,14 +161,12 @@ typedef struct
    * status text PLUS a filtered-only (x) clear-filter button. Mirrors
    * AdwWindowTitle's centering + `.title`/`.subtitle` styling; the (x) is the
    * compact successor to the old full-width filter banner's Clear. */
-  GtkWidget *title_box;   /* the title widget packed into the header bar */
   GtkLabel *title_name;   /* document name (.title) */
   GtkLabel *title_status; /* passive status line (.subtitle) */
   GtkButton
       *filter_clear_btn; /* (x) after the status; shown only when filtered
                           */
-  AdwToolbarView *toolbar;
-  GtkStack *stack; /* "launch" / "grid" / "error" */
+  GtkStack *stack;       /* "launch" / "grid" / "error" */
   AdwStatusPage *error_page;
 
   /* Grid widgets. */
@@ -304,7 +302,6 @@ typedef struct
    * later). */
   GtkWidget *hp_box;
   GtkProgressBar *hp_bar;
-  GtkButton *hp_cancel;
 
   /* Settings + dialect override (this slice). */
   char *doc_path; /* current LOCAL path (OWNED); NULL for a network doc */
@@ -4071,7 +4068,6 @@ build_header_progress (App *app)
   gtk_widget_set_visible (box, FALSE);
   app->hp_box = box;
   app->hp_bar = GTK_PROGRESS_BAR (bar);
-  app->hp_cancel = GTK_BUTTON (cancel);
   g_signal_connect (cancel, "clicked", G_CALLBACK (on_hp_cancel_clicked), app);
 }
 
@@ -4671,19 +4667,35 @@ on_window_destroy (GtkWidget *widget, gpointer data)
                                        app->capture.tick_id);
       app->capture.tick_id = 0;
     }
+  /* Every widget pointer goes NULL together: they all die with the window, and
+   * each one is NULL-guarded at its use sites, so whatever still runs after
+   * this (the copy join below, main()'s teardown) is a no-op instead of a
+   * touch of freed memory. */
   app->window = NULL;
-  app->title_box = NULL;
   app->title_name = NULL;
   app->title_status = NULL;
   app->filter_clear_btn = NULL;
+  app->stack = NULL;
+  app->error_page = NULL;
+  app->area = NULL;
+  app->hscroll = NULL;
+  app->find_button = NULL;
+  app->find_popover = NULL;
+  app->find_entry = NULL;
+  app->find_status = NULL;
   app->find_stack = NULL;
   app->where_column = NULL;
   app->where_op = NULL;
   app->where_value = NULL;
-  app->area = NULL;
+  app->match_case = NULL;
+  app->jump_button = NULL;
+  app->jump_popover = NULL;
+  app->jump_entry = NULL;
+  app->jump_progress = NULL;
+  app->jump_cancel = NULL;
+  app->filter_toggle = NULL;
   app->hp_box = NULL;
   app->hp_bar = NULL;
-  app->hp_cancel = NULL;
   app->copy_button = NULL;
   app->header_toggle = NULL;
   app->header_glyph = NULL;
@@ -4695,9 +4707,14 @@ on_window_destroy (GtkWidget *widget, gpointer data)
   app->prefs = NULL; /* the dialog is destroyed with the window */
   app->prefs_header_row = NULL;
   app->prefs_sep_row = NULL;
+  app->prefs_sep_custom = NULL;
   app->prefs_quote_row = NULL;
+  app->prefs_quote_custom = NULL;
   app->prefs_enc_row = NULL;
   app->prefs_columns_group = NULL;
+  app->prefs_columns_search = NULL;
+  app->prefs_columns_status = NULL;
+  app->prefs_infer_row = NULL;
   copy_stop_and_join (app); /* joins the worker; widget calls now no-op */
 }
 
@@ -6782,7 +6799,6 @@ ensure_window (App *app, GtkApplication *gtk_app)
   gtk_box_append (GTK_BOX (title_box), title_name);
   gtk_box_append (GTK_BOX (title_box), subrow);
   adw_header_bar_set_title_widget (ADW_HEADER_BAR (header), title_box);
-  app->title_box = title_box;
   app->title_name = GTK_LABEL (title_name);
   app->title_status = GTK_LABEL (title_status);
   app->filter_clear_btn = GTK_BUTTON (fx);
@@ -6939,7 +6955,6 @@ ensure_window (App *app, GtkApplication *gtk_app)
                                GTK_WIDGET (app->stack));
 
   GtkWidget *toolbar = adw_toolbar_view_new ();
-  app->toolbar = ADW_TOOLBAR_VIEW (toolbar);
   adw_toolbar_view_add_top_bar (ADW_TOOLBAR_VIEW (toolbar), header);
   adw_toolbar_view_set_content (ADW_TOOLBAR_VIEW (toolbar), toasts);
 
