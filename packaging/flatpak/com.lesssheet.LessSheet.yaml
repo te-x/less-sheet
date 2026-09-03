@@ -1,12 +1,13 @@
 # less-sheet — Flatpak manifest
 #
-# WHY extra-data AND NOT A SOURCE BUILD. less-sheet is closed source, so nobody
-# — Flathub included — can build it from source. extra-data is the shape the
-# Flatpak ecosystem provides for exactly this: the manifest carries only
-# metadata, and the USER'S machine downloads the same tarball published on the
-# release page, verifying the sha256 and size below before unpacking it. This is
-# how proprietary apps ship on Flathub, so what we self-host today is the same
-# manifest we would submit later — not a stepping stone to be redone.
+# WHY extra-data AND NOT A SOURCE BUILD. The app needs Zig 0.16.0 exactly, which
+# no Flathub SDK carries, and the release pipeline already builds the tarball and
+# verifies it by running it, so this manifest ships that binary. extra-data is
+# the shape for a prebuilt payload: the manifest carries only metadata, and the
+# USER'S machine downloads the same tarball published on the release page,
+# verifying the sha256 and size below before unpacking it. What we self-host
+# today is the same manifest we would submit — the source is MIT, so a
+# from-source manifest with a Zig SDK extension is a possible later step.
 #
 # WHY THE RUNTIME MATTERS MORE THAN THE PACKAGE. The plain tarball needs GTK
 # 4.20 and libadwaita 1.8 from the distribution, which is why it cannot run on
@@ -15,7 +16,7 @@
 # one.
 #
 # LGPL: the runtime provides GTK/libadwaita DYNAMICALLY and we do not bundle
-# them, which is what keeps a closed-source binary compliant (docs/RELEASE.md
+# them, which is what keeps the binary compliant (docs/RELEASE.md
 # 4a). Do not "simplify" this by vendoring GTK.
 app-id: com.lesssheet.LessSheet
 runtime: org.gnome.Platform

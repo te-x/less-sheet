@@ -2,9 +2,9 @@
 # Runs ONCE on the user's machine at install time, inside /app/extra, after
 # flatpak has downloaded the extra-data tarball and verified its sha256.
 #
-# extra-data exists because less-sheet is closed source: Flathub cannot build it
-# from source, so the manifest ships metadata and the user's machine fetches the
-# same binary tarball published on the release page. Nothing here is allowed to
+# extra-data lets the manifest ship a prebuilt binary: it carries only metadata
+# and the user's machine fetches the same tarball published on the release page
+# (the app needs Zig 0.16.0 exactly, which no Flathub SDK provides). Nothing here is allowed to
 # reach the network — flatpak already did that, and checked the digest.
 set -e
 

@@ -6,6 +6,10 @@ Sign-off record: §7.3 accepted (system theme only, no manual toggle); §7.4 sta
 §3.3 approved in full (5 shots × 4 variants = 20 files), capture automated per §7.7.
 Supersedes the 2026-07-15 landing page (`0354be9`) in place — same file, same assets directory.
 
+> Note (2026-09-03): the project has since been open-sourced under MIT and everything — source, releases,
+> page — lives in one public repository. The "closed source" premises below (no source link, a site-only
+> repository) are superseded; the page links to the source.
+
 ---
 
 ## Amendment — 2026-08-16 (publication decision; the author sign-off)

@@ -6,9 +6,9 @@
 # Two distribution channels want two different payload mechanisms, and neither
 # can serve the other:
 #
-#   * Flathub REQUIRES extra-data for a closed-source app — they will not
-#     redistribute a proprietary binary, so the user's machine fetches it at
-#     install time. That is the other manifest, and it is the one to submit.
+#   * Flathub does not host binaries it did not build, so a prebuilt payload
+#     there must be extra-data: the user's machine fetches it at install time.
+#     That is the other manifest, and it is the one to submit.
 #
 #   * A single-file .flatpak bundle CANNOT carry extra-data. `flatpak
 #     build-bundle` needs `xa.extra-data-sources` in the commit's DETACHED

@@ -1,5 +1,8 @@
 # ARCH — pre-launch security hardening
 
+> Note (2026-09-03): the project has since been open-sourced under MIT. "Closed-source" below describes
+> the premise at signing, not the current state; the hardening rationale stands regardless of licence.
+
 **Program (not one feature):** a bounded set of memory-safety and untrusted-input hardening work to
 complete before less-sheet ships as a **free, public, closed-source** desktop utility that opens
 **arbitrary local files and network URLs** — i.e. it ingests untrusted bytes from anyone. Spans the

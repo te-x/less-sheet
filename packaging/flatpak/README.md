@@ -6,11 +6,13 @@ Mac cannot produce.
 
 ## Why this manifest downloads a binary
 
-less-sheet is closed source, so no one can build it from source — not us in a
-clean room, not Flathub. `extra-data` is the mechanism the ecosystem provides
-for that case: the manifest ships only metadata, and the **user's machine**
-fetches the tarball from the release page at install time, refusing to proceed
-unless the `sha256` and `size` match exactly.
+The app needs Zig 0.16.0 exactly, which no Flathub SDK carries, and the release
+pipeline already builds the tarball and verifies it by running it. So the
+manifest ships that binary rather than rebuilding it: `extra-data` carries only
+metadata, and the **user's machine** fetches the tarball from the release page
+at install time, refusing to proceed unless the `sha256` and `size` match
+exactly. The source is MIT, so a from-source manifest (a Zig SDK extension plus
+this repository as the source) is possible later; it has not been written.
 
 That means the Flatpak we self-host today and a future Flathub submission are
 **the same manifest**. There is no throwaway step here.
@@ -23,7 +25,7 @@ that pair, so the Flatpak runs regardless of what the host ships. That is the
 whole reason it exists.
 
 GTK and libadwaita come from the runtime, dynamically, and are not bundled —
-which is what keeps a closed-source binary LGPL-compliant (`docs/RELEASE.md`
+which is what keeps the binary LGPL-compliant (`docs/RELEASE.md`
 §4a). Do not "simplify" the manifest by vendoring them.
 
 ## Build and test
@@ -91,8 +93,8 @@ offline, and carries no auto-update — that is what Flathub buys.
 | Flathub | `com.lesssheet.LessSheet.yaml` | `extra-data`, fetched by the user's machine |
 | download button | `com.lesssheet.LessSheet.Bundle.yaml` | embedded at build time |
 
-Flathub **requires** extra-data for a closed-source app — they will not
-redistribute a proprietary binary. A bundle **cannot** use it. Neither manifest
+Flathub does not host binaries it did not build, so a prebuilt payload there
+must be `extra-data`, fetched by the user's machine. A bundle **cannot** use it. Neither manifest
 can serve the other channel, which is why both exist. Both pull the same tarball
 by the same digest, so the two channels ship an identical binary, and the
 `.desktop`, icon and metainfo are shared files that cannot drift.

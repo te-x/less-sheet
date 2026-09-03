@@ -1,6 +1,6 @@
 # Third-Party Notices
 
-less-sheet is a closed-source application. It links the third-party components below. This file must ship with the distributed application (in the bundle/package and/or on the download page). Keep it in sync as dependencies change.
+less-sheet is MIT-licensed (see `LICENSE`). It links the third-party components below. This file must ship with the distributed application (in the bundle/package and/or on the download page). Keep it in sync as dependencies change.
 
 > Applicability: the **GTK/GNOME** components apply to the **Linux/GTK** build only. The **macOS** build uses Apple system frameworks (AppKit/Swift runtime), which require no third-party notice. Both builds link the Zig-compiled core (our own code) whose standard-library portions are covered by the Zig notice below.
 

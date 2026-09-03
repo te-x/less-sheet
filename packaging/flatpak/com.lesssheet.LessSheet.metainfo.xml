@@ -2,9 +2,8 @@
 <component type="desktop-application">
   <id>com.lesssheet.LessSheet</id>
 
-  <!-- The app is closed source; this metadata file is not. AppStream wants the
-       two stated separately, and LicenseRef-proprietary is the SPDX-sanctioned
-       way to say "not an open source licence" without inventing an id. -->
+  <!-- AppStream states the metadata licence and the project licence separately;
+       both are open: CC0 for this file, MIT for the app. -->
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>MIT</project_license>
 

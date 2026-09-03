@@ -291,7 +291,7 @@ def resolve_version(repo, override):
     return (override or root_ver or mac_ver or "0.0.0"), warn
 
 
-# Legal text is not decoration here. The Linux tarball ships a closed-source
+# Legal text is not decoration here. The Linux tarball ships a
 # binary linked against LGPL libraries, and docs/RELEASE.md 4a makes shipping the
 # notices half of what keeps that compliant — the other half being that GTK stays
 # dynamically linked. A template placeholder reaching a user is the same class of
