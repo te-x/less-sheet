@@ -1,15 +1,15 @@
 # REVIEW — csv-gz
 
-**Final verdict: PASS** (external reviewer, claude-native / claude-opus-5, resume transport), bound to
+**Final verdict: PASS** (reviewer, claude-opus-5), bound to
 tree `bcab7bc44fffae56dfb9ef7a8a63d4383e454f4d51bb45f56ce37425f65c3cd1`. No residual `[impl]`, `[contract]`,
 or `[design]` findings. Built on branch `feature/csv-gz` on the reader-interface reorg base (`af83db9`),
 frozen contract `b19fe39`.
 
 ## Cell configuration
-- **Implementer:** external `claude-native` adapter (Claude, claude-opus-5, resume),
+- **Implementer:** `claude-native` runner (claude-opus-5),
   workspace-write via isolated-promotion (repo-root mirror; only `backend/src` promoted back). A prior Round 1
   with claude-native Sonnet was reverted (perf regression + a hang, 14 ACs unreached after 5.5h).
-- **Reviewer:** external `claude-native` adapter (Claude, claude-opus-5, resume).
+- **Reviewer:** `claude-native` runner (claude-opus-5).
 - **Orchestrator gate:** `bash .aidev/gate.sh` run by the orchestrator; the implementer's own claims were
   never accepted as evidence. Round budget extended 5→10 by the user for this large refactor (converged at 5).
 

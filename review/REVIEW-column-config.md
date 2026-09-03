@@ -11,7 +11,7 @@ Structural O(viewport) verification and the headless cold-open runs support it b
 to the author for the live pass.
 
 ## Cell configuration
-- **cc-backend** — implementer (claude-opus-5, isolated-promotion) ⇄ external claude
+- **cc-backend** — implementer (claude-opus-5) ⇄ claude
   reviewer (claude-opus-5). IMPLEMENTATION_PATHS=`src`. Type model + inference + ABI.
 - **cc-macos** — same runners; IMPLEMENTATION_PATHS=`Sources/{LessSheetApp,LessSheetKit}`. Compact column
   control panel + display-only formatting. Disjoint paths, independent gates.

@@ -2,7 +2,7 @@
 
 **Verdict: DONE.** Gate green at every level (root chain: `api/` integrity + backend + macOS),
 verified by the orchestrator's own `bash .aidev/gate.sh` runs each round — backend **142/0**,
-macOS **102 tests / 8 suites**, `zig fmt` clean. Reviewer = Claude `claude-opus-5` (file bridge).
+macOS **102 tests / 8 suites**, `zig fmt` clean. Reviewer = `claude-opus-5`.
 
 **Headline (AC7, GATING):** end-to-end 100k × 10 (1,000,000-cell) full-selection copy through the
 real `TSVCopyBuilder` + `copyCell` + `ls_cell_copy` completes in **~2.6 s** (ceiling 5 s) — vs the

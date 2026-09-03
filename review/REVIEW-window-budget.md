@@ -6,8 +6,8 @@ Backend cell bound tree `3e35e4a9…`; macOS cell bound tree `111f8f22…`; froz
 110/110, api integrity).
 
 ## Cell configuration (two parallel, provably-independent cells)
-- **backend** (`wb-backend`) — implementer (claude-opus-5, isolated-promotion) ⇄ external
-  claude reviewer (claude-opus-5). IMPLEMENTATION_PATHS=`src`.
+- **backend** (`wb-backend`) — implementer (claude-opus-5) ⇄
+  reviewer (claude-opus-5). IMPLEMENTATION_PATHS=`src`.
 - **macOS** (`wb-macos`) — same runners; IMPLEMENTATION_PATHS=`Sources/{LessSheetApp,LessSheetKit,CLessSheet}`.
   Disjoint paths, independent gates, and the AC7 test is pure Kit (no backend link) → ran in parallel.
 - Orchestrator ran every gate; implementer claims never taken as evidence.

@@ -28,12 +28,12 @@ working tree directly (no isolated-promotion); the `guard-contracts.sh` PreToolU
 gate enforce the contract. This build's implementer and reviewer were native Opus.
 
 ## Round history
-- **R1 (claude impl)** — full redesign implemented; gate green (153). Reviewer → 3 `[impl]`:
+- **R1** — full redesign implemented; gate green (153). Reviewer → 3 `[impl]`:
   (1) `SettingsRedesignProbe.swift` untracked (would be absent from the commit); (2) null-sentinel `@State`
   survived a session reset when column 0 stayed selected; (3) the headless probes reported acceptance facts as
   literals (composition true/false, empty-rows 0, header probe bypassing `NativeGridController`) — gate could
   pass on a regressed UI.
-- **R2 (claude impl)** — moved probe logic into tracked `AppUI.swift` (standalone file removed); re-keyed
+- **R2** — moved probe logic into tracked `AppUI.swift` (standalone file removed); re-keyed
   inspector identity + null-sentinel reload by `openGeneration`; probes now scan rendered markers/geometry/
   accessibility + drive the real header coordinate action. Orchestrator removed a stale untracked probe copy
   that isolated-promotion left behind (deletions don't propagate). Gate green (153).

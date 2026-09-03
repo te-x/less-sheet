@@ -510,7 +510,7 @@ const copy_reanchor_gap_max: u64 = base.checkpoint_interval;
 /// the single row it would otherwise step, so this keeps the well-known
 /// exact "N-1 advances for an N-row row-major sweep" cost (sc3) — no "free"
 /// checkpoint-aligned shortcuts. A LARGER gap is never produced by that
-/// pattern, so it is NOT trusted blindly (Claude review finding A) — see
+/// pattern, so it is NOT trusted blindly (review finding A) — see
 /// `cellCopy`, which compares it against a fresh `bestCheckpoint(row)` and
 /// uses whichever starts closer, for a PROVABLE never-slower-than-today
 /// guarantee on any gap, not just a small one.
@@ -672,7 +672,7 @@ pub fn cellCopy(d: *Document, row: u64, col: u32, buf: ?[*]u8, buf_len: usize, o
     // `bestCheckpoint(row)` is compared: the cursor is used only if it
     // starts at/after the checkpoint (`copy_cursor_row >= cp.row`), so
     // `row - copy_cursor_row <= row - cp.row` — provably never costlier than
-    // today's from-scratch locate, for ANY forward gap (Claude review finding
+    // today's from-scratch locate, for ANY forward gap (review finding
     // A: e.g. a cursor at row 100 asked for row 2048, where the checkpoint
     // alone reaches row 2048 in zero steps).
     const cursor_forward = d.copy_cursor_enabled and d.copy_cursor_valid and
@@ -746,7 +746,7 @@ pub fn cellCopy(d: *Document, row: u64, col: u32, buf: ?[*]u8, buf_len: usize, o
 /// fresh locate for the same row (it starts further along, inside the SAME
 /// block a cold locate would relex from its start), so this is NEVER a
 /// forward-attempt-plus-cold-locate double pay, for ANY match distribution
-/// (Claude review finding 2: a clustered/sparse filter must not cost more
+/// (review finding 2: a clustered/sparse filter must not cost more
 /// than the baseline). Zero advances for another column of the same filtered
 /// row. Otherwise (no usable cursor, OR the target spills past the cursor's
 /// block — decided WITHOUT ever starting a doomed row-walk)
@@ -801,7 +801,7 @@ fn cellCopyFilteredLocked(d: *Document, row: u64, col: u32, buf: ?[*]u8, buf_len
             // locate below (never a wrong NO_CELL).
         } else {
             // Target spills past the cursor's block: RESUME the cross-block
-            // cumulative scan from `from_block` (Claude review finding B)
+            // cumulative scan from `from_block` (review finding B)
             // instead of re-walking `filter_block_counts` from block 0 --
             // otherwise a monotonic sparse-filter sweep (~1 match/block) pays
             // O(blocks) EVERY step it crosses a block, O(blocks x matches)

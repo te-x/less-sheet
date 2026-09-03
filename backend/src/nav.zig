@@ -279,7 +279,7 @@ pub const FilteredCopyLoc = struct { row: u64, pos: Pos, block: u64, block_consu
 ///
 /// `start_block`/`start_cum` let the block-summation loop RESUME from a
 /// later block instead of always re-walking `block_counts` from block 0
-/// (Claude review finding B): a true cold locate passes `(0, 0)`; a
+/// (review finding B): a true cold locate passes `(0, 0)`; a
 /// forward-resume whose target spilled past the cursor's own block passes
 /// `(cursor's block, matches counted in blocks [0, that block))` — both
 /// already known to the caller in O(1) from `FilteredCopyLoc`/

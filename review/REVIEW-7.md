@@ -121,7 +121,7 @@ Inspected PNGs (`/tmp/lswin/png/`): `big2g_grid_light`, `big2g_grid_dark`, `big2
 1. **[impl] `NativeGrid.swift` is untracked** (`git status: ?? NativeGrid.swift`). The working
    tree builds green and the gate passes, but a commit of only tracked changes would omit the
    replacement grid and not build from a clean checkout. Action: `git add` it before the commit.
-   (This is the real kernel of Claude's sole finding below; Claude's "does not build" is an artifact
+   (This is the real kernel of the cross-model reviewer's sole finding below; its "does not build" is an artifact
    of `review.sh` feeding `git diff`, which excludes untracked files — the file exists and compiles.)
 2. **[impl] nit** `LESSSHEET_DUMP_FIRSTROW` is not honored by the live cacheDisplay path
    (`FrameDump.captureLiveGrid` never calls `dumpMaterialize`), so the live-grid initial dump always
@@ -142,9 +142,9 @@ EXPLICITLY (not emergent titlebar/scroll-edge compositing), honoring the memory-
 - VoiceOver / accessibility of the AppKit grid.
 - Runtime click/drag confirmation of no-selection / no-resize (code-verified above).
 
-## Cross-model (Claude claude-opus-5) read
+## Cross-model (claude-opus-5) read
 
-Claude raised exactly one item — the untracked-file build concern (folded into F1). Its context was
+The cross-model reviewer raised exactly one item — the untracked-file build concern (folded into F1). Its context was
 the tracked `git diff` only (untracked `NativeGrid.swift` excluded by `review.sh`), so it could not
 review the substance of the new grid; its "clean checkout does not build" is a context artifact, the
 staging point is valid. Independent review above covers the substance.
