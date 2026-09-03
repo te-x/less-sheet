@@ -4407,8 +4407,12 @@ static GtkWidget *
 build_launch_page (App *app)
 {
   GtkWidget *status = adw_status_page_new ();
-  adw_status_page_set_icon_name (ADW_STATUS_PAGE (status),
-                                 "x-office-spreadsheet-symbolic");
+  /* The app LOGO, not a generic spreadsheet glyph: the same embedded icon the
+   * window and the About dialog carry (LSG_APP_ID names the GResource-backed
+   * hicolor entry ensure_window registers), so an app opened without a file
+   * shows its own identity — full colour at the status page's 128 px, the way
+   * GNOME's own welcome pages put the app icon first. */
+  adw_status_page_set_icon_name (ADW_STATUS_PAGE (status), LSG_APP_ID);
   adw_status_page_set_title (ADW_STATUS_PAGE (status), "less-sheet");
   adw_status_page_set_description (
       ADW_STATUS_PAGE (status),

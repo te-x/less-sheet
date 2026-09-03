@@ -10,7 +10,8 @@ import SwiftUI
 //
 // `LESSSHEET_DUMP_SCENE` selects which presentation state to capture:
 //   grid (default) · overlay · titlebar · overscroll · separator · quote ·
-//   jump · progress · settings   (error uses its own entry). "pills" stays as
+//   jump · progress · settings   (error uses its own entry; `launch` is the
+// no-document state and needs no file). "pills" stays as
 // an alias of "separator". Every scene renders EAGERLY (no ScrollView/LazyVStack, which
 // ImageRenderer cannot capture off-screen) and bounded to the loaded window, so
 // a dump stays O(viewport) on any file size.
@@ -208,6 +209,18 @@ enum FrameDump {
             log("lesssheet.frame_dump_failed=\(path)")
             return false
         }
+    }
+
+    /// The no-document LAUNCH state (`LESSSHEET_DUMP_SCENE=launch`): the logo
+    /// above the two entry points. Gated on the scene, unlike the document
+    /// dumps, because every document run ALSO rests on `.launch` until its
+    /// open lands — an ungated dump here would fire (and, under
+    /// LESSSHEET_DUMP_EXIT, quit) before the grid ever painted.
+    @MainActor
+    static func dumpLaunchIfRequested() {
+        guard let path = dumpPath, ProcessInfo.processInfo.environment[sceneKey] == "launch" else { return }
+        render(LaunchStateView(), size: gridSize, to: path)
+        terminateIfRequested()
     }
 
     @MainActor

@@ -139,6 +139,7 @@ struct ContentView: View {
         switch model.phase {
         case .launch:
             LaunchStateView()
+                .task { FrameDump.dumpLaunchIfRequested() }
 
         case .document:
             if model.columnCount == 0 {

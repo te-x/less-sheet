@@ -27,10 +27,31 @@ struct EmptyStateView: View {
 /// a local file (⌘O) and a network URL (⌘⇧O) — instead of the old behavior of
 /// immediately popping the file panel, which predated network support and
 /// wrongly assumed "open" meant a local file. Same quiet, centered aesthetic as
-/// the empty-file state.
+/// the empty-file state, headed by the app logo so an app opened without a file
+/// shows its own identity (the GTK launch page does the same).
 struct LaunchStateView: View {
+    /// Logo tile size — matches the 128 px GNOME status pages (and our GTK
+    /// launch page) draw the app icon at, so both frontends read alike.
+    private static let logoSize: CGFloat = 128
+
+    /// The logo is the bundle's icon (`AppIcon.icns`, generated from
+    /// branding/icon.svg by assemble-app.sh) — the one image AppKit already
+    /// loads for the Dock and About, so no resource of our own is shipped or
+    /// looked up. Outside an assembled bundle (a bare `swift run`) AppKit hands
+    /// back its generic application icon instead; it is never nil in practice,
+    /// and the fallback keeps even that case a blank tile rather than a crash.
+    private static var logo: NSImage {
+        NSApplication.shared.applicationIconImage ?? NSImage()
+    }
+
     var body: some View {
         VStack(spacing: 14) {
+            Image(nsImage: Self.logo)
+                .resizable()
+                .interpolation(.high)
+                .frame(width: Self.logoSize, height: Self.logoSize)
+                .accessibilityHidden(true) // decorative — the title below carries the meaning
+                .padding(.bottom, 8)
             Text("Open a spreadsheet to view it")
                 .font(.title3)
                 .foregroundStyle(.secondary)
