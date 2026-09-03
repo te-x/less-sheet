@@ -1,23 +1,17 @@
 /*
- * less-sheet GTK frontend — the slice-1 viewer ("open + display + scroll").
+ * less-sheet's GNOME frontend: the GTK glue and the drawing. Every decision
+ * that can be made without a display lives in the lsg_* modules beside this
+ * file — the windowed session over the Zig core, the O(viewport) grid
+ * geometry, the poll decision, the network-open drive, the cell formatter.
  *
- * This is the GTK glue + drawing; ALL logic lives in the display-free lsg_*
- * modules (the C analogs of the macOS frontend): lsg_document (windowed
- * session over the Zig core), lsg_grid_geometry (the O(viewport)
- * row/column/scrollbar math), lsg_window_poll (the ~100 ms
- * materialize/keep-polling decision), lsg_net_open (the network-open drive),
- * lsg_formatter (the lossless cell formatter). main.c owns only the
- * AdwApplicationWindow + AdwHeaderBar chrome, the launch / error
- * AdwStatusPages, the header-bar progress widget for long-op / network status,
- * and the custom grid: a
- * GtkDrawingArea painted with Cairo + Pango, driven by a hand-managed
- * GtkAdjustment + GtkScrollbar, materializing ONLY the visible window (+
- * scroll buffer) via lsg_document_set_window — never O(file).
+ * What is left here is the AdwApplicationWindow chrome, the launch and error
+ * status pages, the header-bar progress used by every long operation, and the
+ * grid itself: a GtkDrawingArea painted with Cairo and Pango over a
+ * hand-managed GtkAdjustment, materializing ONLY the visible window plus a
+ * scroll buffer. Nothing here is ever O(file) or O(column_count).
  *
- * The GNOME toolchain (GTK 4.20+/libadwaita 1.8+, decision 7 as raised by
- * ARCH-gtk-a11y decision 1 for AdwShortcutsDialog) is required;
- * this binary is compiled by the gate but run by the author on a real GNOME
- * desktop.
+ * Needs GTK 4.20 / libadwaita 1.8 (AdwShortcutsDialog). The gate compiles this
+ * binary but cannot run it; the rendered UI is a human pass on a real desktop.
  */
 #include <adwaita.h>
 #include <gdk/gdkkeysyms.h>
@@ -76,18 +70,17 @@
 #define WIDTH_MAX_CHARS 60.0
 /* Slack the width estimator adds on top of the widest sampled cell. */
 #define WIDTH_ESTIMATE_SLACK_CHARS 2.0
-/* Frontend byte budget for one clipboard copy (the macOS CopyBudget.standard
- * ~64 MiB analog); the core's LS_COPY_MAX_CELLS still bounds a pathological
- * rect. */
+/* Frontend byte budget for one clipboard copy; the core's LS_COPY_MAX_CELLS
+ * still bounds a pathological rect underneath it. */
 #define COPY_BUDGET_BYTES (64u * 1024u * 1024u)
 /* Per-pull chunk the copy worker frames. */
 #define COPY_CHUNK_BYTES (1u << 16)
 
 /* ------------------------------------------------------------------------- */
-/* Screenshot-capture affordance (LESSSHEET_GTK_CAPTURE) — the state type. The
- * whole contract, and every reason it looks the way it does, is documented at
- * the capture section near the bottom of this file. The types live up here
- * because the state is a field of App and three paths report into it.
+/* Screenshot capture (LESSSHEET_GTK_CAPTURE) — the state types. The contract
+ * is documented at the capture section near the bottom of this file; the types
+ * live here because the state is a field of App and three paths report into
+ * it.
  */
 /* ------------------------------------------------------------------------- */
 
@@ -120,12 +113,11 @@ typedef enum
  * has been handed to the compositor before the tool is told to shoot. */
 #define LSG_CAPTURE_SETTLE_FRAMES 2
 /* How long the last state-changing drive must have been quiet before a settled
- * state is announced. The find entry is a GtkSearchEntry, so setting its text
- * schedules a "search-changed" ~150 ms LATER that re-runs the query and flips
- * the count back to "Searching…"; announcing in front of that pending re-run
- * would hand the tool a window that is about to change. The ONE knob for "no
- * further self-inflicted change is pending", at ~2.6x the toolkit's delay.
- * This never REPLACES the settle predicate — both must hold. */
+ * state is announced. A GtkSearchEntry schedules its "search-changed" ~150 ms
+ * after the text is set, and that re-runs the query and flips the count back
+ * to "Searching…" — announcing in front of it would hand the tool a window
+ * that is about to change. The ONE knob for "no further self-inflicted change
+ * is pending"; it never REPLACES the settle predicate, both must hold. */
 #define LSG_CAPTURE_QUIET_MS 400
 /* Hard budget before the hook gives up and says so, so a capture tool waiting
  * on a marker fails loudly instead of hanging forever. */
@@ -196,10 +188,9 @@ typedef struct
   LsgColumnWindow cur_colwin;
   LsgRowSpan cur_span;
 
-  /* Header labels for the CURRENT column window only (lazy; O(visible
-   * columns), never O(column_count) — mirrors the macOS per-column-window
-   * header fetch). `hdr_labels[i]` is the label of absolute column `hdr_first
-   * + i`. */
+  /* Header labels for the CURRENT column window only: fetched lazily, so
+   * O(visible columns) and never O(column_count). `hdr_labels[i]` is the label
+   * of absolute column `hdr_first + i`. */
   char **hdr_labels;
   guint hdr_first;
   guint hdr_count;
@@ -213,8 +204,8 @@ typedef struct
   guint net_poll_id;
   char *pending_url;
 
-  /* Find (slice 2): the pure view-model session + the popover widgets + the
-   * current window's highlight mask (owned; refreshed each materialize). */
+  /* Find: the pure view-model session, the popover widgets, and the current
+   * window's highlight mask (owned; refreshed each materialize). */
   LsgFindSession find;
   LsgSearchDir
       find_nav_direction;    /* direction of the outstanding navigation */
@@ -229,10 +220,10 @@ typedef struct
   guint find_notice_id;   /* timeout clearing the sticky notice */
 
   /* Find "Where" predicate builder: a `Text | Where` mode of the SAME find
-   * popover (macOS parity) over the already-frozen predicate engine. The mode
-   * lives in `find_stack`; the Where body holds the column picker, the
-   * operator glyph dropdown, and the value field. All compose into
-   * `find.draft` and go through the frozen `lsg_find_submit`. */
+   * popover, over the same predicate engine. The mode lives in `find_stack`;
+   * the Where body holds the column picker, the operator glyph dropdown, and
+   * the value field. All of it composes into `find.draft` and goes through
+   * `lsg_find_submit`. */
   GtkStack *find_stack;      /* "text" | "where" bodies */
   GtkDropDown *where_column; /* column picker (model built lazily per doc) */
   GtkDropDown *where_op;     /* operator glyph picker (= != < > <= >=) */
@@ -248,7 +239,7 @@ typedef struct
    * submit inherits it; toggling it live re-issues the active query. */
   GtkCheckButton *match_case;
 
-  /* Jump-to-row (slice 3): the pure flow + the popover widgets. */
+  /* Jump-to-row: the pure flow + the popover widgets. */
   LsgJumpFlow jump;
   GtkMenuButton *jump_button;
   GtkPopover *jump_popover;
@@ -266,9 +257,8 @@ typedef struct
    * every popover open/close — a hot ramp must never greet a single tap. */
   LsgJumpStepRamp jump_ramp;
 
-  /* Filter-to-matches (slice 4): the pure state + the toggle. The passive
-   * "Filtered — N of M rows" status is shown in the header-bar subtitle
-   * (update_title_subtitle), not a full-width banner. */
+  /* Filter-to-matches: the pure state + the toggle. Its passive
+   * "Filtered — N of M rows" status lives in the header-bar subtitle. */
   LsgFilterState filter;
   GtkToggleButton *filter_toggle;
   gboolean filter_ui_guard; /* re-entrancy guard for programmatic toggle */
@@ -281,11 +271,10 @@ typedef struct
   gboolean is_network;
   gboolean net_drive_active;
 
-  /* Streaming copy (slice 5). Selection is two corners in VIEW row coords
-   * (filtered-aware, like the window) + physical column indices; the mode
-   * chooses cells / whole-rows / whole-columns. The copy runs on an OFF-MAIN
-   * worker so the grid keeps scrolling; the header progress widget shows
-   * determinate progress + a cancel while it streams. */
+  /* Streaming copy. The selection is two corners in VIEW row coordinates
+   * (filtered-aware, like the window) plus physical column indices; the mode
+   * chooses cells / whole rows / whole columns. The copy runs on an OFF-MAIN
+   * worker so the grid keeps scrolling. */
   int sel_mode; /* SEL_* */
   guint64 sel_a_row, sel_b_row;
   guint sel_a_col, sel_b_col;
@@ -297,13 +286,12 @@ typedef struct
       *copy_op;       /* shared worker state (defined in the copy section) */
   guint copy_poll_id; /* main-thread progress/completion poll */
 
-  /* Reusable header-bar progress widget (the author's unified title-bar
-   * progress: determinate bar + inline cancel; other long ops can drive it
-   * later). */
+  /* The one header-bar progress widget: a determinate bar plus an inline
+   * cancel, shared by every long operation. */
   GtkWidget *hp_box;
   GtkProgressBar *hp_bar;
 
-  /* Settings + dialect override (this slice). */
+  /* Settings + dialect override. */
   char *doc_path; /* current LOCAL path (OWNED); NULL for a network doc */
   LsgLocaleGlyphs glyphs; /* process-locale glyphs for the cell formatter */
   LsgColumnUserSettings *col_settings; /* n_cols; per-column user settings */
@@ -311,13 +299,13 @@ typedef struct
   ls_column_datetime_semantics
       *col_sem; /* n_cols; cached datetime semantics */
 
-  AdwToastOverlay *toasts; /* header-change + column-reset toasts (F3 / F7) */
+  AdwToastOverlay *toasts;
 
   /* Dialect quick-controls (header bar) — reflect + drive the ONE dialect
    * state (the effective report), the same state the Preferences "Parsing"
    * page drives, through the one lsg_dialect_compose funnel. */
   GtkToggleButton *header_toggle;
-  GtkWidget *header_glyph; /* GtkDrawingArea: the macOS-style "H" glyph */
+  GtkWidget *header_glyph; /* GtkDrawingArea: the drawn "H" glyph */
   GtkMenuButton *sep_button;
   GtkMenuButton *quote_button;
   GtkLabel *sep_glyph_label; /* the CHARACTER line of the stacked Sep button */
@@ -368,14 +356,14 @@ typedef struct
   gboolean first_frame_pending; /* one-shot: awaiting the first painted grid
                                    frame */
 
-  /* Env-gated screenshot-capture affordance (LESSSHEET_GTK_CAPTURE). Entirely
-   * inert — no output, no allocation, no frame-clock work — unless
-   * `capture.env` is non-NULL, which only the env var can make it. */
+  /* Screenshot capture. Entirely inert — no output, no allocation, no
+   * frame-clock work — unless `capture.env` is non-NULL, which only the env
+   * var can make it. */
   LsgCaptureState capture;
 } App;
 
-/* Selection modes (slice 5): a cell rectangle, whole rows (gutter drag), or
- * whole columns (header drag). */
+/* A cell rectangle, whole rows (gutter drag), or whole columns (header
+ * drag). */
 enum
 {
   SEL_NONE = 0,
@@ -475,9 +463,8 @@ static gboolean filter_poll_fold (App *app);
 static void net_drive_begin (App *app, guint64 target_row);
 static gboolean net_drive_poll (App *app);
 
-/* Streaming copy (slice 5): start a copy of the current selection; stop+join
- * the worker before any document teardown (leaf-before-root). Defined in the
- * copy section; called from the key handlers and app_reset_document. */
+/* Start a copy of the current selection; stop and join the worker before any
+ * document teardown (leaf before root). Defined in the copy section. */
 static void do_copy (App *app);
 static void copy_stop_and_join (App *app);
 static void copy_update_affordance (App *app);
@@ -526,28 +513,26 @@ static LsgColumnLabel *capture_all_labels (App *app, guint *out_n);
 static void entry_reject_feedback (GtkWidget *entry, guint *id_slot);
 static void entry_clear_feedback (GtkWidget *entry, guint *id_slot);
 
-/* Open the jump popover pre-filled with a digit typed on the grid (macOS
- * parity). Defined with the jump helpers; the grid key handler calls it. */
+/* Open the jump popover pre-filled with a digit typed on the grid. Defined
+ * with the jump helpers; the grid key handler calls it. */
 static void open_jump_with_digit (App *app, char digit);
 
 /* Open the jump popover. Defined with the jump helpers; the app.jump action
  * (Ctrl+G / Ctrl+L) calls it. */
 static void open_jump (App *app);
 
-/* Settings + dialect override (this slice). Defined with the settings region
- * below `ensure_window`; called from `open_document` (which is the single
- * post-adoption choke point for BOTH the local and network re-open). */
+/* Defined with the settings region below `ensure_window`; called from
+ * `open_document`, the single post-adoption choke point for BOTH the local and
+ * the network re-open. */
 static void dialect_sync_quick_controls (App *app); /* sync header/sep/quote */
 static void
 settings_reopen_apply (App *app); /* F5 re-anchor + F7 replay/reset */
 static void column_cache_effective (App *app, guint32 col); /* fmt kind/sem */
 static void reopen_state_clear (App *app); /* drop a pending dialect re-open */
 
-/* Screenshot-capture affordance (LESSSHEET_GTK_CAPTURE): the three report
- * hooks into the one-shot settle machine defined near the bottom of this file.
- * Each is a single test away from a no-op when the hook is not armed — which
- * is every normal run, including the LESSSHEET_GTK_TIMING cold-start
- * measurement.
+/* The three report hooks into the capture settle machine near the bottom of
+ * this file. Each is a single test away from a no-op when the hook is not
+ * armed, which is every normal run.
  */
 static void capture_note_paint (App *app, guint32 rows, guint32 cols);
 static void capture_note_find_run (App *app);
@@ -725,10 +710,9 @@ grid_window_headers (App *app, guint first, guint count)
   free_window_headers (app);
   if (count == 0)
     return;
-  /* With a header, the column labels are its cells; with NO header they are
-   * the generic spreadsheet letters A, B, C, … (macOS parity —
-   * GenericColumnName), so the sticky header row is never blank. Still
-   * O(visible columns). */
+  /* With a header the column labels are its cells; without one they are the
+   * generic spreadsheet letters A, B, C, …, so the sticky header row is never
+   * blank. Either way O(visible columns). */
   app->hdr_labels = g_new0 (char *, count);
   for (guint i = 0; i < count; i++)
     app->hdr_labels[i]
@@ -763,9 +747,9 @@ grid_autofit_widths (App *app, LsgColumnWindow colwin, LsgWindow *win)
   for (guint32 ci = 0; ci < gc; ci++)
     {
       guint32 abscol = colwin.first + ci;
-      /* A user-set manual width is authoritative — never let the monotone
-       * auto-fit grow re-widen it (Finding 3). A HIDDEN column is pinned to
-       * width 0 (its hide mechanism), so never grow it either. */
+      /* A user-set manual width is authoritative — the monotone auto-fit must
+       * never re-widen it. A HIDDEN column is pinned to width 0, which IS how
+       * it is hidden, so never grow that either. */
       if (app->col_settings != NULL && abscol < app->n_cols
           && (app->col_settings[abscol].has_manual_width
               || app->col_settings[abscol].hidden))
@@ -880,10 +864,10 @@ grid_materialize (App *app)
    */
   app->window_short = (lsg_window_row_count (nw) < span.row_count);
 
-  /* Refresh the grid's accessible description (position/extent/filter state)
-   * off the freshly-materialized window. O(1) string build on a discrete state
-   * change (scroll/resize/open/filter), never per frame / per scanned byte;
-   * set as a property, never announced (FR3). */
+  /* The grid's accessible description (position / extent / filter state), off
+   * the freshly-materialized window: an O(1) string build on a discrete state
+   * change, never per frame or per scanned byte. Set as a property; announcing
+   * it here would talk over every scroll. */
   grid_update_a11y_description (app);
 }
 
@@ -899,11 +883,10 @@ grid_repaint (App *app)
   gtk_widget_queue_draw (GTK_WIDGET (app->area));
 }
 
-/* The header-bar subtitle is the ONE passive-status line (single source of
- * truth): the "Filtered — N of M rows" status when a filter owns the view,
- * otherwise the document's row count. Everything is re-derived from `app`
- * state, so every caller (open, poll tick, filter apply/clear/poll) funnels
- * through here. Replaces the old full-width filter AdwBanner. */
+/* The header-bar subtitle is the ONE passive-status line: the "Filtered — N of
+ * M rows" status when a filter owns the view, the document's row count
+ * otherwise. Everything is re-derived from `app` state, so open, the poll tick
+ * and every filter transition funnel through here. */
 static void
 update_title_subtitle (App *app)
 {
@@ -990,8 +973,7 @@ grid_poll_tick (gpointer data)
       keep = TRUE;
     }
 
-  /* Keep ticking while a jump scans (ORed at the widget with the frozen
-   * window-poll decision — lsg_window_poll.h is untouched). */
+  /* Keep ticking while a jump scans. */
   if (app->jump.kind == LSG_JUMP_FLOW_SCANNING)
     {
       jump_poll_fold (app);
@@ -1056,9 +1038,7 @@ grid_draw (GtkDrawingArea *area, cairo_t *cr, int width, int height,
   if (app->doc == NULL || app->win == NULL)
     return;
 
-  /* Milestone 2: window-fill = file-open begin -> first painted grid frame.
-   * Cheap one-shot flag check; the delta is recorded here on the first real
-   * paint after a document loads. */
+  /* Window-fill: file-open begin -> the first painted grid frame. */
   if (app->timing && app->first_frame_pending)
     {
       app->first_frame_pending = FALSE;
@@ -1068,15 +1048,12 @@ grid_draw (GtkDrawingArea *area, cairo_t *cr, int width, int height,
           "[timing] window-fill (open begin -> first frame): %.1f ms\n",
           (double)dt / 1000.0);
       /* The TOTAL a user actually waits: process entry -> the first painted
-       * grid frame. The two lines above and below it are SEGMENTS (main ->
-       * window mapped, open begin -> first frame) which overlap and cannot be
-       * added, so neither one answers "how long until I see rows".
+       * grid frame. The other two lines are SEGMENTS that overlap and cannot
+       * be added, so neither one answers "how long until I see rows".
        *
-       * Deliberately the same quantity as the macOS `first_row_pixels` stamp —
-       * process start to a real data row on screen — because these two numbers
-       * are published side by side and a reader will compare them. Two
-       * platforms measuring subtly different things would be worse than not
-       * publishing the second one. */
+       * Deliberately the same quantity the macOS frontend stamps, because the
+       * two numbers get published side by side and a reader will compare
+       * them. */
       g_printerr (
           "[timing] first-rows-visible (main -> first frame): %.1f ms\n",
           (double)(now - app->t_start) / 1000.0);
@@ -1167,9 +1144,9 @@ grid_draw (GtkDrawingArea *area, cairo_t *cr, int width, int height,
               cur_w = colw;
             }
 
-          /* Selection marquee: a MUTED-GRAY fill (the macOS NSColor.systemGray
-           * equivalent, theme-derived from fg so it reads in light + dark),
-           * drawn BEHIND the accent find highlight (which stays accent). */
+          /* The selection marquee is a MUTED fill derived from the theme
+           * foreground, so it reads in light and dark and stays visually
+           * behind the accent find highlight. */
           if (selection_contains (app, view_row, col))
             {
               GdkRGBA sel = fg;
@@ -1199,10 +1176,10 @@ grid_draw (GtkDrawingArea *area, cairo_t *cr, int width, int height,
             }
 
           const char *raw = lsg_window_cell (app->win, ri, ci);
-          /* Display formatting (F14): AUTO / no-option columns paint the raw
-           * spelling with NO allocation (the common case); a configured column
-           * runs the type+options dispatcher (find/filter/copy still use raw —
-           * the ABI rule). */
+          /* An AUTO column paints its raw spelling with NO allocation — the
+           * common case, and the one that keeps this loop cheap. Only a
+           * configured column runs the formatter. Find, filter and copy always
+           * use the raw bytes; formatting is display-only. */
           if (col < app->n_cols && app->col_settings != NULL
               && !lsg_column_format_options_is_auto (
                   app->col_settings[col].format))
@@ -1325,12 +1302,9 @@ grid_draw (GtkDrawingArea *area, cairo_t *cr, int width, int height,
 
   g_object_unref (layout);
 
-  /* Screenshot-capture affordance: report THIS completed frame — and, on the
-   * first DATA-bearing one, arm the hook (the same moment the window-fill
-   * marker above calls "first frame"). Deliberately at the BOTTOM of the draw,
-   * not beside that marker: a capture must never be gated on a frame whose
-   * cells are not drawn yet, which is exactly how the macOS filter shot came
-   * out with a perfect popover and no cell text. */
+  /* Report THIS completed frame to the capture hook, and on the first
+   * data-bearing one arm it. Deliberately at the BOTTOM of the draw: a capture
+   * must never be gated on a frame whose cells are not drawn yet. */
   capture_note_paint (app, got_rows, got_cols);
 }
 
@@ -1455,15 +1429,14 @@ open_document (App *app, LsgDocument *doc, const char *title,
   app->where_columns_dirty
       = TRUE; /* the Where column picker needs a rebuild */
   /* Header labels are NOT prefetched for every column (that would be
-   * O(column_count) window-lane calls + retained strings, breaking the
-   * wide-doc viewport-only NFR). They are fetched lazily for the visible
-   * column window in grid_materialize, exactly as the cells are. */
+   * O(column_count) window-lane calls plus retained strings on a wide
+   * document). They are fetched lazily for the visible column window in
+   * grid_materialize, exactly as the cells are. */
   guint32 nc_alloc = (app->n_cols > 0) ? app->n_cols : 1;
   app->col_widths = g_new0 (double, nc_alloc);
-  /* Per-column user settings + cached effective type for the cell formatter.
-   * All-zero == all-Auto (raw spellings, no inference) — the O(viewport) open
-   * does NO column work (N1). col_kind zero == LS_COLUMN_TYPE_UNKNOWN -> raw.
-   */
+  /* Per-column user settings + the cached effective type the formatter reads.
+   * All-zero means all-Auto — raw spellings, no inference — so an open does NO
+   * column work at all. */
   app->col_settings = g_new0 (LsgColumnUserSettings, nc_alloc);
   app->col_kind = g_new0 (ls_column_type_kind, nc_alloc);
   app->col_sem = g_new0 (ls_column_datetime_semantics, nc_alloc);
@@ -1487,15 +1460,15 @@ open_document (App *app, LsgDocument *doc, const char *title,
 
   gtk_stack_set_visible_child_name (app->stack, "grid");
   grid_repaint (app);
-  filter_sync_ui (app); /* the reset cleared any prior filter (F6) */
+  filter_sync_ui (app); /* the reset cleared any prior filter */
 
   /* Reflect the (possibly re-sniffed) dialect into the header-bar quick
-   * controls + any open Parsing page — the ONE state, three affordances. */
+   * controls and any open Parsing page: one state, three affordances. */
   dialect_sync_quick_controls (app);
 
-  /* A dialect re-open applies its viewport re-anchor (F5) + column-settings
-   * replay-or-reset (F7) + toasts here — the shared post-adoption step for
-   * both the local re-open and the async network re-open (F8). */
+  /* A dialect re-open re-anchors the viewport and replays-or-resets the column
+   * settings here: the ONE post-adoption step, shared by the synchronous local
+   * re-open and the asynchronous network one. */
   if (app->reopen_pending)
     settings_reopen_apply (app);
 
@@ -1507,9 +1480,8 @@ open_document (App *app, LsgDocument *doc, const char *title,
 /* Open local file */
 /* ------------------------------------------------------------------------- */
 
-/* Open one local GFile into the grid (or an error page). Does NOT take
- * ownership of `file`. Shared by the file dialog, drag-open (future), and the
- * command-line "open" path. */
+/* Open one local GFile into the grid, or an error page. Does NOT take
+ * ownership of `file`. Shared by the file dialog and the command-line open. */
 static void
 open_file (App *app, GFile *file)
 {
@@ -1547,9 +1519,7 @@ open_file (App *app, GFile *file)
           app->t_open_begin = begin;
           app->first_frame_pending = TRUE;
         }
-      /* Remember the LOCAL path so a dialect change can re-open it (F1). A
-       * fresh user open (not a dialect re-open) clears any pending re-open
-       * state. */
+      /* Remember the LOCAL path: a dialect change re-opens the same file. */
       g_clear_pointer (&app->doc_path, g_free);
       app->doc_path = g_strdup (path);
       open_document (app, doc, base, FALSE); /* local file */
@@ -1616,11 +1586,9 @@ net_open_abort (App *app)
   header_progress_hide (app);
 }
 
-/* Drive the reusable header-bar progress from a network-open poll (the unified
- * long-op status location — same widget copy uses). Pulse while connecting /
- * before a byte-fraction is known; determinate "Fetching N%" once head bytes
- * arrive. This SUBSUMES the old AdwBanner "Fetching …" (one indicator, not
- * two). */
+/* Drive the shared header-bar progress from a network-open poll: pulse while
+ * connecting or before a byte fraction is known, determinate "Fetching N%"
+ * once head bytes arrive. */
 static void
 update_net_progress (App *app, const LsgNetProgress *p)
 {
@@ -1748,13 +1716,11 @@ on_url_response (AdwAlertDialog *dialog, const char *response, gpointer data)
   app->pending_url = g_strdup (url);
   g_clear_pointer (&app->doc_path, g_free); /* network doc: no local path */
 
-  /* A URL open replaces the current doc, so stop any copy of the OLD doc NOW —
-   * before the net open goes in flight and takes over the shared header
-   * progress. Without this, the old doc + its copy stay alive until the open
-   * reaches DONE (open_document→app_reset_document→copy_stop_and_join), so the
-   * two ops would overlap and fight over the one progress widget / ✕. Stopping
-   * here (plus the app->net gate in do_copy) makes "no copy while a net open
-   * is in flight" a hard invariant — same pattern as do_apply_filter. */
+  /* A URL open replaces the current document, so stop any copy of the OLD one
+   * NOW, before the open goes in flight. Otherwise the copy stays alive until
+   * the open reaches DONE and the two fight over the one progress widget and
+   * its cancel. With the app->net gate in do_copy, "no copy while a net open
+   * is in flight" is a hard invariant in both directions. */
   copy_stop_and_join (app);
 
   net_open_abort (app); /* a previous URL open never survives a new one */
@@ -1841,11 +1807,9 @@ on_scroll (GtkEventControllerScroll *ctrl, double dx, double dy, gpointer data)
 }
 
 /* ------------------------------------------------------------------------- */
-/* Accessibility (gtk-a11y): keyboard cell cursor + live announcements over */
-/* the pure lsg_a11y module. The reducer / string builders / accel table are */
-/* in lsg_a11y.c (gate-tested); this is the display/AT glue (human GNOME/Orca
- */
-/* pass). */
+/* Accessibility: the keyboard cell cursor and the live announcements, over */
+/* the pure lsg_a11y module. The reducer, the string builders and the accel */
+/* table live there; this is only the display and AT glue. */
 /* ------------------------------------------------------------------------- */
 
 /* The current displayed view's row count — the ONE resolver every a11y
@@ -1902,8 +1866,7 @@ a11y_announce_subtitle (App *app)
                  GTK_ACCESSIBLE_ANNOUNCEMENT_PRIORITY_MEDIUM);
 }
 
-/* Set a bare control's accessible name (FR4) from the single lsg_a11y source —
- * no drift from the tooltip text. */
+/* Name an icon-only control for AT, from the single lsg_a11y table. */
 static void
 a11y_name (GtkWidget *w, LsgA11yControl control)
 {
@@ -2015,9 +1978,8 @@ grid_update_a11y_description (App *app)
 }
 
 /* Scroll the MINIMUM needed to bring cell (row, col) fully into view — no move
- * if it is already visible (FR1 auto-scroll). Setting the adjustments fires
- * the existing materialize + repaint (+ net-park drive) via
- * on_adjustment_changed.
+ * if it is already visible. Setting the adjustments fires the materialize,
+ * the repaint and the net-park drive through on_adjustment_changed.
  */
 static void
 a11y_reveal_cell (App *app, guint64 row, guint col)
@@ -2065,8 +2027,7 @@ a11y_reveal_cell (App *app, guint64 row, guint col)
 }
 
 /* Route one keyboard command through the pure cursor reducer, apply the result
- * to the ONE shared selection rectangle, auto-scroll, repaint, and announce
- * per the FR3 verbosity table. */
+ * to the ONE shared selection rectangle, auto-scroll, repaint, announce. */
 static void
 grid_cursor_apply (App *app, LsgA11yCursorCommand command, gboolean extend)
 {
@@ -2108,8 +2069,9 @@ grid_cursor_apply (App *app, LsgA11yCursorCommand command, gboolean extend)
   grid_repaint (app);
   copy_update_affordance (app);
 
-  /* Announcements (FR3): plain move / seed -> the landing cell (LOW); extend /
-   * select-all -> the rect dimensions (MEDIUM); clear -> nothing. */
+  /* A plain move or seed announces the landing cell (LOW); an extend or
+   * select-all announces the rectangle's size (MEDIUM); a clear says
+   * nothing. */
   if (command == LSG_A11Y_CURSOR_CLEAR)
     return;
 
@@ -2153,10 +2115,9 @@ on_key_pressed (GtkEventControllerKey *ctrl, guint keyval, guint keycode,
   gboolean ctrl_held = (state & GDK_CONTROL_MASK) != 0;
   gboolean shift_held = (state & GDK_SHIFT_MASK) != 0;
 
-  /* Ctrl+C copies the current selection; Ctrl+A selects the whole view extent.
-   * BOTH stay on the grid key controller (grid-focus-scoped, G-A7) so a
-   * focused text entry keeps its own Ctrl+C / Ctrl+A — never registered as
-   * global app accelerators. */
+  /* Ctrl+C and Ctrl+A stay on the GRID's key controller, never registered as
+   * global accelerators, so a focused text entry keeps its own copy and
+   * select-all. */
   if (ctrl_held && (keyval == GDK_KEY_c || keyval == GDK_KEY_C))
     {
       do_copy (app);
@@ -2294,7 +2255,7 @@ on_area_resize (GtkDrawingArea *area, int width, int height, gpointer data)
 }
 
 /* ------------------------------------------------------------------------- */
-/* Find (slice 2): the popover UI + highlight glue over lsg_find */
+/* Find: the popover UI + highlight glue over lsg_find */
 /* ------------------------------------------------------------------------- */
 
 static void
@@ -2423,17 +2384,15 @@ find_read_draft (App *app)
   app->find.draft.value = (app->where_value != NULL)
                               ? gtk_editable_get_text (app->where_value)
                               : "";
-  /* One session flag shared by both modes; the checkbox is the ONLY thing that
-   * decides folding (smart case is retired). */
+  /* One session flag shared by both modes. The checkbox is the ONLY thing that
+   * decides case folding — never the shape of the query. */
   app->find.draft.case_sensitive
       = (app->match_case != NULL)
         && gtk_check_button_get_active (app->match_case);
 }
 
-/* Reject feedback for a rejected predicate submit: keep the popover open,
- * focus
- * + select-all the value field, blink it (red + shake, reduce-motion aware),
- * and make NO core call. Shared by find_run_query + do_apply_filter. */
+/* A rejected predicate keeps the popover open, focuses and selects the value
+ * field, blinks it, and makes NO core call at all. */
 static void
 where_reject_value (App *app)
 {
@@ -2455,11 +2414,10 @@ find_run_query (App *app)
 {
   if (app->doc == NULL)
     return;
-  /* A find's ls_search_start / ls_search_nav ALSO take the shared core scan
-   * slot and would cancel a running copy's frontier-advance jump -> the copy
-   * times out at FRONTIER = a TRUNCATED copy (the same slot-contention class
-   * as jump). Yield the slot to a live copy (bounded + ✕-cancellable). See
-   * also do_find_step. */
+  /* THE SHARED SCAN SLOT. The core has exactly one, and a find's
+   * ls_search_start / ls_search_nav takes it — cancelling a running copy's
+   * frontier-advance jump, which times out at FRONTIER and truncates the copy.
+   * Yield to a live copy; it is bounded and the user can cancel it. */
   if (app->copy_op != NULL)
     return;
 
@@ -2484,12 +2442,11 @@ find_run_query (App *app)
   if (sub.outcome == LSG_FIND_RUN
       && lsg_document_search_start (app->doc, sub.request))
     {
-      /* ls_search_start just TOOK the shared scan slot, cancelling any jump in
-       * LS_JUMP_SCANNING to LS_JUMP_IDLE (ABI). A jump preserved past its
-       * popover (the incidental-autohide case) would now be phantom-SCANNING
-       * forever — an IDLE poll never resets a live flow, so grid_poll_tick
-       * would never stop and net_drive would keep yielding (0-row fetches).
-       * Retire it here, mirroring do_apply_filter. */
+      /* ls_search_start just TOOK the shared scan slot, which the ABI says
+       * cancels any scanning jump to IDLE. A jump preserved past its popover
+       * would now be phantom-SCANNING forever, because an IDLE poll never
+       * resets a live flow — the tick would never stop and the net drive would
+       * keep yielding to it. Retire it here. */
       app->jump = lsg_jump_initial ();
       app->find = lsg_find_began (app->find);
       app->find_nav_direction = LSG_SEARCH_FORWARD;
@@ -2510,7 +2467,7 @@ find_run_query (App *app)
   capture_note_find_run (app);
 }
 
-/* Forward-declared above; folds one search poll into the display. */
+/* Fold one search poll into the display. */
 static gboolean
 find_poll_fold (App *app)
 {
@@ -2523,11 +2480,10 @@ find_poll_fold (App *app)
   app->find
       = lsg_find_resolved (app->find, has, snap, app->find_nav_direction);
 
-  /* A wrap notice asks for a follow-up navigation (issued once); it
-   * self-clears when the wrap lands as a FOUND poll. Suppress it while a copy
-   * runs — an ls_search_nav here would also take the shared scan slot from the
-   * copy's jump (deferred, not lost: it re-issues on the next tick once the
-   * copy is done). */
+  /* A wrap notice asks for a follow-up navigation, issued once; it self-clears
+   * when the wrap lands as a FOUND poll. Suppressed while a copy runs — the
+   * nav would take the shared scan slot — but only DEFERRED, not lost: it
+   * re-issues on the next tick once the copy is done. */
   LsgSearchNav wnav;
   if (app->copy_op == NULL && lsg_find_wrap_nav (app->find, &wnav))
     {
@@ -2575,13 +2531,10 @@ do_find_step (App *app, LsgSearchDir direction)
   LsgSearchNav nav;
   if (lsg_find_step (app->find, direction, app->cur_top_row, &nav))
     {
-      /* A scanning nav can take the shared slot too (ABI: "a nav that must
-       * scan
-       * ... cancelling a jump in LS_JUMP_SCANNING"). Retire any preserved jump
-       * so it can't be left phantom-SCANNING. Reachable only after
-       * find_run_query (find must be active), which already retired it, so
-       * this is normally a no-op — kept for symmetry with the slot-taking
-       * find_run_query branch. */
+      /* A nav that must scan takes the shared slot too, so retire any
+       * preserved jump for the same reason. Reachable only after
+       * find_run_query, which already did it, so normally a no-op — kept so
+       * the rule holds at every slot-taking site. */
       app->jump = lsg_jump_initial ();
       app->find_nav_direction = direction;
       app->find_wrap_issued = FALSE;
@@ -2694,14 +2647,6 @@ open_find (App *app)
   gtk_menu_button_popup (app->find_button);
 }
 
-/* The app-level keyboard shortcuts (Ctrl+F Find, Ctrl+G/L Jump, Ctrl+O Open,
- * Ctrl+Shift+O Open URL, Ctrl+comma Preferences, Ctrl+?/F1 Shortcuts) are no
- * longer handled by an ad-hoc window key controller: they are promoted to
- * GActions with gtk_application_set_accels_for_action, sourced from the single
- * lsg_a11y accelerator table (see register_app_shortcuts). Grid-contextual
- * keys (arrows / digits / Ctrl+C / Ctrl+A / Esc) stay on the grid key
- * controller so they never fire while a text entry is focused (FR5 / G-A7). */
-
 /* The WHERE operator dropdown: glyphs shown, names in per-item tooltips +
  * accessible labels. Index i maps 1:1 to LsgSearchOp i (EQ..GE). */
 static const char *const WHERE_OP_GLYPHS[] = { "=", "≠", "<", ">", "≤", "≥" };
@@ -2735,9 +2680,9 @@ where_op_bind (GtkSignalListItemFactory *f, GtkListItem *item, gpointer d)
                                   WHERE_OP_NAMES[pos], -1);
 }
 
-/* A mode / column / operator change re-runs the query, mirroring macOS
- * `.onChange` (the value field is submit-validated instead — on Enter — so a
- * half-typed number does not blink on every keystroke). */
+/* A mode / column / operator change re-runs the query. The value field is
+ * validated at SUBMIT instead, so a half-typed number does not blink on every
+ * keystroke. */
 static void
 on_where_changed (GObject *obj, GParamSpec *pspec, gpointer data)
 {
@@ -2750,7 +2695,7 @@ on_where_changed (GObject *obj, GParamSpec *pspec, gpointer data)
 }
 
 /* The Text|Where stack switched: build the Where column model on first entry,
- * focus the mode's field, and re-run (a mode change re-runs, macOS parity). */
+ * focus the mode's field, and re-run. */
 static void
 on_find_mode_changed (GObject *stack, GParamSpec *pspec, gpointer data)
 {
@@ -2796,8 +2741,9 @@ on_where_value_key (GtkEventControllerKey *ctrl, guint keyval, guint keycode,
     }
 }
 
-/* Forward-declared above: (re)build the column picker's model from every
- * column's label. Lazy (first Where entry / popover show), never at open. */
+/* (Re)build the column picker's model from every column's label. Lazy — first
+ * Where entry or popover show — because it is O(column_count) and open is
+ * not. */
 static void
 where_ensure_columns (App *app)
 {
@@ -2922,8 +2868,7 @@ build_find_popover (App *app)
   GtkWidget *pop = gtk_popover_new ();
   GtkWidget *box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 6);
 
-  /* A `Text | Where` segmented switch at the TOP (a GtkStackSwitcher over the
-   * two-page body stack) — macOS parity. */
+  /* A `Text | Where` segmented switch over the two-page body stack. */
   GtkWidget *stack = gtk_stack_new ();
   gtk_stack_set_transition_type (GTK_STACK (stack),
                                  GTK_STACK_TRANSITION_TYPE_NONE);
@@ -3014,12 +2959,11 @@ build_find_popover (App *app)
   g_signal_connect (pop, "closed", G_CALLBACK (on_find_popover_closed), app);
   g_signal_connect (pop, "show", G_CALLBACK (on_find_popover_show), app);
 
-  /* CAPTURE phase so Enter/Shift+Enter/Esc reach us BEFORE the entry's
-   * internal GtkText consumes Return (its "activate") — that's why Enter did
-   * nothing. In capture we see Return first and return STOP, so Enter advances
-   * to the next match (Shift+Enter → previous), the popover stays open for
-   * repeated Enter, and Esc still closes. Other keys PROPAGATE so
-   * typing/search-changed work. */
+  /* CAPTURE phase, so Enter / Shift+Enter / Esc reach us BEFORE the entry's
+   * internal GtkText consumes Return as its "activate" — in bubble phase they
+   * never arrive at all. Enter therefore advances to the next match and the
+   * popover stays open for the next one; other keys PROPAGATE so typing and
+   * search-changed still work. */
   GtkEventController *keys = gtk_event_controller_key_new ();
   gtk_event_controller_set_propagation_phase (keys, GTK_PHASE_CAPTURE);
   g_signal_connect (keys, "key-pressed", G_CALLBACK (on_find_entry_key), app);
@@ -3027,7 +2971,7 @@ build_find_popover (App *app)
 }
 
 /* ------------------------------------------------------------------------- */
-/* Jump-to-row (slice 3): the popover UI over lsg_jump */
+/* Jump-to-row: the popover UI over lsg_jump */
 /* ------------------------------------------------------------------------- */
 
 /* Show progress + cancel only while scanning; keep the fraction current. */
@@ -3078,9 +3022,7 @@ reject_clear_timeout (gpointer data)
   return G_SOURCE_REMOVE;
 }
 
-/* Whether the desktop wants animations — the reduce-motion switch
- * (gtk-enable-animations). A FALSE means honor reduce-motion: skip the shake.
- */
+/* The desktop's reduce-motion switch: FALSE means skip the shake. */
 static gboolean
 animations_enabled (GtkWidget *w)
 {
@@ -3144,7 +3086,7 @@ jump_clear_feedback (App *app)
   entry_clear_feedback (GTK_WIDGET (app->jump_entry), &app->jump_reject_id);
 }
 
-/* Forward-declared above; fold one core jump poll and act on the outcome. */
+/* Fold one core jump poll and act on the outcome. */
 static void
 jump_poll_fold (App *app)
 {
@@ -3152,16 +3094,16 @@ jump_poll_fold (App *app)
     return;
 
   LsgJumpStatus st = lsg_document_jump_poll (app->doc);
-  /* Composition: a filtered short-land LANDS (filtered index vs original
-   * target are not comparable), never rejects. */
+  /* A filtered short-land LANDS and never rejects: its filtered index and the
+   * original target are not comparable. */
   app->jump = lsg_jump_resolve (app->jump, st, app->filter.active);
 
   switch (app->jump.kind)
     {
     case LSG_JUMP_FLOW_LANDED:
       scroll_to_first_row (app, app->jump.landed_row);
-      /* Observed BEFORE the popdown: the popdown resets the flow to idle, so
-       * this is the only place a capture can learn the landing happened. */
+      /* Before the popdown, which resets the flow to idle: the only place a
+       * capture can learn that the landing happened. */
       capture_note_jump (app, TRUE, app->jump.landed_row);
       gtk_popover_popdown (app->jump_popover); /* closes -> resets to idle */
       break;
@@ -3180,33 +3122,29 @@ jump_poll_fold (App *app)
 }
 
 /*
- * NETWORK DEMAND-DRIVE (net-park rule). On an http_range document the core
- * advances the fetch/filter frontier ONLY when the frontend issues an
- * ls_jump_start / ls_search_nav; a bare ls_window_set fetches nothing. So any
- * viewport landing beyond the fetched frontier — filter-apply, filter scroll,
- * deep scroll — must first drive a jump to the target row. This is the
- * plumbing; it deliberately does NOT touch the user's jump-popover flow
- * (`app->jump`). It is a no-op on local documents (their frontier is already
- * ahead), and it is not gate-testable (no fake network at the C ABI) —
- * verified on a real desktop.
+ * NETWORK DEMAND-DRIVE. On an http_range document the core advances the fetch
+ * and filter frontier ONLY when the frontend issues an ls_jump_start or
+ * ls_search_nav — a bare ls_window_set fetches nothing at all. So every
+ * viewport landing beyond the fetched frontier (filter-apply, filter scroll,
+ * deep scroll) has to drive a jump to the target row first.
+ *
+ * This is plumbing: it deliberately never touches the user's own jump flow.
+ * Inert on local documents, whose frontier is already ahead.
  */
 static void
 net_drive_begin (App *app, guint64 target_row)
 {
   if (!app->is_network || app->doc == NULL)
     return;
-  /* The user's manual jump owns the single core scan slot; a net fetch-drive
-   * (from a scroll or filter-apply) must NOT retarget it to `target_row`
-   * mid-scan and mis-land the user's jump. Filter-apply resets the jump to
-   * IDLE before it drives, so this only suppresses a scroll-drive during a
-   * live user jump. */
+  /* A user's manual jump owns the single scan slot; a fetch-drive must not
+   * retarget it mid-scan and mis-land it. Filter-apply resets the jump to IDLE
+   * before driving, so this only suppresses a scroll-drive. */
   if (app->jump.kind == LSG_JUMP_FLOW_SCANNING)
     return;
-  /* A streaming copy also drives the shared frontier (to its own stalled_row);
-   * a scroll-drive that retargets the slot BELOW that row would leave the
-   * copy's frontier short -> a re-stall on the same row -> a TRUNCATED copy.
-   * Yield: the copy advances the frontier itself; scrolling far ahead just
-   * waits for it. */
+  /* A streaming copy drives the same frontier to its own stalled row; a
+   * scroll-drive that retargets the slot BELOW that row leaves the copy short,
+   * re-stalls it on the same row and truncates it. Yield — the copy advances
+   * the frontier itself. */
   if (app->copy_op != NULL)
     return;
   app->net_drive_active = TRUE;
@@ -3254,12 +3192,10 @@ do_jump_submit (App *app)
   if (app->doc == NULL)
     return;
 
-  /* A streaming copy owns the shared core scan slot (it advances the frontier
-   * to its own stalled_row from the worker). A user jump's ls_jump_start would
-   * retarget that slot and TRUNCATE the copy (and the copy's bg jump would
-   * mis-land this one). Deny while a copy runs — it is bounded + has a ✕
-   * cancel; signal the denial with the field's reject blink ("cancel the copy
-   * first"). */
+  /* A streaming copy owns the shared scan slot: it advances the frontier to
+   * its own stalled row from the worker thread. Starting a jump would retarget
+   * that slot and truncate the copy, and the copy's own jump would mis-land
+   * this one. Deny, and say so with the field's reject blink. */
   if (app->copy_op != NULL)
     {
       jump_reject_feedback (app);
@@ -3286,9 +3222,8 @@ do_jump_submit (App *app)
     }
   else
     {
-      /* The jump has TWO reject paths and a capture must see both: this
-       * UPFRONT one (unparseable, or past a known-exact last row — no scan, no
-       * move) and the post-scan one in jump_poll_fold. */
+      /* The UPFRONT reject: unparseable, or past a known-exact last row. No
+       * scan, no move. The other one is post-scan, in jump_poll_fold. */
       capture_note_jump (app, FALSE, 0);
       jump_reject_feedback (app); /* upfront reject: no scan, no move */
     }
@@ -3315,8 +3250,8 @@ on_jump_go_clicked (GtkButton *button, gpointer data)
   do_jump_submit ((App *)data);
 }
 
-/* Enter in the jump entry submits (a plain GtkEntry consumes Return as its
- * "activate" signal, so the key controller never sees it — wire activate). */
+/* Enter submits: a plain GtkEntry consumes Return as its own "activate", so a
+ * key controller would never see it. */
 static void
 on_jump_activate (GtkEntry *entry, gpointer data)
 {
@@ -3363,7 +3298,7 @@ jump_top_visible_row_1based (App *app)
  *
  * The ramp is keyed off the MONOTONIC CLOCK — elapsed hold time, never a
  * repeat count — so it accelerates at the same rows whatever this desktop's
- * key-repeat rate is set to, and identically to the macOS frontend.
+ * key-repeat rate is set to.
  */
 static void
 jump_step_entry (App *app, LsgJumpStepDir dir)
@@ -3390,9 +3325,9 @@ on_jump_entry_key (GtkEventControllerKey *ctrl, guint keyval, guint keycode,
   (void)ctrl;
   (void)keycode;
   App *app = data;
-  /* Enter is handled by the entry's "activate" signal (the internal GtkText
-   * consumes Return before this bubble-phase controller — that was the bug);
-   * here we only need Escape to close. */
+  /* Enter is handled by the entry's "activate" signal: the internal GtkText
+   * consumes Return before this bubble-phase controller ever sees it. Only
+   * Escape is needed here. */
   if (keyval == GDK_KEY_Escape)
     {
       /* Escape is an EXPLICIT close: flag it so the closed handler cancels the
@@ -3452,23 +3387,21 @@ on_jump_entry_key_released (GtkEventControllerKey *ctrl, guint keyval,
 }
 
 /*
- * Close handler. There are two very different reasons the popover closes and
- * they must NOT be conflated (this was the valid-deep-jump-vanishes gap):
+ * There are two very different reasons the popover closes and they must NOT be
+ * conflated:
  *
- *  - EXPLICIT close (Escape; app->jump_explicit_close == TRUE): the user is
- *    abandoning the jump -> cancel the in-flight scan + restore the viewport +
- *    reset to idle, as before. (The ✕ cancel button takes do_jump_cancel,
- * which cancels in place and leaves the popover open, so it never reaches
- * here.)
+ *  - EXPLICIT close (Escape): the user is abandoning the jump, so cancel the
+ *    in-flight scan, restore the viewport and reset to idle. The cancel button
+ *    takes do_jump_cancel instead, which cancels in place and leaves the
+ *    popover open, so it never reaches here.
  *
- *  - INCIDENTAL autohide (click-away / focus shift; flag FALSE): the popover
- *    vanished for an unrelated reason while a legitimately slow deep/network
- *    scan is still running (a deep net jump is real fetch time — tens of MB /
- *    seconds). Cancelling it here would silently throw away a valid jump. So
- *    KEEP the scan alive: do NOT cancel, restore, or reset the flow. The
- * global grid_poll_tick keeps folding jump_poll_fold (it is not tied to the
- *    popover), so when the scan reaches DONE the viewport scrolls to the
- * target and the flow resets to idle exactly as a normal land would.
+ *  - INCIDENTAL autohide (click-away, focus shift): the popover vanished for
+ *    an unrelated reason while a legitimately slow deep or network scan is
+ *    still running — a deep network jump is tens of MB of real fetch time.
+ *    Cancelling here would silently throw away a valid jump, so KEEP the scan
+ *    alive. The poll tick is not tied to the popover: when the scan reaches
+ *    DONE the viewport scrolls to the target and the flow resets to idle
+ *    exactly as a normal landing would.
  */
 static void
 on_jump_popover_closed (GtkPopover *popover, gpointer data)
@@ -3525,7 +3458,7 @@ open_jump (App *app)
   gtk_menu_button_popup (app->jump_button);
 }
 
-/* Digit typed on the grid opens the jump field pre-filled (macOS parity). */
+/* A digit typed on the grid opens the jump field pre-filled with it. */
 static void
 open_jump_with_digit (App *app, char digit)
 {
@@ -3588,15 +3521,16 @@ build_jump_popover (App *app)
   gtk_widget_add_controller (entry, keys);
 }
 
-/* Install the one-time CSS for the rejection shake animation. */
+/* The app's one CSS provider: the rejection shake, and the dialect dropdown's
+ * flat list. */
 static void
 install_jump_css (void)
 {
   GtkCssProvider *css = gtk_css_provider_new ();
-  /* Shake via `transform: translate` (NOT margins): a transform is a
-   * paint-time offset that does NOT change the widget's allocation, so the
-   * parent GtkPopover never re-measures / re-anchors mid-animation (which
-   * visually detached it). */
+  /* Shake with `transform: translate`, NEVER margins: a transform is a
+   * paint-time offset that does not change the widget's allocation, so the
+   * parent GtkPopover never re-measures and re-anchors mid-animation — which
+   * visually detaches it. */
   gtk_css_provider_load_from_string (
       css, "@keyframes lsg-shake {"
            "  0%   { transform: translateX(0px); }"
@@ -3622,15 +3556,14 @@ install_jump_css (void)
 }
 
 /*
- * The jump-to-row button glyph — a Cairo replication of the macOS
- * `JumpArrowGlyph` (OverlayView.swift): two small circles (a "here" and a
- * "there") joined by a right-bulging circular arc that arrows south-west into
- * the lower circle. The author finds this clearer than the stock
- * `go-jump-symbolic`. Design bbox x[19,56] y[7,93], mapped/centred into the
- * drawing area; the fixed-geometry angles and unit vectors are hardcoded so
- * the app needs no libm. Tinted with the widget's current foreground color
- * (gtk_widget_get_color), so it reads correctly in both light and dark, like
- * the accent handling elsewhere.
+ * The jump-to-row glyph: two small circles — a "here" and a "there" — joined
+ * by a right-bulging arc that arrows south-west into the lower one. Clearer
+ * than the stock `go-jump-symbolic`, and identical to the macOS frontend's.
+ *
+ * Design bbox x[19,56] y[7,93], mapped and centred into the drawing area. The
+ * fixed-geometry angles and unit vectors are precomputed literals so the app
+ * needs no libm. Tinted from the widget's own foreground colour, so it reads
+ * in both light and dark.
  */
 static void
 jump_glyph_draw (GtkDrawingArea *area, cairo_t *cr, int width, int height,
@@ -3693,12 +3626,11 @@ jump_glyph_draw (GtkDrawingArea *area, cairo_t *cr, int width, int height,
 }
 
 /*
- * The header on/off glyph — a macOS-parity "H" (see the macOS `HeaderGlyph`).
- * When the first row IS a header the "H" is drawn solid; when it is DATA the
- * "H" fades to ~0.3 and a FULL-strength diagonal slash crosses it, so the
- * slash (not the H) carries the "not a header" meaning. Theme-tinted via
- * `gtk_widget_get_color`, so it reads in light and dark. Reads the live state
- * from `app->header_toggle`; the caller queue_draws it whenever that flips.
+ * The header on/off glyph, an "H". When the first row IS a header the H is
+ * solid; when it is DATA the H fades to ~0.3 and a FULL-strength diagonal
+ * slash crosses it, so the SLASH, not the H, carries the "not a header"
+ * meaning. Reads the live state off `app->header_toggle`; the caller
+ * queue_draws it whenever that flips.
  */
 static void
 header_glyph_draw (GtkDrawingArea *area, cairo_t *cr, int width, int height,
@@ -3732,7 +3664,7 @@ header_glyph_draw (GtkDrawingArea *area, cairo_t *cr, int width, int height,
 
   if (!on)
     {
-      /* Full-strength forward slash (macOS: a 3x24 capsule rotated 45deg). */
+      /* Full-strength forward slash. */
       gdk_cairo_set_source_rgba (cr, &fg);
       double lwp = (double)height * 0.14;
       if (lwp < 2.0)
@@ -3767,14 +3699,14 @@ build_dialect_button_child (const char *category, GtkLabel **out_glyph)
 }
 
 /* ------------------------------------------------------------------------- */
-/* Filter-to-matches (slice 4): the toggle + subtitle status over lsg_filter */
+/* Filter-to-matches: the toggle + subtitle status over lsg_filter */
 /* ------------------------------------------------------------------------- */
 
-/* The toggle may turn ON only when the current find draft is filterable
- * (canApplyFilter = the compose is not IGNORED — an empty TEXT query), or stay
- * live to turn OFF. Reads the whole draft (text OR predicate) through the one
- * find_read_draft funnel so predicate drafts enable it too: a REJECTED
- * predicate still counts as filterable (the reject blinks at apply time). */
+/* The toggle may turn ON only when the current find draft is filterable — the
+ * compose is not IGNORED, i.e. not an empty text query — and stays live to
+ * turn OFF. It reads the whole draft through the one find_read_draft funnel,
+ * so a predicate draft enables it too; a REJECTED predicate still counts, and
+ * blinks at apply time. */
 static void
 filter_update_toggle_sensitivity (App *app)
 {
@@ -3812,8 +3744,8 @@ filter_sync_ui (App *app)
   update_title_subtitle (app);
 }
 
-/* Capture the ORIGINAL row number of the top visible (filtered) row, so the
- * identity view can re-anchor there after clearing (ARCH criterion 13). */
+/* The ORIGINAL row number of the top visible (filtered) row, so clearing the
+ * filter can re-anchor the identity view on the row that was on screen. */
 static guint64
 capture_top_source_row (App *app)
 {
@@ -3893,20 +3825,16 @@ do_apply_filter (App *app)
   app->find_wrap_issued = FALSE;
   find_clear_mask (app);
   app->jump = lsg_jump_initial ();
-  /* Clearing the STATE is not clearing the LABEL. Without this the status line
-   * keeps whatever it last rendered — typing a Where value starts a live
-   * search that shows "Searching…", and applying the filter then invalidated
-   * that search without ever repainting the widget, so the app sat there fully
-   * filtered while still claiming to be searching. Shipped in a screenshot
-   * before anyone noticed. */
+  /* Clearing the STATE is not clearing the LABEL: without this the status line
+   * keeps whatever it last rendered, so a filter applied while a live search
+   * was running leaves the app fully filtered and still saying "Searching…".
+   */
   find_update_labels (app);
 
   filter_rebuild_grid (app, 0); /* land on filtered row 0 */
-  /* Net-park (Bug 2): ls_filter_set parks the filter-scan immediately (count
-   * 0); the filtered frontier advances ONLY via a filtered ls_jump_start.
-   * Drive it to original row 0 so the first matching rows are fetched and the
-   * view is not empty (a bare ls_window_set fetched nothing). No-op on a local
-   * doc. */
+  /* ls_filter_set parks the filter scan immediately, at count 0, and on a
+   * network document the filtered frontier advances ONLY through a jump. Drive
+   * it to original row 0 or the filtered view paints empty. Inert locally. */
   net_drive_begin (app, 0);
   update_title_subtitle (app);
   a11y_announce_subtitle (app); /* filter apply -> the new status (MEDIUM) */
@@ -3941,7 +3869,7 @@ do_clear_filter (App *app)
   app->find_sticky_notice = LSG_FIND_NOTICE_NONE;
   find_clear_mask (app);
   app->jump = lsg_jump_initial ();
-  find_update_labels (app); /* same omission on the clear path */
+  find_update_labels (app); /* the label, not just the state */
 
   filter_set_toggle (app, FALSE); /* the (x) path also un-presses the toggle */
   filter_rebuild_grid (app, restore); /* identity view, re-anchored */
@@ -3951,8 +3879,8 @@ do_clear_filter (App *app)
   filter_update_toggle_sensitivity (app);
 }
 
-/* The header-bar (x) after the "Filtered — N of M rows" subtitle: the compact
- * successor to the old banner's Clear button. Shown only while filtered. */
+/* The (x) after the "Filtered — N of M rows" subtitle. Shown only while
+ * filtered. */
 static void
 on_filter_clear_clicked (GtkButton *button, gpointer data)
 {
@@ -3960,7 +3888,7 @@ on_filter_clear_clicked (GtkButton *button, gpointer data)
   do_clear_filter ((App *)data);
 }
 
-/* Forward-declared above; fold one filter poll into the subtitle. */
+/* Fold one filter poll into the subtitle. */
 static gboolean
 filter_poll_fold (App *app)
 {
@@ -4011,12 +3939,11 @@ on_match_case_toggled (GtkCheckButton *button, gpointer data)
 }
 
 /* ------------------------------------------------------------------------- */
-/* Streaming copy (slice 5): selection + off-main worker + clipboard + the */
+/* Streaming copy: selection + off-main worker + clipboard + the             */
 /* reusable header-bar progress widget */
 /* ------------------------------------------------------------------------- */
 
-/* The off-main copy worker's shared state (defined up-front so the cancel
- * affordance and the drive can both reach it). */
+/* The off-main copy worker's shared state. */
 struct _CopyOp
 {
   LsgDocument *doc; /* captured at launch (stable per leaf-before-root) */
@@ -4032,20 +3959,18 @@ struct _CopyOp
   guint64 bytes_done;
 };
 
-/* --- reusable header-bar progress: a determinate bar + inline cancel. Hidden
- *     by default; any long op (copy now, scan/index/network later) drives it
- * via header_progress_show / _set / _hide. --- */
+/* --- the shared header-bar progress: a determinate bar + inline cancel,
+ *     hidden by default, driven by every long operation. --- */
 
 static void
 on_hp_cancel_clicked (GtkButton *button, gpointer data)
 {
   (void)button;
   App *app = data;
-  /* The header progress is shared, but by construction only one owner is ever
-   * live: a URL open runs copy_stop_and_join before it goes in flight, and
-   * do_copy refuses to start while app->net != NULL. So at most one of copy_op
-   * / net is non-NULL here, and the copy-first check cancels the true owner.
-   */
+  /* The progress widget is shared, but by construction only one owner is ever
+   * live — a URL open stops any copy before it goes in flight, and a copy
+   * refuses to start while one is in flight — so at most one of copy_op / net
+   * is non-NULL here. */
   if (app->copy_op != NULL)
     g_atomic_int_set (&app->copy_op->cancel,
                       1); /* the worker stops promptly */
@@ -4236,10 +4161,10 @@ copy_worker (gpointer data)
           break;
         }
 
-      /* A stall (row past the demand-driven / still-indexing frontier):
-       * advance the shared frontier via a jump, bounded (~2 s), then pull
-       * again. The fold's no-progress guard turns a re-stall on the same row
-       * into FRONTIER. */
+      /* A stall means the row is past the frontier — still indexing, or not
+       * yet fetched. Advance it with a bounded (~2 s) jump and pull again; the
+       * fold's no-progress guard turns a re-stall on the same row into
+       * FRONTIER rather than looping forever. */
       if (flow.kind == LSG_COPY_FLOW_STALLED)
         {
           lsg_document_jump_start (doc, flow.stalled_row);
@@ -4363,17 +4288,14 @@ copy_tick (gpointer data)
   if (!finished)
     return G_SOURCE_CONTINUE;
 
-  /* Deliver the payload to the clipboard (widgets alive on this path — the
-   * timer is stopped at teardown before the window is gone); a cancelled copy
-   * drops its partial. */
+  /* Deliver the payload; a cancelled copy drops its partial. */
   if (op->outcome != LSG_COPY_OUTCOME_CANCELLED && op->blob != NULL
       && op->blob->len > 0 && app->window != NULL)
     {
       GdkClipboard *clip = gtk_widget_get_clipboard (GTK_WIDGET (app->window));
-      /* NUL-terminate the payload IN PLACE (one appended byte) so it can go
-       * straight to the clipboard — avoids a second ~64 MiB g_strndup copy of
-       * the blob; gdk_clipboard_set_text makes its own internal copy of the
-       * TSV. */
+      /* NUL-terminate IN PLACE, one appended byte, so the blob can go straight
+       * to the clipboard: a g_strndup here would be a second ~64 MiB copy, and
+       * gdk_clipboard_set_text makes its own anyway. */
       guint8 nul = 0;
       g_byte_array_append (op->blob, &nul, 1);
       gdk_clipboard_set_text (clip, (const char *)op->blob->data);
@@ -4391,25 +4313,22 @@ copy_tick (gpointer data)
   return G_SOURCE_REMOVE;
 }
 
-/* Forward-declared: start a copy of the current selection on the off-main
- * worker. */
+/* Start a copy of the current selection on the off-main worker. */
 static void
 do_copy (App *app)
 {
-  /* app->net != NULL: a URL open is in flight and about to replace the doc —
-   * refuse to start a copy of the doomed doc. With copy_stop_and_join at the
-   * start of the net-open flow, this closes the other overlap direction so the
-   * two never share the header progress. */
+  /* A URL open in flight is about to replace this document, so refuse to copy
+   * it. Together with the copy_stop_and_join at the start of the net-open
+   * flow, that keeps copy and network open from ever sharing the header
+   * progress. */
   if (app->doc == NULL || app->sel_mode == SEL_NONE || app->copy_op != NULL
       || app->net != NULL)
     return;
 
-  /* The copy worker advances the shared frontier with
-   * ls_jump_start(stalled_row) on its bg thread. A jump preserved past its
-   * popover would then resolve to LANDED(stalled_row) = a wrong scroll to the
-   * copy's stall row. Retire it now, and free the core slot (jump_cancel) so
-   * the worker's ls_jump_start has it cleanly — mirrors do_apply_filter's jump
-   * retire before a view change. */
+  /* The worker advances the shared frontier with ls_jump_start on its own
+   * thread. A jump preserved past its popover would resolve to LANDED on the
+   * copy's stall row — a wrong scroll. Retire it, and free the core slot so
+   * the worker gets it cleanly. */
   if (app->jump.kind == LSG_JUMP_FLOW_SCANNING)
     lsg_document_jump_cancel (app->doc);
   app->jump = lsg_jump_initial ();
@@ -4428,9 +4347,9 @@ do_copy (App *app)
     app->copy_poll_id = g_timeout_add (80, copy_tick, app);
 }
 
-/* Forward-declared: stop the worker + dispose (leaf-before-root, before any
- * document teardown). Drops any partial payload (no clipboard). The widget
- * updates are NULL-guarded, so this is also safe at window destroy / exit. */
+/* Stop the worker and dispose of it — leaf before root, before any document
+ * teardown. Drops any partial payload. Every widget touch here is
+ * NULL-guarded, so it is safe at window destroy and at process exit too. */
 static void
 copy_stop_and_join (App *app)
 {
@@ -4520,10 +4439,8 @@ build_launch_page (App *app)
 {
   GtkWidget *status = adw_status_page_new ();
   /* The app LOGO, not a generic spreadsheet glyph: the same embedded icon the
-   * window and the About dialog carry (LSG_APP_ID names the GResource-backed
-   * hicolor entry ensure_window registers), so an app opened without a file
-   * shows its own identity — full colour at the status page's 128 px, the way
-   * GNOME's own welcome pages put the app icon first. */
+   * window and the About dialog carry, so an app opened without a file shows
+   * its own identity. */
   adw_status_page_set_icon_name (ADW_STATUS_PAGE (status), LSG_APP_ID);
   adw_status_page_set_title (ADW_STATUS_PAGE (status), "less-sheet");
   adw_status_page_set_description (
@@ -4558,11 +4475,10 @@ build_grid_page (App *app)
   app->vadj = g_object_ref_sink (gtk_adjustment_new (0, 0, 1, 1, 1, 1));
   app->hadj = g_object_ref_sink (gtk_adjustment_new (0, 0, 1, 1, 1, 1));
 
-  /* The grid is a labeled region for AT (FR3, Decision 3): a GROUP role (set
-   * as a construct property — roles are immutable post-construction) + the
-   * fixed name "Data grid"; the dynamic description is set from
-   * grid_materialize. NOT a per-cell GRID/ROW/CELL tree (the
-   * deliberately-deferred deepening). */
+  /* The grid is one LABELLED REGION for assistive tech, not a per-cell
+   * GRID/ROW/CELL tree: a GROUP role plus a fixed name, with the dynamic
+   * description refreshed from grid_materialize. The role has to be a
+   * construct property — GTK4 accessible roles are immutable afterwards. */
   app->area = GTK_DRAWING_AREA (
       g_object_new (GTK_TYPE_DRAWING_AREA, "accessible-role",
                     GTK_ACCESSIBLE_ROLE_GROUP, NULL));
@@ -4609,8 +4525,8 @@ build_grid_page (App *app)
   return grid;
 }
 
-/* Milestone 1: UI cold-start = main() entry -> the window first mapped/shown.
- * One-shot (map can fire again on remap); inert unless timing is enabled. */
+/* UI cold-start: main() entry -> the window first mapped. One-shot, because
+ * map fires again on every remap. */
 static void
 on_window_map (GtkWidget *widget, gpointer data)
 {
@@ -4624,9 +4540,9 @@ on_window_map (GtkWidget *widget, gpointer data)
               (double)dt / 1000.0);
 }
 
-/* On window destroy (app quit): stop timers + JOIN the copy worker while the
- * document is still alive (leaf-before-root), then NULL widget pointers so any
- * later teardown code is a guarded no-op (avoids touching freed widgets). */
+/* Window destroy: stop every timer, then join the copy worker while the
+ * document is still alive (leaf before root), then NULL the widget pointers.
+ */
 static void
 on_window_destroy (GtkWidget *widget, gpointer data)
 {
@@ -4662,9 +4578,8 @@ on_window_destroy (GtkWidget *widget, gpointer data)
       g_source_remove (app->prefs_infer_poll_id);
       app->prefs_infer_poll_id = 0;
     }
-  /* The capture settle machine's frame-clock tick — removed here, while
-   * app->area is still a live widget, for the same leaf-before-root reason the
-   * timers above are. Always 0 in an unarmed run. */
+  /* The capture settle machine's frame-clock tick, removed while app->area is
+   * still a live widget. Always 0 in an unarmed run. */
   if (app->capture.tick_id != 0 && app->area != NULL)
     {
       gtk_widget_remove_tick_callback (GTK_WIDGET (app->area),
@@ -4723,15 +4638,14 @@ on_window_destroy (GtkWidget *widget, gpointer data)
 }
 
 /* ========================================================================= */
-/* Settings + dialect override (this slice)                                  */
+/* Settings + dialect override                                               */
 /*                                                                           */
-/* The three header-bar quick-controls (header toggle, separator ▾, quote ▾),*/
-/* the Preferences "Parsing" page, and this compose/re-open funnel all read +
+/* The three header-bar quick controls (header toggle, separator, quote), the
  */
-/* drive the ONE dialect state (the effective report from
- * lsg_document_dialect*/
-/* through the single lsg_dialect_compose funnel. A dialect change is an ABI */
-/* re-open (F1); a network doc re-opens through the NETWORK funnel (F8). */
+/* Preferences "Parsing" page and this funnel all read and drive the ONE */
+/* dialect state — the effective report from lsg_document_dialect, composed */
+/* through lsg_dialect_compose. Changing any of it means re-opening the */
+/* document, and a network document re-opens through the network funnel. */
 /* ========================================================================= */
 
 /* Separator/quote dropdown item tags (object data on each row + the item's
@@ -4746,13 +4660,13 @@ on_window_destroy (GtkWidget *widget, gpointer data)
 #define PARSING_QUOTE_NONE_INDEX LSG_DIALECT_QUOTE_CANDIDATE_COUNT
 #define PARSING_QUOTE_CUSTOM_INDEX (LSG_DIALECT_QUOTE_CANDIDATE_COUNT + 1)
 
-/* Forward declarations for the settings region (callee-before-caller cycles).
+/* Forward declarations for the settings region's callee-before-caller cycles.
  */
 static void settings_present (App *app);
 static void columns_group_rebuild (App *app);
 static void column_row_sync (App *app, GtkWidget *expander, guint32 col);
 
-/* -------- toast (F3 / F7) ------------------------------------------------ */
+/* -------- toast --------------------------------------------------------- */
 
 static void
 settings_toast (App *app, const char *text)
@@ -4776,8 +4690,7 @@ combo_set_items (GtkWidget *combo, const char *const *items)
   g_object_unref (m);
 }
 
-/* -------- cached effective type for the cell formatter --------------------
- */
+/* -------- cached effective type for the cell formatter ------------------- */
 
 static void
 column_cache_effective (App *app, guint32 col)
@@ -4795,7 +4708,7 @@ column_cache_effective (App *app, guint32 col)
     }
 }
 
-/* -------- re-open capture helpers (F7) ----------------------------------- */
+/* -------- re-open capture helpers ---------------------------------------- */
 
 static gboolean
 columns_any_authored (App *app)
@@ -4809,8 +4722,8 @@ columns_any_authored (App *app)
 }
 
 /* Copy every column's header label out (owned), in bounded LS_COLUMN_BATCH_MAX
- * batches — used only for the F7 re-open identity comparison (never the open
- * path). Returns a fresh n_cols array, or NULL. */
+ * batches. O(column_count), so never on the open path — only where the whole
+ * label set is genuinely the answer. Returns a fresh n_cols array, or NULL. */
 static LsgColumnLabel *
 capture_all_labels (App *app, guint *out_n)
 {
@@ -4866,7 +4779,7 @@ labels_to_identities (LsgColumnLabel *labels, guint n)
   return ids;
 }
 
-/* -------- the re-open funnel (F1 / F8) ----------------------------------- */
+/* -------- the re-open funnel --------------------------------------------- */
 
 /* Drop the pending dialect re-open capture. Called on the end of a successful
  * apply, on EVERY re-open failure / cancel path, and defensively at a fresh
@@ -4890,8 +4803,8 @@ reopen_state_clear (App *app)
 
 /* Close + re-open the current document with `options`. Local re-opens
  * synchronously (open_document runs the post-open re-anchor/replay); a NETWORK
- * doc re-opens through the net funnel — never fed to the local open (F8) — and
- * the async net poll adopts into the SAME open_document choke point. Every
+ * document re-opens through the NET funnel — never fed to the local open —
+ * and its async poll adopts into the same open_document choke point. Every
  * failure path clears the pending capture so it can never fire stale. */
 static void
 dialect_reopen (App *app, ls_open_options options)
@@ -4942,8 +4855,8 @@ dialect_reopen (App *app, ls_open_options options)
     }
 }
 
-/* One user selection -> compose -> validate -> capture -> re-open (F1). A
- * rejected compose is a silent no-op (F2). */
+/* One user selection -> compose -> validate -> capture -> re-open. A rejected
+ * compose is a silent no-op. */
 static void
 dialect_apply_change (App *app, LsgDialectChange change)
 {
@@ -4962,17 +4875,18 @@ dialect_apply_change (App *app, LsgDialectChange change)
   app->reopen_pending = TRUE;
   app->reopen_header_change = header_change;
   app->reopen_header_now = new_header;
-  /* F5 (header toggle): re-anchor to the SAME top data-row index across the
-   * re-open — no ±1 record shift. At the top (index 0) this keeps data row 0
-   * pinned, so header->data REVEALS the former-header row as the new data row
-   * 0 (it used to be shifted out of view just above the top); when scrolled
-   * (index > 0) the scroll position is preserved and only the labels flip. */
+  /* Re-anchor to the SAME top data-row index across the re-open — deliberately
+   * no ±1 record shift. At index 0 that keeps data row 0 pinned, so turning
+   * the header off REVEALS the former header row as the new row 0 instead of
+   * shifting it out of view; further down, the scroll position is preserved
+   * and only the labels flip. */
   app->reopen_top_view = app->cur_top_row;
   app->reopen_old_count = app->n_cols;
 
-  /* Snapshot the user column settings + (for a byte change over a headered
-   * doc) the header identities — only when some settings were authored, so the
-   * common all-Auto case does no O(column_count) label work (N1 / N2). */
+  /* Snapshot the user column settings, and for a separator/quote change over a
+   * headered document the header identities too — but ONLY when something was
+   * actually authored, so the common all-Auto case does no O(column_count)
+   * label work. */
   if (columns_any_authored (app))
     {
       guint32 nc = (app->n_cols > 0) ? app->n_cols : 1;
@@ -4987,27 +4901,28 @@ dialect_apply_change (App *app, LsgDialectChange change)
   dialect_reopen (app, c.options);
 }
 
-/* Post-adoption re-anchor (F5) + column replay/reset (F7) + toasts (F3/F7).
- * Runs at the end of open_document for BOTH the local and network re-open. */
+/* The post-adoption step of a dialect re-open: re-anchor the viewport, replay
+ * or reset the column settings, and say which happened. Runs at the end of
+ * open_document for BOTH the local and the network re-open. */
 static void
 settings_reopen_apply (App *app)
 {
   app->reopen_pending = FALSE;
 
-  /* --- F5: viewport re-anchor (header toggle only; no ±1 shift) --- */
+  /* --- viewport re-anchor (header toggle only; no ±1 shift) --- */
   if (app->reopen_header_change)
     {
       guint64 row = app->reopen_top_view;
       scroll_to_first_row (app, row);
       grid_repaint (app);
       if (app->is_network)
-        net_drive_begin (app, row); /* F8: net funnel drives the landing */
+        net_drive_begin (app, row); /* a net doc must be driven to land */
       settings_toast (app, app->reopen_header_now ? "First row is now a header"
                                                   : "First row is now data");
     }
   /* separator/quote/encoding rest at top-left (open_document already did). */
 
-  /* --- F7: column-settings replay or reset --- */
+  /* --- column settings: replay or reset --- */
   if (app->reopen_snapshot != NULL)
     {
       LsgColumnReopenChange kind
@@ -5059,10 +4974,10 @@ settings_reopen_apply (App *app)
                 lsg_document_column_null_sentinel_set (
                     app->doc, i, s.null_sentinel_len ? s.null_sentinel : NULL,
                     s.null_sentinel_len);
-              /* Cache the effective type ONLY for columns that feed the
-               * formatter — never O(column_count) metadata reads on a wide
-               * doc (N2: O(visible) column work). A pure-default column needs
-               * no cache (it paints raw). */
+              /* Cache the effective type ONLY for the columns that feed the
+               * formatter. A pure-default column paints raw and needs no
+               * cache, which is what keeps this off O(column_count) on a wide
+               * document. */
               if (s.has_override
                   || !lsg_column_format_options_is_auto (s.format))
                 column_cache_effective (app, i);
@@ -5262,7 +5177,7 @@ dialect_sync_quick_controls (App *app)
   app->dialect_ui_guard = FALSE;
 }
 
-/* -------- header-bar quick controls (F3 / F3b) --------------------------- */
+/* -------- header-bar quick controls -------------------------------------- */
 
 static void
 on_header_toggle_toggled (GtkToggleButton *btn, gpointer data)
@@ -5277,12 +5192,10 @@ on_header_toggle_toggled (GtkToggleButton *btn, gpointer data)
 }
 
 /*
- * A separator/quote preset ROW was clicked in a header-bar dropdown. The
- * dropdown is a plain (autohide) GtkPopover holding a GtkListBox of presets
- * plus an always-visible "Custom" entry below the list; a preset applies the
- * change and popdowns, while a custom byte is typed into the entry and applied
- * on its Enter (on_dialect_custom_activate). No GtkPopoverMenu / menu-model
- * and no radios, so nothing auto-dismisses on activation.
+ * A separator/quote preset row was clicked. The dropdown is a plain autohide
+ * GtkPopover holding a GtkListBox of presets plus an always-visible "Custom"
+ * entry — deliberately not a GtkPopoverMenu, so nothing auto-dismisses on
+ * activation and only a VALID pick closes it.
  */
 static void
 on_dialect_row_activated (GtkListBox *list, GtkListBoxRow *row, gpointer data)
@@ -5332,12 +5245,11 @@ on_dialect_custom_activate (GtkWidget *entry, gpointer data)
       if (pop != NULL)
         gtk_popover_popdown (GTK_POPOVER (pop));
     }
-  /* An invalid byte is a silent no-op (F3b) — leave the entry for a retry. */
+  /* An invalid byte is a silent no-op — leave the entry for a retry. */
 }
 
-/* Append one clickable preset ROW to the dropdown list (no radios): the
- * CHARACTER glyph far-LEFT and the DIMMED name far-RIGHT (space-between), no
- * parentheses. The row is activatable, so Adwaita highlights it on hover. */
+/* One clickable preset row: the character glyph far left, the dimmed name far
+ * right. Activatable, so Adwaita highlights it on hover. */
 static void
 add_dialect_row (GtkWidget *list, const char *glyph, const char *name,
                  int kind, int byte, gboolean is_none)
@@ -5374,11 +5286,10 @@ build_dialect_dropdown_popover (App *app, int kind)
   gtk_widget_set_margin_start (box, 6);
   gtk_widget_set_margin_end (box, 6);
 
-  /* A plain clickable presets list (hover-highlighted rows), NOT radios and
-   * NOT a menu-model. The `.lsg-flat-list` class drops the GtkListBox's own
-   * `@view_bg_color` fill so the standard popover background shows through
-   * (matching Find/Jump) on both light and dark themes. A preset applies +
-   * popdowns via on_dialect_row_activated. */
+  /* A plain clickable presets list, not radios and not a menu model. The
+   * `.lsg-flat-list` class drops the GtkListBox's own `@view_bg_color` fill so
+   * the popover background shows through — without it the list reads as a
+   * darker panel inside the popover on dark themes. */
   GtkWidget *list = gtk_list_box_new ();
   gtk_list_box_set_selection_mode (GTK_LIST_BOX (list), GTK_SELECTION_NONE);
   gtk_widget_add_css_class (list, "lsg-flat-list");
@@ -5419,13 +5330,13 @@ build_dialect_dropdown_popover (App *app, int kind)
 
 /* -------- primary menu: Preferences / Keyboard Shortcuts / About --------- */
 
-/* The native shortcuts surface (Decision 1: AdwShortcutsDialog, the modern
- * replacement for the deprecated GtkShortcutsWindow) generated ENTIRELY from
- * the single lsg_a11y accelerator table — one AdwShortcutsSection per group,
- * one AdwShortcutsItem per command. APP-scope entries use the action name so
- * the displayed accelerator is resolved from the registered app accels (which
- * the SAME table drives); GRID / DISPLAY entries carry the table's accel /
- * display token directly. No hand-typed list anywhere (FR5 / G-A4). */
+/* The shortcuts window, generated ENTIRELY from the single lsg_a11y
+ * accelerator table: one section per group, one item per command, no
+ * hand-typed list anywhere. APP-scope entries are added by ACTION NAME so the
+ * accelerator shown is the one actually registered (and shows every
+ * alternative); GRID and DISPLAY entries carry the table's token directly.
+ * AdwShortcutsDialog is the current surface — GtkShortcutsWindow is deprecated
+ * and gone in GTK 5. */
 static void
 action_shortcuts (GSimpleAction *a, GVariant *p, gpointer data)
 {
@@ -5512,9 +5423,8 @@ static GMenuModel *
 build_primary_menu (App *app)
 {
   (void)app;
-  /* Preferences / Shortcuts / About are now APP-level GActions (registered in
-   * register_app_shortcuts, so their accelerators are real and the menu shares
-   * the one action set); the menu just references them. */
+  /* Preferences / Shortcuts / About are APP-level GActions, so their
+   * accelerators are real and the menu shares the one action set. */
   GMenu *menu = g_menu_new ();
   g_menu_append (menu, "Preferences", "app.preferences");
   g_menu_append (menu, "Keyboard Shortcuts", "app.shortcuts");
@@ -5894,12 +5804,11 @@ columns_refresh_summaries (App *app)
 }
 
 /* Set column `col`'s visibility. A hidden column is removed from the grid by
- * pinning its layout width to 0 (the frozen lsg_grid_column_window treats a
- * 0/negative width as contributing no space, so following columns close the
- * gap and the contiguous fetch just draws it at zero width); showing it again
- * restores its manual width, else re-samples the auto width. O(1) per column
- * (plus one head-window sample on show) — no per-frame O(column_count) work.
- */
+ * pinning its layout WIDTH TO 0: lsg_grid_column_window treats a zero width as
+ * contributing no space, so the following columns close the gap and the
+ * contiguous fetch simply draws it at zero width. Showing it again restores
+ * its manual width, or re-samples the auto one. O(1) per column plus, on show,
+ * one head-window sample — never per-frame work. */
 static void
 set_column_hidden (App *app, guint32 col, gboolean hidden)
 {
@@ -6132,7 +6041,7 @@ on_col_reset (GtkButton *btn, gpointer data)
   lsg_document_column_null_sentinel_clear (app->doc, col);
   column_cache_effective (app, col);
   /* Reset cleared has_manual_width — re-sample the auto width so a previously
-   * widened column shrinks back (Finding 3). */
+   * widened column shrinks back. */
   sample_one_column_width (app, col);
   grid_update_hadjustment (app);
   grid_repaint (app);
@@ -6151,7 +6060,7 @@ on_col_expanded (GObject *expander, GParamSpec *pspec, gpointer data)
   columns_refresh_summaries (app);
   if (!adw_expander_row_get_expanded (ADW_EXPANDER_ROW (expander)))
     return;
-  /* Auto-collapse the previously-open row (F11: at most one usefully open). */
+  /* At most one row is usefully open: collapse the previous one. */
   GtkWidget *grp = app->prefs_columns_group;
   if (grp == NULL)
     return;
@@ -6199,7 +6108,7 @@ column_row_sync (App *app, GtkWidget *expander, guint32 col)
     gtk_widget_set_visible (w, is_date);
 }
 
-/* Build one column's inline expander-row inspector (F11). */
+/* Build one column's inline expander-row inspector. */
 static GtkWidget *
 build_column_row (App *app, guint32 col)
 {
@@ -6397,10 +6306,10 @@ on_columns_search_changed (GtkEditable *entry, gpointer data)
   columns_group_rebuild (app);
 }
 
-/* BUG A: re-read the RESOLVED type of each displayed column and refresh its
- * "Detected type" subtitle, its kind-dependent rows, and its collapsed
- * summary. Called from the inference poll once the core commits a generation,
- * so the initial "Unknown" is replaced by the real inferred kind. */
+/* Re-read the RESOLVED type of each displayed column and refresh its "Detected
+ * type" subtitle, its kind-dependent rows and its collapsed summary. A
+ * column's type stays Unknown until inference is REQUESTED for it, so this is
+ * what replaces the initial "Unknown" once the core commits a generation. */
 static void
 columns_refresh_types (App *app)
 {
@@ -6429,7 +6338,7 @@ columns_refresh_types (App *app)
 
 /* Poll the core's async type-inference job while the Columns page is open;
  * refresh the displayed types whenever the metadata generation advances, and
- * stop once the job settles (BUG A wiring). */
+ * stop once the job settles. */
 static gboolean
 prefs_infer_poll_cb (gpointer data)
 {
@@ -6470,8 +6379,8 @@ prefs_infer_poll_cb (gpointer data)
   return G_SOURCE_CONTINUE;
 }
 
-/* Request type inference for exactly the currently-displayed columns and
- * (re)start the poll that refreshes their types. O(<=10) IDs (N2). */
+/* Request type inference for exactly the currently-displayed columns — never
+ * the whole document — and (re)start the poll that refreshes their types. */
 static void
 columns_request_inference (App *app)
 {
@@ -6497,8 +6406,8 @@ columns_request_inference (App *app)
         = g_timeout_add (INFER_POLL_INTERVAL_MS, prefs_infer_poll_cb, app);
 }
 
-/* (Re)populate the Columns page's per-column group from the discovery mode +
- * current search (O(<=10) rows — N2). */
+/* (Re)populate the Columns page's per-column group from the discovery mode and
+ * the current search. Bounded to a handful of rows, never O(column_count). */
 static void
 columns_group_rebuild (App *app)
 {
@@ -6636,8 +6545,8 @@ columns_group_rebuild (App *app)
         gtk_widget_set_visible (app->prefs_columns_status, FALSE);
     }
 
-  /* BUG A: infer the types of exactly these displayed columns, then poll +
-   * refresh their "Detected type" as the core commits. */
+  /* Infer the types of exactly these displayed columns, then poll and refresh
+   * their "Detected type" as the core commits them. */
   columns_request_inference (app);
 }
 
@@ -6739,17 +6648,13 @@ ensure_window (App *app, GtkApplication *gtk_app)
   g_signal_connect (win, "map", G_CALLBACK (on_window_map), app);
   g_signal_connect (win, "destroy", G_CALLBACK (on_window_destroy), app);
 
-  /* App-level shortcuts (Find / Jump / Open / Preferences / Shortcuts) are
-   * GActions with accelerators (register_app_shortcuts, from the single accel
-   * table), so no window-level key controller is needed here. */
+  /* The app-level shortcuts are GActions with accelerators, registered from
+   * the single accel table, so no window-level key controller is needed. */
   gtk_window_set_title (app->window, "less-sheet");
   {
     /* LESSSHEET_GTK_CAPTURE_SIZE=<w>x<h> pins the window for a screenshot run,
-     * the twin of macOS's LESSSHEET_CAPTURE_SIZE. Without it the Linux shots
-     * could not be made to sit at the same proportion of the frame as the
-     * macOS ones: the frame is identical (1500x989) but this window's 1024x720
-     * has a different ASPECT from the macOS window, so it read as noticeably
-     * bigger on the page even at the same frame size. Inert in normal use. */
+     * so a published shot can be framed at a chosen aspect. Inert otherwise.
+     */
     int dw = 1024, dh = 720;
     const char *size = g_getenv ("LESSSHEET_GTK_CAPTURE_SIZE");
     if (size != NULL)
@@ -6764,21 +6669,19 @@ ensure_window (App *app, GtkApplication *gtk_app)
     gtk_window_set_default_size (app->window, dw, dh);
   }
 
-  /* App logo: register the embedded GResource icon (compiled into the binary
-   * as a hicolor-laid-out resource) so the running app shows it without an
-   * install, then name the window's icon after the app id. */
+  /* The logo is compiled into the binary as a hicolor-laid-out GResource, so
+   * the running app shows it WITHOUT being installed. */
   GdkDisplay *display = gdk_display_get_default ();
   if (display != NULL)
     gtk_icon_theme_add_resource_path (gtk_icon_theme_get_for_display (display),
                                       LSG_ICON_RESOURCE_PATH);
   gtk_window_set_icon_name (app->window, LSG_APP_ID);
 
-  /* Header bar: Open + Open URL on the left, filename title in the center.
-   * The title is a CUSTOM widget (not an AdwWindowTitle) so the filtered
-   * subtitle can carry a (x) clear-filter button: a centered document-name
-   * label over a subtitle ROW (the status label + the filtered-only (x)).
-   * `.title`/`.subtitle` + ellipsize + centering match AdwWindowTitle, so the
-   * unfiltered look is unchanged (the (x) is hidden, taking no space). */
+  /* The title is a CUSTOM widget rather than an AdwWindowTitle, which cannot
+   * hold a button: a centered name label over a subtitle ROW carrying the
+   * status text and the filtered-only (x). The `.title` / `.subtitle` classes,
+   * the ellipsizing and the centering match AdwWindowTitle, so the unfiltered
+   * look is identical — the (x) is hidden and takes no space. */
   GtkWidget *header = adw_header_bar_new ();
   GtkWidget *title_box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
   gtk_widget_set_valign (title_box, GTK_ALIGN_CENTER);
@@ -6841,20 +6744,17 @@ ensure_window (App *app, GtkApplication *gtk_app)
   build_find_popover (app);
   gtk_menu_button_set_popover (GTK_MENU_BUTTON (find_btn),
                                GTK_WIDGET (app->find_popover));
-  /* Packed at the end in the signed order (see below). */
-
   /* Jump-to-row: a menu button whose popover is the jump UI (Ctrl+G / Ctrl+L,
-   * or type a digit on the grid). Its icon is the custom macOS-style jump
-   * glyph (drawn into a 16px GtkDrawingArea child, tinting with the theme fg).
-   */
+   * or a digit typed on the grid). Its icon is the custom jump glyph, drawn
+   * into a 16px GtkDrawingArea child and tinted from the theme. */
   GtkWidget *jump_btn = gtk_menu_button_new ();
   /* Flat like the other header-bar buttons (background only on hover/active).
    * GtkMenuButton defaults has-frame TRUE, and a custom `set_child` icon
    * doesn't get the `image-button` flattening `set_icon_name` gives the find
    * button, so without this the jump button looks permanently highlighted. */
   gtk_menu_button_set_has_frame (GTK_MENU_BUTTON (jump_btn), FALSE);
-  /* The drawn glyph is decorative (role NONE / presentational, construct-only)
-   * so the interactive parent button is the single named AT stop (FR3). */
+  /* The drawn glyph is decorative — role NONE, construct-only — so the button
+   * around it is the single named AT stop. */
   GtkWidget *jump_glyph
       = g_object_new (GTK_TYPE_DRAWING_AREA, "accessible-role",
                       GTK_ACCESSIBLE_ROLE_NONE, NULL);
@@ -6870,15 +6770,12 @@ ensure_window (App *app, GtkApplication *gtk_app)
   build_jump_popover (app);
   gtk_menu_button_set_popover (GTK_MENU_BUTTON (jump_btn),
                                GTK_WIDGET (app->jump_popover));
-  /* Packed at the end in the signed order (see below). */
+  /* There is deliberately no Copy button in the bar; Ctrl+C on the grid copies
+   * the selection. app->copy_button stays NULL, which every use guards for. */
 
-  /* Copy button is DROPPED (F15): Ctrl+C on the grid still copies the
-   * selection (on_key_pressed -> do_copy); only the bar button is removed.
-   * app->copy_button stays NULL (copy_update_affordance is NULL-guarded). */
-
-  /* Dialect quick-controls (F3): a header toggle + separator ▾ + quote ▾, all
-   * driving the ONE lsg_dialect_compose funnel and reflecting the effective
-   * report (kept in sync by dialect_sync_quick_controls after every open). */
+  /* The dialect quick controls: a header toggle, a separator picker and a
+   * quote picker, all driving the ONE compose funnel and all reflecting the
+   * effective report after every open. */
   GtkWidget *hdr_toggle = gtk_toggle_button_new ();
   gtk_widget_set_tooltip_text (hdr_toggle, "First row is a header");
   a11y_name (hdr_toggle, LSG_A11Y_CONTROL_HEADER_TOGGLE);
@@ -6929,14 +6826,13 @@ ensure_window (App *app, GtkApplication *gtk_app)
   gtk_menu_button_set_menu_model (GTK_MENU_BUTTON (settings_btn), primary);
   g_object_unref (primary); /* the button holds its own ref */
 
-  /* Reusable header-bar progress (determinate bar + inline cancel) for long
-   * ops; hidden until a copy / network op drives it. */
+  /* Hidden until a copy or a network open drives it. */
   build_header_progress (app);
 
-  /* Signed right-side layout (E). pack_end is right-anchored (first packed =
-   * rightmost), so pack in reverse of the L-to-R order
-   * [Find][Jump][Header][Separator ▾][Quote ▾][Settings]; the progress box
-   * sits leftmost of the group, next to the title. */
+  /* pack_end is right-anchored — the first packed ends up rightmost — so this
+   * is the REVERSE of the left-to-right order
+   * [Find][Jump][Header][Separator][Quote][Settings], with the progress box
+   * leftmost of the group, next to the title. */
   adw_header_bar_pack_end (ADW_HEADER_BAR (header), settings_btn);
   adw_header_bar_pack_end (ADW_HEADER_BAR (header), quote_btn);
   adw_header_bar_pack_end (ADW_HEADER_BAR (header), sep_btn);
@@ -6958,9 +6854,8 @@ ensure_window (App *app, GtkApplication *gtk_app)
 
   gtk_stack_set_visible_child_name (app->stack, "launch");
 
-  /* Toast overlay for the header-change + column-reset notices (F3 / F7). The
-   * passive filter status lives in the header-bar subtitle, so the stack is
-   * the overlay's sole child (no full-width status banner above it). */
+  /* Toast overlay for the transient notices. The passive filter status lives
+   * in the header-bar subtitle, so the stack is the overlay's sole child. */
   GtkWidget *toasts = adw_toast_overlay_new ();
   app->toasts = ADW_TOAST_OVERLAY (toasts);
   adw_toast_overlay_set_child (ADW_TOAST_OVERLAY (toasts),
@@ -6973,10 +6868,9 @@ ensure_window (App *app, GtkApplication *gtk_app)
   adw_application_window_set_content (ADW_APPLICATION_WINDOW (win), toolbar);
 }
 
-/* GAction wrappers: adapt the existing button/open helpers to the
- * GSimpleAction activate signature so the app-level accelerators can drive
- * them. action_open / action_open_url ignore their button arg (comment above),
- * so NULL is fine. */
+/* Adapt the button handlers to the GSimpleAction signature so the app-level
+ * accelerators can drive them. They ignore their button argument, so NULL is
+ * fine. */
 static void
 act_open (GSimpleAction *a, GVariant *p, gpointer d)
 {
@@ -7012,10 +6906,10 @@ act_jump (GSimpleAction *a, GVariant *p, gpointer d)
 /* Register the app-level GActions and wire their accelerators from the SINGLE
  * lsg_a11y accelerator table (SCOPE_APP entries) via
  * gtk_application_set_accels_for_action — so every app accelerator is real,
- * centrally defined, and identical to what the shortcuts surface displays (FR5
- * / G-A4). Grid-scoped keys (Copy / Select-All / cursor moves / digit-jump /
- * Esc) are deliberately NOT here — they stay on the grid key controller so a
- * focused text entry keeps its own Ctrl+C / Ctrl+A (G-A7). */
+ * centrally defined, and identical to what the shortcuts window displays.
+ * Grid-scoped keys (copy, select-all, cursor moves, digit-jump, Escape) are
+ * deliberately NOT here: they stay on the grid's key controller so a focused
+ * text entry keeps its own Ctrl+C and Ctrl+A. */
 static void
 register_app_shortcuts (App *app, GApplication *gapp)
 {
@@ -7046,82 +6940,62 @@ register_app_shortcuts (App *app, GApplication *gapp)
 }
 
 /* ========================================================================= */
-/* Screenshot-capture affordance (LESSSHEET_GTK_CAPTURE)                     */
-/*                                                                          */
-/* The frontpage shows five screenshots per platform (hero / jump / dialect /
+/* Screenshot capture (LESSSHEET_GTK_CAPTURE)                                */
+/*                                                                           */
+/* A way to drive the app into one of five documented states and be told when
  */
-/* search / filter) behind a macOS|Linux toggle. The macOS ten are captured  */
-/* by tools/shots/capture_shots photographing the REAL window; the Linux     */
-/* column was placeholders because this app took a file path and one env var */
-/* (LESSSHEET_GTK_TIMING) — there was no way to reach the other four states. */
-/* This is the GTK half of apps/macos/Sources/LessSheetApp/CaptureProbe.swift
+/* it is genuinely there, so the published screenshots can be taken by a tool
  */
-/* and it keeps that file's two rules:                                       */
-/*                                                                          */
-/*   INERT UNLESS ASKED. With LESSSHEET_GTK_CAPTURE unset, main() does one   */
-/*     g_getenv and nothing else: no parse, no allocation, no frame-clock    */
-/*     work, and the three report hooks are one struct test from a no-op. So */
-/*     this never appears in the < 500 ms cold-start LESSSHEET_GTK_TIMING    */
-/*     measures.                                                            */
-/*   NEVER BEFORE THE FIRST DATA-BEARING PAINT. The hook arms at the END of  */
-/*     the first grid_draw that painted actual rows AND columns — the same */
-/*     moment the window-fill marker reports, taken at frame completion */
-/*     instead of frame entry.                                              */
-/*                                                                          */
-/* ENV SURFACE (the whole of it):                                            */
+/* instead of by hand. Two rules hold the whole thing up: */
+/*                                                                           */
+/*   INERT UNLESS ASKED. With the env var unset, main() does one g_getenv and
+ */
+/*     nothing else — no parse, no allocation, no frame-clock work — and the */
+/*     three report hooks are one struct test away from a no-op. It can never
+ */
+/*     show up in the cold-start measurement. */
+/*   NEVER BEFORE THE FIRST DATA-BEARING PAINT. The hook arms at the END of */
+/*     the first grid_draw that painted actual rows AND columns. */
+/*                                                                           */
+/* THE WHOLE ENV SURFACE: */
 /*   LESSSHEET_GTK_CAPTURE=hero|jump|dialect|search|filter */
 /*   LESSSHEET_GTK_CAPTURE_QUERY=<text>   search + filter: the find query */
 /*   LESSSHEET_GTK_CAPTURE_ROW=<n>        jump: the row, exactly as typed */
+/*   LESSSHEET_GTK_CAPTURE_WHERE=<header>=<value>   filter: a predicate */
+/*   LESSSHEET_GTK_CAPTURE_SIZE=<w>x<h>   pin the window size */
 /* An armed run that cannot use its arguments says so and stops; it never */
-/* degrades into a different shot.                                          */
-/*                                                                          */
-/* DELIBERATELY NOT HERE, because the platform already provides it: */
-/*   THEME — libadwaita honours ADW_DEBUG_COLOR_SCHEME=prefer-dark | */
-/*     prefer-light | default itself (verified against the pinned container's
+/* degrades into a different shot. */
+/*                                                                           */
+/* Theme, geometry and window identity are deliberately absent: libadwaita */
+/* honours ADW_DEBUG_COLOR_SCHEME itself, the compositor owns the window size
  */
-/*     libadwaita 1.8.6), so both page variants come for free. macOS needed */
-/*     LESSSHEET_CAPTURE_APPEARANCE only because AppKit has no such hook. */
-/*   GEOMETRY — the window is sized by the compositor from outside (a */
-/*     Hyprland/sway rule on the app id), which under Wayland is the only */
-/*     authority anyway: a client can request a size, not impose one. And */
-/*     unlike the macOS window this one autosaves no frame — it opens at a */
-/*     fixed default size every run — so there is no geometry to pin.        */
-/*   WINDOW ID — macOS prints one because `screencapture -l` takes a */
-/*     CGWindowID. Wayland has no client-visible window id; the compositor */
-/*     side matches on the app id (LSG_APP_ID) and title, both already set. */
-/*                                                                          */
-/* THE STATES ARE DRIVEN THROUGH THE APP'S REAL HANDLERS — the same entry */
-/* points a click or a keystroke reaches (open_find / open_jump are the */
-/* Ctrl+F / Ctrl+G actions, gtk_menu_button_popup is the separator button's */
-/* own click, do_jump_submit is Enter, and the filter is turned on by setting
+/* under Wayland (a client can request one, not impose it) and there is no */
+/* client-visible window id to print — the compositor matches on the app id */
+/* and title, which are already set. */
+/*                                                                           */
+/* THE STATES ARE DRIVEN THROUGH THE APP'S REAL HANDLERS: the same entry */
+/* points a click or a keystroke reaches. Nothing here reimplements a feature
  */
-/* the toggle ACTIVE so its "toggled" handler runs). Nothing here            */
-/* reimplements a feature and nothing synthesizes an input event, because a */
-/* screenshot of a fake state is worse than no screenshot.                   */
-/*                                                                          */
-/* THE SETTLE MARKER IS THE POINT. The capture tool gates on the app's own */
-/* marker and never on a sleep, so each state announces when it is GENUINELY */
-/* finished — and "finished" is two independent claims, both required: */
-/*                                                                          */
+/* and nothing synthesizes an input event, because a screenshot of a fake */
+/* state is worse than no screenshot. */
+/*                                                                           */
+/* "SETTLED" IS TWO INDEPENDENT CLAIMS, both required: */
+/*                                                                           */
 /*   1. the feature reports done (the find count is FINAL, the jump LANDED, */
-/*      the filter scan's count is EXACT), and                               */
-/*   2. a frame that carried real cells has been painted with it, and */
-/*      survived LSG_CAPTURE_SETTLE_FRAMES further frame boundaries.         */
-/*                                                                          */
-/* Claim 2 exists because claim 1 alone already shipped a wrong image once: */
-/* the macOS filter shot was captured mid-rematerialize — perfect popover, */
-/* correct "Filtered — 400 of 2.0K rows" pill, correct filtered gutter */
-/* numbers, and NO CELL TEXT AT ALL — purely because it keyed on a marker */
-/* that fired before the repaint. Only looking at the image caught it. So the
+/*      the filter scan's count is EXACT), and */
+/*   2. a frame that carried real cells has been painted with it, and has */
+/*      survived LSG_CAPTURE_SETTLE_FRAMES further frame boundaries. */
+/*                                                                           */
+/* Claim 1 alone is not enough: a marker that fires before the repaint gets */
+/* you a perfect popover, a correct row count and no cell text at all. So the
  */
 /* row/column counts of the frame that settled are checked here AND printed */
-/* in the marker, which makes that failure visible in the log instead of */
-/* only in the picture.                                                      */
-/*                                                                          */
+/* in the marker, which puts that failure in the log instead of only in the */
+/* picture. */
+/*                                                                           */
 /* Exactly ONE marker is printed per run, to stderr: */
-/*   lesssheet.gtk.capture_ready=<shot> <facts…>    settled; shoot now */
-/*   lesssheet.gtk.capture_failed=<shot> reason=…   cannot be reached honestly
- */
+/*   lesssheet.gtk.capture_ready=<shot> <facts…>       settled; shoot now */
+/*   lesssheet.gtk.capture_failed=<shot> reason=…      cannot be reached */
 /*   lesssheet.gtk.capture_timeout=<shot> waited_ms=…  never settled */
 /* ========================================================================= */
 
@@ -7185,10 +7059,9 @@ capture_sep_popover (App *app)
              : NULL;
 }
 
-/* The marker's facts: the numbers that make a shot checkable from the log
- * alone. Every shot ends with the painted window's row/column counts — the
- * "there IS cell text on screen" proof whose absence is exactly how the macOS
- * filter shot shipped empty. Caller frees. */
+/* The numbers that make a shot checkable from the log alone. Every shot ends
+ * with the painted window's row/column counts — the "there IS cell text on
+ * screen" proof. Caller frees. */
 static char *
 capture_facts (App *app)
 {
@@ -7241,11 +7114,10 @@ capture_finish (App *app, const char *event, char *facts)
   app->capture.stage = LSG_CAPTURE_STAGE_TERMINAL;
 }
 
-/* Is the promised state on screen and FINISHED? (Claim 1 of the two the
- * section comment sets out; claim 2 — that a data-bearing frame carried it —
- * is the tick callback's PAINTING stage.) IMPOSSIBLE is for a state that can
- * never be reached truthfully with these arguments: the tool must fail loudly
- * rather than photograph a lie.
+/* Is the promised state on screen and FINISHED? Claim 1 of the two; claim 2 —
+ * that a data-bearing frame carried it — is the tick callback's PAINTING
+ * stage. IMPOSSIBLE is for a state that can never be reached truthfully with
+ * these arguments: the tool must fail loudly rather than photograph a lie.
  *
  * `*out_reason` is ALWAYS written: the unmet condition's name on a WAIT (which
  * the timeout marker reports, so "it never settled" says WHAT it was waiting
@@ -7334,9 +7206,8 @@ capture_state_verdict (App *app, const char **out_reason)
         return capture_wait (out_reason, "toggle_not_on");
       if (!app->filter.active)
         return capture_wait (out_reason, "filter_not_active");
-      /* total_exact is the filter scan's OWN "the set is final" — the fact the
-       * macOS shot did not wait for. The rows it selected still have to be
-       * painted; that is claim 2. */
+      /* total_exact is the filter scan's own "the set is final". The rows it
+       * selected still have to be painted; that is claim 2. */
       if (!app->filter.snapshot.total_exact)
         return capture_wait (out_reason, "filter_count_not_final");
       if (app->filter.snapshot.total == 0)
@@ -7383,29 +7254,20 @@ capture_drive (App *app, const char *query, const char *row)
 
     case LSG_CAPTURE_FILTER:
       {
-        /* LESSSHEET_GTK_CAPTURE_WHERE=<header>=<value> shoots a COLUMN
-         * PREDICATE instead of a text match filtered to hits. Without it the
-         * filter shot differs from the search shot only by the toggle — same
-         * tab, same popover — so the predicate feature is never pictured.
-         * Mirrors the macOS LESSSHEET_FILTER_WHERE contract, header by NAME so
-         * a fixture gaining a column cannot silently retarget the shot. */
-        /* LESSSHEET_GTK_CAPTURE_WHERE=<header>=<value> shoots a COLUMN
-         * PREDICATE instead of a text match filtered to hits. Without it the
-         * filter shot differs from the search shot only by the toggle — same
-         * tab, same popover — so the predicate feature is never pictured.
-         * Mirrors the macOS LESSSHEET_FILTER_WHERE contract, header by NAME so
-         * a fixture gaining a column cannot silently retarget the shot. */
+        /* With CAPTURE_WHERE the filter shot is a COLUMN PREDICATE rather
+         * than a text match; without it the filter shot differs from the
+         * search shot only by the toggle, so the predicate is never pictured.
+         * The column is addressed by header NAME, so a fixture gaining a
+         * column cannot silently retarget the shot. */
         const char *where = g_getenv ("LESSSHEET_GTK_CAPTURE_WHERE");
         const char *eq = (where != NULL) ? strchr (where, '=') : NULL;
         gboolean did_where = FALSE;
 
         if (eq != NULL && eq != where && *(eq + 1) != '\0')
           {
-            /* open_find FIRST. The Where widgets do not exist until the
-             * popover is built, so testing them before this point always
-             * failed and the shot silently fell back to the text filter —
-             * which is exactly the wrong picture this hook exists to stop
-             * shipping. */
+            /* open_find FIRST: the Where widgets do not exist until the
+             * popover is built, so testing them before this point always fails
+             * and silently falls back to the text filter. */
             open_find (app);
             if (app->find_stack != NULL && app->where_column != NULL)
               {
@@ -7442,10 +7304,9 @@ capture_drive (App *app, const char *query, const char *row)
                     if (app->where_value != NULL)
                       gtk_editable_set_text (app->where_value, eq + 1);
                     did_where = TRUE;
-                    /* Report SUCCESS too, not just the failures. A hook that
-                     * is silent when it works and silent when it quietly falls
-                     * back cannot be diagnosed from a log at all — which is
-                     * exactly the position this one left us in. */
+                    /* Report success too: a hook that is silent when it works
+                     * and silent when it quietly falls back cannot be
+                     * diagnosed from a log at all. */
                     g_printerr (
                         "lesssheet.gtk.capture_where=applied column=%u\n",
                         found);
@@ -7713,8 +7574,8 @@ on_activate (GtkApplication *gtk_app, gpointer data)
 /*
  * Command-line / file-manager open (G_APPLICATION_HANDLES_OPEN). Opens the
  * FIRST passed file via the shared local-open path; extra files are ignored
- * (single-window slice 1). The GFile array is owned by GApplication for the
- * duration of the call — we borrow, never unref.
+ * (one window, one document). The GFile array is owned by GApplication for the
+ * duration of the call — borrowed, never unref'd.
  */
 static void
 on_open (GApplication *gapp, GFile **files, gint n_files, const char *hint,
@@ -7734,20 +7595,17 @@ main (int argc, char *argv[])
   App app = { 0 };
   app.t_start = g_get_monotonic_time (); /* capture entry ASAP */
   app.timing = (g_getenv ("LESSSHEET_GTK_TIMING") != NULL);
-  /* Screenshot-capture affordance: ONE env read, and deliberately nothing
-   * else — the value is not even PARSED until after the first data-bearing
-   * paint, and the query/row vars are not read at all, so an unarmed run
-   * (every normal run, including the one LESSSHEET_GTK_TIMING measures
-   * above) costs a single getenv and allocates nothing. See the capture
-   * section. */
+  /* ONE env read, and deliberately nothing else: the value is not even PARSED
+   * until after the first data-bearing paint and the other vars are not read
+   * at all, so an unarmed run costs a single getenv and allocates nothing. */
   app.capture.env = g_getenv ("LESSSHEET_GTK_CAPTURE");
   app.row_estimate = 1;
   app.find = lsg_find_initial ();
   app.find_nav_direction = LSG_SEARCH_FORWARD;
   app.jump = lsg_jump_initial ();
   app.filter = lsg_filter_initial ();
-  /* Data cell VALUES: small MONOSPACE (uniform advance -> accurate O(1)
-   * column widths + macOS parity). Headers + all chrome stay sans-serif. */
+  /* Data cells are MONOSPACE: a uniform advance is what makes the O(1) column
+   * width arithmetic accurate. Headers and all chrome stay sans-serif. */
   app.font_desc = pango_font_description_from_string ("Monospace 10");
   app.header_font_desc = pango_font_description_from_string ("Sans Bold 10");
   app.gutter_font_desc = pango_font_description_from_string ("Sans 10");
