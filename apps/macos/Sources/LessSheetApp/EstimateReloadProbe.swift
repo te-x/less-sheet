@@ -1,40 +1,25 @@
 import AppKit
 import Foundation
 
-// Verification-only instrumentation for the estimate-refinement / elastic-
-// overscroll collision (the "flashes / resets and resumes during the first
-// few seconds" bug): for a while after opening a large file the background
-// indexer refines `DocumentModel.rowCountInfo` on or near every 100 ms poll
-// tick (see `DocumentModel.startPolling`), and each refinement drives
-// `NativeGridController.apply()` to re-sync the scrollbar via a `reloadData`
-// + clip-origin restore (REVIEW-7: sanctioned over `noteNumberOfRowsChanged`,
-// which is O(row-count delta) on a huge table). Doing that WHILE the clip is
-// mid an elastic rubber-band bounce (a live drag past the top/left edge, or
-// its spring bounce-back still returning) resets/resumes the bounce — the
-// reported flash. Both hooks below are INERT unless their env var is set, so
-// they cost nothing in normal use and never touch the < 500 ms cold-start
-// measurement (armed only after the live grid is built).
+// Verification-only instrumentation for the collision between row-count-estimate
+// refinement and an elastic overscroll bounce: for the first seconds of a large
+// file the indexer refines the estimate on nearly every poll tick, and each
+// refinement re-syncs the scrollbar with a reload plus a clip-origin restore.
+// Doing that while the clip is mid rubber-band resets the bounce, which reads as
+// a flash. Both hooks are inert unless their variable is set, and are armed only
+// after the live grid is built, so neither touches the cold-start measurement.
 //
-//   LESSSHEET_LOG_ESTIMATE=1   Log every row-count-estimate reload decision
-//     `NativeGridController.syncRowCountEstimate` makes — applied
-//     immediately, or deferred because the clip is beyond its natural range
-//     on either axis — with the clip's current origin. This is the
-//     applied/overscroll correlation the fix must break: `applied=true`
-//     must never coincide with `overscroll_x=true` or `overscroll_y=true`.
+//   LESSSHEET_LOG_ESTIMATE=1   Logs every reload decision with the clip's
+//     origin. `applied=true` must never coincide with an overscrolled axis.
 //
-//   LESSSHEET_SIMULATE_OVERSCROLL=top|left   Headless proxy for a HELD
-//     elastic bounce, without any synthetic input event / TCC prompt: once
-//     the live grid is built, force the clip just beyond the named edge
-//     (nothing else moves it afterwards — a static hold, like a finger held
-//     past the edge) for LESSSHEET_SIMULATE_OVERSCROLL_MS (default 4000,
-//     matching the reported 3-5 s window) while the REAL background indexer
-//     keeps refining the estimate and driving `apply()`, then release back
-//     to the resting top-left, log the release marker, and quit shortly
-//     after so a follow-up (flushed) reload's timing is observable — a
-//     self-contained run that does not depend on LESSSHEET_DUMP_EXIT (the
-//     app's first-paint hook would otherwise consume that to quit almost
-//     immediately, well before the hold completes). Combine with
-//     LESSSHEET_LOG_ESTIMATE=1 to see the correlation directly.
+//   LESSSHEET_SIMULATE_OVERSCROLL=top|left   A headless proxy for a HELD bounce,
+//     with no synthetic input event and so no permission prompt: force the clip
+//     just beyond the named edge and leave it there — nothing else moves it, so
+//     it behaves like a finger held past the edge — while the REAL indexer keeps
+//     refining, then release, log, and quit. Self-contained, because the app's
+//     first-paint hook would otherwise consume LESSSHEET_DUMP_EXIT and quit long
+//     before the hold completes. Combine with the log hook to see the
+//     correlation directly.
 @MainActor
 enum EstimateReloadProbe {
     private static let env = ProcessInfo.processInfo.environment

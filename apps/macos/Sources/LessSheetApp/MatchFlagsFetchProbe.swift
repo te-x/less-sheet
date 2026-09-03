@@ -3,9 +3,9 @@ import Contracts
 import Foundation
 
 // Verification-only instrumentation for the match-flags FETCH CADENCE — INERT
-// unless LESSSHEET_MATCHFLAGS_FETCH is set. It locks ARCH-thin-frontend-shared-core
-// Phase-1 AC5 ("one flags fetch per window materialization, NOT per repaint") and
-// Round-2 finding 1 (a stale mask must never be served after a same-geometry
+// unless LESSSHEET_MATCHFLAGS_FETCH is set. It locks two rules: one flags fetch
+// per window materialization and NOT per repaint, and that a stale mask must
+// never be served after a same-geometry
 // content change), which the direct MatchFlagsBridgeTests (they call
 // windowMatchFlags on the session, not through DocumentModel.highlights) can't see.
 //
@@ -22,7 +22,7 @@ import Foundation
 //       repaint_cadence     — N repaints of a fixed window fetch EXACTLY once (not N).
 //       repaint_stable      — further repaints with no change fetch zero times.
 //       refetch_same_geom   — a same-GEOMETRY, same-REQUEST re-materialize STILL
-//                             refetches (LOCKS finding 1: geometry can't gate the
+//                             refetches (geometry alone cannot gate the
 //                             cache; only the content epoch changed).
 //       refetch_after_filter— a filter set+clear round-trip refetches (locks the
 //                             filter-path content-epoch bumps).
@@ -100,7 +100,7 @@ enum MatchFlagsFetchProbe {
         for _ in 0..<repaintN { repaint(model) }
         report("repaint_stable", model.matchFlagsFetchCount, expected: 0, pass: model.matchFlagsFetchCount == 0)
 
-        // --- refetch_same_geom (LOCKS finding 1): a same-GEOMETRY, same-REQUEST
+        // --- refetch_same_geom: a same-GEOMETRY, same-REQUEST
         // re-materialize MUST refetch. Geometry + request are byte-identical to the
         // stable state above; only the content epoch differs — so a key that keyed
         // off geometry+request alone would (wrongly) serve the stale mask here.

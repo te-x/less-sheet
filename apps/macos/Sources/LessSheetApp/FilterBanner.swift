@@ -1,13 +1,8 @@
 import Contracts
 import SwiftUI
 
-// The filtered banner (ARCH-filtered-views app req. 11 / criterion 16): a
-// persistent "Filtered — N of M rows" indicator with a Clear (✕) affordance,
-// shown while a filter is active. Unlike the bottom-right control row it does
-// NOT hover-fade — the filter is a standing view mode, not a transient
-// interaction, so its indicator stays put the whole time it's active (the
-// same glass language, top-leading, clear of the chromeless title-bar area).
-
+/// The "Filtered — N of M rows" indicator, with its Clear affordance. A filter
+/// is a standing view mode, so this stays put the whole time one is active.
 struct FilterBannerView: View {
     @Bindable var model: DocumentModel
     @Environment(\.overlayDumpChrome) private var dumpChrome
@@ -15,13 +10,10 @@ struct FilterBannerView: View {
     var body: some View {
         if let banner = model.filterBanner {
             HStack(spacing: 8) {
-                // ARCH-stream-copy AC9 ("just wiring"): the scan-progress bar
-                // + % SURFACE only once the shared delayed-progress gate says
-                // so (past ~500 ms) — a filter that resolves sooner never
-                // flickers it. The "Filtered — N of M rows" text + Clear
-                // below stay unconditional: a persistent VIEW-MODE indicator,
-                // not a transient long-op affordance (no cancel — ARCH:
-                // "Filter's indicator need not offer cancel").
+                // Only the progress bar is gated by the shared delay, so a filter
+                // that resolves quickly never flickers it. The text and Clear stay
+                // unconditional: they are the view-mode indicator, not a
+                // transient long-op affordance.
                 if let progress = banner.progress, model.filterProgressIndication.isVisible {
                     let fraction = max(0, min(1, progress))
                     if dumpChrome {
@@ -59,9 +51,8 @@ struct FilterBannerView: View {
     }
 }
 
-/// Filtered-banner copy — sentence case, user vocabulary (ARCH req. 11):
-/// "Filtered — 5 of 812 rows", the converging "Filtered — 5 of ~812 rows…",
-/// and the empty result "Filtered — no matching rows" (criterion 18).
+/// "Filtered — 5 of 812 rows", the converging "Filtered — 5 of ~812 rows…", and
+/// the empty "Filtered — no matching rows".
 enum FilterCopy {
     static func summary(_ banner: FilterBanner) -> String {
         if banner.isEmptyResult { return "Filtered — no matching rows" }

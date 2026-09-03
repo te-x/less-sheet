@@ -5,19 +5,8 @@ import LessSheetKit
 import Observation
 import SwiftUI
 
-// Opt-in end-to-end hooks for the frozen Settings redesign probes. Split out of
-// AppDelegate.swift as pure code motion (that file hit the 400-line budget when
-// the launch-open prewarm landed), which also puts this probe where every other
-// probe in this target already lives: its own `*Probe.swift` file. It is a
-// TRACKED source file — the note it used to carry ("lives in an existing
-// promoted source file so it cannot be dropped as an untracked standalone
-// file") was about the risk of an uncommitted new file, not about coupling to
-// the delegate; nothing here touches AppDelegate's private state.
-
-/// Opt-in end-to-end hooks for the frozen Settings redesign probes. The
-/// implementation lives in this existing promoted source file so it cannot be
-/// dropped as an untracked standalone file. Production is inert unless a pinned
-/// `LESSSHEET_SETTINGS_*` variable is present.
+/// Opt-in end-to-end hooks for the Settings probes, inert unless one of the
+/// pinned `LESSSHEET_SETTINGS_*` variables is present.
 @MainActor
 enum SettingsRedesignProbe {
     private static let env = ProcessInfo.processInfo.environment

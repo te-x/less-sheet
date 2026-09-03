@@ -3,9 +3,8 @@ import Contracts
 import Foundation
 import SwiftUI
 
-/// Find popup copy — sentence case, user vocabulary, identical terms everywhere
-/// (ARCH req. 10): "Match 3 of 47", the growing "Match 3 of 47…", "No matches",
-/// "Wrapped to start" / "Wrapped to end", "Stopped", "Scanning… 34%".
+/// Find popup copy: "Match 3 of 47", the growing "Match 3 of 47…", "No matches",
+/// "Wrapped to start", "Stopped".
 enum FindCopy {
     static func status(_ display: FindDisplay) -> String {
         if let notice = display.notice {
@@ -29,7 +28,6 @@ enum FindCopy {
 }
 
 extension SearchOperator {
-    /// The picker glyph (= ≠ < > ≤ ≥).
     var glyph: String {
         switch self {
         case .equals: "="
@@ -41,7 +39,6 @@ extension SearchOperator {
         }
     }
 
-    /// VoiceOver name for the operator.
     var accessibilityName: String {
         switch self {
         case .equals: "Equals"

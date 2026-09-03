@@ -5,12 +5,10 @@ import LessSheetKit
 import Observation
 import SwiftUI
 
-// The app delegate, Settings-window plumbing, and the headless Settings-redesign
-// verification probe, split out of AppUI.swift to keep each file within the length
-// budget. Pure code motion — no behavior change.
+// The app delegate: the deterministic single window, open routing, and the
+// Settings window.
 
-// MARK: - App delegate (deterministic single window + open routing + Settings)
-
+/// What the headless Settings probes read back off the live hierarchy.
 struct SettingsProbeSnapshot {
     let configureColumnsCommand: Bool
     let columnSheet: Bool
@@ -42,17 +40,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         LaunchTiming.phase("did_finish_launching")
-        // PRIMARY CLI path: a document path in argv (direct exec / `open --args`).
         if !routedLaunchOpen, let path = LaunchArguments.documentPath(from: CommandLine.arguments) {
             routedLaunchOpen = true
             route(path)
         }
-        // Headless NETWORK open. ⌘⇧O is a MODAL sheet, so until now the network
-        // funnel had no scriptable entry — and therefore no headless coverage
-        // and no way to measure a network open end to end. This supplies the URL
-        // exactly as the sheet does: same `openURL`, same forced-dialect
-        // override, no recents entry. argv wins if both are present, so it can
-        // never divert a real document. Inert without the variable.
+        // ⌘⇧O is a MODAL sheet, so the network funnel would otherwise have no
+        // scriptable entry and no headless coverage at all. This supplies the URL
+        // exactly as the sheet does. argv wins when both are present, so it can
+        // never divert a real document.
         if !routedLaunchOpen,
            let url = ProcessInfo.processInfo.environment["LESSSHEET_OPEN_URL"],
            !url.isEmpty {
@@ -63,13 +58,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         LaunchTiming.phase("after_show_window")
         NSApp.activate(ignoringOtherApps: true)
 
-        // No document on launch: rest on the launch state (LaunchStateView),
-        // which spells out both entry points (⌘O local file, ⌘⇧O Open URL).
-        // Auto-popping the open panel predated network support and now wrongly
-        // assumes "open" means a local file — the user picks the entry point.
+        // With no document we rest on the launch state, which spells out both
+        // entry points. Auto-popping the file panel would assume "open" means a
+        // local file, which stopped being true when URLs landed.
     }
 
-    // `open -a LessSheet file.csv`, Finder double-click, drag-onto-icon.
+    // `open -a`, Finder double-click, drag onto the icon.
     func application(_ application: NSApplication, open urls: [URL]) {
         routedLaunchOpen = true
         for url in urls { route(url.path(percentEncoded: false)) }
@@ -88,18 +82,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return true
     }
 
-    private func route(_ path: String) {   // launch-phase stamps: see LaunchTiming.phase
-        // The FIRST path routed at launch belongs to LaunchOpenPrewarm, whose
-        // core open is already running off-main; every later open — a drag onto
-        // the running app, a second launch URL — takes the normal async funnel.
+    private func route(_ path: String) {
+        // The FIRST path routed at launch belongs to the prewarm, whose core open
+        // is already running off-main; every later one takes the normal funnel.
         if LaunchOpenPrewarm.handleLaunchRoute(path, forcing: launchForcedOverride()) { return }
         Task { await DocumentModel.shared.open(path: path, forcing: launchForcedOverride()) }
     }
 
-    /// Creates the single chromeless main window (idempotent) hosting the
-    /// SwiftUI content. The title bar is transparent and the title hidden, so
-    /// the grid fills the whole frame; the window still carries the document
-    /// title for Mission Control / the Window menu / the Dock (ARCH req 1).
+    /// Creates the single chromeless main window, idempotently. The title bar is
+    /// transparent and the title hidden, so the grid fills the whole frame; the
+    /// window still carries the document title for Mission Control, the Window
+    /// menu and the Dock.
     func showMainWindow() {
         if let window = mainWindow {
             window.makeKeyAndOrderFront(nil)
@@ -117,18 +110,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.isMovableByWindowBackground = true
         window.isReleasedWhenClosed = false
         window.contentMinSize = NSSize(width: 520, height: 360)
-        // Native chromeless content (as the first viewer-ui build had it): the
-        // transparent full-size-content title bar lets grid content scroll UNDER
-        // it, and macOS 26's ScrollView scroll-edge effect frosts that content
-        // through the title-bar region — the look the author liked. NO custom
-        // opaque strip (that was the regression). The grid insets its top by the
-        // title-bar height (see GridView) so at rest row 1 sits fully below the
-        // title-bar region while scrolled content still travels under it.
-        //
         // Adopt the prewarmed launch open if it has ALREADY landed, so SwiftUI's
-        // FIRST pass renders the grid instead of rendering the launch state and
-        // then re-rendering. Never blocks: if the open is still running this
-        // does nothing and the prewarm adopts from its own completion.
+        // first pass renders the grid rather than rendering the launch state and
+        // then re-rendering. Never blocks: if the open is still running this does
+        // nothing and the prewarm adopts from its own completion.
         LaunchOpenPrewarm.adoptIfReady()
         LaunchTiming.phase("before_hosting_view")
         window.contentView = NSHostingView(rootView: ContentView(model: .shared))
@@ -138,7 +123,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             window.center()
         }
         CaptureProbe.configure(window: window)   // inert without LESSSHEET_CAPTURE_*
-        // Traffic lights always visible (no fade).
         for type in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
             window.standardWindowButton(type)?.alphaValue = 1
         }
@@ -146,7 +130,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         mainWindow = window
     }
 
-    /// File › Open… — the shared open-panel entry.
     static func openViaPanel() {
         let panel = NSOpenPanel()
         panel.allowsMultipleSelection = false
@@ -160,9 +143,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// File › Open URL… (⌘⇧O) — a small sheet with a URL field, funneling into
-    /// `DocumentModel.openURL` (ARCH-network-source req 9). ⌘O's local panel is
-    /// unaffected. The URL is opened as typed; no recents entry.
+    /// A small sheet with a URL field. The URL is opened as typed, with no
+    /// recents entry.
     static func openURLViaSheet() {
         let alert = NSAlert()
         alert.messageText = "Open URL"
@@ -180,8 +162,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Raises the sole normal Settings surface, optionally deep-linked from a
-    /// grid header to one logical column.
+    /// Raises the Settings window, optionally deep-linked from a grid header to
+    /// one column.
     func presentSettings(selecting column: Int? = nil) {
         DocumentModel.shared.beginSettings(selecting: column)
         if let window = settingsWindow {
@@ -204,9 +186,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         settingsWindow = window
     }
 
-    /// Reads acceptance facts from the live Settings/AppKit hierarchy and the
-    /// discovery model state that hierarchy renders. Missing markers are false,
-    /// so a composition regression cannot be hidden by the probe.
+    /// Reads facts from the LIVE Settings hierarchy, not from the model alone.
+    /// A missing marker reads false, so a composition regression cannot hide
+    /// behind the probe.
     func settingsProbeSnapshot(model: DocumentModel) -> SettingsProbeSnapshot {
         settingsWindow?.contentView?.layoutSubtreeIfNeeded()
         settingsWindow?.contentView?.displayIfNeeded()
@@ -288,9 +270,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return children.contains { containsConfigureColumnsAccessibility($0, depth: depth + 1) }
     }
 
-    /// Verification-only fallback for off-screen launches where SwiftUI may not
-    /// schedule the content `.task`: force the opened document view through its
-    /// first display pass before driving a Settings probe.
+    /// Off-screen, SwiftUI may never schedule the content `.task`, so force the
+    /// document view through a first display pass before driving the probe.
     func runSettingsProbeAfterFirstPaint(model: DocumentModel) {
         guard SettingsRedesignProbe.active else { return }
         showMainWindow()
@@ -301,8 +282,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
-/// Clears `settingsOpen` when the Settings window closes (so the overlay can
-/// resume its idle fade).
+/// Clears `settingsOpen` when the Settings window closes.
 @MainActor
 final class SettingsWindowObserver: NSObject, NSWindowDelegate {
     static let shared = SettingsWindowObserver()

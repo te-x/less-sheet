@@ -2,7 +2,7 @@ import AppKit
 import Contracts
 import Foundation
 
-// Verification-only instrumentation for the search-escape defect-pass — INERT
+// Verification-only instrumentation for the search-escape path — INERT
 // unless LESSSHEET_FIND_ESCAPE is set. Proves the "escape from search" path:
 // once a find is open (the common stuck case is focus having left the popup
 // field — the user clicked a cell after searching, so Esc reaches the GRID, not

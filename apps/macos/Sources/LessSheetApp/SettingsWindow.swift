@@ -18,23 +18,18 @@ struct SettingsProbeMarker: NSViewRepresentable {
     }
 }
 
-// The sole column-configuration surface: compact full-width Parsing above the
-// adaptive discovery list and selected-column inspector.
-//
-// csv-hardening (ARCH req. 11/12) adds a fourth Parsing control, "Text
-// encoding": Automatic + the five forced encodings, routed through the SAME
-// `applyDialectChange` re-open path as the other three — it is deliberately
-// NOT an overlay pill (per the ARCH), so it lives only here.
-
+/// The sole column-configuration surface: a compact full-width Parsing section
+/// above the adaptive discovery list and the selected-column inspector. Text
+/// encoding lives only here — it is deliberately not an overlay pill — but takes
+/// the same re-open path as the other three parsing controls.
 struct SettingsView: View {
     @Bindable var model: DocumentModel
 
-    // Custom separator/quote entry (parity with the overlay pills, which offer a
-    // "Custom…" single-ASCII-character field). The fixed pickers can only PICK a
-    // preset or echo an already-forced custom byte; selecting "Custom…" reveals
-    // an inline one-character field routed through the SAME `applyDialectChange`
-    // funnel, so the frozen `DialectComposer` still owns validation (ASCII
-    // 0x01–0x7F, not CR/LF, separator ≠ quote — an invalid byte is a no-op).
+    // Custom separator/quote entry, matching what the overlay pills offer. The
+    // fixed pickers can only PICK a preset or echo an already-forced byte;
+    // "Custom…" reveals an inline one-character field routed through the same
+    // funnel, so the composer still owns the validation and an invalid byte is a
+    // no-op.
     @State private var showSeparatorCustom = false
     @State private var showQuoteCustom = false
     @State private var separatorCustomText = ""
@@ -180,7 +175,7 @@ struct SettingsView: View {
         }
     }
 
-    /// The report's resolved encoding (ARCH req. 11's "detected: …" subtitle),
+    /// The report's resolved encoding,
     /// surfaced whether Automatic is active or a forced choice is confirmed.
     private var detectedEncoding: TextEncoding { EncodingPicker.detected(in: model.dialect) }
 
@@ -188,7 +183,7 @@ struct SettingsView: View {
     /// (that pinned order is exactly what the `ForEach` above renders). Reading
     /// re-derives the selected option from the live report every time (so a
     /// re-open from elsewhere stays in sync); writing composes + re-opens
-    /// through the SAME path as every other dialect control (ARCH req. 12).
+    /// through the SAME path as every other dialect control.
     private var encodingIndexBinding: Binding<Int> {
         Binding(
             get: { EncodingPicker.options.firstIndex(of: EncodingPicker.selection(for: model.dialect)) ?? 0 },

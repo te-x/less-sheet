@@ -3,7 +3,7 @@ import Contracts
 import Foundation
 
 // Verification-only instrumentation for the STREAMING-COPY DRIVE OUTCOMES
-// (ARCH-thin-frontend-shared-core Phase 2, Round-2 findings 1 & 2) — INERT unless
+// — INERT unless
 // LESSSHEET_STREAM_COPY_OUTCOME is set, so it costs nothing in normal use.
 //
 // It drives `DocumentModel.streamCopy` (the OFF-main streaming drive behind
@@ -20,7 +20,7 @@ import Foundation
 //     line each, then (under LESSSHEET_DUMP_EXIT) quit. Cases:
 //       byte_budget     — MORE chunks exceeding a small maxTotalBytes stop at
 //                         `.stoppedAtBudget` (bounded blob), and the job is closed.
-//       filtered_stall  — LOCKS finding 1: a STALLED that recurs on the SAME view
+//       filtered_stall  — a STALLED that recurs on the SAME view
 //                         row after a jump that returned DONE without advancing (the
 //                         filtered mis-target) stops CLEANLY at `.stoppedAtFrontier`
 //                         with NO busy-spin — asserted by a tiny bounded next()/jump
@@ -165,7 +165,7 @@ private final class FakeCopyStream: CopyStreaming, @unchecked Sendable {
 /// A minimal `DocumentSession` double: only `openCopy` / `startJump` / `jumpStatus`
 /// (the members `streamCopy` calls) do real work. `startJump` is a no-op and
 /// `jumpStatus` reports `.done` immediately WITHOUT advancing any frontier — exactly
-/// the filtered mis-target finding 1 fixes. Every other member is unreachable from
+/// the filtered mis-target. Every other member is unreachable from
 /// `streamCopy`.
 private final class FakeCopySession: DocumentSession, @unchecked Sendable {
     private let stream: FakeCopyStream

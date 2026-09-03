@@ -2,13 +2,9 @@ import AppKit
 import Contracts
 import SwiftUI
 
-// Jump-to-row overlay controls, split out of OverlayView.swift to keep each
-// file within the length budget. Pure code motion — no behavior change.
-
-/// Jump-to-row (req. 6): a glass button that opens an upward popup with a
-/// digits-only field showing the current row-count knowledge; while a scan runs
-/// the popup shows progress with an Esc-cancel affordance (ARCH req. 7). Jump
-/// behavior itself is unchanged — only its presentation moved into the popup.
+/// Jump-to-row: a button opening a popup with a digits-only field that shows
+/// the current row-count knowledge. While a scan runs the popup shows progress
+/// with an Esc-cancel affordance.
 struct JumpControlView: View {
     @Bindable var model: DocumentModel
     @Environment(\.overlayDumpChrome) private var dumpChrome
@@ -24,8 +20,7 @@ struct JumpControlView: View {
         return false
     }
 
-    /// The field shows its rejected (red) styling on a live blink or when a
-    /// headless dump forces it.
+    /// Red on a live blink, or when a dump forces it.
     private var rejected: Bool { rejectedFlash || dumpRejected }
 
     var body: some View {
@@ -33,9 +28,8 @@ struct JumpControlView: View {
             model.openJumpField()
             DispatchQueue.main.async { fieldFocused = true }
         } label: {
-            // A custom "jump from here to there" glyph (item 4): two stacked
-            // circles joined by an arc that bulges right and arrows into the
-            // lower circle. SF Symbols had nothing that read correctly.
+            // A custom glyph: SF Symbols had nothing that reads as "jump from
+            // this row to that one".
             JumpArrowGlyph(lineWidth: 1.1)
                 .foregroundStyle(.primary)
                 .frame(width: OverlayMetrics.controlSize, height: OverlayMetrics.controlSize)
@@ -45,9 +39,8 @@ struct JumpControlView: View {
         .glassChrome(.regular.interactive(), in: Circle())
         .overlay(alignment: .top) {
             if popupVisible {
-                // Float the popup above the button (expands upward); fixedSize
-                // so it uses its own width, not the button's small frame. The
-                // shake is applied here so a rejection nudges the whole popup.
+                // `fixedSize` so the popup uses its own width, not the button's
+                // small frame. The shake sits here, so a rejection nudges it all.
                 popup
                     .fixedSize()
                     .modifier(Shake(animatableData: shake))
@@ -58,28 +51,24 @@ struct JumpControlView: View {
         .accessibilityLabel("Jump to row")
         .onChange(of: model.jumpFlow) { _, flow in
             switch flow {
-            // Landing or cancelling collapses the popup back to the button.
             case .landed, .cancelled: model.jumpFieldActive = false
-            // A rejection also lands the flow on .idle, but the field must STAY
-            // open for correction — so .idle does NOT close it (item 4).
+            // A rejection also lands on .idle, but the field must STAY open for
+            // correction — so .idle deliberately does not close it.
             case .idle: break
             case .scanning:
-                // The scanning progress state reached the view layer — evidence
-                // (main-actor) that progress rendered right after submit.
                 JumpProbe.noteScanningShown()
             }
         }
         .onChange(of: model.jumpRejections) { _, _ in reject() }
         .onChange(of: model.jumpFocusRequests) { _, _ in
-            // ⌘J: open the field and focus it (keyboard reveal path).
             if case .scanning = model.jumpFlow { return }
             model.openJumpField()
             DispatchQueue.main.async { fieldFocused = true }
         }
     }
 
-    /// A rejected jump (item 4): keep the field open with its text selected for
-    /// correction, blink it red, and — unless Reduce Motion — shake it briefly.
+    /// Keep the field open with its text selected for correction, blink it red,
+    /// and — unless Reduce Motion — shake it.
     private func reject() {
         model.jumpFieldActive = true
         fieldFocused = true
@@ -101,12 +90,10 @@ struct JumpControlView: View {
     private var popup: some View {
         Group {
             if case let .scanning(_, _, progress) = model.jumpFlow {
-                // ARCH-stream-copy AC9 ("just wiring"): the scanning
-                // progress bar + Cancel only SURFACE once the shared gate
-                // says so (past ~500 ms) — a scan that lands sooner never
-                // flickers it. Esc still cancels the REAL scan either way
-                // (`field(onExit:)` below), so gating the VISUAL never
-                // weakens cancellability.
+                // The progress bar surfaces only past the shared threshold, so a
+                // scan that lands sooner never flickers it. Esc still cancels the
+                // REAL scan either way, so gating the visual never weakens
+                // cancellability.
                 if model.jumpProgressIndication.isVisible {
                     scanning(progress: progress)
                 } else {
@@ -119,18 +106,16 @@ struct JumpControlView: View {
         .glassChrome(.regular, in: Capsule())
     }
 
-    /// The row/hint field. `onExit` differs by context (ARCH-stream-copy
-    /// AC9): plain Esc dismisses the popup when idle, but while a
-    /// sub-threshold scan is quietly running underneath (see `popup` above)
-    /// Esc must still CANCEL that real scan, not merely hide UI that was
-    /// never shown.
+    /// `onExit` differs by context: Esc dismisses the popup when idle, but while
+    /// a sub-threshold scan is quietly running underneath it must CANCEL that
+    /// real scan, not merely hide UI that was never shown.
     private func field(onExit: @escaping () -> Void) -> some View {
         let rowSummary = RowCountText.summary(
             model.jumpRowCountInfo, unknownTotal: model.documentTotalUnknown)
         return HStack(spacing: 8) {
             Group {
                 if dumpChrome {
-                    // ImageRenderer can't snapshot a live TextField; show its state.
+                    // A dump cannot capture a live TextField, so mirror its state.
                     let typed = model.jumpFieldText
                     Text(typed.isEmpty ? "Row" : typed)
                         .foregroundStyle(rejected ? Color.red : (typed.isEmpty ? Color.secondary : Color.primary))
@@ -142,20 +127,12 @@ struct JumpControlView: View {
                         .foregroundStyle(rejected ? Color.red : Color.primary)
                         .focused($fieldFocused)
                         .onSubmit(submit)
-                        // ↑/↓ step the row number — INVERTED on purpose (↑ goes
-                        // toward row 1, ↓ toward the end; see `JumpFieldStep`).
-                        // They only EDIT the field: nothing travels until Enter.
-                        // Attached to the field itself, so they exist only while
-                        // it does — a closed popup leaves the arrows to the grid.
-                        // `.repeat` included so HOLDING an arrow keeps stepping.
-                        // Without it a held key steps once, while GTK auto-repeats
-                        // natively — a user-visible divergence the GTK
-                        // implementer found by reading this file and could not fix
-                        // from its side. Holding to run through rows is what every
-                        // stepper does, so macOS matches GTK rather than the reverse.
-                        // `.up` too: a held arrow ACCELERATES (step 1 → 10 → 100 →
-                        // 1000, see `JumpFieldRamp`) and releasing the key is what
-                        // returns the next press to step 1.
+                        // ↑/↓ only EDIT the field; nothing travels until Enter.
+                        // Attached to the field itself, so a closed popup leaves
+                        // the arrows to the grid. `.repeat` is what makes HOLDING
+                        // an arrow keep stepping, as every stepper does; `.up` is
+                        // what ends the hold, so the acceleration cannot carry
+                        // into the user's next single tap.
                         .onKeyPress(.upArrow, phases: [.down, .repeat, .up]) { stepped(.towardStart, $0) }
                         .onKeyPress(.downArrow, phases: [.down, .repeat, .up]) { stepped(.towardEnd, $0) }
                 }
@@ -182,7 +159,7 @@ struct JumpControlView: View {
     private func progressBar(_ progress: Double) -> some View {
         let fraction = max(0, min(1, progress))
         if dumpChrome {
-            // ImageRenderer can't snapshot a live ProgressView; draw a static bar.
+            // A dump cannot capture a live ProgressView; draw a static bar.
             ZStack(alignment: .leading) {
                 Capsule().fill(.quaternary).frame(width: 96, height: 6)
                 Capsule().fill(Color.accentColor).frame(width: 96 * fraction, height: 6)
@@ -213,13 +190,12 @@ struct JumpControlView: View {
             model.jumpFieldText = ""
             if case .scanning = model.jumpFlow {} else { model.jumpFieldActive = false }
         }
-        // Invalid input: keep the field open for correction (no re-open).
+        // Invalid input keeps the field open for correction.
     }
 
-    /// One arrow key event: a press (or an auto-repeat) steps the field's number,
-    /// a RELEASE ends the hold so the ramp cannot stay accelerated into the user's
-    /// next single tap. Either way the key is consumed, so the field editor never
-    /// also moves the caret. No jump, no scan, no scroll.
+    /// A press or auto-repeat steps the field's number; a RELEASE ends the hold.
+    /// Either way the key is consumed, so the field editor never also moves the
+    /// caret.
     private func stepped(_ direction: JumpFieldStep, _ keyPress: KeyPress) -> KeyPress.Result {
         if keyPress.phase.contains(.up) {
             model.endJumpFieldHold()
@@ -230,21 +206,15 @@ struct JumpControlView: View {
     }
 }
 
-/// The custom jump glyph (item 4): two circles stacked and horizontally
-/// aligned; an arrow leaves the TOP circle heading south-east, arcs out to the
-/// right, curves back south-west and arrows into the BOTTOM circle — "jump from
-/// this row to that row". Drawn as stroked paths (no fill) so it adapts to
-/// light/dark via the inherited foreground style; stroke weight matches the
-/// neighbouring SF Symbols (~semibold).
+/// Two stacked circles with an arrow arcing from the top one into the bottom —
+/// "jump from this row to that row". Stroked paths with no fill, so it adapts to
+/// light and dark through the inherited foreground style.
 struct JumpArrowGlyph: View {
     var lineWidth: CGFloat = 2
-    /// Fraction of the (square) frame the glyph height fills (~10% up from the
-    /// previous tuning).
+    /// Fraction of the square frame the glyph height fills.
     var fill: CGFloat = 0.43
-    // TRUE content bounding box in design coords (NOT an outer design box):
-    // circle-left … arc-right, top-circle-top … bottom-circle-bottom. Centering
-    // THIS box in the frame centers the visible glyph exactly (the stroke adds a
-    // symmetric outset, so it doesn't shift the centre).
+    // The TRUE content bounding box, not an outer design box: centering THIS
+    // centers the visible glyph exactly, since the stroke outsets symmetrically.
     private let bMinX: CGFloat = 19, bMaxX: CGFloat = 56
     private let bMinY: CGFloat = 7, bMaxY: CGFloat = 93
 
@@ -252,20 +222,17 @@ struct JumpArrowGlyph: View {
         GeometryReader { geo in
             let boxWidth = bMaxX - bMinX, boxHeight = bMaxY - bMinY
             let scale = min(geo.size.width / boxWidth, geo.size.height / boxHeight) * fill
-            // Center the content bbox in the frame on BOTH axes (no eyeballed
-            // padding): map bbox-centre → frame-centre.
             let originX = (geo.size.width - boxWidth * scale) / 2 - bMinX * scale
             let originY = (geo.size.height - boxHeight * scale) / 2 - bMinY * scale
             let mapPoint = { (pointX: CGFloat, pointY: CGFloat) in
                 CGPoint(x: originX + pointX * scale, y: originY + pointY * scale)
             }
 
-            let dotRadius: CGFloat = 11 * scale          // small circles
+            let dotRadius: CGFloat = 11 * scale
             let topC = mapPoint(30, 18), botC = mapPoint(30, 82)
             let start = mapPoint(40, 26), end = mapPoint(40, 74)
-            // A TRUE circular arc (constant radius) bulging right: its centre
-            // sits to the LEFT of the vertical start→end chord, so the arc bows
-            // out to the right — smoother than a Bézier.
+            // A true circular arc rather than a Bézier — constant radius reads
+            // smoother — with its centre left of the chord so it bows right.
             let arcCenter = mapPoint(30, 50)
             let arcR = hypot(start.x - arcCenter.x, start.y - arcCenter.y)
             let arcStartAngle = atan2(start.y - arcCenter.y, start.x - arcCenter.x)

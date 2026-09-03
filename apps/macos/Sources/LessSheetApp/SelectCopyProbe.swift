@@ -2,11 +2,10 @@ import AppKit
 import Contracts
 import Foundation
 
-// Verification-only instrumentation for the select-copy slice (ARCH-select-
-// copy) — INERT unless LESSSHEET_SELECT_COPY is set, so it costs nothing in
-// normal use and never touches the < 500 ms cold-start measurement (it starts
-// only after the first data-bearing frame). Mirrors JumpProbe/FindProbe: drive
-// the REAL model entry points a mouse/keyboard event would ultimately call
+// Verification-only instrumentation for select-copy — INERT unless
+// LESSSHEET_SELECT_COPY is set, and armed only after the first data-bearing
+// frame, so it never touches the cold-start measurement. Like the other probes it
+// drives the REAL model entry points a mouse or keyboard event would call
 // (`DocumentModel.selectCell`/`extendSelection`/`selectWholeRow`/
 // `selectWholeColumn`/`selectAll`/`copySelection`/`resizeWindowColumn`/
 // `autoFitWindowColumn`) DIRECTLY — exactly like JumpProbe drives
@@ -56,7 +55,7 @@ enum SelectCopyProbe {
             return
         }
 
-        // AC1 — selection geometry, driven exactly as the mouse/keyboard
+        // Selection geometry, driven exactly as the mouse/keyboard
         // handlers in NativeGridController would call it.
         model.selectCell(row: 0, column: 0)
         log("lesssheet.selectcopy.select_cell rect=\(describe(model.selection?.rect))")
@@ -80,7 +79,7 @@ enum SelectCopyProbe {
         // already-loaded row content instead of reconfiguring it as loading.
         selectionInteractionRegressions()
 
-        // AC5 — column resize + auto-fit (O(1)/O(visible rows); no reload).
+        // Column resize + auto-fit: no reload, and measured over visible rows.
         let before = model.windowWidths().first ?? 0
         NativeGridController.live?.resizeColumn(windowIndex: 0, toWidth: 250)
         let afterResize = model.windowWidths().first ?? 0
@@ -89,12 +88,12 @@ enum SelectCopyProbe {
         let afterFit = model.windowWidths().first ?? 0
         log("lesssheet.selectcopy.autofit before=\(afterResize) after=\(afterFit)")
 
-        // ARCH-select-copy round 2, finding 1 regression: a header click must
+        // A header click must
         // resolve the ABSOLUTE column under the cursor even when the grid is
         // scrolled horizontally — see the function's own comment for the bug.
         headerScrolledSelectRegression()
 
-        // AC2/AC3 — a small, deterministic copy: rows 0-2, the first (up to 3)
+        // A small, deterministic copy: rows 0-2, the first (up to 3)
         // columns — small enough to complete instantly, so its exact payload
         // (logged in full) is directly comparable against the fixture.
         let smallLastCol = min(2, lastCol)
@@ -160,7 +159,7 @@ enum SelectCopyProbe {
             + " pending_before=\(pendingBefore) pending_after=\(loadedRow.view.pending)")
     }
 
-    /// FIX 1 regression guard (ARCH-select-copy round 2, finding 1): a header
+    /// FIX 1 regression guard: a header
     /// click must select the ABSOLUTE column under the cursor even when the
     /// grid is scrolled horizontally. `GridHeaderView.mouseDown` re-bases its
     /// own (descrolled) local click x into the controller's ABSOLUTE space
@@ -239,7 +238,7 @@ enum SelectCopyProbe {
             + " pass=\(extendPass)")
     }
 
-    /// AC4 — a copy spanning as much of the document as exists (capped so a
+    /// A copy spanning as much of the document as exists (capped so a
     /// modest fixture still exercises the SAME code path as a budget-filling
     /// one): a fast (16 ms) heartbeat runs alongside it, proving the main
     /// thread stays responsive for the whole build (mirrors LandingStallProbe).

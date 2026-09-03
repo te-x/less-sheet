@@ -2,30 +2,17 @@ import AppKit
 import Contracts
 import Foundation
 
-// Verification-only instrumentation for the config-repaint defect-pass
-// regression-LOCK (cc-macos) — INERT unless LESSSHEET_CONFIG_REPAINT is set, so
-// it costs nothing in normal use and never touches the < 500 ms cold-start
-// measurement (it starts only after the first data-bearing frame). Mirrors
-// SelectCopyProbe/JumpProbe: drive the REAL model entry point the Settings
-// inspector's "Thousands grouping" toggle ultimately calls
-// (`DocumentModel.setColumnFormat`) DIRECTLY — no synthetic input events (no
-// TCC prompt risk) — then prove the fix headlessly.
+// Locks the rule that a column-config edit repaints the grid ITSELF rather than
+// waiting for the user's next click or scroll. Inert unless
+// LESSSHEET_CONFIG_REPAINT is set, and armed only after the first data-bearing
+// frame, so it never touches the cold-start measurement. It drives the real model
+// entry point the Settings inspector calls, with no synthetic input events.
 //
-// The bug: a column-config edit made from the SEPARATE (key) Settings window did
-// not repaint the already-visible grid until the user clicked/scrolled it. Root
-// cause: the `@Observable` -> updateNSView -> apply() SwiftUI bridge does not
-// reliably re-fire when the mutation originates in a different key window. The
-// fix (in ViewerModel's `refreshAfterColumnConfiguration`) adds an explicit
-// `NativeGridController.live?.apply()` poke after bumping the revision.
-//
-// The MATERIALIZATION-INDEPENDENT seam this locks: after the model-side edit,
-// the controller's APPLIED column-configuration revision
-// (`appliedColumnConfigurationRevision`) must equal the model's current
-// `columnConfigurationRevision` — proven WITHOUT this probe ever calling
-// apply() itself. The lock is that the MODEL's mutator pokes the controller;
-// remove the poke and, in a headless window (no implicit updateNSView), nothing
-// applies the edit -> the controller's applied revision LAGS the model's ->
-// applied=false -> RED.
+// The seam is deliberately materialization-independent: after the model-side
+// edit, the controller's APPLIED revision must equal the model's current one —
+// proven without this probe ever calling apply() itself. Remove the mutator's
+// explicit poke and, in a headless window where no implicit update fires, the
+// applied revision lags and this goes red.
 //
 //   LESSSHEET_CONFIG_REPAINT=1   After first paint, drive ONE real column-config
 //     edit once and read both revisions in the SAME synchronous main-actor turn

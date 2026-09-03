@@ -5,11 +5,10 @@ import LessSheetKit
 import Observation
 import SwiftUI
 
-// The non-grid content states (empty / launch / error panels) and the reactive
-// window chrome, split out of AppUI.swift to keep each file within the length
-// budget. Pure code motion — no behavior change.
+// The non-grid content states — empty, launch and error — and the reactive
+// window chrome.
 
-/// A single quiet line, centered — used for the empty-file state.
+/// A single quiet line, centered.
 struct EmptyStateView: View {
     let line: String
 
@@ -22,24 +21,17 @@ struct EmptyStateView: View {
     }
 }
 
-/// The blank launch screen shown when the app starts with no document (i.e. not
-/// via a Finder open / argv). It spells out the two ways to open something —
-/// a local file (⌘O) and a network URL (⌘⇧O) — instead of the old behavior of
-/// immediately popping the file panel, which predated network support and
-/// wrongly assumed "open" meant a local file. Same quiet, centered aesthetic as
-/// the empty-file state, headed by the app logo so an app opened without a file
-/// shows its own identity (the GTK launch page does the same).
+/// Shown when the app starts with no document. It spells out both ways to open
+/// one rather than popping the file panel, which would assume "open" means a
+/// local file.
 struct LaunchStateView: View {
-    /// Logo tile size — matches the 128 px GNOME status pages (and our GTK
-    /// launch page) draw the app icon at, so both frontends read alike.
+    /// Matches what the GNOME status pages draw the app icon at, so both
+    /// frontends read alike.
     private static let logoSize: CGFloat = 128
 
-    /// The logo is the bundle's icon (`AppIcon.icns`, generated from
-    /// branding/icon.svg by assemble-app.sh) — the one image AppKit already
-    /// loads for the Dock and About, so no resource of our own is shipped or
-    /// looked up. Outside an assembled bundle (a bare `swift run`) AppKit hands
-    /// back its generic application icon instead; it is never nil in practice,
-    /// and the fallback keeps even that case a blank tile rather than a crash.
+    /// The bundle's own icon — the one image AppKit already loads for the Dock
+    /// and About, so no resource of ours is shipped or looked up. Outside an
+    /// assembled bundle AppKit hands back its generic application icon.
     private static var logo: NSImage {
         NSApplication.shared.applicationIconImage ?? NSImage()
     }
@@ -50,7 +42,7 @@ struct LaunchStateView: View {
                 .resizable()
                 .interpolation(.high)
                 .frame(width: Self.logoSize, height: Self.logoSize)
-                .accessibilityHidden(true) // decorative — the title below carries the meaning
+                .accessibilityHidden(true) // the title below carries the meaning
                 .padding(.bottom, 8)
             Text("Open a spreadsheet to view it")
                 .font(.title3)
@@ -77,8 +69,7 @@ struct LaunchStateView: View {
     }
 }
 
-/// In-window error panel: the fact, then the fix path (ARCH: errors = fact +
-/// fix). Semantic colors; the path is selectable.
+/// The in-window error panel: the fact, then the fix.
 struct ErrorPanel: View {
     let error: DocumentOpenError
     let path: String
@@ -118,11 +109,9 @@ struct ErrorPanel: View {
     }
 }
 
-/// The network-open analog of `ErrorPanel` (ARCH-network-source AC7 — round-2
-/// review finding 2): renders each of the 7 distinct `NetworkOpenError` cases
-/// with its own fact + fix, so a 404, a DNS/connect failure, a timeout, a
-/// redirect-loop, a disallowed scheme, and a spool-IO error never read as the
-/// same generic message.
+/// The network analog of `ErrorPanel`. Each case gets its own fact and fix, so a
+/// 404, a DNS failure, a timeout, a redirect loop, a disallowed scheme and a
+/// spool-IO error never read as the same generic message.
 struct NetworkErrorPanel: View {
     let error: NetworkOpenError
     let path: String
@@ -174,9 +163,8 @@ struct NetworkErrorPanel: View {
 
 // MARK: - Window chrome (reactive)
 
-/// Reveals/hides the traffic lights with the overlay and keeps the window's
-/// document title current. Static chrome (transparent title bar, hidden title)
-/// is set once by the delegate at window creation.
+/// Keeps the window's document title current. The static chrome — transparent
+/// title bar, hidden title — is set once by the delegate at window creation.
 struct WindowConfigurator: NSViewRepresentable {
     let title: String
 
@@ -192,19 +180,14 @@ struct WindowConfigurator: NSViewRepresentable {
 
     private func apply(to window: NSWindow?) {
         guard let window else { return }
-        // Keep the document title current for Mission Control / the Window menu
-        // / the Dock (ARCH req 1) — but NEVER toggle `titleVisibility`. Making the
-        // title visible flips AppKit into "titled" layout: it insets the content
-        // view BELOW the title bar (so grid content no longer scrolls under it —
-        // killing the scroll-edge frost) and misaligns the pinned header vs row 1
-        // (the 6 pt overlap). be86b2a kept it statically `.hidden`; that is what
-        // preserved the blur and the clean top edge, so we restore that. Only the
-        // traffic lights fade in/out with the overlay reveal.
+        // The title is kept current for Mission Control, the Window menu and the
+        // Dock, but `titleVisibility` must NEVER be toggled: making the title
+        // visible flips AppKit into titled layout, which insets the content view
+        // below the title bar — killing the under-titlebar scroll and its frost —
+        // and misaligns the pinned header against row 1. The filename the user
+        // sees is our own label instead.
         window.title = title
         window.titleVisibility = .hidden
-        // Traffic lights always visible (no fade); the filename is drawn by our
-        // own always-on title label (keeping titleVisibility .hidden preserves
-        // the under-titlebar scroll + frost + header alignment).
         for type in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
             window.standardWindowButton(type)?.alphaValue = 1
         }

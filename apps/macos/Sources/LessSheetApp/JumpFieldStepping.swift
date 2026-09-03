@@ -1,21 +1,18 @@
 import Contracts
 import Foundation
 
-// Arrow-key stepping of the OPEN jump field's row number (⌘J, then ↑/↓). The
-// field's TEXT is the only thing that changes: no jump begins, no scan runs and
-// the viewport never moves until Enter — so stepping costs exactly the same on a
-// 40-byte file as on a 40 GB one, and the < 500 ms cold start is untouched
-// (nothing here runs at launch).
+// Arrow-key stepping of the OPEN jump field's row number. The field's TEXT is
+// the only thing that changes: no jump begins, no scan runs and the viewport
+// never moves until Enter, so stepping costs the same on a 40-byte file as on a
+// 40 GB one.
 
 /// Which way an arrow key walks the jump field's 1-based row number.
 ///
-/// DELIBERATELY INVERTED relative to a numeric stepper (the author, 2026-08): ↑
-/// steps toward the START of the document (a SMALLER row number), ↓ toward the
-/// END (a LARGER one). Rows travel UP the screen while you scroll DOWN, so
-/// "down" reads as "further down the document" — the direction the row number
-/// grows. The physical-key → case mapping lives in exactly ONE place
-/// (`JumpControlView`'s `onKeyPress`), so the inversion is stated once and
-/// cannot drift.
+/// DELIBERATELY INVERTED relative to a numeric stepper: ↑ steps toward the START
+/// of the document, ↓ toward the END. Rows travel up the screen while you scroll
+/// down, so "down" reads as "further down the document" — the direction the row
+/// number grows. The physical-key mapping lives in exactly one place, so the
+/// inversion is stated once and cannot drift.
 enum JumpFieldStep {
     /// ↑ — one row toward row 1, wrapping from row 1 round to the LAST row.
     case towardStart
@@ -26,21 +23,17 @@ enum JumpFieldStep {
     /// or nil when it is empty (or holds something the jump submit would reject
     /// anyway) — that steps from `seed`, the top visible row, instead.
     ///
-    /// `lastRow` is the 1-based last row the document is known — or merely
-    /// ESTIMATED — to have: both the wrap boundary and the clamp, so an arrow
-    /// never leaves a number outside 1…lastRow. Under an estimate the boundary
-    /// IS the estimate (the author: "wraps up to the end, estimate if needed"); it
-    /// sharpens by itself as the background index converges and no scan is ever
-    /// forced to sharpen it here.
+    /// `lastRow` is both the wrap boundary and the clamp, so an arrow never
+    /// leaves a number outside 1…lastRow. Under an estimate the boundary IS the
+    /// estimate, sharpening by itself as the index converges; no scan is ever
+    /// forced here.
     ///
-    /// `magnitude` is the held-arrow step size (`JumpFieldRamp`). A step larger
-    /// than 1 SNAPS to the next multiple of itself in the direction of travel, so
-    /// a held ↓ reads 20, 30, 40 … rather than 22, 32, 42 (the author's ramp) — and
-    /// snapping to the next multiple is always forward, never a step back. A step
-    /// that would leave the document LANDS ON the end it was heading for (the last
-    /// row, or row 1) instead of jumping over it; only a press made while already
-    /// standing on that end wraps round. So no step size can ever overshoot the
-    /// wrap, and with `magnitude == 1` this is exactly the original ±1 rule.
+    /// `magnitude` is the held-arrow step size. A step larger than 1 SNAPS to the
+    /// next multiple of itself in the direction of travel, so a held ↓ reads 20,
+    /// 30, 40 rather than 22, 32, 42 — and snapping is always forward, never a
+    /// step back. A step that would leave the document LANDS ON the end it was
+    /// heading for; only a press made while already standing there wraps. So no
+    /// step size can overshoot the wrap, and a magnitude of 1 is exactly ±1.
     func applied(from current: UInt64?, seed: UInt64, lastRow: UInt64, magnitude: UInt64) -> String {
         let bound = max(1, lastRow)                     // every document has a row 1
         let step = max(1, magnitude)
@@ -61,8 +54,8 @@ enum JumpFieldStep {
     }
 }
 
-/// Hold-to-accelerate for the arrow keys: the step size grows the LONGER the key
-/// is held, so a hold is useful past a nudge (the author's ramp, 2026-08).
+/// Hold-to-accelerate: the step size grows the longer the key is held, so a hold
+/// is useful past a nudge.
 ///
 ///     hold ↓ from row 1
 ///       0.0s   1  2  3  4 …        step 1
@@ -71,31 +64,28 @@ enum JumpFieldStep {
 ///       3.0s   2000  3000 …        step 1000
 ///     release → back to step 1
 ///
-/// Keyed off ELAPSED HOLD TIME, never off a repeat COUNT: the OS auto-repeat rate
-/// differs per platform and per user (~11/s on this Mac, ~12.5/s on GTK, both
-/// configurable), so a count-based ramp would accelerate at different rows on each
-/// — while the two frontends must behave identically.
+/// Keyed off ELAPSED HOLD TIME, never a repeat COUNT: the auto-repeat rate
+/// differs per platform and per user, so a count-based ramp would accelerate at
+/// different rows on each, and the two frontends must behave identically.
 struct JumpFieldRamp {
     /// How long the key must have been held before each step size takes over, and
     /// the gap that ends a hold — the ONE place the ramp is tuned.
     static let tensAfter: Duration = .seconds(1)
     static let hundredsAfter: Duration = .seconds(2)
     static let thousandsAfter: Duration = .seconds(3)
-    /// A gap longer than this ends the hold BY ITSELF, with no key-up needed.
-    /// Comfortably above one auto-repeat interval (~90 ms here) so a real hold is
-    /// never cut short, and short enough that the ramp cannot survive to the next
-    /// deliberate tap. This is the belt to the key-up's braces: a key-up that is
-    /// swallowed (focus change, popup close, dropped event) must NEVER leave the
-    /// ramp hot, because the next single tap would then move 1000 rows.
+    /// A gap longer than this ends the hold BY ITSELF, with no key-up needed:
+    /// comfortably above one auto-repeat interval, so a real hold is never cut
+    /// short, and short enough that the ramp cannot survive to the next tap. It is
+    /// the belt to the key-up's braces — a swallowed key-up must never leave the
+    /// ramp hot, or the next single tap would move a thousand rows.
     static let holdLapse: Duration = .milliseconds(300)
 
     private var startedAt: ContinuousClock.Instant?
     private var steppedAt: ContinuousClock.Instant?
     /// Which arrow the open hold belongs to. A press in the OTHER direction is a
     /// new intent, never a continuation — the third defence, after the key-up and
-    /// the lapse. Without it, a swallowed key-up followed within 300 ms by the
-    /// opposite arrow would step 1000 in the new direction. Added to match the GTK
-    /// implementation, which had this guard while this side did not.
+    /// the lapse: a swallowed key-up followed quickly by the opposite arrow would
+    /// otherwise step a thousand rows the other way.
     private var direction: JumpFieldStep?
 
     /// The step size for a press at `now`, opening a FRESH hold (step 1) whenever
@@ -132,28 +122,22 @@ struct JumpFieldRamp {
 }
 
 extension DocumentModel {
-    /// Step the OPEN jump field's row number one row (↑/↓ while the popup is up).
-    /// Edits `jumpFieldText` and NOTHING else: no `beginJump`, no core call, no
-    /// `pendingScrollRow` — the user still presses Enter to travel, exactly as
-    /// before. Inert while the field is closed, so the grid keeps its own arrow
-    /// navigation (`KeyboardNavigator`) to itself.
-    /// Held arrows accelerate through `jumpFieldRamp` (step 1 → 10 → 100 → 1000 by
-    /// elapsed hold time); a closed field returns BEFORE the ramp is touched, so a
+    /// Steps the OPEN jump field's row number. Edits the text and NOTHING else —
+    /// no jump, no core call — so the user still presses Enter to travel. Inert
+    /// while the field is closed, and it returns BEFORE the ramp is touched, so a
     /// keypress the grid owns can never arm it.
     func stepJumpField(_ direction: JumpFieldStep) {
         guard jumpFieldActive else { return }
         let magnitude = jumpFieldRamp.magnitude(pressedAt: progressClock.now, going: direction)
-        // Read the current text through the FROZEN parser the submit path uses
-        // (`parseTarget` is 0-based; the field is 1-based), so "what counts as a
-        // row number" can never disagree between stepping and submitting.
+        // Read the text through the SAME parser the submit path uses, so "what
+        // counts as a row number" cannot disagree between stepping and submitting.
         let current = jumpControl.parseTarget(jumpFieldText).map { $0 &+ 1 }
         jumpFieldText = direction.applied(from: current, seed: jumpFieldSeedRow,
                                           lastRow: jumpRowCountInfo.count, magnitude: magnitude)
     }
 
-    /// The arrow key came UP: end the hold so the very next press steps by 1.
-    /// Paired with `JumpFieldRamp.holdLapse`, which ends a hold on its own if this
-    /// never arrives — a missed key-up must not leave the ramp accelerated.
+    /// Ends the hold, so the next press steps by 1. Paired with the hold lapse,
+    /// which ends one on its own if this never arrives.
     func endJumpFieldHold() {
         jumpFieldRamp.release()
     }
@@ -161,17 +145,13 @@ extension DocumentModel {
     /// The 1-based row an empty field steps from: the row the gutter shows for
     /// the TOP VISIBLE row.
     ///
-    /// "Top visible row" is the grid's `currentTopDataRow()` — the row at the top
-    /// of the UNOBSCURED data area — the same definition the grid's own arrow
-    /// navigation seeds from (`NativeGridController.navigate`), NOT the paging
-    /// `firstVisibleRow`, which counts the rows scrolled under the glass band and
-    /// so sits a row or two above what the user sees. One definition of "the top
-    /// row" for both keyboard features; `firstVisibleRow` is only the fallback
-    /// for a model with no live grid (headless dumps). `gutterRow` then maps it
-    /// exactly as the gutter does, which is already the ORIGINAL row number under
-    /// a filter — the domain the jump field takes (ARCH criterion 12/17) — so the
-    /// seed needs no filtered/identity branch of its own. Row 1 when that row is
-    /// not currently servable.
+    /// "Top visible" is the row at the top of the UNOBSCURED data area — the same
+    /// definition the grid's own arrow navigation seeds from — not the paging
+    /// `firstVisibleRow`, which counts rows scrolled under the band and so sits a
+    /// row or two above what the user sees. That one is only the fallback for a
+    /// model with no live grid. The gutter's mapping is already the ORIGINAL row
+    /// number under a filter, which is the domain the jump field takes, so the
+    /// seed needs no filtered branch of its own.
     var jumpFieldSeedRow: UInt64 {
         let top = NativeGridController.live?.currentTopDataRow() ?? firstVisibleRow
         return (gutterRow(forRow: top) ?? 0) &+ 1

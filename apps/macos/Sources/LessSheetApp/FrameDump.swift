@@ -67,7 +67,7 @@ enum FrameDump {
         render(DumpGrid(model: model), size: gridSize, to: path)
     }
 
-    /// The find-family scenes (ARCH req. 9). Returns false if `scene` is not one.
+    /// The find-family scenes. Returns false if `scene` is not one.
     @MainActor
     private static func renderFindScene(_ scene: String, model: DocumentModel, path: String) -> Bool {
         switch scene {
@@ -144,7 +144,7 @@ enum FrameDump {
     }
 
     /// The plain grid-CONTENT scene is captured from the LIVE grid (cacheDisplay
-    /// of the real NSTableView — ARCH bonus), self-triggered by the grid
+    /// of the real NSTableView
     /// controller once built (deterministic, unlike the first-paint .task which
     /// races the representable's makeNSView). Returns the dump path when that
     /// applies; overlay/find/settings/overscroll keep the SwiftUI mirror, and
@@ -181,8 +181,8 @@ enum FrameDump {
         // Appearance: honor the SYSTEM/inherited appearance by default (so a dark
         // system captures dark, matching what the user sees and avoiding a
         // forced-light flash), and let LESSSHEET_DUMP_APPEARANCE=dark|light pin
-        // either for the deterministic light+dark verification pair (ARCH
-        // criterion 5). Only set when forced — never override the live default.
+        // either for the deterministic light+dark pair. Set ONLY when forced, so
+        // the live default is never overridden.
         switch ProcessInfo.processInfo.environment["LESSSHEET_DUMP_APPEARANCE"]?.lowercased() {
         case "dark": container.appearance = NSAppearance(named: .darkAqua)
         case "light": container.appearance = NSAppearance(named: .aqua)
@@ -268,7 +268,7 @@ enum FrameDump {
     // MARK: - Scene composition
     // The pure scene builders (overlayScene / rejectScene / titleBarScene /
     // findScene / overscrollScene) live in `extension FrameDump` in
-    // FrameDumpScenes.swift (pure code motion). `dumpFindResult` stays here
+    // FrameDumpScenes.swift. `dumpFindResult` stays here
     // because it drives the private `render` / `captureLiveGrid`.
 
     /// The find verification hook's terminal dump: the LIVE model already holds

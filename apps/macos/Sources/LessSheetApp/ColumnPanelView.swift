@@ -23,9 +23,8 @@ private enum PanelRowSource: Equatable {
     }
 }
 
-/// The embedded Columns section of the normal Settings window. The legacy
-/// `panel` names below describe the bounded caches/contracts, not another
-/// user-visible surface.
+/// The embedded Columns section of the Settings window. The `panel` names below
+/// describe its bounded caches, not a second user-visible surface.
 struct ColumnSettingsSection: View {
     @Bindable var model: DocumentModel
     @State private var matches: [UInt32] = []

@@ -2,30 +2,16 @@ import AppKit
 import Contracts
 import Foundation
 
-// Verification-only instrumentation for the filter-repaint defect-pass — INERT
-// unless LESSSHEET_FILTER_REPAINT is set, so it costs nothing in normal use and
-// never touches the < 500 ms cold-start measurement (it starts only after the
-// first data-bearing frame). Mirrors ConfigRepaintProbe: drive the REAL model
-// entry point the Find popup's "Filter to matches" toggle ultimately calls
-// (`DocumentModel.applyFindAsFilter`) DIRECTLY — no synthetic input events (no
-// TCC prompt risk) — then prove the fix headlessly.
+// The filter twin of ConfigRepaintProbe: locks that toggling "Filter to matches"
+// repaints the grid itself rather than waiting for a scroll. Inert unless
+// LESSSHEET_FILTER_REPAINT is set, armed only after the first data-bearing frame,
+// and it drives the real model entry point with no synthetic input events.
 //
-// The bug: toggling "Filter to matches" ON repainted the grid only after a
-// scroll. Root cause: applyFindAsFilter/clearFilter set the @Observable filter
-// state and scheduled an ASYNC landing apply, but when the filter is applied
-// while already at the top (landing row 0 == the current top), that apply
-// produces no scroll and AppKit defers the row/gutter redraw until this window
-// next handles an event — the reported "shows only after a scroll". The fix adds
-// an explicit synchronous `NativeGridController.live?.apply()` poke (the same
-// remedy the column-config mutators use).
-//
-// The MATERIALIZATION-INDEPENDENT seam this locks: after the model-side toggle,
-// the controller's APPLIED filter state (`appliedFilterState`) must equal the
-// model's current `isFiltered` — proven WITHOUT this probe ever calling apply().
-// Remove the poke and, in a headless window (no implicit updateNSView; the async
-// landing apply runs on a LATER main-actor turn, AFTER this synchronous read),
-// nothing applies the toggle -> the controller's applied state LAGS the model's
-// -> applied=false -> RED.
+// The seam is materialization-independent in the same way: after the toggle, the
+// controller's APPLIED filter state must equal the model's — proven without this
+// probe ever calling apply(). Remove the poke and, in a headless window, the
+// async landing apply runs on a LATER turn than this synchronous read, so the
+// applied state lags and this goes red.
 //
 //   LESSSHEET_FILTER_REPAINT=<query>   After first paint, seed the find draft
 //     with <query> (Text mode) and apply it as a filter once, then read both

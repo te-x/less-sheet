@@ -1,22 +1,16 @@
 import Contracts
 import SwiftUI
 
-// The LIVE chromeless spreadsheet grid is the NSTableView-backed engine in
-// NativeGrid.swift (`GridView` -> `NativeGridRepresentable`): native row
-// recycling makes every landing O(viewport). This file RETAINS the SwiftUI
-// spreadsheet row (`SheetRow`) + its highlight type as the off-screen DUMP
-// MIRROR — `ImageRenderer` can capture these where FrameDump composites the
-// SwiftUI overlay/popup/find scenes over a grid (see FrameDump.DumpGrid /
-// DumpEndGrid). The live grid ships its own AppKit cell drawing and its own
-// cacheDisplay capture; the two share only the pinned geometry in `GridMetrics`.
+// The LIVE grid is the AppKit engine in NativeGrid.swift. This file keeps the
+// SwiftUI spreadsheet row as the off-screen DUMP MIRROR: `ImageRenderer` can
+// capture it where the frame dump composites an overlay or popup scene over a
+// grid, which it cannot do for the live table. The two share only the pinned
+// geometry in `GridMetrics`.
 
-/// One grid row: a fixed leftmost row-number cell, then fixed-width data cells,
-/// each with their own hairlines (a single full-width bottom line and per-column
-/// right lines — never a full-height Canvas). Data cells use tabular numerals;
-/// the header row is semibold on the window background so it reads as pinned. The
-/// row-number gutter uses secondary text on the window background so it reads as
-/// chrome, not data, and (in the live grid) counter-translates the horizontal
-/// scroll so it stays pinned to the left edge. Semantic colors only.
+/// One mirrored grid row: a fixed row-number cell, then fixed-width data cells,
+/// each with their own hairlines — one full-width bottom line and per-column
+/// right lines, never a full-height Canvas, which would allocate a backing store
+/// the size of the whole document.
 struct SheetRow: View {
     let rowNumber: Int?
     let rowNumberWidth: CGFloat
@@ -25,13 +19,9 @@ struct SheetRow: View {
     let widths: [CGFloat]
     let fillerColumns: Int
     let isHeader: Bool
-    /// Find-highlight state per visible column (render order). Empty = none;
-    /// header / filler rows never pass highlights (header cells are never
-    /// matched).
+    /// Empty for header and filler rows, which are never matched.
     var highlights: [SheetCellHighlight] = []
-    /// Per-cell display-truncation flags (ARCH req. 13/20), PARALLEL to
-    /// `cells`; mirrors `RowWindow.truncated`. Empty = none (header/filler rows
-    /// never carry a truncation flag, like `headerCells` in the contract).
+    /// Per-cell truncation flags, parallel to `cells`.
     var truncated: [Bool] = []
     @Environment(\.overlayDumpChrome) private var dumpChrome
 
@@ -57,17 +47,15 @@ struct SheetRow: View {
             }
         }
         .frame(height: GridMetrics.rowHeight)
-        // The header is transparent in the live app so the Liquid Glass band
-        // behind it shows through (data frosts through the glass); it falls back
-        // to an opaque background only in headless dumps, where glass can't be
-        // captured. Data/filler rows are always clear (over the grid fill).
+        // The header is transparent live, so the glass band behind it shows
+        // through; it falls back to opaque only in a dump, where glass cannot be
+        // captured at all.
         .background(isHeader && dumpChrome ? Color(nsColor: .windowBackgroundColor) : Color.clear)
         .overlay(alignment: .bottom) { hairline.frame(height: 1) }   // hairline ON TOP of the glass
     }
 
-    /// The leftmost fixed cell: the 1-based row number (right-aligned, faded), or
-    /// blank for the header corner and filler rows. Opaque so data scrolling
-    /// under it is occluded; pinned to the left edge under horizontal scroll.
+    /// The 1-based row number, or blank for the header corner and filler rows.
+    /// Opaque, so data scrolling under it is occluded.
     private var gutterCell: some View {
         Text(rowNumber.map(String.init) ?? "")
             .font(.system(.body).monospacedDigit())
@@ -75,9 +63,8 @@ struct SheetRow: View {
             .lineLimit(1)
             .padding(.horizontal, GridMetrics.rowNumberHPadding)
             .frame(width: rowNumberWidth, height: GridMetrics.rowHeight, alignment: .trailing)
-            // Data/filler gutter is opaque (occludes data scrolled horizontally
-            // behind the pinned gutter); the HEADER corner is transparent live so
-            // the glass band is continuous across the full header width.
+            // The header corner stays transparent live, so the glass band is
+            // continuous across the full header width.
             .background(isHeader && !dumpChrome ? Color.clear : Color(nsColor: .windowBackgroundColor))
             .overlay(alignment: .trailing) { hairline.frame(width: 1) }
             .modifier(StickyLeading(enabled: stickyRowNumber))
@@ -99,13 +86,9 @@ struct SheetRow: View {
         index < highlights.count ? highlights[index] : .none
     }
 
-    /// Find highlight fill (accent chips — legible in light/dark and over the
-    /// glass band): a rounded, slightly-inset chip rather than a full-bleed
-    /// painted cell, subtle on every matching visible cell and stronger on the
-    /// current match. Accent like the selection overlay (the author's pick over
-    /// the find-yellow idiom); the two stay distinguishable by GEOMETRY — a
-    /// match is a rounded inset chip, a selection is a full-cell wash inside
-    /// a 2 pt marquee.
+    /// A rounded, inset chip rather than a full-bleed painted cell. It shares the
+    /// accent with the selection overlay, so the two are told apart by GEOMETRY:
+    /// a match is an inset chip, a selection a full-cell wash inside a marquee.
     @ViewBuilder
     private func highlightFill(at index: Int) -> some View {
         switch highlight(at: index) {
@@ -121,8 +104,8 @@ struct SheetRow: View {
         }
     }
 
-    /// The current match gets a distinct full-strength accent border so it
-    /// reads apart from the other (subtle) matches.
+    /// A full-strength border, so the current match reads apart from the subtle
+    /// ones.
     @ViewBuilder
     private func highlightBorder(at index: Int) -> some View {
         if highlight(at: index) == .strong {
@@ -132,12 +115,9 @@ struct SheetRow: View {
         }
     }
 
-    /// A truncated cell's indicator (ARCH req. 13/20): a subtle dot inset from
-    /// the column's trailing hairline, in addition to the tail-truncating "…"
-    /// `cellText` already applies when the (possibly 4 KiB-capped) text
-    /// overflows the column. Mirrors the live grid's `drawTruncationMarker` so
-    /// the same cue is headlessly verifiable through `FrameDump`. Purely
-    /// presentational: rendered exactly as the flag says, no re-measuring.
+    /// Mirrors the live grid's own truncation marker, so the cue is verifiable in
+    /// a dump. Distinct from the tail "…", which only means the text overflows
+    /// the column.
     @ViewBuilder
     private func truncationMarker(at index: Int) -> some View {
         if index < truncated.count, truncated[index] {
@@ -149,8 +129,7 @@ struct SheetRow: View {
     }
 }
 
-/// Per-cell find-highlight state (semantic, adaptive colors). Header cells are
-/// never highlighted (they are never matched).
+/// Per-cell find-highlight state. Header cells are never highlighted.
 enum SheetCellHighlight: Equatable {
     case none
     /// A matching cell currently in the viewport.
@@ -159,12 +138,8 @@ enum SheetCellHighlight: Equatable {
     case strong
 }
 
-/// Shared styling constants for the find-highlight chips — read by BOTH the
-/// live AppKit draw (`SheetRowView.draw`) and this SwiftUI dump mirror
-/// (`SheetRow`), so the two renderings stay identical. Accent washes, chip
-/// geometry: a match reads as a rounded inset chip ON the cell, while a
-/// selection (same accent — ARCH-select-copy AC1) reads as a full-cell wash
-/// inside a 2 pt marquee, so the two never blur despite the shared color.
+/// Read by BOTH the live AppKit draw and the SwiftUI dump mirror, so the two
+/// renderings cannot drift.
 enum FindHighlightStyle {
     static let cornerRadius: CGFloat = 4
     /// The chip's inset from the cell bounds (clears the hairlines, so a chip
@@ -175,34 +150,27 @@ enum FindHighlightStyle {
     static let borderWidth: CGFloat = 1.5
 }
 
-/// One cell's selection-overlay state (ARCH-select-copy AC1): whether it is
-/// inside the live selection rect, and which of its FOUR sides sit on the
-/// rect's OUTER boundary — an interior selected cell gets the accent fill
-/// only (`isSelected`), a boundary cell ALSO gets a border stroke on the
-/// matching side(s), so a multi-cell selection reads as one continuous
-/// outlined range rather than a grid of individually-boxed cells. Mirrors
-/// `SheetCellHighlight`'s role: precomputed OUTSIDE the draw loop (by
-/// `DocumentModel.windowSelectionMarks`) so `SheetRowView.draw` stays a flat,
-/// O(visible columns) per-frame read — never a per-cell model call.
+/// One cell's selection-overlay state: whether it is inside the selection, and
+/// which of its four sides sit on the rect's OUTER boundary — so a multi-cell
+/// selection reads as one continuous outline rather than a grid of boxed cells.
+/// Precomputed outside the draw loop, so the row view's draw stays a flat
+/// per-column read.
 struct SelectionMark: Equatable {
     var isSelected = false
     var borderTop = false
     var borderBottom = false
     var borderLeft = false
     var borderRight = false
-    /// The ACTIVE corner of the selection (`selection.active`) — the keyboard/
-    /// mouse cursor cell (ARCH-macos-kbdnav FR4). Drives the accent focus
-    /// outline drawn atop the muted-gray marquee; set on exactly one visible
-    /// cell when the active corner is on screen.
+    /// The cursor cell. Set on exactly one visible cell when the active corner is
+    /// on screen.
     var isActive = false
 
     static let none = SelectionMark()
 }
 
-/// Pins a view to the leading edge of its enclosing ScrollView by counter-
-/// translating the horizontal scroll (GPU-composited via `visualEffect`, so it
-/// never lags the scroll the way a state round-trip would). Disabled for the
-/// eager dump grid, which has no ScrollView to read.
+/// Pins a view to the leading edge by counter-translating the horizontal
+/// scroll. GPU-composited, so it never lags the scroll the way a state
+/// round-trip would. Disabled for the dump grid, which has no scroll view.
 private struct StickyLeading: ViewModifier {
     let enabled: Bool
 

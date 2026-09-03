@@ -6,12 +6,12 @@ import SwiftUI
 // circles showing the CURRENT effective value and visually distinguishing a
 // guessed value from a user-overridden one (accent ring).
 //
-// - Header (req. 4): NO popup — a click toggles the header on/off immediately;
+// - Header: NO popup — a click toggles the header on/off immediately;
 //   the glyph swaps "H" ↔ "H with a slash"; the tooltip (also the VoiceOver
 //   hint) reads "File contains header" / "File contains no header". The toggle
 //   also raises a brief auto-fading notice ("First row is now a header/data")
 //   through the model, since the glyph swap alone is easy to miss.
-// - Separator / Quote (req. 5): a click opens a HORIZONTAL labeled panel that
+// - Separator / Quote: a click opens a HORIZONTAL labeled panel that
 //   floats above the button (right-aligned to it, growing leftward): the
 //   control's name ("Separator" / "Quote character") followed by the candidate
 //   glyphs in a row (plus Custom…), the current one marked. Selecting one
@@ -21,7 +21,7 @@ import SwiftUI
 // Shared vocabulary with the Settings window is pinned in `DialectGlyph`
 // ("First row is header", "Separator", "Quote character").
 
-/// The header toggle (req. 4): immediate on/off, no popup.
+/// The header toggle: immediate on/off, no popup.
 struct HeaderButton: View {
     @Bindable var model: DocumentModel
 
@@ -80,7 +80,7 @@ struct HeaderGlyph: View {
     }
 }
 
-/// A separator / quote control (req. 5): a glass button showing the current
+/// A separator / quote control: a glass button showing the current
 /// value that opens a narrow pill popup of candidates above it.
 struct DialectPopupButton: View {
     let kind: PillKind          // .separator or .quote
@@ -316,7 +316,7 @@ enum DialectGlyph {
         }
     }
 
-    /// Plain name of a resolved encoding (ARCH req. 11 vocabulary).
+    /// Plain name of a resolved encoding.
     static func textEncodingName(_ encoding: TextEncoding) -> String {
         switch encoding {
         case .utf8: return "UTF-8"
@@ -341,7 +341,7 @@ enum DialectGlyph {
     }
 
     /// The "Text encoding" picker row label for one `EncodingPicker.options`
-    /// entry (ARCH req. 11): Automatic always surfaces the report's resolved
+    /// entry: Automatic always surfaces the report's resolved
     /// encoding ("Automatic — detected: Latin-1"), mirroring how the
     /// separator/quote pills always show their current effective value; the
     /// five concrete options are their plain name.

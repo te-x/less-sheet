@@ -33,7 +33,7 @@ extension JumpStepProbe {
 
     // MARK: - 1. Tiers + the hold state machine (synthetic instants)
 
-    /// the author's ramp, read straight off the resolver at each boundary and just
+    /// the ramp, read straight off the resolver at each boundary and just
     /// inside it: <1 s step 1, <2 s step 10, <3 s step 100, ≥3 s step 1000.
     static func rampTiers() {
         let probes: [(held: Duration, want: UInt64)] = [
@@ -114,7 +114,7 @@ extension JumpStepProbe {
 
     // MARK: - 2. Wrap + clamp at every step size
 
-    /// A big step snaps to round numbers (the author's 20/30/40 → 200/300/400 →
+    /// A big step snaps to round numbers (20/30/40 → 200/300/400 →
     /// 2000/3000) and can never overshoot an end: it LANDS on the end, and only a
     /// press made while standing there wraps.
     static func rampBigStepWraps() {

@@ -8,7 +8,7 @@ import Foundation
 // the < 500 ms cold-start measurement.
 //
 // Why it exists: the frontpage's screenshots were first produced from
-// `FrameDump`'s off-screen content renders, and the author rejected them — no
+// `FrameDump`'s off-screen content renders, and they are rejected here — no
 // window frame, no traffic lights, none of the glass/scroll-edge material the
 // real window has, because `ImageRenderer` rasterizes a view tree, not a
 // composited window. The honest fix is photographing the REAL window

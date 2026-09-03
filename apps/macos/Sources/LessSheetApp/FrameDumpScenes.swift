@@ -4,7 +4,7 @@ import Foundation
 import SwiftUI
 
 // Eager, ImageRenderer-capturable scene views + synthetic fixtures for the
-// headless frame dump. Split out of FrameDump.swift as pure code motion so each
+// headless frame dump. Split out of FrameDump.swift so each
 // file stays within the length budget; all types keep their original internal
 // access and are used only by `FrameDump` in the same target.
 
@@ -71,7 +71,7 @@ struct DumpGrid: View {
 
 private let frameDumpGridHeight: CGFloat = 600
 
-/// End-anchored eager grid for the overscroll dump (req. 8): the last loaded
+/// End-anchored eager grid for the overscroll dump: the last loaded
 /// data rows, then the end-of-file overscroll strip of empty grid, so the final
 /// data row lands above where the floating controls sit. Mirrors the live
 /// scrolled-to-end state (header pinned at top, earlier rows scrolled off).
@@ -123,7 +123,7 @@ struct DumpEndGrid: View {
     }
 }
 
-/// A simulated macOS title bar for the headless title-bar dump (req. 1): traffic
+/// A simulated macOS title bar for the headless title-bar dump: traffic
 /// lights at the leading edge and the document title centered, over a
 /// translucent band standing in for the real chrome's top-of-window blur.
 struct DumpTitleBar: View {
@@ -276,7 +276,7 @@ enum FindScenes {
 }
 
 // MARK: - Scene composition (pure SwiftUI builders)
-// Moved out of FrameDump.swift as pure code motion. `internal` (not `private`)
+// `internal` (not `private`)
 // so `FrameDump.renderScene`'s dispatch helpers in FrameDump.swift can reach
 // them; none touch FrameDump's private members (they only build views).
 extension FrameDump {
@@ -311,7 +311,7 @@ extension FrameDump {
         .environment(\.overlayJumpRejected, true)
     }
 
-    /// The revealed title-bar state (req. 1): the grid with the document title +
+    /// The revealed title-bar state: the grid with the document title +
     /// traffic lights shown, plus the bottom-right control row. The real title
     /// bar is NSWindow chrome ImageRenderer can't capture, so it is simulated
     /// here (like the glass/Form dump mirrors) purely for verification.
@@ -331,7 +331,7 @@ extension FrameDump {
         .environment(\.overlayDumpChrome, true)
     }
 
-    /// A find scene (ARCH req. 9): the grid (with the search's viewport
+    /// A find scene: the grid (with the search's viewport
     /// highlights) plus the overlay's find popup in a chosen state, rendered
     /// with the opaque dump chrome. The synthetic `findSession` drives the popup
     /// copy AND the strong current-match highlight; the SUBTLE highlights come
@@ -355,7 +355,7 @@ extension FrameDump {
         .environment(\.overlayDumpChrome, true)
     }
 
-    /// The scrolled-to-end state (req. 8): the last data rows anchored so the
+    /// The scrolled-to-end state: the last data rows anchored so the
     /// final row sits above the floating controls, with the end-of-file
     /// overscroll strip of empty grid below it — proving the last row stays
     /// legible instead of hiding under the buttons.

@@ -3,22 +3,19 @@ import Contracts
 import Foundation
 import SwiftUI
 
-// The Find control (ARCH-find-seek app reqs. 6–10): the LEFTMOST glass button in
-// the floating control row, opening an upward popup with a Text | Where switch,
-// incremental "match n of m" counts + scan progress, wrap notices, and a
-// cancel affordance — the same glass/reveal/popup language as Jump and the
-// dialect pills. Grid highlighting lives in SheetRow (driven by the model's
-// CellMatcher); the shortcuts (⌘F / ⌘G / ⇧⌘G) are wired in AppUI.
+// The Find control: the leftmost button in the floating row, opening a popup
+// with a Text | Where switch, incremental counts, scan progress, wrap notices
+// and a cancel affordance. The per-cell highlighting is the core's verdict, and
+// the shortcuts are wired in AppUI.
 
 extension EnvironmentValues {
-    /// Forces the find value field's rejected (red) styling in a headless dump.
+    /// Forces the value field's rejected styling in a headless dump.
     @Entry var overlayFindRejected: Bool = false
 }
 
-/// Find (req. 6): a glass magnifying-glass button that opens an upward popup.
-/// ⌘F reveals + focuses it; Esc closes it and clears highlights (the typed
-/// query is retained for the session). While a scan runs the popup shows
-/// progress + a cancel affordance; the main window stays fully interactive.
+/// ⌘F opens and focuses the popup; Esc closes it and clears the highlights,
+/// keeping the typed query. While a scan runs the popup shows progress and a
+/// cancel affordance, and the main window stays fully interactive.
 struct FindControlView: View {
     @Bindable var model: DocumentModel
     @Environment(\.overlayDumpChrome) private var dumpChrome
@@ -34,8 +31,7 @@ struct FindControlView: View {
     private var searching: Bool { display.progress != nil }
     private var hasActiveSearch: Bool { display.request != nil }
     private var popupVisible: Bool { model.findFieldActive }
-    /// The value field shows its rejected (red) styling on a live blink or when
-    /// a headless dump forces it.
+    /// Red on a live blink, or when a dump forces it.
     private var rejected: Bool { rejectedFlash || dumpRejected }
 
     var body: some View {
@@ -62,7 +58,6 @@ struct FindControlView: View {
         .help("Find text or a value in a column")
         .accessibilityLabel("Find")
         .onChange(of: model.findFocusRequests) { _, _ in
-            // ⌘F: open + focus (keyboard reveal path).
             model.openFindField()
             DispatchQueue.main.async { focus = focusTarget }
         }
@@ -76,8 +71,8 @@ struct FindControlView: View {
         model.findSession.draft.mode == .text ? .query : .value
     }
 
-    /// Overestimated popup height so the upward float always clears the button
-    /// (an overestimate only widens the gap; it never overlaps).
+    /// Deliberately an overestimate, which only widens the gap above the button
+    /// and can never overlap it.
     private var popupHeight: CGFloat {
         let base: CGFloat = model.findSession.draft.mode == .text ? 116 : 156
         return base + (searching ? 34 : 0) + 28 + 24   // + apply-as-filter + match-case rows
@@ -111,12 +106,9 @@ struct FindControlView: View {
         .accessibilityLabel("Find")
     }
 
-    // "Filter to matches" (ARCH-filtered-views req. 10): a TOGGLE reflecting the
-    // standing filter state — On applies the SAME draft as Find
-    // (`FindControlling.submit` — identical grammar, no new predicate UI) via
-    // `setFilter`; Off clears it (req. 11 — "Clearing is also available from the
-    // Find popup"). Disabled while Off and the draft composes nothing, so it
-    // never reads as dead text.
+    /// Reflects the standing filter state: on applies the SAME draft Find would
+    /// run, off clears it. Disabled when off and the draft composes nothing, so
+    /// it never reads as dead text.
     private var filterRow: some View {
         HStack(spacing: 8) {
             Text("Filter to matches").font(.caption)
@@ -131,17 +123,14 @@ struct FindControlView: View {
         .accessibilityLabel("Filter to matches")
     }
 
-    /// On = apply the current find draft as the active filter; Off = clear it.
     private var filterBinding: Binding<Bool> {
         Binding(get: { model.isFiltered },
                 set: { enabled in enabled ? model.applyFindAsFilter() : model.clearFilter() })
     }
 
-    // "Match case" (ARCH-search-case-mode §6.C): the ONE shared control for both
-    // Text and Where (smart-case is retired). Default OFF = ASCII case-insensitive
-    // fold; ON = byte-exact. Flipping it live-re-issues the active find and
-    // re-applies an active filter (`setCaseSensitive`), since `caseSensitive` is
-    // part of the request's identity. Native macOS checkbox.
+    /// The ONE case control, shared by Text and Where: off folds ASCII case, on
+    /// is byte-exact. Flipping it re-issues whatever is active, since case
+    /// sensitivity is part of the request's identity.
     private var matchCaseRow: some View {
         HStack(spacing: 8) {
             Toggle("Match case", isOn: matchCaseBinding)
@@ -154,18 +143,18 @@ struct FindControlView: View {
         .accessibilityHint("Off folds letter case; on matches exactly.")
     }
 
-    /// Reflects + drives the shared draft flag; the setter routes through the
-    /// model so the toggle re-issues (never merely records the flag).
+    /// The setter routes through the model, so the toggle re-issues rather than
+    /// merely recording the flag.
     private var matchCaseBinding: Binding<Bool> {
         Binding(get: { model.findSession.draft.caseSensitive },
                 set: { model.setCaseSensitive($0) })
     }
 
-    // Text mode: one query field; case folding is the shared "Match case" control.
     private var textFields: some View {
         HStack(spacing: 8) {
             Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
             if dumpChrome {
+                // A dump cannot capture a live TextField, so mirror its state.
                 Text(model.findSession.draft.text.isEmpty ? "Find" : model.findSession.draft.text)
                     .foregroundStyle(model.findSession.draft.text.isEmpty ? Color.secondary : Color.primary)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -183,8 +172,8 @@ struct FindControlView: View {
 }
 
 extension FindControlView {
-    // Where mode: a column picker (all columns; hidden ones marked), an
-    // operator picker (= ≠ < > ≤ ≥), and a value field (ARCH req. 7).
+    /// A column picker listing every column, hidden ones marked, an operator
+    /// picker, and a value field.
     private var whereFields: some View {
         VStack(alignment: .leading, spacing: 8) {
             columnPicker
@@ -272,7 +261,6 @@ extension FindControlView {
         return empty ? .secondary : .primary
     }
 
-    // The count / notice line + previous/next navigation (ARCH reqs. 8, 10).
     private var statusRow: some View {
         HStack(spacing: 8) {
             Text(FindCopy.status(display))
@@ -294,8 +282,6 @@ extension FindControlView {
         .font(.caption)
     }
 
-    // While scanning: progress bar + "Scanning… 34%" + cancel (ARCH reqs. 8, 10;
-    // no silent stalls, sentence-case copy).
     private func scanningRow(_ progress: Double) -> some View {
         let fraction = max(0, min(1, progress))
         return HStack(spacing: 8) {
@@ -325,14 +311,11 @@ extension FindControlView {
         return model.visibility.isHidden(column) ? "\(base) (hidden)" : base
     }
 
-    /// Return in a find field (standard find-bar pairing). Shift+Return steps to
-    /// the PREVIOUS match — the exact ⇧⌘G action (`stepFind(.backward)`) — and is
-    /// consumed here. Plain Return falls through to `.onSubmit`
-    /// (`submitFindField` = start-a-search-or-advance-to-the-next-match), so the
-    /// FIRST Enter runs the search and each subsequent Enter jumps to the next
-    /// occurrence. Either way the field is re-asserted as first responder on the
-    /// next runloop, so a landing scroll can never quietly drop focus and stall
-    /// repeated-Enter cycling (the popup stays open + hot; Esc/⌘F unaffected).
+    /// Shift+Return steps to the previous match and is consumed here; plain
+    /// Return falls through to `.onSubmit`, so the first Enter runs the search and
+    /// each later one advances. Either way the field is re-asserted as first
+    /// responder next runloop, so a landing scroll cannot quietly drop focus and
+    /// stall repeated-Enter cycling.
     private func handleReturn(_ keyPress: KeyPress) -> KeyPress.Result {
         DispatchQueue.main.async { focus = focusTarget }
         guard keyPress.modifiers.contains(.shift) else { return .ignored }
@@ -340,9 +323,8 @@ extension FindControlView {
         return .handled
     }
 
-    /// A rejected submit (ordering predicate, non-numeric value): keep the field
-    /// open with its text selected, blink it red, and — unless Reduce Motion —
-    /// shake it (reuses the jump rejection components).
+    /// Keep the field open with its text selected, blink it red, and — unless
+    /// Reduce Motion — shake it.
     private func reject() {
         model.openFindField()
         focus = .value
@@ -360,9 +342,8 @@ extension FindControlView {
     }
 }
 
-/// The Text | Where segmented switch (ARCH req. 7). Custom-drawn (not a native
-/// segmented Picker) so it renders in headless ImageRenderer dumps. Sentence-
-/// case user vocabulary; "Where" renders `FindMode.predicate`.
+/// Custom-drawn rather than a native segmented picker, so it renders in a
+/// headless dump.
 struct FindModeSwitch: View {
     @Binding var mode: FindMode
 
