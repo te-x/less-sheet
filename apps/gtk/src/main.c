@@ -66,6 +66,16 @@
  * only these leading columns are measured; the rest take a default width. */
 #define WIDTH_SAMPLE_COLS 256
 #define WIDTH_SAMPLE_ROWS 64
+/* Column widths, in characters of the measured monospace advance plus a fixed
+ * pixel pad. Every width the grid computes — the open sample, the "Reset to
+ * Auto" re-sample, and the auto-fit-on-scroll ceiling — resolves through the
+ * four accessors below, so a width rule is changed in exactly one place. */
+#define WIDTH_PAD_PX 12.0
+#define WIDTH_DEFAULT_CHARS 12.0
+#define WIDTH_MIN_CHARS 3.0
+#define WIDTH_MAX_CHARS 60.0
+/* Slack the width estimator adds on top of the widest sampled cell. */
+#define WIDTH_ESTIMATE_SLACK_CHARS 2.0
 /* Frontend byte budget for one clipboard copy (the macOS CopyBudget.standard
  * ~64 MiB analog); the core's LS_COPY_MAX_CELLS still bounds a pathological
  * rect. */
@@ -393,6 +403,30 @@ digits_of (guint64 v)
   return d;
 }
 
+static double
+width_default (const App *app)
+{
+  return app->char_advance * WIDTH_DEFAULT_CHARS + WIDTH_PAD_PX;
+}
+
+static double
+width_min (const App *app)
+{
+  return app->char_advance * WIDTH_MIN_CHARS + WIDTH_PAD_PX;
+}
+
+static double
+width_max (const App *app)
+{
+  return app->char_advance * WIDTH_MAX_CHARS + WIDTH_PAD_PX;
+}
+
+static double
+width_estimate_padding (const App *app)
+{
+  return app->char_advance * WIDTH_ESTIMATE_SLACK_CHARS + WIDTH_PAD_PX;
+}
+
 static gboolean
 is_saturated (const App *app)
 {
@@ -716,7 +750,7 @@ grid_autofit_widths (App *app, LsgColumnWindow colwin, LsgWindow *win)
   guint *cols = g_new (guint, gc);
   gdouble *cand = g_new (gdouble, gc);
   const char **buf = g_new (const char *, (gr > 0) ? gr : 1);
-  double max_w = app->char_advance * 60.0 + 12.0;
+  double max_w = width_max (app);
 
   guint nfit = 0; /* only the non-manual columns are auto-fit candidates */
   for (guint32 ci = 0; ci < gc; ci++)
@@ -736,7 +770,7 @@ grid_autofit_widths (App *app, LsgColumnWindow colwin, LsgWindow *win)
                             ? app->hdr_labels[ci]
                             : NULL;
       double wpx = lsg_grid_column_width_estimate (
-          buf, cnt, hdr, app->char_advance, app->char_advance * 2.0 + 12.0);
+          buf, cnt, hdr, app->char_advance, width_estimate_padding (app));
       if (wpx > max_w)
         wpx = max_w;
       cand[nfit] = wpx;
@@ -744,28 +778,36 @@ grid_autofit_widths (App *app, LsgColumnWindow colwin, LsgWindow *win)
       nfit++;
     }
 
-  gdouble *out = g_new (gdouble, app->n_cols);
-  lsg_grid_grow_widths (app->col_widths, app->n_cols, cols, cand, nfit, out);
-  gboolean changed
-      = memcmp (out, app->col_widths, (gsize)app->n_cols * sizeof (gdouble))
-        != 0;
-  g_free (app->col_widths);
-  app->col_widths = out;
+  /* Steady state: every visible column already fits, so nothing changes. Test
+   * that over the O(visible) candidates FIRST — the merge below allocates and
+   * walks a whole column_count-sized array, and this runs on every frame that
+   * materializes, so on a 100k-column document that check is the difference
+   * between two full passes per frame and none. */
+  gboolean grows = FALSE;
+  for (guint j = 0; j < nfit && !grows; j++)
+    grows = (cols[j] < app->n_cols && cand[j] > app->col_widths[cols[j]]);
+
+  if (grows)
+    {
+      gdouble *out = g_new (gdouble, app->n_cols);
+      lsg_grid_grow_widths (app->col_widths, app->n_cols, cols, cand, nfit,
+                            out);
+      g_free (app->col_widths);
+      app->col_widths = out;
+      grid_update_hadjustment (
+          app); /* only grows the upper; never re-materializes */
+    }
 
   g_free (cols);
   g_free (cand);
   g_free (buf);
-
-  if (changed)
-    grid_update_hadjustment (
-        app); /* only grows the upper; never re-materializes */
 }
 
 /* Choose the visible row/column window and materialize it (O(viewport)). */
 static void
 grid_materialize (App *app)
 {
-  if (app->doc == NULL)
+  if (app->doc == NULL || app->area == NULL)
     return;
   int w = gtk_widget_get_width (GTK_WIDGET (app->area));
   int h = gtk_widget_get_height (GTK_WIDGET (app->area));
@@ -1305,7 +1347,7 @@ sample_column_widths (App *app)
 {
   guint32 sample_cols
       = (app->n_cols < WIDTH_SAMPLE_COLS) ? app->n_cols : WIDTH_SAMPLE_COLS;
-  double default_w = app->char_advance * 12.0 + 12.0;
+  double default_w = width_default (app);
   for (guint32 c = 0; c < app->n_cols; c++)
     app->col_widths[c] = default_w;
   if (sample_cols == 0)
@@ -1316,8 +1358,8 @@ sample_column_widths (App *app)
   guint32 got = lsg_window_row_count (sw);
   guint32 gotc = lsg_window_col_count (sw);
 
-  double min_w = app->char_advance * 3.0 + 12.0;
-  double max_w = app->char_advance * 60.0 + 12.0;
+  double min_w = width_min (app);
+  double max_w = width_max (app);
   for (guint32 c = 0; c < gotc; c++)
     {
       const char *cells[WIDTH_SAMPLE_ROWS];
@@ -1329,7 +1371,7 @@ sample_column_widths (App *app)
       char *hdr = app->has_header ? lsg_document_header_cell_dup (app->doc, c)
                                   : NULL;
       double wpx = lsg_grid_column_width_estimate (
-          cells, cnt, hdr, app->char_advance, app->char_advance * 2.0 + 12.0);
+          cells, cnt, hdr, app->char_advance, width_estimate_padding (app));
       g_free (hdr);
       if (wpx < min_w)
         wpx = min_w;
@@ -1348,9 +1390,9 @@ sample_one_column_width (App *app, guint32 col)
 {
   if (app->doc == NULL || app->col_widths == NULL || col >= app->n_cols)
     return;
-  double wpx = app->char_advance * 12.0 + 12.0; /* default */
-  double min_w = app->char_advance * 3.0 + 12.0;
-  double max_w = app->char_advance * 60.0 + 12.0;
+  double wpx = width_default (app);
+  double min_w = width_min (app);
+  double max_w = width_max (app);
 
   LsgWindow *sw
       = lsg_document_set_window (app->doc, 0, WIDTH_SAMPLE_ROWS, col, 1);
@@ -1365,7 +1407,7 @@ sample_one_column_width (App *app, guint32 col)
                       ? lsg_document_header_cell_dup (app->doc, col)
                       : NULL;
       wpx = lsg_grid_column_width_estimate (cells, cnt, hdr, app->char_advance,
-                                            app->char_advance * 2.0 + 12.0);
+                                            width_estimate_padding (app));
       g_free (hdr);
       if (wpx < min_w)
         wpx = min_w;
@@ -6221,7 +6263,7 @@ build_column_row (App *app, guint32 col)
   /* Width + auto-fit + reset. */
   double cur_w = (col < app->n_cols && app->col_widths[col] > 0.0)
                      ? app->col_widths[col]
-                     : 100.0;
+                     : width_default (app);
   GtkWidget *width = adw_spin_row_new_with_range (30.0, 800.0, 5.0);
   adw_preferences_row_set_title (ADW_PREFERENCES_ROW (width), "Column width");
   adw_spin_row_set_value (ADW_SPIN_ROW (width), cur_w);
