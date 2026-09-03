@@ -3051,6 +3051,10 @@ typedef struct
   guint *id_slot;
 } LsgRejectClear;
 
+/* Re-add the shake class one main-loop iteration later so the CSS animation
+ * restarts on a repeated reject. The source holds a REFERENCE to the entry:
+ * without it a reject fired just before the window goes away would run this
+ * against a finalized widget. */
 static gboolean
 reject_shake_add (gpointer entry)
 {
@@ -3095,7 +3099,8 @@ entry_reject_feedback (GtkWidget *entry, guint *id_slot)
   gtk_widget_add_css_class (entry, "error");
   gtk_widget_remove_css_class (entry, "lsg-shake");
   if (animations_enabled (entry))
-    g_idle_add (reject_shake_add, entry);
+    g_idle_add_full (G_PRIORITY_DEFAULT_IDLE, reject_shake_add,
+                     g_object_ref (entry), g_object_unref);
   if (*id_slot != 0)
     g_source_remove (*id_slot);
   LsgRejectClear *c = g_new (LsgRejectClear, 1);
