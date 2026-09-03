@@ -498,6 +498,14 @@ static void header_progress_show (App *app, const char *label);
 static void header_progress_set (App *app, gdouble fraction);
 static void header_progress_hide (App *app);
 
+/* Drop an in-flight network open. Defined with the network helpers; every path
+ * that opens a different document calls it first. */
+static void net_open_abort (App *app);
+
+/* Post a transient AdwToast. Defined with the settings region below; the copy
+ * completion notice uses it too. */
+static void settings_toast (App *app, const char *text);
+
 /* Filter helpers referenced from the earlier find section (the toggle lives in
  * the find popover); defined with the filter helpers below. */
 static void on_filter_toggled (GtkToggleButton *toggle, gpointer data);
@@ -1511,6 +1519,9 @@ open_file (App *app, GFile *file)
   /* A fresh user open is never a dialect re-open — drop any pending capture so
    * a prior failed re-open can't fire a stale settings_reopen_apply here. */
   reopen_state_clear (app);
+  /* An in-flight URL open would otherwise reach DONE later and replace the
+   * file we are about to show with the network document. */
+  net_open_abort (app);
 
   char *path = g_file_get_path (file);
   char *base = g_file_get_basename (file);
@@ -1582,6 +1593,31 @@ action_open (GtkButton *button, gpointer data)
 /* ------------------------------------------------------------------------- */
 /* Open URL (network) */
 /* ------------------------------------------------------------------------- */
+
+/*
+ * Abandon an in-flight network open: stop its poll, cancel + release the job,
+ * and clear the shared header progress.
+ *
+ * Every path that opens a DIFFERENT document must call this first. The net
+ * open is asynchronous and its own poll owns the adopt-and-replace step, so a
+ * job left running past e.g. a local open would reach DONE seconds later and
+ * silently swap the document the user just opened for the network one.
+ */
+static void
+net_open_abort (App *app)
+{
+  if (app->net_poll_id != 0)
+    {
+      g_source_remove (app->net_poll_id);
+      app->net_poll_id = 0;
+    }
+  if (app->net == NULL)
+    return;
+  lsg_net_open_cancel (app->net);
+  lsg_net_open_release (app->net);
+  app->net = NULL;
+  header_progress_hide (app);
+}
 
 /* Drive the reusable header-bar progress from a network-open poll (the unified
  * long-op status location — same widget copy uses). Pulse while connecting /
@@ -1724,12 +1760,7 @@ on_url_response (AdwAlertDialog *dialog, const char *response, gpointer data)
    * is in flight" a hard invariant — same pattern as do_apply_filter. */
   copy_stop_and_join (app);
 
-  if (app->net != NULL)
-    {
-      lsg_net_open_cancel (app->net);
-      lsg_net_open_release (app->net);
-      app->net = NULL;
-    }
+  net_open_abort (app); /* a previous URL open never survives a new one */
   app->net = lsg_net_open_start (url, NULL);
   if (app->net == NULL)
     {
@@ -4801,12 +4832,7 @@ dialect_reopen (App *app, ls_open_options options)
           return;
         }
       copy_stop_and_join (app);
-      if (app->net != NULL)
-        {
-          lsg_net_open_cancel (app->net);
-          lsg_net_open_release (app->net);
-          app->net = NULL;
-        }
+      net_open_abort (app);
       app->net = lsg_net_open_start (app->pending_url, &options);
       if (app->net == NULL)
         {
@@ -4816,6 +4842,8 @@ dialect_reopen (App *app, ls_open_options options)
           return;
         }
       header_progress_show (app, "Connecting…");
+      header_progress_set (app,
+                           -1.0); /* pulse until a byte fraction is known */
       if (app->net_poll_id == 0)
         app->net_poll_id
             = g_timeout_add (POLL_INTERVAL_MS, net_poll_tick, app);
