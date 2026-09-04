@@ -1069,6 +1069,29 @@ test "c1: out-of-domain options are a distinct usage error" {
     api.ls_close(doc.?);
 }
 
+test "open: a record wider than the column backstop is refused cleanly, and the backstop itself still opens (AC-h1)" {
+    // 2^20 + 1 empty fields: 2^20 separators and a newline, well inside the head budget.
+    const too_many: usize = (1 << 20) + 1;
+    const wide = try std.testing.allocator.alloc(u8, too_many);
+    defer std.testing.allocator.free(wide);
+    @memset(wide[0 .. too_many - 1], ',');
+    wide[too_many - 1] = '\n';
+    var fx = try makeFixture(wide, 0o644);
+    defer fx.deinit();
+    var doc: ?*api.Doc = null;
+    try std.testing.expectEqual(api.Status.io, api.ls_open(fx.path.ptr, &manual, &doc));
+    try std.testing.expectEqual(@as(?*api.Doc, null), doc);
+
+    // Exactly 2^20 columns is inside the bound and opens with the full count.
+    const at_bound: usize = 1 << 20;
+    const ok = try std.testing.allocator.alloc(u8, at_bound);
+    defer std.testing.allocator.free(ok);
+    @memset(ok[0 .. at_bound - 1], ',');
+    ok[at_bound - 1] = '\n';
+    var od = try openWith(ok, manual);
+    defer od.deinit();
+    try std.testing.expectEqual(@as(u32, 1 << 20), api.ls_column_count(od.doc));
+}
 test "c1: NULL options mean all-sniff + AUTO index" {
     var fx = try makeFixture("a,b\n1,2\n", 0o644);
     defer fx.deinit();

@@ -233,6 +233,11 @@ fn buildShape(doc: *Document, opt: api.OpenOptions) bool {
         tmp_refs.deinit(doc.gpa);
         return false;
     };
+    if (tmp_refs.items.len > base.max_columns) {
+        tmp_buf.deinit(doc.gpa);
+        tmp_refs.deinit(doc.gpa);
+        return false;
+    }
     doc.column_count = @intCast(tmp_refs.items.len);
     doc.record1_capped = res.capped;
 

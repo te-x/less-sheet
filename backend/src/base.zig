@@ -44,6 +44,12 @@ const Reader = reader_mod.Reader;
 /// re-lex distance of any window to O(interval + window).
 pub const checkpoint_interval: u64 = 2048;
 
+/// Column-count backstop for record 1: a record declaring more than this many
+/// fields is refused at open (LS_ERROR_IO) instead of being trusted into the
+/// per-column tables every layer sizes from it. A memory-safety bound, not a
+/// product limit — a hundred thousand columns is a supported document.
+pub const max_columns: u32 = 1 << 20;
+
 /// The LOCAL (mmap/gzip) open-head budget — the full 4 MiB (disk-cheap).
 pub const head_budget: u64 = api.open_head_max_bytes;
 /// The NETWORK open-head budget — deliberately small (row estimation is
