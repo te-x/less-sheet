@@ -152,17 +152,31 @@ else
 fi
 
 # ------------------------------------------------------------------- verify --
-say "verifying every asset is PUBLIC"
-# Logged out on purpose: gh and a browser both carry your credentials, so a
-# private asset looks perfect to you and 404s for everyone else.
+say "verifying every asset is PUBLIC and complete"
+# Through the UNAUTHENTICATED REST API on purpose, and never through the asset
+# URLs: gh and a browser carry your credentials (a private asset looks perfect
+# to you and 404s for everyone else), and GitHub counts every request on an
+# asset URL as a download — a HEAD included — which would make the release's
+# first "downloads" our own check. The API answers only for a public release
+# and lists each asset with its size, which is compared to the file we uploaded.
+LISTING="$(curl -sS "https://api.github.com/repos/$RELEASE_REPO/releases/tags/$TAG" 2>/dev/null || true)"
 FAIL=0
 for a in "${ARTIFACTS[@]}"; do
-    url="$BASE/$(basename "$a")"
-    code="$(curl -sSLI -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || echo 000)"
-    if [ "$code" = "200" ]; then printf '  200  %s\n' "$(basename "$a")"
-    else printf '  %-4s %s   <-- NOT PUBLIC\n' "$code" "$(basename "$a")"; FAIL=1; fi
+    name="$(basename "$a")"
+    want="$(stat -c %s "$a" 2>/dev/null || stat -f %z "$a")"
+    have="$(printf '%s' "$LISTING" | python3 -c '
+import json, sys
+name = sys.argv[1]
+try:
+    for asset in json.load(sys.stdin).get("assets", []):
+        if asset["name"] == name:
+            print(asset["size"]); break
+except Exception:
+    pass' "$name")"
+    if [ "$have" = "$want" ]; then printf '  ok   %s (%s bytes)\n' "$name" "$want"
+    else printf '  MISSING or wrong size: %s (uploaded %s, listed %s)\n' "$name" "$want" "${have:-none}"; FAIL=1; fi
 done
-[ "$FAIL" = 0 ] || die "some assets are not reachable — Homebrew and the curl install are broken until this is fixed"
+[ "$FAIL" = 0 ] || die "the public release listing does not match dist/ — Homebrew and the curl install are broken until this is fixed"
 
 say "waiting for the frontpage to deploy"
 # The push triggers the workflow; Pages then lags it. Poll rather than guess.
