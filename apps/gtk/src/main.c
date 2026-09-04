@@ -359,6 +359,16 @@ typedef struct
   LsgColumnLabel *reopen_old_labels;      /* OWNED old identities; or NULL */
   guint reopen_n_old_labels;
 
+  /* Cold-start prefetch: the core open of the file named on the command line,
+   * started on a worker at main() entry and adopted by open_file. The worker
+   * writes doc/err and nothing else; the join in prefetch_claim is what
+   * publishes them to this thread. */
+  GThread *prefetch_thread;
+  char *prefetch_path; /* OWNED; the local path this prefetch is for */
+  LsgDocument *prefetch_doc;
+  LsgOpenError prefetch_err;
+  gint64 prefetch_begin;
+
   /* Env-gated timing instrumentation (LESSSHEET_GTK_TIMING). Entirely inert —
    * no output, no measurable cost — unless `timing` is set. */
   gboolean timing;
@@ -1507,6 +1517,86 @@ open_document (App *app, LsgDocument *doc, const char *title,
 /* Open local file */
 /* ------------------------------------------------------------------------- */
 
+/*
+ * Cold-start prefetch. Opening the document is the one part of a launch that
+ * needs no display, and gtk_init + adw_init + the window's first Wayland
+ * roundtrip cost some 65 ms on their own, so the core open runs on a worker
+ * started before any of it and is already finished when open_file asks.
+ *
+ * It is a pure overlap, not a shortcut: the SAME lsg_document_open_local call
+ * with the same arguments, funnelled into the same open_file, so the error
+ * page, the URL path and "a local file cancels an in-flight URL open" are
+ * untouched. If the open is slower than the toolkit (a huge file), open_file
+ * simply waits on the join exactly as it used to wait on the call.
+ */
+static gpointer
+prefetch_worker (gpointer data)
+{
+  App *app = data;
+  app->prefetch_doc
+      = lsg_document_open_local (app->prefetch_path, NULL, &app->prefetch_err);
+  return NULL;
+}
+
+/* Start it, if argv names something that resolves to a local path. Options
+ * (anything leading with '-') and non-local URIs are left entirely alone: they
+ * are GApplication's and the URL path's business, and a run that never reaches
+ * open_file just closes the prefetched document at exit. */
+static void
+prefetch_start (App *app, int argc, char *argv[])
+{
+  if (argc < 2 || argv[1] == NULL || argv[1][0] == '\0' || argv[1][0] == '-')
+    return;
+  /* The same call GApplication's own command-line handling uses to turn an
+   * argument into a GFile, so the path compared in prefetch_claim is the one
+   * open_file will hold. */
+  GFile *file = g_file_new_for_commandline_arg (argv[1]);
+  char *path = g_file_get_path (file);
+  g_object_unref (file);
+  if (path == NULL)
+    return;
+  app->prefetch_path = path;
+  app->prefetch_err = LSG_OPEN_OK;
+  app->prefetch_begin = g_get_monotonic_time ();
+  app->prefetch_thread = g_thread_new ("lsg-open", prefetch_worker, app);
+}
+
+/* Take the prefetched document when it is for exactly this path, else open
+ * here. `*begin` receives the moment the open actually started, which is what
+ * the window-fill line reports. */
+static LsgDocument *
+prefetch_claim (App *app, const char *path, LsgOpenError *err, gint64 *begin)
+{
+  if (app->prefetch_thread == NULL
+      || g_strcmp0 (app->prefetch_path, path) != 0)
+    {
+      *begin = g_get_monotonic_time ();
+      return lsg_document_open_local (path, NULL, err);
+    }
+  g_thread_join (app->prefetch_thread); /* publishes the worker's writes */
+  app->prefetch_thread = NULL;
+  g_clear_pointer (&app->prefetch_path, g_free);
+  LsgDocument *doc = app->prefetch_doc;
+  app->prefetch_doc = NULL;
+  *err = app->prefetch_err;
+  *begin = app->prefetch_begin;
+  return doc;
+}
+
+/* Join and close an unclaimed prefetch: a remote instance, a run whose
+ * argument never reached open_file, or plain exit. */
+static void
+prefetch_discard (App *app)
+{
+  if (app->prefetch_thread != NULL)
+    {
+      g_thread_join (app->prefetch_thread);
+      app->prefetch_thread = NULL;
+      g_clear_pointer (&app->prefetch_doc, lsg_document_close);
+    }
+  g_clear_pointer (&app->prefetch_path, g_free);
+}
+
 /* Open one local GFile into the grid, or an error page. Does NOT take
  * ownership of `file`. Shared by the file dialog and the command-line open. */
 static void
@@ -1530,11 +1620,13 @@ open_file (App *app, GFile *file)
       return;
     }
 
-  /* Window-fill begin edge is captured BEFORE the open so the measured time
-   * includes the O(head) ls_open cost; armed only on success. */
-  gint64 begin = app->timing ? g_get_monotonic_time () : 0;
+  /* Window-fill begin edge is the moment the open STARTED, which for the
+   * command-line file is when the prefetch worker began — before gtk_init —
+   * so the segment stays honest about what it covers. Armed only on success.
+   */
+  gint64 begin = 0;
   LsgOpenError err = LSG_OPEN_OK;
-  LsgDocument *doc = lsg_document_open_local (path, NULL, &err);
+  LsgDocument *doc = prefetch_claim (app, path, &err, &begin);
   if (doc == NULL)
     {
       show_error (app, "Could not open file", open_error_text (err));
@@ -7759,6 +7851,9 @@ main (int argc, char *argv[])
   app.filter = lsg_filter_initial ();
   /* Data cells are MONOSPACE: a uniform advance is what makes the O(1) column
    * width arithmetic accurate. Headers and all chrome stay sans-serif. */
+  /* Before gtk_init/adw_init (they run inside g_application_run): the whole
+   * point is to overlap the core open with the toolkit's own start-up. */
+  prefetch_start (&app, argc, argv);
   app.font_desc = pango_font_description_from_string ("Monospace 10");
   app.header_font_desc = pango_font_description_from_string ("Sans Bold 10");
   app.gutter_font_desc = pango_font_description_from_string ("Sans 10");
@@ -7770,6 +7865,7 @@ main (int argc, char *argv[])
   register_app_shortcuts (&app, G_APPLICATION (application));
   int status = g_application_run (G_APPLICATION (application), argc, argv);
 
+  prefetch_discard (&app); /* a run that never reached open_file */
   app_reset_document (&app);
   if (app.net != NULL)
     {
