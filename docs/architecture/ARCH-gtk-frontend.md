@@ -105,6 +105,10 @@ Every item below is INHERITED from `apps/macos/` and must behave equivalently (i
     Jump, Select-All, Copy, Escape, arrow / shift-arrow selection.
 11. **Progress & no silent stalls.** Every non-instant operation (indexing, jump-scan, search, filter-scan,
     network fetch, copy) shows constant feedback from t0 and never blocks the UI thread.
+    *(amended 2026-09-04)* Copy is the exception, and follows ARCH-stream-copy AC8 as the macOS build does:
+    a copy that finishes within the progress threshold (`LSG_PROGRESS_DELAY_MS`, 500 ms, one knob) shows no
+    chrome at all; the header progress appears only once the copy has run longer. "From t0" stands for
+    indexing, the scans and network fetches.
 
 ---
 

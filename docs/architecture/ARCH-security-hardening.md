@@ -555,9 +555,17 @@ where to point the fuzzer next, and the net arm of that defect is not lockable i
   (~2 GiB, single named tunable const) trips **cap + warn**: spooling stops, already-fetched rows stay
   viewable, a "stream exceeds size limit" state is surfaced; **local mmap documents are never subject to
   this cap** (driven via the net fixture).
+  *(amended 2026-09-04)* **AC-h1 is built** (`base.max_columns`, refused at open with `LS_ERROR_IO`;
+  gate-pinned). **AC-h2 is DEFERRED**, deliberately: the spool is transient and per document, every
+  network fetch beyond the head is driven by an explicit user operation that shows progress and can be
+  cancelled, and a hard ceiling would break the one legitimate case the streaming design exists for —
+  searching or filtering a remote file larger than the ceiling. It also needs an ABI state for its
+  "cap + warn", which no v1 frontend has a place for. Revisit if a metered-connection complaint ever
+  arrives; until then it is an imagined threat with a real cost.
 
 ### DEFERRED (post-launch — not built in this program)
 - Control-character / RTL-override display sanitizing (bidi-spoofing).
+- The cumulative network spool ceiling (AC-h2) — see the 2026-09-04 amendment under (h).
 - CI-integrated continuous fuzzing (the pre-launch campaign is one-time).
 - Outlier-cap tightening beyond (h)'s two gaps.
 - TLS `allow_truncation_attacks` strictness (accepted known risk for a public-data viewer; covered
