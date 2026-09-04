@@ -28,3 +28,9 @@ site/assets/shots/.fixture-*.csv
 # Local-only private corner (history archives, identity-sweep tooling).
 # Never tracked, never ships.
 private/
+
+# Flatpak bundle build outputs (publish.sh builds the bundle inside packaging/flatpak/)
+packaging/flatpak/.flatpak-builder/
+packaging/flatpak/repo-bundle/
+packaging/flatpak/bundle-dir/
+packaging/flatpak/*.flatpak
