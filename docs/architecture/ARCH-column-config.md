@@ -726,6 +726,13 @@ bounded.
     open/raise and result scroll target at most 100 ms, and each remains below 500 ms. The unchanged
     `wide_100k_cols` cold-open path remains below 500 ms to first visible rows whether or not Settings was open in
     the previous document session.
+    *(measured 2026-09-04, release build, 6-column fixture)* a cold Settings open settles in 220–350 ms: ~75 ms
+    is ours (60 ms constructing the SwiftUI hosting view), the rest is AppKit/SwiftUI first layout and draw of
+    the grouped Form, its pickers and the column table, with no code of ours running. The 100 ms target is
+    therefore not reachable by trimming our code. Pre-building the panel at idle reaches it (a hidden window:
+    ~40 ms opens; a window-less hosting view: ~85 ms) but costs 16 MB / 11 MB of resident memory in every
+    session, measured against a 54 MB baseline — rejected: a panel's latency does not buy a quarter of the
+    app's footprint. The 500 ms bound holds with margin; the target stands as an aspiration.
 12. **The 6/10/100k discovery boundary and `#N` route are exact.** A six-column fixture shows exactly six
     unfiltered source-order rows and no search field; a ten-column fixture shows exactly ten and no search field.
     Eleven-column and `wide_100k_cols` fixtures show a search field, zero unfiltered/empty-query result rows, and
