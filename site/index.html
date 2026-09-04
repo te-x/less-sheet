@@ -215,8 +215,6 @@
     .dl > div { padding: 0 0 26px; }
     .dl > div + div { border-left: 0; border-top: 1px solid var(--line); padding-top: 26px; }
   }
-  .reads { font: 12.5px var(--sans); color: var(--dim); margin-top: 26px; }
-  .reads b { color: var(--ink); }
 
   footer { padding: 30px 0 60px; }
   footer .col { display: flex; gap: 14px; flex-wrap: wrap; justify-content: space-between; }
@@ -306,8 +304,9 @@
         columns — do add to the load time.</p>
       <p>Memory is quoted as <b>engine + window</b>. Only the first number is
         about your file, and it is the small one: ten gigabytes, a hundred and
-        thirty-five million rows, rests in under three megabytes. The second is
-        the window itself, and it does not move whatever you open.</p>
+        thirty-five million rows, rests in a few megabytes. The second is what
+        the toolkit allocates to draw the window; it depends on the display and on
+        how wide the sheet is, not on how long the file is.</p>
     </div>
     <div class="figs cmp-wrap">
       <div class="only-mac">
@@ -317,12 +316,12 @@
             <tr><th>size</th><th>open</th><th>memory</th><th>open</th><th>memory</th><th>open</th><th>memory</th></tr>
           </thead>
           <tbody>
-            <tr><td>10 KB</td><td>167 ms</td><td>1.2 + 59 MiB</td><td>—</td><td>—</td><td>166 ms</td><td>8.4 + 59 MiB</td></tr>
-            <tr><td>10 MB</td><td>168 ms</td><td>1.2 + 59 MiB</td><td>219 ms</td><td>7.9 + 59 MiB</td><td>215 ms</td><td>8.4 + 59 MiB</td></tr>
-            <tr><td>10 GB</td><td>214 ms</td><td>2.5 + 59 MiB</td><td>201 ms</td><td>7.9 + 59 MiB</td><td>213 ms</td><td>10.6 + 59 MiB</td></tr>
+            <tr><td>10 KB</td><td>204 ms</td><td>1.4 + 59 MiB</td><td>—</td><td>—</td><td>220 ms</td><td>8.6 + 59 MiB</td></tr>
+            <tr><td>10 MB</td><td>212 ms</td><td>1.4 + 37 MiB</td><td>258 ms</td><td>8.2 + 97 MiB</td><td>250 ms</td><td>8.6 + 41 MiB</td></tr>
+            <tr><td>10 GB</td><td>210 ms</td><td>8.6 + 41 MiB</td><td>246 ms</td><td>13.2 + 82 MiB</td><td>242 ms</td><td>13.8 + 47 MiB</td></tr>
           </tbody>
         </table>
-        <p class="reqs" style="margin-top:14px">MacBook Pro, Apple M2 Pro</p>
+        <p class="reqs" style="margin-top:14px">MacBook Pro, Apple M2 Pro, macOS 26</p>
       </div>
       <div class="only-linux">
         <table class="cmp grid7">
@@ -331,13 +330,16 @@
             <tr><th>size</th><th>open</th><th>memory</th><th>open</th><th>memory</th><th>open</th><th>memory</th></tr>
           </thead>
           <tbody>
-            <tr><td>10 KB</td><td>151 ms</td><td>0.8 + 68 MiB</td><td>—</td><td>—</td><td>158 ms</td><td>7.9 + 68 MiB</td></tr>
-            <tr><td>10 MB</td><td>166 ms</td><td>0.8 + 68 MiB</td><td>179 ms</td><td>6.9 + 67 MiB</td><td>258 ms</td><td>7.9 + 68 MiB</td></tr>
-            <tr><td>10 GB</td><td>168 ms</td><td>2.3 + 68 MiB</td><td>182 ms</td><td>6.9 + 67 MiB</td><td>259 ms</td><td>9.5 + 68 MiB</td></tr>
+            <tr><td>10 KB</td><td>250 ms</td><td>0.8 + 78 MiB</td><td>—</td><td>—</td><td>253 ms</td><td>7.9 + 48 MiB</td></tr>
+            <tr><td>10 MB</td><td>255 ms</td><td>0.8 + 62 MiB</td><td>268 ms</td><td>6.9 + 46 MiB</td><td>327 ms</td><td>7.9 + 47 MiB</td></tr>
+            <tr><td>10 GB</td><td>260 ms</td><td>2.3 + 57 MiB</td><td>270 ms</td><td>6.9 + 41 MiB</td><td>330 ms</td><td>9.5 + 42 MiB</td></tr>
           </tbody>
         </table>
-        <p class="reqs" style="margin-top:14px">Arch Linux, Ryzen 3600, Samsung
-          960 EVO</p>
+        <p class="reqs" style="margin-top:14px">Omarchy (Arch Linux), Intel Core i7-12700, NVIDIA RTX 3080,
+          Samsung 980 PRO</p>
+        <p class="quiet" style="font-size:13.5px;margin-top:8px">Most of the Linux "open" is GTK
+          starting its Vulkan renderer on this driver, about 170 ms; the app's own open, from
+          file to first painted frame, is about 15 ms.</p>
       </div>
     </div>
   </div>
@@ -493,8 +495,7 @@
         <div>
           <h3>macOS</h3>
           <p style="margin:0"><a class="btn" href="https://github.com/te-x/less-sheet/releases/download/v0.1.1/less-sheet-0.1.1-macos-arm64.dmg">Download 0.1.1 · .dmg</a></p>
-          <p class="reqs">macOS 26.0+ · Apple silicon · ~3&nbsp;MB<br>
-            reads csv · csv.gz · http(s)</p>
+          <p class="reqs">macOS 26.0+ · Apple silicon · ~3&nbsp;MB</p>
 
           <div class="dl-way">Homebrew</div>
           <pre class="cmd"><code>brew tap te-x/tap
@@ -517,8 +518,7 @@ brew install --cask less-sheet</code></pre>
         <div>
           <h3>Linux</h3>
           <p style="margin:0"><a class="btn" href="https://github.com/te-x/less-sheet/releases/download/v0.1.1/less-sheet-0.1.1-x86_64.flatpak">Download 0.1.1 · Flatpak</a></p>
-          <p class="reqs">x86_64 · runs on any distribution<br>
-            reads csv · csv.gz · http(s)</p>
+          <p class="reqs">x86_64 · runs on any distribution</p>
 
           <div class="dl-way">Flatpak</div>
           <pre class="cmd"><code>flatpak install ./less-sheet-0.1.1-x86_64.flatpak
