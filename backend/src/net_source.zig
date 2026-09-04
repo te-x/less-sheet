@@ -1,8 +1,8 @@
-//! network-source slice (ARCH-network-source): the `http_range` byte Source —
-//! a genuinely random-access provider peer to mmap/gzip (source.zig), backed by
+//! The `http_range` byte Source — a genuinely random-access provider peer to
+//! mmap/gzip (source.zig), backed by
 //! a private, unlinked local spool file (mode 0600) plus a bounded (16 MiB) RAM
 //! chunk cache. A byte, once fetched over the transport, is persisted to the
-//! spool and NEVER re-fetched (AC6/AC13/AC14). The transport is either the real
+//! spool and NEVER re-fetched. The transport is either the real
 //! std.http.Client (production) or an injected fake describing a server
 //! (tests — the gate exercises only the fake; the real client is a human
 //! target-host probe, per contracts/api.zig NETWORK notes).
@@ -41,7 +41,7 @@ pub const cache_ceiling: u64 = 16 * 1024 * 1024; // 16 MiB resident RAM bound (A
 const open_bytes: u64 = base.net_head_budget;
 const redirect_cap: u32 = 3; // Zig std's small fixed redirect cap (AC12)
 
-// security-hardening (e) AC-e1 — NOT DELIVERABLE IN v1, see `.aidev/CHANGE-REQUEST.md`
+// NOT DELIVERABLE IN v1, see `.aidev/CHANGE-REQUEST.md`
 // (sec_w2b2). There is NO connect deadline and NO idle-read deadline on the real
 // transport in Zig 0.16, and deliberately NO knob that pretends otherwise:
 //   * connect: `std.http.Client.ConnectTcpOptions.timeout` is DECLARED AND NEVER
@@ -49,8 +49,8 @@ const redirect_cap: u32 = 3; // Zig std's small fixed redirect cap (AC12)
 //     `connectTcpOptions` at :1445 calls `host.connect(io, port, .{ .mode = .stream })`
 //     with no deadline). The working plumbing is one level down
 //     (`Io.net.IpAddress.ConnectOptions.timeout`, `Io/net.zig:335`), unreachable
-//     through `std.http.Client` without owning connection setup — which is exactly
-//     what caused the round-1 TLS crash (finding 1).
+//     through `std.http.Client` without owning connection setup — reaching for
+//     it by hand-rolling the connect is what caused a TLS crash.
 //   * idle read: no per-read deadline hook on the blocking response reader.
 // Both are therefore covered by the cancellable fetch model + user cancel, and
 // that cover is SCOPED TO OPEN. No deadline fires on its own. DURING OPEN, a hung
@@ -109,7 +109,7 @@ const redirect_cap: u32 = 3; // Zig std's small fixed redirect cap (AC12)
 // most once, deliberately never deinitialized. Both reasons are correctness, not
 // convenience:
 //
-//   * CANCELLATION (round-3). `std.Io.Threaded` can only interrupt a blocking
+//   * CANCELLATION. `std.Io.Threaded` can only interrupt a blocking
 //     syscall on a thread IT owns: `Threaded.Syscall.start` takes the
 //     module-global `Thread.current` threadlocal and, when it is unset, returns
 //     `.{ .thread = null }` — an UNCANCELLABLE syscall (Io/Threaded.zig:1348).
@@ -153,8 +153,8 @@ pub fn netIo() std.Io {
     return net_io_threaded.io();
 }
 
-/// security-hardening (e) AC-e2: the PURE redirect scheme-downgrade decision — a
-/// small, unit-testable seam used by BOTH the fake taxonomy mapping (net.runFake)
+/// The PURE redirect scheme-downgrade decision — a small, unit-testable seam
+/// used by BOTH the fake taxonomy mapping (net.runFake)
 /// and the real std.http.Client redirect handling (RealTransport). A redirect
 /// DOWNGRADES the transport iff it leaves an https origin for a plaintext http
 /// one; that alone is refused (LS_NET_ERROR_INSECURE_REDIRECT). http->https
@@ -166,7 +166,7 @@ pub fn redirectDowngrades(from_scheme: []const u8, to_scheme: []const u8) bool {
     return from_secure and !to_secure;
 }
 
-/// Live-progress callback (round-2 review finding 1): invoked with the running
+/// Live-progress callback: invoked with the running
 /// (bytes fetched so far, resource total) every time a NEW range is actually
 /// fetched over the transport (never on a cache/spool hit), so a poller
 /// (`ls_net_open_poll`) sees real, incrementally-updating progress rather than
@@ -282,14 +282,10 @@ fn parseContentRange(head_bytes: []const u8) ContentRange {
 /// (1f 8b) verdict on the body head. A 206's Content-Length is the partial slice
 /// (never the total), so a 206 without a usable Content-Range total is treated
 /// as an unknown-length stream rather than truncated to the probe range.
-/// never-full-download-streaming (AC17 / TD4 / TD5): the REAL streaming
-/// classification. Two changes from the old download-all model:
-///   * `range = !is_gz` is DROPPED — gzip now composes over the growing spool
-///     (random OR sequential fill), so a gzip resource on a range host keeps
-///     random access instead of forcing a full download.
-///   * `length_known` splits `Content-Length: 0` (a genuinely EMPTY resource,
-///     known total 0) from an ABSENT length (an unknown-length stream whose
-///     total firms only at EOF).
+/// A gzip resource composes over the growing spool (random OR sequential fill),
+/// so it keeps random access instead of forcing a full download; `length_known`
+/// splits `Content-Length: 0` (a genuinely EMPTY resource, known total 0) from
+/// an ABSENT length (an unknown-length stream whose total firms only at EOF).
 /// Mapping:
 ///   206 + a usable Content-Range total -> RANDOM fill, known total.
 ///   206 without a usable total -> SEQUENTIAL fill, UNKNOWN length (a 206's
@@ -312,15 +308,15 @@ pub fn decideProbe(status: i32, content_length: ?u64, content_range_total: ?u64,
 /// (over the process-global `netIo` executor), constructed once and reused across
 /// the probe AND every subsequent ranged fetch — `std.http.Client`'s connection
 /// pool then keeps the underlying TCP/TLS connection alive across requests to
-/// the same host instead of a fresh handshake per 256 KiB chunk (round-2 review
-/// finding 5). Heap-allocated so its address stays stable for the transport's
+/// the same host instead of a fresh handshake per 256 KiB chunk.
+/// Heap-allocated so its address stays stable for the transport's
 /// whole lifetime — which, on a DONE open, is the DOCUMENT's lifetime, not the
 /// job's (hence the executor cannot live in here; see `netIo`).
 /// The result of one forward drain of a sequential body reader: bytes copied
 /// into `dest` and whether the stream ended (clean or dropped).
 pub const DrainResult = struct { n: usize, eof: bool };
 
-/// A persistent forward-draining GET for SEQUENTIAL fill (TD3): ONE request
+/// A persistent forward-draining GET for SEQUENTIAL fill: ONE request
 /// whose response body is drained across successive `drainForward` calls, so a
 /// no-range server is NOT re-GET per 256 KiB chunk (the shipped bug). The
 /// request/response/transfer buffer are heap-owned so the body Reader's
@@ -383,7 +379,7 @@ pub const RealTransport = struct {
         self.head_len = 0;
     }
 
-    /// SEQUENTIAL fill (TD3): drain the resource body forward. `offset` must
+    /// SEQUENTIAL fill: drain the resource body forward. `offset` must
     /// equal the already-drained high-water (sequential access — never a
     /// backward/random request, which the reader's forward-contiguous invariant
     /// guarantees). Opens ONE GET lazily on the first call and reuses it.
@@ -482,8 +478,7 @@ pub const RealTransport = struct {
             error.TooManyHttpRedirects => .{ .err = .too_many_redirects },
             else => .{ .err = .unreachable_ },
         };
-        // security-hardening (e) AC-e2: std auto-followed any redirect; `req.uri` is
-        // the FINAL hop. Refuse if the chain downgraded the transport https->http
+        // std auto-followed any redirect, so `req.uri` is the FINAL hop. Refuse if the chain downgraded the transport https->http
         // (the material downgrade -- serving content over plaintext after starting
         // secure). http->https / same-scheme (incl. cross-host) are unaffected.
         // DETECT-AND-DISCARD, not prevention: std's `Request.redirect`
@@ -561,7 +556,7 @@ pub const RealTransport = struct {
     fn fetchInto(self: *RealTransport, dest: []u8, offset: u64) FetchOutcome {
         if (dest.len == 0) return .ok;
         // The probe's retained head first (`head_buf`). This is where the
-        // never-re-fetch invariant (AC6/AC13) was actually being broken and could
+        // never-re-fetch invariant was actually being broken and could
         // not be seen: its instrument, `HttpRange.fetch_count`, lives on the
         // Source, and the probe runs before a Source exists — so the duplicate
         // transfer happened entirely outside the counter's view. Serving the head
@@ -593,8 +588,8 @@ pub const RealTransport = struct {
         req.sendBodiless() catch return .failed;
         var redirect_buf: [8192]u8 = undefined;
         var response = req.receiveHead(&redirect_buf) catch return .failed;
-        // security-hardening (e) AC-e2: discard an https->http downgraded response
-        // (see `probe()` -- detect-and-discard, and `uri.scheme` is the origin).
+        // Discard an https->http downgraded response (see `probe()` --
+        // detect-and-discard, and `uri.scheme` is the origin).
         if (redirectDowngrades(uri.scheme, req.uri.scheme)) return .failed;
         const code = @intFromEnum(response.head.status);
         if (code < 200 or code >= 300) {
@@ -603,8 +598,8 @@ pub const RealTransport = struct {
         }
         var transfer_buf: [64 * 1024]u8 = undefined;
         const body = response.reader(&transfer_buf);
-        // security-hardening (e) AC-e3: a short body delivers fewer bytes than the
-        // requested range -- report it (never zero-fill the undelivered tail).
+        // A short body delivers fewer bytes than the requested range -- report
+        // it (never zero-fill the undelivered tail).
         // `out` is `dest` minus any prefix already served from the retained head,
         // so a short tail is still reported against what was actually requested.
         const got = body.readSliceShort(out) catch return .failed;
@@ -614,17 +609,17 @@ pub const RealTransport = struct {
 
 /// The injected fake "server" for the gate (heap-owned by the Transport). Holds
 /// the full resource bytes plus the streaming controls a NetFixture describes:
-///   released    — withhold gate (AC13): only bytes in [0, released) are
+///   released    — withhold gate: only bytes in [0, released) are
 ///                 delivered right now; a demand beyond it waits (SCANNING).
 ///                 Borrowed from the test (outlives the job/doc); null = all.
-///   drop_after  — post-open stream DROP (AC16): the body ends hard at this
+///   drop_after  — post-open stream DROP: the body ends hard at this
 ///                 offset (the gzip damaged-EOF analog); null = full body.
 pub const FakeServer = struct {
     body: []u8,
     released: ?*std.atomic.Value(u64) = null,
     drop_after: ?u64 = null,
-    /// security-hardening (e) AC-e3 short-body seam: the server delivers body bytes
-    /// only within [0, short_body_at); a range fetch beyond it is SHORT. null = full.
+    /// Short-body seam: the server delivers body bytes only within
+    /// [0, short_body_at); a range fetch beyond it is SHORT. null = full.
     short_body_at: ?u64 = null,
     /// Frontier-commit-guard lock (`api.NetFixture.fetch_attempts`): borrowed
     /// REQUEST-ATTEMPT tally, bumped once per request this server is ASKED to serve
@@ -639,8 +634,7 @@ pub const FakeServer = struct {
     }
 };
 
-/// security-hardening (e) AC-e3: the outcome of a ranged fetch. `.ok` delivered
-/// every requested byte; `.short` delivered FEWER (a short/zero body -- the
+/// The outcome of a ranged fetch. `.ok` delivered every requested byte; `.short` delivered FEWER (a short/zero body -- the
 /// undelivered tail is neither fabricated nor marked present); `.failed` is a
 /// transport error. Replaces the old `bool` so a short body is distinct from a
 /// full one AND from a hard failure (the caller flags `.short` for the open-time
@@ -659,8 +653,8 @@ pub const Transport = union(enum) {
         switch (self) {
             .fake => |fs| {
                 fs.countAttempt(); // the request was ASKED for, whatever it delivers
-                // security-hardening (e) AC-e3 short body: the fake advertises its
-                // full length but delivers body bytes only within [0, deliver). A
+                // Short body: the fake advertises its full length but delivers
+                // body bytes only within [0, deliver). A
                 // request that reaches at/beyond `deliver` comes back SHORT -- the
                 // undelivered tail is NEVER zero-filled (correcting the prior silent
                 // zero-fill) and the caller never marks it present. deliver ==
@@ -676,7 +670,7 @@ pub const Transport = union(enum) {
         }
     }
 
-    /// SEQUENTIAL fill (TD3): drain the body forward from `offset` (== the
+    /// SEQUENTIAL fill: drain the body forward from `offset` (== the
     /// download high-water). Returns bytes copied + whether the stream ENDED.
     /// n==0 with eof==false means bytes are momentarily withheld (wait+retry).
     pub fn drainForward(self: Transport, dest: []u8, offset: u64) DrainResult {
@@ -708,12 +702,12 @@ pub const Transport = union(enum) {
 
 // ---------------------------------------------------------------------------
 // HttpRange: the network byte Source (peer to source.Gzip). Two fill
-// strategies behind one Source variant (TD2): RANDOM (206 + Content-Range —
+// strategies behind one Source variant: RANDOM (206 + Content-Range —
 // ranged GET per chunk into a presized spool + `present[]` bitmap) and
 // SEQUENTIAL (200 / no usable total — ONE forward-draining GET into a growing
 // contiguous spool prefix, `seq_hw` high-water). Known length presizes the
 // spool; UNKNOWN length grows it under a stable virtual reservation so
-// outstanding spool slices never dangle across a growth (TD5).
+// outstanding spool slices never dangle across a growth.
 // ---------------------------------------------------------------------------
 
 /// The virtual address reservation for an UNKNOWN-length sequential spool:
@@ -766,13 +760,13 @@ pub const HttpRange = struct {
     shutdown: std.atomic.Value(bool) = .init(false),
     // RANDOM fill: a single transport-busy guard. Set (under the mutex) while a
     // thread holds the transport for a ranged GET with the mutex RELEASED, so
-    // present-byte reads never block behind that GET (bug #1) and concurrent
+    // present-byte reads never block behind that GET, and concurrent
     // fetchers serialize (one GET at a time — no double-fetch, no torn spool
     // region, no concurrent use of the shared transport client).
     fetching: bool = false,
     progress: ?Progress = null,
-    /// security-hardening (e) AC-e3: set once any ranged fetch came back SHORT
-    /// (server advertised its length but delivered fewer bytes / a zero body).
+    /// Set once any ranged fetch came back SHORT (the server advertised its
+    /// length but delivered fewer bytes, or a zero body).
     /// buildNet reads it right after the head fetch to fail the OPEN with
     /// LS_NET_ERROR_SHORT_BODY; post-open it only records that the un-fetched
     /// tail stays not-present (no post-open error state -- root-planner boundary).
@@ -817,7 +811,7 @@ pub const HttpRange = struct {
     /// Unknown-length: create the spool file and reserve a stable virtual
     /// address range (PROT_NONE anonymous). The file is ftruncated + MAP_FIXED
     /// into the reservation as the download grows (growSpoolLocked), so the base
-    /// never moves and outstanding spool slices never dangle (TD5).
+    /// never moves and outstanding spool slices never dangle.
     fn openSpoolUnknown(self: *HttpRange) bool {
         const fd = self.createSpoolFd() orelse return false;
         const reservation = posix.mmap(null, @intCast(seq_reserve), .{}, .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .NORESERVE = true }, -1, 0) catch {
@@ -883,8 +877,8 @@ pub const HttpRange = struct {
             const dest = self.spool[@intCast(start)..@intCast(start + len)];
             switch (self.transport.fetchInto(dest, start)) {
                 .ok => {},
-                // security-hardening (e) AC-e3: leave the chunk not-present (no
-                // zero-fill served) and flag a short body for the open-time check.
+                // Leave the chunk not-present (no zero-fill served) and flag a
+                // short body for the open-time check.
                 .short => {
                     self.short_fetch.store(true, .release);
                     return;
@@ -902,10 +896,10 @@ pub const HttpRange = struct {
 
     /// Ensure chunks [first, last] are present, COALESCING each contiguous run of
     /// missing chunks into ONE ranged fetchInto (a single transport round-trip,
-    /// so the O(head) open assembles in <=2 GETs, not one-per-256-KiB-chunk —
-    /// bug #5), and releasing the document mutex ACROSS that network GET so
-    /// concurrent present-byte reads / polls never block behind it (bug #1). The
-    /// `fetching` guard serializes transport access while the mutex is down: a
+    /// so the O(head) open assembles in <=2 GETs, not one-per-256-KiB-chunk),
+    /// and releasing the document mutex ACROSS that network GET so concurrent
+    /// present-byte reads / polls never block behind it. The `fetching` guard
+    /// serializes transport access while the mutex is down: a
     /// second thread that wants a byte covered by an in-flight GET waits WITHOUT
     /// the mutex (so unrelated present-byte reads still proceed) and re-checks
     /// when it frees — never a double-fetch, a torn spool region, or a concurrent
@@ -941,8 +935,8 @@ pub const HttpRange = struct {
             self.fetching = false;
             switch (outcome) {
                 .ok => {},
-                // security-hardening (e) AC-e3: a short/failed GET leaves the whole
-                // run not-present (ensureSlice then clamps to the present prefix, so
+                // A short/failed GET leaves the whole run not-present
+                // (ensureSlice then clamps to the present prefix, so
                 // the frontier never advances over un-fetched bytes). `.short` also
                 // flags the open-time short-body classification.
                 .short => {
@@ -1049,8 +1043,7 @@ pub const HttpRange = struct {
         }
     }
 
-    /// security-hardening (b) AC-b2: whether bytes this Source does not have yet
-    /// can STILL ARRIVE — the "NOT YET ARRIVED" vs "NEVER ARRIVING" question,
+    /// Whether bytes this Source does not have yet can STILL ARRIVE — the "NOT YET ARRIVED" vs "NEVER ARRIVING" question,
     /// asked wherever a stalled frontier must choose between waiting and calling
     /// an end (see index.zig's jump-stall branch).
     ///
@@ -1059,15 +1052,15 @@ pub const HttpRange = struct {
     /// landed is simply not downloaded YET; only the peer ending the body (`eof`)
     /// or the document shutting down makes its absence final. The RANDOM arm
     /// answers false because a hole there is a SHORT or FAILED range — a byte the
-    /// server refused — which AC-e3 already resolves by ending the demand at the
-    /// frontier instead of re-hammering the transport for it.
+    /// server refused — already resolved by ending the demand at the frontier
+    /// instead of re-hammering the transport for it.
     pub fn awaitsBytes(self: *const HttpRange) bool {
         if (self.range_mode != 2) return false;
         if (self.shutdown.load(.acquire)) return false;
         return !self.eof.load(.acquire);
     }
 
-    /// Blocking forward drain to serve `internal` (AC13): waits (releasing the
+    /// Blocking forward drain to serve `internal`: waits (releasing the
     /// lock while sleeping, so poll / other lanes never block) until the byte at
     /// `internal` is downloaded, or the stream ends / shuts down. This lets a
     /// demand scan STAY SCANNING under withheld bytes and distinguishes a
@@ -1100,15 +1093,15 @@ pub const HttpRange = struct {
         if (self.spool.len == 0) return &.{};
         if (self.range_mode == 2) return self.ensureSliceSequentialLocked(internal, want);
         // RANDOM fill: presized spool, contiguous missing chunks fetched in ONE
-        // coalesced ranged GET (bug #5), with the mutex released across it (#1).
+        // coalesced ranged GET, with the mutex released across it.
         if (internal >= self.total) return &.{};
         const end = @min(self.total, internal + want);
         if (end <= internal) return &.{};
         const first = internal / chunk_bytes;
         const last = (end - 1) / chunk_bytes;
         self.ensureChunkRangeLocked(@intCast(first), @intCast(last));
-        // security-hardening (e) AC-e3: never serve un-fetched bytes. A short/
-        // failed range leaves its chunks not-present, so clamp the returned slice
+        // Never serve un-fetched bytes. A short/failed range leaves its chunks
+        // not-present, so clamp the returned slice
         // to the CONTIGUOUS PRESENT prefix from `internal` -- the un-fetched tail
         // is neither returned as (zero-fill) content nor allowed to advance the
         // frontier over it. When every requested chunk is present (the normal
@@ -1123,7 +1116,7 @@ pub const HttpRange = struct {
         return self.spool[@intCast(internal)..@intCast(served_end)];
     }
 
-    /// gzip compressed provider (TD4): ensure the contiguous compressed prefix
+    /// gzip compressed provider: ensure the contiguous compressed prefix
     /// is fetched up to `want` and return the present high-water. The inflater
     /// consumes compressed bytes strictly forward; checkpoint replay reads only
     /// already-present bytes. For sequential fill this drains forward; for random
@@ -1137,6 +1130,9 @@ pub const HttpRange = struct {
         }
         const end = @min(self.total, want);
         while (self.comp_fetched < end) {
+            // Every other blocking-fetch loop re-reads `shutdown` at the top;
+            // this one relied on the present-break below to unwind a close.
+            if (self.shutdown.load(.acquire)) break;
             const ci = self.comp_fetched / chunk_bytes;
             if (!self.present[@intCast(ci)]) self.ensureChunkLocked(@intCast(ci));
             // A chunk that did NOT arrive ends the contiguous prefix. Leaving
@@ -1232,7 +1228,7 @@ pub const HttpRange = struct {
         //     returns as soon as the byte AT `internal` is available and ignores
         //     `want` entirely, so only asking for the FAR end drains the prefix far
         //     enough. Blocking here is the documented withhold-then-release
-        //     behavior (AC13): the scan stays SCANNING until the bytes arrive.
+        //     behavior: the scan stays SCANNING until the bytes arrive.
         _ = self.ensureSlice(reach + self.bom_len, need);
         _ = self.ensureSlice(reach + self.bom_len + need - 1, 1);
         return self.commitBoundNoFetch(need);
@@ -1289,7 +1285,7 @@ pub const NetBuildOpts = struct {
     total: u64, // known resource total (0 / don't-care when !total_known)
 };
 
-/// Build the streaming network Source for EVERY case (TD2/TD3/TD4): plain CSV or
+/// Build the streaming network Source for EVERY case: plain CSV or
 /// `.csv.gz`, on a range or no-range server, of known or unknown length — always
 /// demand-driven, never fully downloaded. Creates the spool, fetches only enough
 /// head to classify (magic) + serve the first viewport, and (for a gzip resource)
@@ -1339,8 +1335,8 @@ pub fn buildNet(gpa: std.mem.Allocator, transport: Transport, opts: NetBuildOpts
         hr.unlock();
     }
 
-    // security-hardening (e) AC-e3: a SHORT / zero-length HEAD fetch is a
-    // retryable short body -- fail the open with LS_NET_ERROR_SHORT_BODY rather
+    // A SHORT / zero-length HEAD fetch is a retryable short body -- fail the
+    // open with LS_NET_ERROR_SHORT_BODY rather
     // than serving zero-filled (un-fetched) bytes as document content. (A short
     // range fetched POST-open is handled by the present-prefix clamp in
     // ensureSlice; there is no post-open error state -- root-planner boundary.)

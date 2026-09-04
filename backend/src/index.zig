@@ -59,6 +59,7 @@ pub fn headScan(doc: *Document) void {
     const lim = headSourceLimit(doc); // == min(hb, source end)
     var pos = doc.data_start;
     var row: u64 = 0;
+    var indexable = true;
     base.beginOversizedChunk(doc);
     // FRONTIER COMMIT GUARD (source.Source.commitBound), hoisted. This is the
     // document's FIRST frontier commit, and for a NETWORK doc the head budget is
@@ -75,14 +76,21 @@ pub fn headScan(doc: *Document) void {
         if (b.capped) break; // record spills past the head budget: leave for later
         if (doc.bom_len + doc.reader.bytesConsumed(doc.source, b.next) > hb) break; // keep bytes_scanned <= budget
         if (guarded and doc.reader.logicalBytes(doc.source, b.next) > commit_end) break;
-        // ARCH-huge-row-budget: this row's source extent may exceed the
-        // WINDOW's per-row scan cap (LS_WINDOW_ROW_SCAN_MAX_BYTES, much
-        // smaller than the O(head) budget above) even though headScan itself
-        // -- like every frontier scan -- always finds the row's true end.
+        // This row's source extent may exceed the WINDOW's per-row scan cap
+        // (LS_WINDOW_ROW_SCAN_MAX_BYTES, much smaller than the O(head) budget
+        // above) even though headScan itself -- like every frontier scan --
+        // always finds the row's true end.
         base.stageOversized(doc, row, pos, b.next);
         pos = b.next;
         row += 1;
-        if (row % checkpoint_interval == 0) doc.checkpoints.append(doc.gpa, .{ .row = row, .pos = pos }) catch {};
+        if (row % checkpoint_interval == 0) doc.checkpoints.append(doc.gpa, .{ .row = row, .pos = pos }) catch {
+            // Skipping this block's checkpoint would leave every later entry at
+            // the wrong index, and nav/search/filter address checkpoints[b] as
+            // block b's first row. Stop indexing instead and report exactly the
+            // rows already recorded.
+            indexable = false;
+            break;
+        };
         if (doc.reader.atEnd(doc.source, pos)) break;
     }
     // headScan is the document's very first frontier advance (the worker has
@@ -90,14 +98,14 @@ pub fn headScan(doc: *Document) void {
     base.drainOversized(doc, true);
     doc.frontier_pos = pos;
     doc.frontier_rows = row;
-    if (doc.reader.atEnd(doc.source, pos)) {
+    if (!indexable or doc.reader.atEnd(doc.source, pos)) {
         doc.complete = true;
         doc.total_rows = row;
     }
-    // ARCH-security-hardening (g): the file shrank inside the open window, so the
-    // head this scan just indexed is partly zero-fill. Clamp to the rows still
-    // backed; `openWithAllocator` turns a faulted open into the existing `.io`
-    // status. No lock needed — the worker has not spawned yet.
+    // The file shrank inside the open window, so the head this scan just
+    // indexed is partly zero-fill. Clamp to the rows still backed;
+    // `openWithAllocator` turns a faulted open into the existing `.io` status.
+    // No lock needed — the worker has not spawned yet.
     base.reportSourceFaultLocked(doc);
 }
 
@@ -106,8 +114,8 @@ pub fn headScan(doc: *Document) void {
 // ---------------------------------------------------------------------------
 
 pub fn workerMain(doc: *Document) void {
-    // THE DESIGNATED FETCHER (security-hardening (e) AC-e1 residual — see
-    // `source.fetchPermitted`). This one thread owns every scan that advances the
+    // THE DESIGNATED FETCHER (see `source.fetchPermitted`). This one thread
+    // owns every scan that advances the
     // frontier: the AUTO indexer, jumps, search, filter and the column job. It is
     // the only post-open path allowed to BLOCK on the transport, and it is exactly
     // the path that already pays for fetches — cancellable, off the document mutex
@@ -145,8 +153,8 @@ pub fn workerMain(doc: *Document) void {
         const do_nav = !do_jump and !do_search and doc.filter_state != .idle and
             doc.nav_pending and doc.search_nav == .searching and
             doc.search_state == .done and doc.filter_total_exact;
-        // never-full-download-streaming (TD1): a NETWORK document has NO
-        // background frontier drive — neither the AUTO indexer nor the filter's
+        // A NETWORK document has NO background frontier drive — neither the
+        // AUTO indexer nor the filter's
         // auto-drive-to-completion. The frontier advances only on concrete demand
         // (viewport jump / search nav / filtered jump), all on this same worker
         // but never as an unbidden to-EOF scan over the wire. LOCAL docs
@@ -176,8 +184,8 @@ pub fn workerMain(doc: *Document) void {
         if (do_column) {
             const faults_before = base.sourceFaultCount(doc);
             column.workerRunLocked(doc);
-            // security-hardening (g): the type sampler re-reads the head, so it can
-            // be the FIRST reader to touch dead bytes. Report the fault; the types
+            // The type sampler re-reads the head, so it can be the FIRST
+            // reader to touch dead bytes. Report the fault; the types
             // it just inferred from zero-fill are advisory and the document is now
             // terminal, so the rows they would have described are gone anyway.
             if (base.sourceFaultCount(doc) != faults_before) base.reportSourceFaultLocked(doc);
@@ -218,8 +226,8 @@ pub fn workerMain(doc: *Document) void {
             const outcome = search.resolveFilteredNavOffMain(doc, nav_gen, search_gen, filter_gen, anchor, dir, pctx, fctx);
 
             doc.lock();
-            // security-hardening (g): a nav resolved against the guard's zero-fill
-            // is not a navigation — report the fault and discard the outcome.
+            // A nav resolved against the guard's zero-fill is not a
+            // navigation — report the fault and discard the outcome.
             if (base.sourceFaultCount(doc) != faults_before) {
                 base.reportSourceFaultLocked(doc);
                 search.failSearchLocked(doc);
@@ -265,8 +273,8 @@ pub fn workerMain(doc: *Document) void {
             const res = filter.filterScanChunk(doc, start_pos, start_row, gen);
 
             doc.lock();
-            // security-hardening (g) AC-g1: the source faulted under this chunk —
-            // discard it (its matches came from zero-fill) and end the filtered
+            // The source faulted under this chunk: discard it (its matches
+            // came from zero-fill) and end the filtered
             // jump at the last match we DO have, mirroring the stalled-network
             // clamp below.
             if (base.sourceFaultCount(doc) != faults_before) {
@@ -284,8 +292,8 @@ pub fn workerMain(doc: *Document) void {
                 filter.commitFilter(doc, res);
                 filter.resolveFilterJumpLocked(doc);
                 column.sourceCompletedLocked(doc);
-                // security-hardening (e) AC-e3: the filtered jump is the LIVE
-                // network filter driver (`do_filter` is gated off for net docs),
+                // The filtered jump is the LIVE network filter driver
+                // (`do_filter` is gated off for net docs),
                 // so this is where a short body strands it. The scan made no
                 // progress and cannot: end the jump at the last match we DO have
                 // (mirroring resolveFilterJumpLocked's clamp, but WITHOUT
@@ -327,8 +335,8 @@ pub fn workerMain(doc: *Document) void {
             const res = filter.filterScanChunk(doc, start_pos, start_row, gen);
 
             doc.lock();
-            // security-hardening (g) AC-g1: source faulted under this chunk —
-            // discard it and freeze the filter at its last consistent state.
+            // The source faulted under this chunk: discard it and freeze the
+            // filter at its last consistent state.
             if (base.sourceFaultCount(doc) != faults_before) {
                 base.reportSourceFaultLocked(doc);
                 filter.finishStalledLocked(doc);
@@ -338,8 +346,8 @@ pub fn workerMain(doc: *Document) void {
             if (doc.filter_gen == gen and doc.filter_state == .scanning) {
                 filter.commitFilter(doc, res);
                 column.sourceCompletedLocked(doc);
-                // security-hardening (e) AC-e3: the scan stalled on un-fetched
-                // bytes. Freeze the filter at its last consistent state
+                // The scan stalled on un-fetched bytes. Freeze the filter at
+                // its last consistent state
                 // (CANCELLED — counts exact for what IS present, view NOT
                 // complete) instead of re-entering on a zero-progress cursor.
                 if (res.stalled) filter.finishStalledLocked(doc);
@@ -385,8 +393,8 @@ pub fn workerMain(doc: *Document) void {
             const res = search.searchScanChunk(doc, start_pos, start_row, filtered, gen);
 
             doc.lock();
-            // security-hardening (g) AC-g1: source faulted under this chunk —
-            // discard it (matches against zero-fill are not matches) and freeze
+            // The source faulted under this chunk: discard it (matches
+            // against zero-fill are not matches) and freeze
             // the search where it stood, serving no phantom hits.
             if (base.sourceFaultCount(doc) != faults_before) {
                 base.reportSourceFaultLocked(doc);
@@ -405,8 +413,8 @@ pub fn workerMain(doc: *Document) void {
                     // A nav-limited resume served its navigation before EOF.
                     doc.search_state = .cancelled;
                 }
-                // security-hardening (e) AC-e3: the scan stalled on un-fetched
-                // bytes. `resolveNavLocked` above already served any navigation
+                // The scan stalled on un-fetched bytes. `resolveNavLocked`
+                // above already served any navigation
                 // reachable within the PRESENT rows; freeze the search there
                 // (CANCELLED, counts frozen, pending nav -> NONE) rather than
                 // spinning and inflating the row/match counts. Runs after the
@@ -431,8 +439,8 @@ pub fn workerMain(doc: *Document) void {
         const res = scanChunk(doc, start_pos, start_row);
 
         doc.lock();
-        // ARCH-security-hardening (g) AC-g1: the bytes this chunk lexed stopped
-        // existing while it ran, so what it produced is the guard's zero-fill and
+        // The bytes this chunk lexed stopped existing while it ran, so what
+        // it produced is the guard's zero-fill and
         // not the file — DISCARD it whole (committing it would fabricate rows out
         // of zeroes) and report the terminal truncated/faulted outcome instead.
         // The jump resolves below through `doc.complete`, exactly as it does for a
@@ -445,7 +453,12 @@ pub fn workerMain(doc: *Document) void {
         }
         doc.frontier_pos = res.end_pos;
         doc.frontier_rows = res.end_row;
-        if (res.checkpoint) |cp| doc.checkpoints.append(doc.gpa, cp) catch {};
+        if (res.checkpoint) |cp| doc.checkpoints.append(doc.gpa, cp) catch {
+            // See headScan: a dropped checkpoint misaligns every later block
+            // lookup. Freeze the document here instead, at rows it can serve.
+            doc.complete = true;
+            doc.total_rows = doc.frontier_rows;
+        };
         // scanChunk always starts exactly at the frontier: always the leading
         // edge, so always drained (see base.drainOversized).
         base.drainOversized(doc, true);
@@ -457,8 +470,8 @@ pub fn workerMain(doc: *Document) void {
             doc.total_rows = doc.frontier_rows;
         } else if (doc.jump_state == .scanning and !doc.stop_atomic.load(.monotonic) and
             no_progress and
-            // security-hardening (b) AC-b2: ONLY when the missing bytes are never
-            // arriving. A SEQUENTIAL body is still being drained, so a byte that
+            // ONLY when the missing bytes are never arriving. A SEQUENTIAL
+            // body is still being drained, so a byte that
             // has not landed is late, not absent — ending the jump there reports
             // "the document stops here" about a document that is still coming, and
             // the demand can never resume because the slot already read `.done`
@@ -471,8 +484,8 @@ pub fn workerMain(doc: *Document) void {
             // costs a sleeping thread rather than a spinning one.
             !source_mod.sourceAwaitsBytes(doc.source))
         {
-            // security-hardening (e) AC-e3: a NETWORK jump that made NO forward
-            // progress because the next bytes are un-fetched (a short/failed range
+            // A NETWORK jump that made NO forward progress because the next
+            // bytes are un-fetched (a short/failed range
             // left them not-present, below the known end) is a STALL, not EOF. End
             // the jump at the current frontier WITHOUT marking the doc complete (the
             // un-fetched tail is never zero-filled or counted) and stop driving, so
@@ -516,7 +529,7 @@ const ChunkResult = struct {
 /// multiple, or EOF, or a stop request. Reads only via the Reader (immutable
 /// mmap bytes, for CSV); also stages any oversized row it crosses
 /// (base.stageOversized) for the caller to drain at commit time
-/// (base.drainOversized) -- ARCH-huge-row-budget.
+/// (base.drainOversized).
 fn scanChunk(doc: *Document, start_pos: Pos, start_row: u64) ChunkResult {
     var pos = start_pos;
     var row = start_row;
@@ -559,7 +572,7 @@ fn updateJump(doc: *Document) void {
         else if (doc.frontier_rows > 0) doc.frontier_rows - 1 else 0;
         doc.jump_progress = 1.0;
     } else {
-        // Byte-frontier progress (bug #6): the fraction of BYTES the scan has
+        // Byte-frontier progress: the fraction of BYTES the scan has
         // covered toward where the target row is PROJECTED to sit, capped at the
         // resource end — so a BEYOND-EOF target tracks the advance toward EOF and
         // climbs high near the end, instead of a ratio against an UNREACHABLE
@@ -624,14 +637,14 @@ fn madviseDontNeed(doc: *Document, start_physical: u64, end_physical: u64) void 
 pub fn rowCount(d: *Document) api.RowCount {
     d.lock();
     defer d.unlock();
-    base.reportSourceFaultLocked(d); // security-hardening (g): report a faulted source
+    base.reportSourceFaultLocked(d);
     // While filtered, report the FILTERED match count (see FILTERED VIEWS):
     // identical semantics to the unfiltered count during indexing (a
     // converging lower bound that becomes exact at LS_FILTER_DONE).
     if (d.filter_state != .idle) return .{ .count = d.filter_total, .exact = d.filter_total_exact };
     if (d.complete) return .{ .count = d.total_rows, .exact = true };
-    // never-full-download-streaming (TD6): an UNKNOWN-length network stream has
-    // no total to project from, so it reports a discovered-rows LOWER BOUND
+    // An UNKNOWN-length network stream has no total to project from, so it
+    // reports a discovered-rows LOWER BOUND
     // (frontier_rows, exact=false) that firms only as the user navigates. A
     // KNOWN-length network doc keeps the free projection below (no fetch).
     if (d.net and source_mod.netPhysicalTotal(d.source) == null)
@@ -658,30 +671,31 @@ pub fn rowCount(d: *Document) api.RowCount {
 pub fn indexPoll(d: *Document) api.ScanProgress {
     d.lock();
     defer d.unlock();
-    base.reportSourceFaultLocked(d); // security-hardening (g): report a faulted source
-    // never-full-download-streaming (TD5): a network document's total comes from
-    // the Source (known length, or the received size once EOF firmed it), or the
-    // UINT64_MAX sentinel while an unknown-length stream's total is not yet
-    // known. bytes_scanned is the frontier's physical high-water. `complete` is
-    // true only when navigation has reached EOF (the lazy gate never drives it).
+    base.reportSourceFaultLocked(d);
+    // A network document's total comes from the Source (known length, or the
+    // received size once EOF firmed it), or the UINT64_MAX sentinel while an
+    // unknown-length stream's total is not yet known. `complete` is true only
+    // when navigation has reached EOF (the lazy gate never drives it).
+    const frontier_phys = d.reader.physicalBytes(d.source, d.frontier_pos);
+    var total: u64 = d.file_size;
+    var scanned: u64 = if (d.complete) d.file_size else @min(d.file_size, frontier_phys);
     if (d.net) {
-        const frontier_phys = d.reader.physicalBytes(d.source, d.frontier_pos);
-        if (source_mod.netPhysicalTotal(d.source)) |phys_total| return .{
-            .bytes_scanned = if (d.complete) phys_total else @min(phys_total, frontier_phys),
-            .bytes_total = phys_total,
-            .complete = d.complete,
-        };
-        return .{
-            .bytes_scanned = frontier_phys,
-            .bytes_total = api.bytes_total_unknown,
-            .complete = d.complete,
-        };
+        if (source_mod.netPhysicalTotal(d.source)) |phys_total| {
+            total = phys_total;
+            scanned = if (d.complete) phys_total else @min(phys_total, frontier_phys);
+        } else {
+            total = api.bytes_total_unknown;
+            scanned = frontier_phys;
+        }
     }
-    return .{
-        .bytes_scanned = if (d.complete) d.file_size else @min(d.file_size, d.reader.physicalBytes(d.source, d.frontier_pos)),
-        .bytes_total = d.file_size,
-        .complete = d.complete,
-    };
+    // The ABI pins bytes_scanned MONOTONE NON-DECREASING for the document's
+    // lifetime; the frontier's PHYSICAL byte is not. For a gzip source it is the
+    // serving lane's compressed high-water, so a chunk served from a replay lane
+    // can publish a lower one than a forward-lane chunk already did, and a source
+    // fault clamps the frontier back outright. Latch it here — the one place the
+    // ABI value is produced — rather than at every frontier writer.
+    d.poll_bytes_high_water = @max(d.poll_bytes_high_water, scanned);
+    return .{ .bytes_scanned = d.poll_bytes_high_water, .bytes_total = total, .complete = d.complete };
 }
 
 // ---------------------------------------------------------------------------
@@ -757,6 +771,6 @@ pub fn jumpCancel(d: *Document) void {
 pub fn jumpPoll(d: *Document) api.JumpStatus {
     d.lock();
     defer d.unlock();
-    base.reportSourceFaultLocked(d); // security-hardening (g): report a faulted source
+    base.reportSourceFaultLocked(d);
     return .{ .state = d.jump_state, .progress = d.jump_progress, .landed_row = d.jump_landed };
 }

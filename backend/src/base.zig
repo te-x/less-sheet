@@ -22,8 +22,8 @@ const matcher = @import("matcher.zig");
 // `startWorker`/`joinWorker`. Not a new module cycle: base -> source_mod ->
 // net_source -> base already exists.
 const net_source = @import("net_source.zig");
-// ARCH-security-hardening (g): the SOURCE-FAULT GUARD over the document's own
-// mmap region. See src/fault_guard.zig for the mechanism.
+// The SOURCE-FAULT GUARD over the document's own mmap region. See
+// src/fault_guard.zig for the mechanism.
 const fault_guard = @import("fault_guard.zig");
 
 const posix = std.posix;
@@ -44,12 +44,11 @@ const Reader = reader_mod.Reader;
 /// re-lex distance of any window to O(interval + window).
 pub const checkpoint_interval: u64 = 2048;
 
-/// The LOCAL (mmap/gzip) open-head budget — the full 4 MiB (disk-cheap; the
-/// exact-count corpus + the ABI determinism-pin ACs depend on it byte-identically).
+/// The LOCAL (mmap/gzip) open-head budget — the full 4 MiB (disk-cheap).
 pub const head_budget: u64 = api.open_head_max_bytes;
-/// The NETWORK open-head budget — deliberately small (the author: "256 KiB, row
-/// estimation secondary to speed") so a slow-link open FETCHES + INDEXES only
-/// this much (~4x faster open). SINGLE SOURCE OF TRUTH for the network head size:
+/// The NETWORK open-head budget — deliberately small (row estimation is
+/// secondary to speed) so a slow-link open FETCHES + INDEXES only this much
+/// (~4x faster open). SINGLE SOURCE OF TRUTH for the network head size:
 /// net_source's open prefetch reads it directly (that module is always the
 /// network path) and index.zig's headBudget() selects it when doc.net — no other
 /// site hardcodes the size or re-decides net-vs-local.
@@ -68,8 +67,8 @@ pub const CellRef = struct { start: usize, len: usize, truncated: bool = false }
 /// A sparse row-index entry: data row `row` begins at (opaque) position `pos`.
 pub const Checkpoint = struct { row: u64, pos: Pos };
 
-/// ARCH-huge-row-filtered: the FULL-cell filter-match result the background
-/// filter-scan already decided for OVERSIZED row `row` (source extent >
+/// The FULL-cell filter-match result the background filter-scan already
+/// decided for OVERSIZED row `row` (source extent >
 /// LS_WINDOW_ROW_SCAN_MAX_BYTES) — see filter.filterScanChunk and Document's
 /// `filter_oversized_matches`. Lets the FILTERED window path (window.
 /// windowSetFiltered / nav.nthMatchInBlock) honor that already-decided FULL-
@@ -129,7 +128,7 @@ pub const Decimal = struct {
 
 // --- The document -----------------------------------------------------------
 
-/// View discriminant for the copy cursor (ARCH-stream-copy FR4): identity
+/// View discriminant for the copy cursor: identity
 /// (window.cellCopy) and filtered (window.cellCopyFiltered) occupy disjoint
 /// coordinate spaces, so a switch between them must never reuse the other
 /// view's cursor state.
@@ -143,9 +142,8 @@ pub const ColumnWindowRow = struct { row: u64, pos: Pos, oversized: bool };
 /// `Document.joinWorker` the ONE place that tears either down; no other module
 /// re-derives the policy (every other site only null-tests `doc.worker`).
 ///
-///   * `.thread` — a raw `std.Thread`, the shape every document used before.
-///     Shut down by `stop` + `wakeWorker` + `join`: the worker observes `stop`
-///     between chunks and returns on its own.
+///   * `.thread` — a raw `std.Thread`. Shut down by `stop` + `wakeWorker` +
+///     `join`: the worker observes `stop` between chunks and returns on its own.
 ///   * `.task` — an `io.concurrent` task of the process-global network executor
 ///     (`net_source.netIo`). Identical code on a DIFFERENT kind of thread: one
 ///     the executor owns, so `Thread.current` is set and every blocking socket
@@ -165,10 +163,10 @@ pub const Document = struct {
 
     // File mapping (immutable after open). `mapping` is null for an empty file.
     mapping: ?[]align(std.heap.page_size_min) const u8,
-    // ARCH-security-hardening (g) AC-g1/AC-g2 — SOURCE-FAULT GUARD (immutable
-    // after open). `fault_slot` is this mapping's slot in the process-wide
-    // guard registry (src/fault_guard.zig), or null when the mapping is
-    // unguarded: an empty file, a network source, or a full registry.
+    // SOURCE-FAULT GUARD (immutable after open). `fault_slot` is this
+    // mapping's slot in the process-wide guard registry (src/fault_guard.zig),
+    // or null when the mapping is unguarded: an empty file, a network source,
+    // or a full registry.
     fault_slot: ?u32,
     // The source fd, held open for the document's lifetime for exactly one
     // reason: when the guard reports a fault, `fstat` is the only authoritative
@@ -207,8 +205,8 @@ pub const Document = struct {
     header_buf: []const u8,
     header_refs: []const CellRef,
 
-    // BOUNDED RECORD 1 (see api/lesssheet.h DELIMITED-TEXT / requirement 9):
-    // true iff record 1 did not terminate within the O(head) budget.
+    // BOUNDED RECORD 1 (see api/lesssheet.h DELIMITED-TEXT): true iff record 1
+    // did not terminate within the O(head) budget.
     // `row0_pinned_*` holds record 1's bounded decode when it is ALSO data
     // row 0 (header off): served by ls_cell/ls_window_set directly, bypassing
     // the frontier (which never claims a row whose true extent past the
@@ -222,7 +220,7 @@ pub const Document = struct {
     mutex: sysio.Mutex,
     cond: sysio.Condition,
     checkpoints: std.ArrayList(Checkpoint),
-    // ARCH-huge-row-budget: an extra checkpoint dropped immediately AFTER
+    // An extra checkpoint dropped immediately AFTER
     // every row whose source extent exceeded LS_WINDOW_ROW_SCAN_MAX_BYTES
     // (row `r+1` at oversized row `r`'s true end), found by whichever scan
     // (headScan / index's background scanChunk / a search or filter scan)
@@ -301,7 +299,7 @@ pub const Document = struct {
     nav_scratch: std.ArrayList(u8),
     nav_refs: std.ArrayList(CellRef),
 
-    // Filter (filtered-views slice) — a persistent VIEW MODE, not a transient
+    // Filter — a persistent VIEW MODE, not a transient
     // job: it PERSISTS (scanning/done/cancelled) until cleared or re-opened,
     // regardless of scan-slot contention (see api/lesssheet.h FILTERED VIEWS).
     // Mirrors the search job's per-block counting machinery with its OWN
@@ -328,7 +326,7 @@ pub const Document = struct {
     // Per-index-block filter-match counters (owned): O(checkpoints) always,
     // aligned 1:1 with `checkpoints`, exactly like the search job's block_counts.
     filter_block_counts: std.ArrayList(u64),
-    // ARCH-huge-row-filtered: per-OVERSIZED-row filter-match record (see
+    // Per-OVERSIZED-row filter-match record (see
     // OversizedMatch) -- lets the FILTERED window path (window.
     // windowSetFiltered / nav.nthMatchInBlock) honor the background filter-
     // scan's FULL-cell match decision for a giant row without re-scanning it.
@@ -374,12 +372,12 @@ pub const Document = struct {
     win_pos: std.ArrayList(Pos) = .empty,
     // win_oversized[i] mirrors win_source[i]: true iff materialized row
     // win_first+i's SOURCE extent exceeded LS_WINDOW_ROW_SCAN_MAX_BYTES, so it
-    // was served as a bounded prefix (see ls_row_oversized / ARCH-huge-row-
-    // budget). Set by windowSet alongside win_refs/win_source.
+    // was served as a bounded prefix (see ls_row_oversized). Set by windowSet
+    // alongside win_refs/win_source.
     win_oversized: std.ArrayList(bool),
     win_first: u64,
     win_rows: u64,
-    // Window MATERIALIZATION EPOCH (thin-frontend-shared-core Phase 1): bumped
+    // Window MATERIALIZATION EPOCH: bumped
     // by window.windowSet on EVERY call (a re-request may EXTEND win_rows, so
     // win_first/win_rows alone can't tell a stale window from a grown one, and
     // an identical first_row/count under a new filter holds different content).
@@ -406,48 +404,43 @@ pub const Document = struct {
     win_candidate_next_pos: Pos = .{ .logical = 0, .physical = 0 },
     win_candidate_next_row: u64 = 0,
 
-    // --- Copy cursor + test instrumentation (ARCH-stream-copy) --------------
-    // The forward, view-scoped COPY CURSOR that accelerates consecutive,
+    // --- Copy cursor + test instrumentation ---------------------------------
+    // The forward, view-scoped COPY CURSOR accelerates consecutive,
     // monotonically-non-decreasing ls_cell_copy calls (window.cellCopy /
-    // window.cellCopyFiltered) to O(1) per row-major step: the implementer adds
-    // the cursor state itself here ({ row, pos, view-generation, filtered
-    // match-walk state }, reset on open / filter set-clear per FR4). The two
-    // fields below are the TEST-ONLY instrumentation seam behind that work
-    // (ARCH-stream-copy AC1-AC5), reached ONLY through the Zig-level seams in
-    // contracts/api.zig (copyCursorSetEnabled / copyAdvances / copyAdvancesReset,
-    // via root.zig) — NEVER across the C ABI. Both are DEFAULTED so the
-    // openWithAllocator construction literal need not mention them.
+    // window.cellCopyFiltered) to O(1) per row-major step. The two fields below
+    // are the TEST-ONLY instrumentation seam behind it, reached ONLY through the
+    // Zig-level seams in contracts/api.zig (copyCursorSetEnabled / copyAdvances
+    // / copyAdvancesReset, via root.zig) — NEVER across the C ABI. Both are
+    // DEFAULTED so the openWithAllocator construction literal need not mention
+    // them.
     //
     //   * copy_cursor_enabled — when false the copy path bypasses the cursor and
-    //     locates every cell from scratch (today's behavior): the byte-identical
-    //     REFERENCE for the AC1/AC2 equivalence sweeps and the interval-costly
-    //     BASELINE for the AC3/AC4/AC5 advance counts. Defaults TRUE (production
-    //     copies THROUGH the cursor once it lands).
+    //     locates every cell from scratch: the byte-identical REFERENCE for the
+    //     equivalence sweeps and the interval-costly BASELINE for the advance
+    //     counts. Defaults TRUE (production copies THROUGH the cursor).
     //   * copy_advances — a monotone count of SOURCE ROW-ADVANCES taken on the
     //     copy path (a boundsAfter skip in cursor-OFF mode; one cursor forward
     //     step in cursor-ON mode), in BOTH the identity and filtered paths.
     //     Reset/read by the test seam; pure instrumentation, irrelevant to the
-    //     copied bytes. SEED: never incremented (== 0) — see root.zig's seam
-    //     comment for why that makes the AC3/AC4/AC5 counts RED until built.
-    //     TEST-ONLY and measured single-threaded (a sweep resets it, then
-    //     reads it back once the sweep is done) — the plain, un-guarded `+=`
-    //     below is fine as a simple additive aggregate; no reader ever
+    //     copied bytes. TEST-ONLY and measured single-threaded (a sweep resets
+    //     it, then reads it back once the sweep is done) — the plain, un-guarded
+    //     `+=` below is fine as a simple additive aggregate; no reader ever
     //     depends on it being linearizable across concurrent copies.
     copy_cursor_enabled: bool = true,
     copy_advances: u64 = 0,
 
-    // The REAL cursor state (FR1/FR2/FR4), all DEFAULTED so a freshly opened
-    // Document (openWithAllocator's literal, unedited) starts with an invalid
-    // cursor -- "reset on open" (FR4) falls out for free. `copy_cursor_valid`
-    // gates every field below: false means "absent", so window.cellCopy /
-    // cellCopyFiltered always re-anchor (FR3). Tagged with the VIEW it was
-    // captured under (`copy_cursor_view`) and the `filter_gen` in effect at
-    // capture (`copy_cursor_gen`) -- together, FR4's "view identity + filter
-    // generation" tag: a view switch (tag mismatch) OR any filter set/clear
-    // (filter_gen always bumps -- filter.setFilter/clearFilter -- so even a
-    // same-view round-trip back to identity sees a stale gen) invalidates the
-    // cursor without an explicit reset call. Positions themselves are never
-    // invalidated (stable once scanned, per FR4) -- only the tag is compared.
+    // The REAL cursor state, all DEFAULTED so a freshly opened Document
+    // (openWithAllocator's literal, unedited) starts with an invalid cursor --
+    // "reset on open" falls out for free. `copy_cursor_valid` gates every field
+    // below: false means "absent", so window.cellCopy / cellCopyFiltered always
+    // re-anchor. Tagged with the VIEW it was captured under
+    // (`copy_cursor_view`) and the `filter_gen` in effect at capture
+    // (`copy_cursor_gen`) -- together the "view identity + filter generation"
+    // tag: a view switch (tag mismatch) OR any filter set/clear (filter_gen
+    // always bumps -- filter.setFilter/clearFilter -- so even a same-view
+    // round-trip back to identity sees a stale gen) invalidates the cursor
+    // without an explicit reset call. Positions themselves are never
+    // invalidated (stable once scanned) -- only the tag is compared.
     // `copy_cursor_row` is the coordinate the cursor last served, in ITS OWN
     // space (identity: physical row; filtered: filtered index);
     // `copy_cursor_pos` the SOURCE position where that row/match begins (a
@@ -462,8 +455,8 @@ pub const Document = struct {
     // (nav.nthMatchForwardFrom safely resumes, provably no costlier than a
     // fresh block-indexed locate for that row) or spill into a later block
     // (skip the row-walk entirely and go straight to the fresh locate) --
-    // never both (ARCH-stream-copy FR3 "never slower than today", for ANY
-    // match distribution, not just a dense/monotonic one).
+    // never both, so this is never slower than a fresh locate for ANY match
+    // distribution, not just a dense/monotonic one.
     //
     // Thread-safety: every FIELD READ/WRITE above happens under `d.lock()`,
     // but window.cellCopy drops the lock across its (potentially long) walk
@@ -484,7 +477,7 @@ pub const Document = struct {
     copy_cursor_source_row: u64 = 0,
     copy_cursor_block_consumed: u64 = 0,
 
-    // --- Streaming-copy cap test seam (thin-frontend-shared-core Phase 2) ----
+    // --- Streaming-copy cap test seam ---------------------------------------
     // DEFAULTED (like copy_cursor_* above), so openWithAllocator's literal is
     // undisturbed. 0 == the natural LS_COPY_MAX_CELLS (api.copy_max_cells); a
     // Zig-only test seam (copyCapCellsForTest) forces a small value so the
@@ -492,7 +485,7 @@ pub const Document = struct {
     // Read only by the ls_copy_* job path; never crosses the C ABI.
     copy_cap_cells: u64 = 0,
 
-    // --- Match-flags memo (thin-frontend-shared-core Phase 1) ----------------
+    // --- Match-flags memo ----------------------------------------------------
     // One flag byte per visible cell (1 = matches the active search request,
     // 0 = not), row-major over the materialized window x the requested column
     // range, computed by window.matchFlags (ls_window_match_flags) from the
@@ -511,16 +504,13 @@ pub const Document = struct {
     mf_first_col: u32 = 0,
     mf_col_count: u32 = 0,
 
-    // --- csv-gz instrumentation state (ARCH-csv-gz) -------------------------
+    // --- csv-gz instrumentation state ---------------------------------------
     // All DEFAULTED (like copy_cursor_* above), so openWithAllocator's literal
     // need not mention them AND a plain-CSV document reports zeros -> the mmap
-    // fast path is unaffected (AC20). The implementer sets these as the gzip
-    // Source consumes the dual open budget, spills/reads checkpoints, replays a
-    // behind-frontier landing, and streaming-matches. In the SEED they stay
-    // zero, which is exactly what makes every csv-gz quantitative AC RED (each
-    // asserts the counter did REAL work, e.g. `> 0 and <= bound`) -- mirroring
-    // stream-copy's `copy_advances == 0` RED seed. Read/reset only via the
-    // Zig-level seams in contracts/api.zig (gz* -> root.zig), NEVER the C ABI.
+    // fast path is unaffected. Set as the gzip Source consumes the dual open
+    // budget, spills/reads checkpoints, replays a behind-frontier landing, and
+    // streaming-matches. Read/reset only via the Zig-level seams in
+    // contracts/api.zig (gz* -> root.zig), NEVER the C ABI.
     gz_physical_in: u64 = 0, // compressed input consumed at open
     gz_inflated_out: u64 = 0, // inflated output produced at open
     gz_match_resident_bytes: u64 = 0, // peak per-row matcher residency
@@ -533,15 +523,15 @@ pub const Document = struct {
     match_scan_owner: MatchScanOwner = .none,
     match_scan_gen: u64 = 0,
 
-    // TEST-ONLY seam (gz-filter-stream regression; contracts/api.zig
-    // gzScanParkWorker): when set, the background worker declines the
-    // FILTER/SEARCH match-scan slot so a test can drive that scan ONE 2048-row
-    // block at a time on its own thread and deterministically interleave
-    // behind-frontier window/copy work between blocks. DEFAULTED false, so
-    // production behavior is byte-identical; only test code ever sets it.
+    // TEST-ONLY seam (contracts/api.zig gzScanParkWorker): when set, the
+    // background worker declines the FILTER/SEARCH match-scan slot so a test can
+    // drive that scan ONE 2048-row block at a time on its own thread and
+    // deterministically interleave behind-frontier window/copy work between
+    // blocks. DEFAULTED false, so production behavior is byte-identical; only
+    // test code ever sets it.
     scan_park: std.atomic.Value(bool) = .init(false),
 
-    // --- window-budget instrumentation state (ARCH-window-budget) -----------
+    // --- window-budget instrumentation state --------------------------------
     // DEFAULTED (like copy_cursor_* / gz_* above) so openWithAllocator's literal
     // need not mention them. Read ONLY via contracts/api.zig's
     // windowChargedBytes / navChargedBytes (Zig-only seams -> root.zig), NEVER the
@@ -554,33 +544,34 @@ pub const Document = struct {
     window_charged_bytes: u64 = 0, // AC2/AC3/AC4/AC8: last ls_window_set charged work
     nav_charged_bytes: u64 = 0, // AC11/AC12 (#6): last ls_search_nav SYNCHRONOUS charged work
     nav_charge_active: bool = false,
+    /// The high-water `ls_index_poll` has already reported. The ABI pins its
+    /// bytes_scanned monotone non-decreasing, and the frontier's physical byte
+    /// is not (see index.indexPoll).
+    poll_bytes_high_water: u64 = 0,
     nav_gen: u64 = 0, // replacement/cancel guard for off-main filtered navigation
 
-    // --- network-source instrumentation state (ARCH-network-source) ---------
+    // --- network-source instrumentation state -------------------------------
     // DEFAULTED (like gz_* / window-budget above) so openWithAllocator's literal
     // need not mention them AND a non-network document reports zeros. Read ONLY
     // via contracts/api.zig's Zig-only seams (netRangeMode / netFetchCount /
     // netResidentBytes / netSpoolStore / netForceCacheBytes -> root.zig), NEVER
-    // the C ABI. The implementer populates these from the http_range Source it
-    // adds (peer to mmap/gzip in source.zig): net_range_mode when the probe
-    // resolves, net_fetch_count per network fetch issued, net_resident_bytes to
-    // the Source's live resident RAM (bound 16 MiB), and the spool fields from
-    // the private spool file. In the SEED they stay zero, which makes every
-    // network-source quantitative AC RED until the Source is built + wired
-    // (mirroring the gz_* seed).
-    // never-full-download-streaming (TD1): the lazy-frontier gate. True for a
-    // network-sourced document (http_range, or gzip composed over http_range);
-    // false for every LOCAL mmap/gzip doc, so local behavior is byte-identical.
-    // When set, the worker suppresses the AUTO background frontier indexer and
-    // the filter auto-drive-to-completion, and search starts parked — the
-    // frontier advances only on concrete demand (viewport jump / search nav /
-    // filter demand). Set in open.buildDocument, keyed strictly on source kind.
+    // the C ABI. Populated from the http_range Source (peer to mmap/gzip in
+    // source.zig): net_range_mode when the probe resolves, net_fetch_count per
+    // network fetch issued, net_resident_bytes to the Source's live resident RAM
+    // (bound 16 MiB), and the spool fields from the private spool file.
+    //
+    // `net` is the lazy-frontier gate. True for a network-sourced document
+    // (http_range, or gzip composed over http_range); false for every LOCAL
+    // mmap/gzip doc, so local behavior is byte-identical. When set, the worker
+    // suppresses the AUTO background frontier indexer and the filter
+    // auto-drive-to-completion, and search starts parked — the frontier advances
+    // only on concrete demand (viewport jump / search nav / filter demand). Set
+    // in open.buildDocument, keyed strictly on source kind.
     net: bool = false,
     net_range_mode: u8 = 0, // 0 unknown, 1 random-access, 2 sequential-fallback
 
-    // ARCH-column-config: entirely empty at open. Dynamic storage remains
-    // sparse and is first allocated only by an explicit column request or
-    // configuration mutation.
+    // Entirely empty at open. Dynamic storage remains sparse and is first
+    // allocated only by an explicit column request or configuration mutation.
     column_store: column_state.Store = .{},
     // Lazily allocated inference worker/event storage. Empty ArrayList
     // headers add no inference payload allocation to cold open.
@@ -786,7 +777,7 @@ pub fn freeDoc(doc: *Document) void {
     doc.gpa.destroy(doc);
 }
 
-/// ARCH-security-hardening (g) AC-g1 — SOURCE-FAULT GUARD, caller side.
+/// SOURCE-FAULT GUARD, caller side.
 ///
 /// How many times this document's mapping has faulted (see src/fault_guard.zig).
 /// Every piece of work that reads the mapping is bracketed by two reads of this:
@@ -809,7 +800,7 @@ pub fn sourceFaultCount(doc: *const Document) u32 {
 /// first by a reader that has no result worth discarding (the column-type
 /// sampler, a nav resolve), and then no delta check would ever fire again and the
 /// document would be left serving nothing while still claiming it is making
-/// progress. That is precisely the outcome AC-g1 forbids.
+/// progress.
 ///
 /// So the progress/count queries the frontends poll continuously call this: it
 /// folds in ANY fault, whoever first hit it, exactly once per fault (the count is
@@ -868,7 +859,7 @@ fn goTerminalOnSourceFaultLocked(doc: *Document) void {
     doc.total_rows = keep_rows;
 }
 
-/// security-hardening (e) AC-e3: the ONE stall predicate shared by all three
+/// The ONE stall predicate shared by all three
 /// frontier drivers (index.scanChunk's jump/plain-index branch,
 /// search.searchScanChunk, filter.filterScanChunk) — a row lex that consumed
 /// ZERO logical bytes.
@@ -908,7 +899,7 @@ pub fn searchProgress(doc: *Document, pos: Pos) f64 {
 }
 
 // ---------------------------------------------------------------------------
-// ARCH-huge-row-budget: oversized-row checkpoint staging. Every scan loop
+// Oversized-row checkpoint staging. Every scan loop
 // that may advance the shared frontier past a row's true end (index.zig's
 // headScan / scanChunk, search.searchScanChunk, filter.filterScanChunk) calls
 // beginOversizedChunk once before its loop and stageOversized per row; the
@@ -932,8 +923,8 @@ pub fn beginOversizedChunk(doc: *Document) void {
 
 /// If the record spanning positions [start, end) exceeded the per-row
 /// window-scan cap (LS_WINDOW_ROW_SCAN_MAX_BYTES), stage a checkpoint
-/// immediately AFTER it (row `row + 1` at position `end`) — see ARCH-huge-row-
-/// budget decision 2. Lock-free: exclusive to whichever single chunk is
+/// immediately AFTER it (row `row + 1` at position `end`).
+/// Lock-free: exclusive to whichever single chunk is
 /// currently executing (never two concurrently for the same document — one
 /// worker thread, or a degraded caller holding the document mutex throughout;
 /// see `oversized_stage`'s doc comment on Document). A normal-sized row
@@ -956,8 +947,8 @@ pub fn stageOversized(doc: *Document, row: u64, start: Pos, end: Pos) void {
 /// row-ascending order nav.checkpointAtOrBefore's binary search relies on —
 /// discarding it is safe because whichever scan advanced the frontier through
 /// those rows FIRST already staged+drained them. Each staged entry is only
-/// appended if its `.row` strictly exceeds the current last entry's `.row`
-/// (REVIEW-huge-row-budget-1 finding 2): keeps the list sorted BY
+/// appended if its `.row` strictly exceeds the current last entry's `.row`:
+/// that keeps the list sorted BY
 /// CONSTRUCTION, robust even if a future change let a second mid-block
 /// frontier overlap occur (today there is at most one — left mid-block only
 /// by headScan at open, so at most one straddling chunk can ever re-walk
