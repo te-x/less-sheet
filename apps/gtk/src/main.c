@@ -85,7 +85,14 @@
  * ONE place the default lives. The grid is painted with Cairo and Pango
  * whatever GSK does afterwards, so a GPU renderer only uploads and composites
  * an already-CPU-drawn frame: it buys nothing at steady state here, and its
- * context creation costs the whole launch budget. */
+ * context creation costs the whole launch budget.
+ *
+ * No version gate is needed for fractional scaling: Wayland fractional scale
+ * landed in GTK 4.11.1 working with the CAIRO renderer (GL and Vulkan were the
+ * experimental ones then, behind GDK_DEBUG=gl-fractional), and this app's
+ * floor is GTK 4.20 — the meson minimum and what the GNOME 49 Flatpak runtime
+ * ships. Verified on a 1.5x display: GTK still commits a viewport-scaled
+ * buffer under this default. */
 #define LSG_DEFAULT_GSK_RENDERER "cairo"
 
 /* ------------------------------------------------------------------------- */
@@ -7830,8 +7837,15 @@ static void
 on_activate (GtkApplication *gtk_app, gpointer data)
 {
   App *app = data;
+  /* The launch page is shown exactly where it used to be built — on the
+   * window's FIRST activation. A second activate (this app is single-instance,
+   * so `less-sheet-gtk` with no argument while one is open just raises it)
+   * must raise the window, never replace the document on show with the launch
+   * page. */
+  gboolean first = (app->window == NULL);
   ensure_window (app, gtk_app);
-  launch_page_show (app);
+  if (first)
+    launch_page_show (app);
   gtk_window_present (app->window);
 }
 
