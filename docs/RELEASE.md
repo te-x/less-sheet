@@ -265,12 +265,12 @@ tools/release/cut 0.1.1
 git push origin master --tags
 
 # dist/ is gitignored, so the artifacts do NOT travel with the repo
-rsync -av dist/ <linux-box>:~/less-sheet/dist/      # into the clone: publish.sh reads ./dist
+rsync -av dist/ <linux-box>:~/Documents/less-sheet/dist/   # into the clone: publish.sh reads ./dist
 
 # on the Linux box (a plain clone of the repository) — releases, builds the
 # Flatpak bundle, updates the tap, and verifies all of it logged out. The page
 # deploys itself from the push (.github/workflows/deploy-site.yml).
-cd ~/less-sheet && git pull --tags && tools/release/publish.sh
+cd ~/Documents/less-sheet && git pull --tags && tools/release/publish.sh
 ```
 
 **Why two scripts.** The Mac is the only machine with the Swift toolchain (and it
