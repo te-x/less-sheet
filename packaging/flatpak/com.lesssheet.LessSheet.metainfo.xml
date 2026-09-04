@@ -66,7 +66,7 @@
   <releases>
     <release version="0.1.2" date="2026-09-05">
       <description>
-        <p>Bug fixes.</p>
+        <p>Faster launch: the window opens in about a third of the time, and memory at rest is lower.</p>
       </description>
     </release>
     <release version="0.1.1" date="2026-09-04">
