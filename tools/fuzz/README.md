@@ -28,7 +28,7 @@ N=1, 40, all and look at the scaling.
 
 It builds the harness, replays the committed corpus, runs the campaign, decodes
 the coverage map, prints a per-module coverage report, and writes the whole
-transcript to `tools/fuzz/campaign/campaign-<host>-<timestamp>.log` (the AC-c3
+transcript to `tools/fuzz/campaign/campaign-<platform>-<timestamp>.log` (the AC-c3
 campaign log). It exits non-zero if the campaign found anything **or** if any
 AC-c1 hotspot module was never entered.
 

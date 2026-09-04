@@ -91,12 +91,12 @@ done
 [ "$(zig version)" = "0.16.0" ] || { echo "zig 0.16.0 required, found $(zig version)" >&2; exit 1; }
 
 mkdir -p campaign
-log="campaign/campaign-$(hostname -s)-$(date +%Y%m%d-%H%M%S).log"
+log="campaign/campaign-$(uname -s | tr '[:upper:]' '[:lower:]')-$(date +%Y%m%d-%H%M%S).log"
 exec > >(tee -a "$log") 2>&1
 
 echo "=== less-sheet fuzz campaign (security-hardening wave (c)) ==="
 echo "date        : $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-echo "host        : $(hostname -s) $(uname -sm)"
+echo "platform    : $(uname -sm)"
 echo "zig         : $(zig version)"
 echo "repo tip    : $(git -C "$repo" rev-parse --short HEAD) ($(git -C "$repo" rev-parse --abbrev-ref HEAD))"
 echo "tree        : $(if [ -z "$(git -C "$repo" status --porcelain)" ]; then echo clean; else echo DIRTY; fi)"
@@ -108,7 +108,7 @@ else
   echo "              comparable only between runs of the SAME harness version"
 fi
 echo "mode        : ReleaseSafe (the shipped mode — a safety panic counts as a crash)"
-echo "log         : $here/$log"
+echo "log         : tools/fuzz/$log"
 echo
 
 if [ -n "$regen" ]; then
