@@ -56,6 +56,9 @@
 #define TOAST_TIMEOUT_SECONDS 3
 /* Poll cadence for the Columns page's async type-inference refresh. */
 #define INFER_POLL_INTERVAL_MS 80
+/* A copy shows its progress bar only once it has run this long: a quick copy
+ * shows no chrome at all (the same 500 ms gate the macOS build applies). */
+#define LSG_PROGRESS_DELAY_MS 500
 /* Bound the per-open width sample so a wide (100k-col) document stays O(head):
  * only these leading columns are measured; the rest take a default width. */
 #define WIDTH_SAMPLE_COLS 256
@@ -3955,6 +3958,8 @@ struct _CopyOp
   gboolean finished;
   GByteArray *blob; /* worker-owned; read by main after join */
   LsgCopyOutcome outcome;
+  gint64 started_us;       /* main thread: when the copy was launched */
+  gboolean progress_shown; /* main thread: the delayed gate has opened */
   guint64 rows_done;
   guint64 bytes_done;
 };
@@ -4284,7 +4289,15 @@ copy_tick (gpointer data)
   gboolean finished = op->finished;
   g_mutex_unlock (&op->lock);
 
-  header_progress_set (app, prog); /* determinate rows_done / row_count */
+  if (!op->progress_shown && !finished
+      && g_get_monotonic_time () - op->started_us
+             >= (gint64)LSG_PROGRESS_DELAY_MS * 1000)
+    {
+      header_progress_show (app, "Copying…");
+      op->progress_shown = TRUE;
+    }
+  if (op->progress_shown)
+    header_progress_set (app, prog); /* determinate rows_done / row_count */
   if (!finished)
     return G_SOURCE_CONTINUE;
 
@@ -4293,12 +4306,28 @@ copy_tick (gpointer data)
       && op->blob->len > 0 && app->window != NULL)
     {
       GdkClipboard *clip = gtk_widget_get_clipboard (GTK_WIDGET (app->window));
-      /* NUL-terminate IN PLACE, one appended byte, so the blob can go straight
-       * to the clipboard: a g_strndup here would be a second ~64 MiB copy, and
-       * gdk_clipboard_set_text makes its own anyway. */
+      /* Two flavours of the same bytes: a string for every text consumer, and
+       * text/tab-separated-values so a spreadsheet pastes the selection into
+       * cells (the macOS build publishes .tabularText for the same reason).
+       * The NUL is appended IN PLACE for the string provider; the TSV provider
+       * takes the payload by reference, minus that byte. */
       guint8 nul = 0;
       g_byte_array_append (op->blob, &nul, 1);
-      gdk_clipboard_set_text (clip, (const char *)op->blob->data);
+      gsize tsv_len = op->blob->len - 1;
+      GdkContentProvider *providers[2];
+      providers[0] = gdk_content_provider_new_typed (
+          G_TYPE_STRING, (const char *)op->blob->data);
+      GBytes *payload = g_byte_array_free_to_bytes (op->blob);
+      op->blob = NULL;
+      GBytes *tsv = g_bytes_new_from_bytes (payload, 0, tsv_len);
+      g_bytes_unref (payload);
+      providers[1] = gdk_content_provider_new_for_bytes (
+          "text/tab-separated-values", tsv);
+      g_bytes_unref (tsv);
+      GdkContentProvider *content
+          = gdk_content_provider_new_union (providers, 2);
+      gdk_clipboard_set_content (clip, content);
+      g_object_unref (content);
       /* A toast, not the header subtitle: the subtitle is the document's
        * standing row-count / filter line, and overwriting it left a stale
        * "Copied …" sitting there for the rest of the session on a document
@@ -4339,9 +4368,9 @@ do_copy (App *app)
   op->budget = COPY_BUDGET_BYTES;
   g_mutex_init (&op->lock);
   op->progress = 0.0;
+  op->started_us = g_get_monotonic_time ();
   app->copy_op = op;
 
-  header_progress_show (app, "Copying…");
   app->copy_thread = g_thread_new ("lsg-copy", copy_worker, op);
   if (app->copy_poll_id == 0)
     app->copy_poll_id = g_timeout_add (80, copy_tick, app);
