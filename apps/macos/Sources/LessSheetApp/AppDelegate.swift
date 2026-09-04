@@ -115,14 +115,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // then re-rendering. Never blocks: if the open is still running this does
         // nothing and the prewarm adopts from its own completion.
         LaunchOpenPrewarm.adoptIfReady()
-        LaunchTiming.phase("before_hosting_view")
-        window.contentView = NSHostingView(rootView: ContentView(model: .shared))
-        LaunchTiming.phase("after_hosting_view")
+        // The frame FIRST: the window is born at the placeholder size above, and
+        // giving it the restored one after the content view is in place makes
+        // SwiftUI lay the whole tree out twice.
         window.setFrameAutosaveName("LessSheetMain")
         if !window.setFrameUsingName("LessSheetMain") {
             window.center()
         }
         CaptureProbe.configure(window: window)   // inert without LESSSHEET_CAPTURE_*
+        LaunchTiming.phase("before_hosting_view")
+        window.contentView = NSHostingView(rootView: ContentView(model: .shared))
+        LaunchTiming.phase("after_hosting_view")
         for type in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
             window.standardWindowButton(type)?.alphaValue = 1
         }
