@@ -113,6 +113,10 @@ cd backend && zig build -Doptimize=ReleaseSafe
 bash apps/macos/scripts/assemble-app.sh
 # → apps/macos/.build/<triple>/release/less-sheet.app
 #   (rebuilds the ReleaseSafe core, force-relinks it — avoids the stale-.a hazard — and lays out the bundle)
+# → apps/macos/.build/<triple>/release/less-sheet.dSYM
+#   (the executable ships stripped of local symbols; this symbolicates its crash reports.
+#    It embeds the build machine's source paths: keep it, never ship it — make_release
+#    files it under private/dsyms/<version>/)
 ```
 Bundle facts: `CFBundleIdentifier = com.lesssheet.app`, `CFBundleName = less-sheet`, executable `LessSheet`, `LSMinimumSystemVersion = 26.0` (macOS 26 — corrected from 15.0 on 2026-08-05, see the note at the top of this doc).
 

@@ -37,6 +37,14 @@ bash "$macos_dir/../../branding/generate-icons.sh"
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$bin_dir/LessSheet" "$app/Contents/MacOS/LessSheet"
+
+# Ship the executable without its local symbol table (5.2 -> 2.8 MiB; Swift
+# reflection lives in __swift5_* sections and is unaffected). The names live on in
+# a dSYM next to the bundle, which is what symbolicates a crash report. The dSYM
+# embeds the build machine's source paths, so it is kept, never shipped.
+rm -rf "$bin_dir/less-sheet.dSYM"
+dsymutil "$bin_dir/LessSheet" -o "$bin_dir/less-sheet.dSYM"
+strip -x "$app/Contents/MacOS/LessSheet"
 # Info.plist carries __LESSSHEET_VERSION__; the real number comes from the root
 # VERSION file and is substituted into the COPY only, so the tracked plist never
 # holds a number that can drift from it.

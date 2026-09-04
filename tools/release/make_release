@@ -352,6 +352,20 @@ def build_macos(repo, out, version, do_verify, formats, notes):
         die("assemble-app.sh reported success but %s is missing" % app)
     binary = os.path.join(app, "Contents", "MacOS", "LessSheet")
 
+    # The executable ships stripped of local symbols; the dSYM assemble-app.sh
+    # wrote beside the bundle is what symbolicates a crash report from this
+    # build. It embeds the build machine's source paths, so it is filed in the
+    # gitignored private corner and never in dist/.
+    dsym = os.path.join(os.path.dirname(app), "less-sheet.dSYM")
+    if not os.path.isdir(dsym):
+        die("assemble-app.sh reported success but %s is missing" % dsym)
+    kept = os.path.join(repo, "private", "dsyms", version, "less-sheet.dSYM")
+    shutil.rmtree(kept, ignore_errors=True)
+    os.makedirs(os.path.dirname(kept), exist_ok=True)
+    shutil.copytree(dsym, kept, symlinks=True)
+    notes.append("macOS dSYM for %s kept at private/dsyms/%s/ (never ship it: it embeds local source paths)"
+                 % (version, version))
+
     # --- staleness guard -------------------------------------------------
     # SwiftPM does not track liblesssheet.a as a build input, so a successful
     # build is NOT evidence that the shipped binary contains the current core.
