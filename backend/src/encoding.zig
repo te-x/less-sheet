@@ -37,7 +37,7 @@ fn matchingBomLen(raw: []const u8, enc: u8) u64 {
 /// UTF-8 validation step of detection: like `std.unicode.utf8ValidateSlice`,
 /// except a multibyte sequence that is simply CUT by the sample boundary
 /// (not enough bytes left to tell, but every available byte of it is a
-/// plausible continuation byte) does not fail detection -- requirement 3. A
+/// plausible continuation byte) does not fail detection. A
 /// genuinely invalid byte (bad lead byte, bad continuation, overlong,
 /// surrogate) anywhere, including in a trailing "short" sequence that has
 /// more sample bytes after it that AREN'T valid continuations, still fails.
@@ -61,7 +61,7 @@ fn looksLikeUtf8(sample: []const u8) bool {
 
 /// NUL-ratio heuristic for BOM-less UTF-16: true (LE, NULs on odd offsets),
 /// false (BE, NULs on even offsets), or null (neither parity is UTF-16
-/// shaped). Thresholds are an implementation detail (pinned outcomes only).
+/// shaped).
 fn detectUtf16NulRatio(sample: []const u8) ?bool {
     if (sample.len < 8) return null;
     var even_total: usize = 0;
@@ -133,22 +133,14 @@ pub inline fn unitIsByte(u: Unit, b: u8) bool {
 
 /// True iff `u` ENDS A FIELD under dialect `sep` — the separator, CR or LF.
 ///
-/// ONE HOME for the UNIT-WISE structural test, which was re-expressed at seven
-/// call sites: `lexer.scanToStructural`, the non-UTF-8 arm of
-/// `lexer.storeToStructural`, and the five `csv_reader` cursor loops
-/// (`matchCursor`, `lexStream`, `lexStreamSelected`, `cellStream`,
-/// `decodeColumn`). All seven were the same SET of three bytes — only the
-/// `'\n'`/`'\r'` order differed between them, which an OR cannot notice — so
-/// this unifies them without flattening any real difference.
-///
-/// Note it tests the DECODED OUTPUT (`unitIsByte`), not source bytes, which is
-/// why this cannot be replaced by a byte scan for every encoding: under Latin-1
-/// or Windows-1252 one source byte can decode to two output bytes, and under
-/// UTF-16 a unit is 2 or 4 source bytes. `lexer.findStructural` is the byte-wise
-/// counterpart and is sound ONLY for UTF-8, where `decodeUnit` is a pass-through
-/// (one raw byte in, the same raw byte out). Those two are the only definitions
-/// of "structural" in the codebase and they must agree on UTF-8;
-/// `tools/fuzz/lexer_diff.zig` pins exactly that, across all encodings.
+/// THE unit-wise structural test. It tests the DECODED OUTPUT (`unitIsByte`), not
+/// source bytes, which is why it cannot be replaced by a byte scan for every
+/// encoding: under Latin-1 or Windows-1252 one source byte can decode to two
+/// output bytes, and under UTF-16 a unit is 2 or 4 source bytes.
+/// `lexer.findStructural` is the byte-wise counterpart and is sound ONLY for
+/// UTF-8, where `decodeUnit` is a pass-through (one raw byte in, the same raw
+/// byte out). Those two are the only definitions of "structural" in the codebase
+/// and they must agree on UTF-8.
 pub inline fn unitIsStructural(u: Unit, sep: u8) bool {
     return unitIsByte(u, sep) or unitIsByte(u, '\r') or unitIsByte(u, '\n');
 }
@@ -163,8 +155,7 @@ fn replacementUnit(src_len: usize) Unit {
 /// Decode the SOURCE code unit at `off` (SOURCE bytes; `content` is always
 /// the document's full post-BOM source buffer), or null if no complete unit
 /// is available before `limit` -- every caller treats that exactly like
-/// hitting `limit` (`capped`), the same as the pre-csv-hardening byte-wise
-/// bound check.
+/// hitting `limit` (`capped`).
 pub inline fn decodeUnit(content: []const u8, off: usize, limit: usize, encoding: u8) ?Unit {
     if (off >= limit) return null;
     // UTF-8 (the default / by far most common case) is the fast path: one
@@ -237,11 +228,10 @@ fn decodeUtf16Unit(content: []const u8, off: usize, limit: usize, little: bool) 
     return u;
 }
 
-/// UTF-8 pass-through (Option A): bytes are NEVER validated or rewritten (an
-/// invalid byte survives unchanged -- see requirement 7). This is the hot
-/// path (the default, and by far the most common, encoding): ALWAYS a
-/// singleton raw byte, exactly like the pre-csv-hardening byte-wise lexer,
-/// so scanning an all-ASCII/UTF-8 document costs no more than it did before.
+/// UTF-8 pass-through: bytes are NEVER validated or rewritten (an invalid byte
+/// survives unchanged). This is the hot path (the default, and by far the most
+/// common, encoding): ALWAYS a singleton raw byte, so scanning an
+/// all-ASCII/UTF-8 document costs no more than a plain byte-wise lexer.
 /// A cap that lands inside a multibyte sequence is fixed up once per
 /// (truncated) field by `utf8TrimToBoundary`, not per byte here.
 inline fn decodeUtf8PassthroughUnit(content: []const u8, off: usize) Unit {
@@ -261,11 +251,11 @@ fn utf8LeadLen(b: u8) usize {
 /// For the UTF-8 pass-through path only: `bytes` was stored one raw byte at a
 /// time (see `decodeUtf8PassthroughUnit`), so a cap/limit cut can land in the
 /// middle of a multibyte sequence. Returns the length to KEEP so the result
-/// never ends on a split code point (requirement 8), fixing the boundary up
-/// ONCE per truncated field rather than paying a lookahead per byte scanned.
+/// never ends on a split code point, fixing the boundary up ONCE per truncated
+/// field rather than paying a lookahead per byte scanned.
 /// O(1) for the overwhelming common case (the last byte is plain ASCII or
 /// already a bare lead byte); at most a 3-byte backward walk otherwise.
-/// Invalid UTF-8 (Option A: never rewritten) is otherwise left exactly as-is.
+/// Invalid UTF-8 (never rewritten) is otherwise left exactly as-is.
 pub fn utf8TrimToBoundary(bytes: []const u8) usize {
     if (bytes.len == 0 or bytes[bytes.len - 1] < 0x80) return bytes.len;
     var back: usize = 0;

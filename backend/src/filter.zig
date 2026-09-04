@@ -1,11 +1,10 @@
-//! Filtered views (filtered-views slice) — see api/lesssheet.h FILTERED VIEWS
-//! for the full model. A FILTER is a persistent VIEW MODE (not a transient
-//! job): it mirrors the search job's per-block counting machinery with its
-//! OWN predicate, cursor, and counters — never a materialized match-row
-//! list. `ls_filter_set` validates EXACTLY like `ls_search_start`
-//! (duplicated rather than shared, so neither call site risks drifting the
-//! other's already-frozen-green behavior — see src/search.zig). Parsing
-//! goes through `Document.reader` (see docs/architecture/ARCH-reader-
+//! Filtered views — see api/lesssheet.h FILTERED VIEWS for the full model. A
+//! FILTER is a persistent VIEW MODE (not a transient job): it mirrors the
+//! search job's per-block counting machinery with its OWN predicate, cursor,
+//! and counters — never a materialized match-row list. `ls_filter_set`
+//! validates EXACTLY like `ls_search_start` (duplicated rather than shared, so
+//! neither call site can drift the other's behavior — see src/search.zig).
+//! Parsing goes through `Document.reader` (see docs/architecture/ARCH-reader-
 //! interface.md) — this module never imports `lexer.zig`.
 
 const api = @import("api");
@@ -74,17 +73,17 @@ const FilterChunk = struct {
     end_pos: Pos,
     end_row: u64,
     eof: bool,
-    /// security-hardening (e) AC-e3: see search.SearchChunk.stalled — the next
-    /// bytes are not present, so the chunk ended without counting anything and
-    /// the caller must stop driving rather than spin on a zero-progress cursor.
+    /// See search.SearchChunk.stalled — the next bytes are not present, so the
+    /// chunk ended without counting anything and the caller must stop driving
+    /// rather than spin on a zero-progress cursor.
     stalled: bool = false,
     checkpoint: ?Checkpoint,
     matches: u64,
 };
 
-/// ARCH-huge-row-filtered: stage row `row`'s FULL-cell filter-match decision
-/// (`matched`) IFF its extent [start, end) exceeded the per-row window scan
-/// cap -- mirrors base.stageOversized's size test, but records the match
+/// Stage row `row`'s FULL-cell filter-match decision (`matched`) IFF its extent
+/// [start, end) exceeded the per-row window scan cap -- mirrors
+/// base.stageOversized's size test, but records the match
 /// decision itself (never scan-relevant positions) so the FILTERED window
 /// path can honor it later without re-scanning (see base.OversizedMatch /
 /// window.windowSetFiltered / nav.nthMatchInBlock). Lock-free: exclusive to
@@ -142,8 +141,8 @@ pub fn filterScanChunk(doc: *Document, start_pos: Pos, start_row: u64, generatio
             reader_mod.readerMatchRowAtScanCursor(doc.reader, cur, doc.wf_ctx, null)
         else
             reader_mod.readerMatchRow(doc.reader, doc.source, pos, doc.wf_ctx, null, .{});
-        // security-hardening (e) AC-e3: see search.searchScanChunk — a row that
-        // consumed no bytes is an un-fetched tail, never a row.
+        // See search.searchScanChunk — a row that consumed no bytes is an
+        // un-fetched tail, never a row.
         if (base.scanStalled(doc, pos, res.next)) {
             doc.endMatchScanIf(.filter, generation);
             return .{ .end_pos = pos, .end_row = row, .eof = false, .stalled = true, .checkpoint = null, .matches = matches };
@@ -160,8 +159,8 @@ pub fn filterScanChunk(doc: *Document, start_pos: Pos, start_row: u64, generatio
         }
         const matched = res.matched_col != null;
         if (matched) matches += 1;
-        // This scan also feeds the base row index (ARCH-huge-row-budget): see
-        // the matching comment in search.searchScanChunk.
+        // This scan also feeds the base row index: see the matching comment in
+        // search.searchScanChunk.
         base.stageOversized(doc, row, pos, res.next);
         stageOversizedMatch(doc, row, pos, res.next, matched);
         pos = res.next;
@@ -175,10 +174,10 @@ pub fn filterScanChunk(doc: *Document, start_pos: Pos, start_row: u64, generatio
     return .{ .end_pos = pos, .end_row = row, .eof = false, .checkpoint = .{ .row = row, .pos = pos }, .matches = matches };
 }
 
-/// security-hardening (e) AC-e3: terminate a filter-scan whose chunk STALLED on
-/// un-fetched bytes (`FilterChunk.stalled`) — the mirror of
-/// search.finishStalledLocked. Counts stay exact for the rows that ARE present;
-/// the view is NEVER marked complete/exact over an un-fetched tail. Idempotent.
+/// Terminate a filter-scan whose chunk STALLED on un-fetched bytes
+/// (`FilterChunk.stalled`) — the mirror of search.finishStalledLocked. Counts
+/// stay exact for the rows that ARE present; the view is NEVER marked
+/// complete/exact over an un-fetched tail. Idempotent.
 pub fn finishStalledLocked(d: *Document) void {
     if (d.filter_state == .scanning) failFilterLocked(d);
 }
@@ -192,8 +191,8 @@ pub fn failFilterLocked(doc: *Document) void {
 
 /// Fold a completed filter-scan chunk into the filter's counted region
 /// (caller holds the mutex): mirrors search.commitSearch, advancing the
-/// shared frontier where the scan broke new ground beyond it (paid once —
-/// fv9). Does NOT itself decide SCANNING vs CANCELLED (the caller — the
+/// shared frontier where the scan broke new ground beyond it (paid once).
+/// Does NOT itself decide SCANNING vs CANCELLED (the caller — the
 /// plain filter job or a filtered jump — owns that per the shared-slot
 /// rules); only EOF unconditionally resolves to LS_FILTER_DONE (the total is
 /// final however it got there).
@@ -217,11 +216,11 @@ pub fn commitFilter(doc: *Document, res: FilterChunk) void {
         doc.frontier_rows = res.end_row;
         if (res.checkpoint) |cp| doc.checkpoints.appendAssumeCapacity(cp);
     }
-    // ARCH-huge-row-budget: see the matching comment in search.commitSearch.
+    // See the matching comment in search.commitSearch.
     base.drainOversized(doc, advancing);
-    // ARCH-huge-row-filtered: drain this chunk's staged oversized-row filter-
-    // match records UNCONDITIONALLY (never gated on `advancing`, unlike the
-    // shared oversized_checkpoints above) — see drainOversizedMatches.
+    // Drain this chunk's staged oversized-row filter-match records
+    // UNCONDITIONALLY (never gated on `advancing`, unlike the shared
+    // oversized_checkpoints above) — see drainOversizedMatches.
     drainOversizedMatches(doc);
     if (res.eof) {
         doc.complete = true;
@@ -332,9 +331,9 @@ pub fn setFilter(d: *Document, request: *const api.SearchRequest) bool {
     if (kind_i != 0 and kind_i != 1) return false;
     if (req.value_ptr == null and req.value_len != 0) return false;
     const value: []const u8 = if (req.value_ptr) |vp| vp[0..req.value_len] else &[_]u8{};
-    // Case folding is driven SOLELY by the request flag (smart-case retired):
-    // insensitive (case_sensitive == false) folds ASCII case for the TEXT
-    // substring and predicate EQ/NE; ordering predicates ignore it.
+    // Case folding is driven SOLELY by the request flag: insensitive
+    // (case_sensitive == false) folds ASCII case for the TEXT substring and
+    // predicate EQ/NE; ordering predicates ignore it.
     const fold = !req.case_sensitive;
     if (kind_i == 0) { // TEXT
         if (value.len == 0) return false; // empty query means "no filter"
@@ -410,17 +409,17 @@ pub fn setFilter(d: *Document, request: *const api.SearchRequest) bool {
         d.unlock();
         return true;
     }
-    // never-full-download-streaming (TD1/TD7): a NETWORK filtered view launches
-    // NO to-EOF filter scan. It parks immediately (CANCELLED — the filter MODE is
-    // active and the view IS filtered; counts firm only as the user navigates),
-    // mirroring the startSearch net-park. The frontier then advances only on a
+    // A NETWORK filtered view launches NO to-EOF filter scan. It parks
+    // immediately (CANCELLED — the filter MODE is active and the view IS
+    // filtered; counts firm only as the user navigates), mirroring the
+    // startSearch net-park. The frontier then advances only on a
     // filtered demand (a filtered ls_jump_start / scroll, which drives
     // filterScanChunk via the worker's do_jump path and re-parks), never as a
     // background drive over the wire. This guard sits BEFORE the `.scanning`
     // assignment so it also bypasses the degraded (worker == null) synchronous
     // to-completion loop below — which for a net doc would otherwise fetch and
-    // scan the whole resource ("No full download, ever"). LOCAL is byte-identical
-    // (doc.net == false; AC21).
+    // scan the whole resource ("No full download, ever"). LOCAL is
+    // byte-identical (doc.net == false).
     if (d.net) {
         d.filter_state = .cancelled;
         d.unlock();
@@ -440,8 +439,8 @@ pub fn setFilter(d: *Document, request: *const api.SearchRequest) bool {
     while (d.filter_state == .scanning) {
         const res = filterScanChunk(d, d.filter_pos, d.filter_rows, generation);
         commitFilter(d, res);
-        // security-hardening (e) AC-e3: a stalled chunk makes no progress, so
-        // without this the loop never exits.
+        // A stalled chunk makes no progress, so without this the loop never
+        // exits.
         if (res.stalled) finishStalledLocked(d);
     }
     d.unlock();

@@ -1,7 +1,7 @@
-//! The CSV Reader: the first (and, in this slice, only) implementation of
-//! the Reader interface (src/reader.zig) — CSV's format→rows/cells parsing,
-//! wrapping `lexer.zig` / `encoding.zig` / `sniff.zig` (moved BEHIND this
-//! module, not rewritten — see docs/architecture/ARCH-reader-interface.md).
+//! The CSV Reader: the only implementation of the Reader interface
+//! (src/reader.zig) today — CSV's format→rows/cells parsing, wrapping
+//! `lexer.zig` / `encoding.zig` / `sniff.zig`. See
+//! docs/architecture/ARCH-reader-interface.md.
 //! Its row `Pos` IS a byte offset into the `Source`; every cast between
 //! `Pos` and a byte offset lives HERE (`toPos`/`toOffset` below) — nothing
 //! outside this file may rely on that (see reader.zig's module doc).
@@ -250,9 +250,8 @@ pub const CsvReader = struct {
         return if (source.knownEnd()) |end| toOffset(pos) >= end else false;
     }
 
-    /// See reader.Reader.posAtByteBudget. CSV: `min(from + budget, len)`,
-    /// exactly the bound every window/head-scan call site computed inline
-    /// before the reorg (now the ONLY place that arithmetic happens).
+    /// See reader.Reader.posAtByteBudget. CSV: `min(from + budget, len)` —
+    /// the one place that arithmetic happens.
     pub fn posAtByteBudget(self: CsvReader, source: Source, from: Pos, budget: u64) Pos {
         _ = self;
         const off = toOffset(from);
@@ -366,8 +365,8 @@ pub const CsvReader = struct {
                 return .{ .next = row_start, .rows = rows, .eof = false };
             rows += 1;
         }
-        // security-hardening (e) AC-e3: as scanUtf8Rows -- an empty stream unit is
-        // EOF only at a genuine end-of-source, never a network short-body stall.
+        // As scanUtf8Rows: an empty stream unit is EOF only at a genuine
+        // end-of-source, never a network short-body stall.
         // The row question again, for the same reason it is asked above: a stub the
         // `max_rows` budget stopped short of is a row still to come, not EOF.
         const eof = !streamHasRow(&cur, self.encoding) and !streamAtLimit(&cur) and cur.spanTerminal();
@@ -519,13 +518,8 @@ fn matchCursor(cur: anytype, sep: u8, quote: ?u8, encoding: u8, primary: base.Ma
         var fs = if (filter_ctx) |fc| matcher.StreamCell.init(fc, col) else null;
         // Settled verdicts stop being fed, exactly as in `matchMmapUtf8` above
         // and for the same reason: `ps`/`fs` are read nowhere else, and cursor
-        // advance is independent of both flags.
-        // NOTE for anyone measuring: this is the ONLY half of the structural-scan
-        // cell that reaches `.gzip` / `.http_range`. `lexer.findStructural` is
-        // byte-wise and `.mmap`-only, so a local `.csv.gz` or a network document
-        // gains nothing from the vector scan and everything it gains comes from
-        // here — measured 0.829x on a 2000-column local `.csv.gz` whose match is
-        // in the FIRST column, and 1.000x when the match is in the last.
+        // advance is independent of both flags. Worth 0.829x on a 2000-column
+        // local `.csv.gz` whose match is in the FIRST column, 1.000x in the last.
         const pfeed = wantsCell(primary, col) and primary_col == null;
         const ffeed = if (filter_ctx) |fc| wantsCell(fc, col) and !filter_ok else false;
         var ended = false;
@@ -550,43 +544,32 @@ fn matchCursor(cur: anytype, sep: u8, quote: ?u8, encoding: u8, primary: base.Ma
         };
         if (!ended) {
             if (encoding == api.encoding_utf8) {
-                // UTF-8 BYTE-WISE FAST PATH. This is the gzip / http_range match
-                // scan (mmap + UTF-8 never gets here -- `matchStream` routes it to
-                // `matchMmapUtf8`), and unit-at-a-time was costing ~87% of the wait
-                // on a local .csv.gz: a call to decode each byte, three compares,
-                // one `advance` per byte, and -- worst -- a ONE-BYTE `feed`, which
-                // is below the matcher's vector prefilter threshold, so every byte
-                // took the scalar KMP step. Running whole fields through
-                // `findStructural` and feeding them in one call fixes all four.
+                // UTF-8 BYTE-WISE FAST PATH for the gzip / http_range match scan
+                // (mmap + UTF-8 never gets here -- `matchStream` routes it to
+                // `matchMmapUtf8`). Unit-at-a-time cost ~87% of the wait on a local
+                // .csv.gz: a decode call, three compares and one `advance` per
+                // byte, and -- worst -- a ONE-BYTE `feed`, below the matcher's
+                // vector prefilter threshold, so every byte took the scalar KMP
+                // step. Whole fields through `findStructural`, fed in one call,
+                // fixes all four.
                 //
-                // SCOPE, because the headline numbers are easy to over-read: this
-                // replaces the UNQUOTED field scan only. The QUOTED arm above is
-                // untouched and still walks unit-at-a-time with ONE-BYTE feeds --
-                // the very cost singled out as worst here. Measured: a local
-                // .csv.gz with every field quoted gets NOTHING from this cell
-                // (1.00x), and in fact runs ~1.5-1.8% SLOWER on a full-column text
-                // scan (reproducible in min and median, `index_scan` control flat,
-                // bands non-overlapping). Mechanism UNVERIFIED; the one hypothesis
-                // tested -- the per-field `encoding` branch -- was DISPROVEN by
-                // hoisting it out of the loop, which changed nothing (1.016x vs
-                // 1.015x). Most likely this function's body roughly doubling
-                // changes inlining/code layout for the quoted arm, but that is not
-                // established and must not compress into "code layout caused it".
-                // The trade is deliberate: quote-heavy gz pays ~1.8% so unquoted
-                // gz gains 3.9-4.2x. Bulk-feeding quoted bodies is the uncosted
-                // follow-on (see review/, closed-out backlog).
+                // SCOPE: this replaces the UNQUOTED field scan only. The QUOTED arm
+                // above still walks unit-at-a-time with one-byte feeds, so an
+                // all-quoted local .csv.gz gains nothing (1.00x) and in fact runs
+                // ~1.5-1.8% SLOWER; the mechanism for that is UNVERIFIED (the
+                // per-field `encoding` branch was tested and disproven). The trade
+                // is deliberate: quote-heavy gz pays ~1.8% so unquoted gz gains
+                // 3.9-4.2x. Bulk-feeding quoted bodies is the uncosted follow-on.
                 //
-                // WHY IT IS EXACTLY EQUIVALENT, not merely similar: for UTF-8
-                // `decodeUnit` is `decodeUtf8PassthroughUnit` -- ALWAYS one raw
-                // source byte in and the same raw byte out, never null, never
-                // validated (encoding.zig). So the unit loop this replaces already
-                // WAS a byte loop: `src_len == 1`, `out_len == 1`,
-                // `out[0] == the byte`, and `unitIsStructural` reduces to
-                // `b == sep or b == '\r' or b == '\n'` -- precisely
-                // `findStructural`'s needle set. Feeding a run instead of N
-                // singletons hands the matcher the same byte sequence, and
-                // `StreamCell.feed` is split-invariant by construction (the
-                // property `tools/fuzz/matcher_diff.zig` exists to pin).
+                // EXACTLY EQUIVALENT, not merely similar: for UTF-8 `decodeUnit` is
+                // `decodeUtf8PassthroughUnit` -- ALWAYS one raw source byte in and
+                // the same raw byte out, never null, never validated. So the unit
+                // loop this replaces already WAS a byte loop and `unitIsStructural`
+                // reduces to `findStructural`'s needle set. That pass-through is
+                // the ONLY reason a byte-wise structural scan is sound here; it
+                // would be WRONG for UTF-16 / Latin-1 / Windows-1252. Feeding a run
+                // instead of N singletons hands the matcher the same byte sequence,
+                // and `StreamCell.feed` is split-invariant by construction.
                 //
                 // `streamUnit` REMAINS THE AUTHORITY for both decisions that can
                 // end a field -- is there a unit here at all (EOF / budget), and is
@@ -624,9 +607,8 @@ fn matchCursor(cur: anytype, sep: u8, quote: ?u8, encoding: u8, primary: base.Ma
                     if (ffeed) fs.?.feed(bytes[0..run]);
                     // `bytes` IS DEAD FROM HERE -- advancing a gzip cursor can
                     // re-fill or reallocate the lane buffer it points into, the
-                    // same rule `scanUtf8Rows` follows after a peek (see
-                    // review/REVIEW-row-count-drift.md). Nothing below reads it;
-                    // only `rel`, an integer, survives the advance.
+                    // same rule `scanUtf8Rows` follows after a peek. Nothing below
+                    // reads it; only `rel`, an integer, survives the advance.
                     cur.advance(run);
                     if (rel != null) break;
                 }
@@ -679,14 +661,13 @@ fn scanUtf8Rows(cur: *source_mod.Cursor, sep: u8, quote: ?u8, max_rows: u64) rea
     // which re-lex from the positions this walk publishes). A CR whose LF falls in
     // the NEXT span is the only terminator a span cannot settle from its own bytes,
     // and it is settled AT the boundary below (`peek` reads through a span end;
-    // `span` does not), never by carrying a pending-LF flag: such a flag drifted the
-    // count in BOTH directions — set against an already-incremented index it
-    // swallowed a following lone LF as a CRLF's second byte (UNDERcount), and since
-    // `index.scanChunk` calls this once per checkpoint batch it did not survive the
-    // RETURN, leaving a published position BETWEEN a CR and its LF where the next
-    // call — and every re-lex from that checkpoint — counted the LF as its own empty
-    // row (OVERcount). Neither is expressible now: there is no pending state to
-    // mis-set or to drop, and every position this walk hands back is a row START.
+    // `span` does not), never by carrying a pending-LF flag across the return: such
+    // a flag drifts the count in BOTH directions, swallowing a following lone LF as
+    // a CRLF's second byte, and — since `index.scanChunk` calls this once per
+    // checkpoint batch — publishing a position BETWEEN a CR and its LF, which every
+    // re-lex from that checkpoint counts as its own empty row. There is no pending
+    // state to mis-set or to drop, and every position this walk hands back is a row
+    // START.
 
     // FRONTIER COMMIT GUARD (source.Source.commitBound). Hoisted: a LOCAL document
     // leaves `commit_end` at maxInt, so the only per-row cost is one compare
@@ -698,8 +679,8 @@ fn scanUtf8Rows(cur: *source_mod.Cursor, sep: u8, quote: ?u8, max_rows: u64) rea
     // The last row boundary that is BOTH whole and committable — the position this
     // call publishes, paired with `rows` (see the final position, below). A bulk span
     // walk otherwise leaves the cursor MID-ROW when the present region ends inside a
-    // row, which would publish a frontier whose own lookahead is absent (the wedge
-    // again, by a second route) and a row count that does not describe that position.
+    // row, which would publish a frontier whose own lookahead is absent and a row
+    // count that does not describe that position.
     var commit_logical: u64 = cur.logical;
     var withheld = false;
     while (rows < max_rows) {
@@ -772,7 +753,7 @@ fn scanUtf8Rows(cur: *source_mod.Cursor, sep: u8, quote: ?u8, max_rows: u64) rea
                         //     is CR+1 and would silently read a CRLF as a bare CR.
                         //     `commitBound` documents that same trap and works around
                         //     it the same way, by demanding its far byte separately
-                        //     (net_source.zig:985-989).
+                        //     (net_source.zig).
                         //   * `spanTerminal` answers for the CURRENT offset only, so
                         //     asking it here asks about the successor -- the true-end
                         //     question this decision actually turns on, on EVERY
@@ -844,7 +825,7 @@ fn scanUtf8Rows(cur: *source_mod.Cursor, sep: u8, quote: ?u8, max_rows: u64) rea
         if (withheld) break;
         cur.advance(i);
     }
-    // security-hardening (e) AC-e3: an empty span is EOF only at a genuine
+    // An empty span is EOF only at a genuine
     // end-of-source; a NETWORK short body leaves un-fetched bytes below the known
     // end, so an empty span there is a retryable STALL (the worker ends the jump
     // WITHOUT completing) -- never a clean EOF that would count a phantom tail row.
@@ -853,9 +834,9 @@ fn scanUtf8Rows(cur: *source_mod.Cursor, sep: u8, quote: ?u8, max_rows: u64) rea
     // FINAL POSITION: the last WHOLE terminator, i.e. a row START, paired with the
     // `rows` that describes it. At a genuine end there is nothing to withhold (every
     // byte is present and `peekHttp` caps at the known end), so EOF keeps the true
-    // end — that is the 1f-b exemption, and without it every network document would
-    // permanently lose its last row (the unterminated tail row counted just above is
-    // exactly one such row).
+    // end. Without that exemption every network document would permanently lose its
+    // last row (the unterminated tail row counted just above is exactly one such
+    // row).
     if (!eof and cur.logical != commit_logical) {
         // The walk stopped MID-ROW: the span ran out inside a row, or the row was
         // given back (commit guard, or an undecidable terminator). The bytes from
@@ -1330,38 +1311,3 @@ fn decodeColumn(
         return .{ .len = 0, .truncated = false }; // record terminator: col beyond -> ragged pad
     }
 }
-
-// ---------------------------------------------------------------------------
-// AC5 note (docs/architecture/ARCH-reader-interface.md) — validated on paper
-// against the two acid-test format shapes; neither would touch reader.zig or
-// any core file (window/index/nav/search/filter/root), only add a sibling
-// `..._reader.zig` + a `Reader` union variant:
-//
-//   * Parquet (columnar-binary; most different from CSV). `Pos` would encode
-//     `(row_group: u32, in_group_index: u32)` packed into the same `u64`
-//     (still an opaque handle to the core). `start`/`atEnd` read the footer's
-//     row-group directory; `posAtByteBudget` bounds "open" to the footer +
-//     first row group (still O(head) bytes, per the ABI); `boundsAfter` just
-//     increments `in_group_index` (wrapping into the next row group at its
-//     boundary — no byte scan at all); `materialize`/`cell` decode the
-//     row's typed column chunks into display text; `bytesConsumed` sums the
-//     row groups' on-disk byte ranges up to `pos` (Parquet's footer already
-//     has these, so the ABI's byte-denominated progress fields stay exact,
-//     not estimated). No byte-oriented `Source` is touched at all — Parquet
-//     reads its own file structure directly (see source.zig's module doc).
-//
-//   * ODS/XLSX (ZIP container of XML; the container+stateful-position acid
-//     test). A `zip_reader.zig` Source variant streams-inflates one ZIP
-//     entry (e.g. `xl/worksheets/sheet1.xml`) — `len`/`slice` hide the
-//     inflate exactly like a future gzip Source (source.zig's module doc).
-//     An `xml_reader.zig` Reader parses that inflated stream; because a
-//     `<row>` element's true start can depend on open ancestor tags, `Pos`
-//     packs an inflated-stream offset PLUS a small parser-state tag (e.g.
-//     "inside <sheetData>, no open row") into the same opaque `u64` — still
-//     just a value the core stores/compares/hands back, never inspects.
-//     `boundsAfter`/`materialize`/`cell` resume the SAX-style scan from that
-//     state instead of re-parsing from the top of the sheet.
-//
-// Both slot in as a new Reader (+ new Source, for ODS) variant with zero
-// change to window.zig/index.zig/nav.zig/search.zig/filter.zig/root.zig,
-// which is the seam this reorg exists to prove (ARCH-reader-interface AC5).

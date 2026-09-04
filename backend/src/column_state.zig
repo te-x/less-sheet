@@ -1,4 +1,4 @@
-//! Sparse, session-scoped storage for ARCH-column-config.  Keeping the
+//! Sparse, session-scoped storage for the per-column metadata. Keeping the
 //! storage types separate from column.zig lets base.Document own them without
 //! creating an import cycle with the worker.
 

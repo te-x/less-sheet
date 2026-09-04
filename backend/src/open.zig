@@ -14,8 +14,8 @@ const posix = std.posix;
 const sysio = @import("sysio.zig");
 
 const base = @import("base.zig");
-// ARCH-security-hardening (g): released here only on the failure path before a
-// Document exists to own the guard slot (afterwards `freeDoc` does it).
+// Released here only on the failure path before a Document exists to own the
+// guard slot (afterwards `freeDoc` does it).
 const fault_guard = @import("fault_guard.zig");
 const csv_reader = @import("csv_reader.zig");
 const source_mod = @import("source.zig");
@@ -37,11 +37,11 @@ const encoding_sample_bytes: usize = 256 * 1024;
 /// `mapping` is null — the Source owns its spool. `file_size` is the physical
 /// byte total for progress.
 ///
-/// `fault_slot` and `fd` are the ARCH-security-hardening (g) SOURCE-FAULT GUARD's
-/// two handles on a LOCAL file: the registry slot guarding `mapping` (armed by
+/// `fault_slot` and `fd` are the SOURCE-FAULT GUARD's two handles on a LOCAL
+/// file: the registry slot guarding `mapping` (armed by
 /// the caller BEFORE any byte was read) and the source fd kept open so a fault
 /// can be sized with `fstat`. Both are null for a network document — the local
-/// mmap is what AC-g1 scopes, and the network spool is a file this process
+/// mmap is what the guard scopes, and the network spool is a file this process
 /// creates, holds and extends itself rather than one a stranger can truncate.
 pub fn buildDocument(
     gpa: std.mem.Allocator,
@@ -166,9 +166,9 @@ pub fn buildDocument(
     };
     source_owned = false;
 
-    // never-full-download-streaming (TD1): the lazy-frontier gate keys strictly
-    // on source kind — true for a network Source (http_range, or gzip composed
-    // over http_range), false for every local mmap/gzip doc (byte-identical).
+    // The lazy-frontier gate keys strictly on source kind — true for a network
+    // Source (http_range, or gzip composed over http_range), false for every
+    // local mmap/gzip doc.
     doc.net = source_mod.sourceIsNetwork(doc.source);
 
     if (is_gzip) switch (doc.source) {

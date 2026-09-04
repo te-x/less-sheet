@@ -11,7 +11,7 @@ const posix = std.posix;
 const sysio = @import("sysio.zig");
 
 const net_source = @import("net_source.zig");
-/// The network `http_range` Source state (ARCH-network-source) — a genuinely
+/// The network `http_range` Source state — a genuinely
 /// random-access byte provider peer to mmap/gzip, defined in net_source.zig.
 pub const HttpRange = net_source.HttpRange;
 
@@ -32,43 +32,32 @@ pub const Mmap = struct { bytes: []const u8, physical_base: u64 = 0 };
 pub const SourceKind = enum { mmap, gzip };
 
 // ---------------------------------------------------------------------------
-// THE FETCH PERMIT (security-hardening (e) AC-e1 residual, cell `net_gz_wedge`)
+// THE FETCH PERMIT
 // ---------------------------------------------------------------------------
-// The last unbounded route in the signed ARCH (ARCH-security-hardening :444-449)
-// is `produce`'s compressed READ-AHEAD: it calls
-// `ensureCompressed(s.input.seek + chunk_bytes)` on EVERY inflate op — a fixed
-// 256 KiB read-ahead, not a demand the row needs — so a network gzip re-lex on
-// the FOREGROUND lane (`ls_window_set` / `ls_cell` / `ls_cell_copy` / nav) issues
-// a ranged GET on the UI thread, however far behind the frontier it sits. A slow
-// or silent peer then wedges the document: every poll, cancel and `ls_close`
-// blocks behind the same lane and the same document mutex.
-//
-// A commit-side bound cannot cover it (see `Source.commitGuarded`): the demand is
-// not a function of where the frontier committed. So the cure is the OTHER half of
-// the same idiom the frontier-commit guard already uses — `commitBound` vs
-// `commitBoundNoFetch`, a path that MAY block vs one that reads only what is
-// present — lifted from "which function did you call" to "who is calling":
-//
 //   THE DESIGNATED FETCHER FETCHES; THE FOREGROUND READ LANE DOES NOT.
 //
+// `produce`'s compressed READ-AHEAD calls `ensureCompressed(seek + chunk_bytes)`
+// on EVERY inflate op — a fixed 256 KiB look-ahead, not a demand the row needs.
+// On the FOREGROUND lane (`ls_window_set` / `ls_cell` / `ls_cell_copy` / nav)
+// that issues a ranged GET on the UI thread however far behind the frontier the
+// read sits, and a slow or silent peer then wedges the whole document: every
+// poll, cancel and `ls_close` blocks behind the same lane and the same document
+// mutex. A commit-side bound cannot cover it (see `Source.commitGuarded`) — the
+// demand is not a function of where the frontier committed.
+//
 // The permit is AMBIENT (thread-local) rather than a parameter because the
-// discriminator is the CALL STACK, not the data: `cursorAt` / `scanCursorAt` /
-// `sourceCursorAt` and the whole `Reader`/`csv_reader` layer under them are shared
-// verbatim between the scan worker and the window lane (and `sourceCursorAt`'s
-// signature is frozen — contracts/api.zig:687 — so it could not carry a flag
-// anyway). Threading a bool through ~12 cursor construction sites would have to
-// re-decide the same question at each of them; this decides it once, where the
-// thread's ROLE is known.
+// discriminator is the CALL STACK, not the data: the cursor constructors and the
+// whole `Reader`/`csv_reader` layer under them are shared verbatim between the
+// scan worker and the window lane, and `sourceCursorAt`'s signature is frozen.
+// This decides it once, where the thread's ROLE is known.
 //
 // DEFAULT DENY, and that direction is the point: a scope that forgets to opt in
-// declines to fetch, which shows up as a frontier that stops advancing — loud,
-// and covered by existing tests (netgz1 itself asserts `landed > 100_000`).
-// Default-allow would fail the other way: a forgotten mutex-held path wedges the
-// UI silently. Only LOCAL gzip and mmap are unaffected either way (no provider,
-// so no permission question is ever asked).
+// declines to fetch, which shows up as a frontier that stops advancing — loud.
+// Default-allow fails the other way: a forgotten mutex-held path wedges the UI
+// silently. LOCAL gzip and mmap have no provider, so the question is never asked.
 //
-// The permit costs ONE thread-local load per NETWORK-gzip inflate op and nothing
-// at all for a local one (`produce` only reads it inside `if (self.provider)`).
+// Costs ONE thread-local load per NETWORK-gzip inflate op and nothing at all for
+// a local one (`produce` only reads it inside `if (self.provider)`).
 threadlocal var fetch_permit: bool = false;
 
 /// Whether the CURRENT thread is a designated fetcher — the ONE resolver every
@@ -100,8 +89,8 @@ const PhysicalMark = struct { logical_end: u64, physical_end: u64 };
 const checkpoint_ram_budget: usize = 4 * 1024 * 1024;
 const max_checkpoint_entries: usize = 64 * 1024;
 
-/// The inflater's INPUT reader (security-hardening (b), AC-b1/AC-b2): a
-/// `Reader.fixed` over the compressed mapping in every respect EXCEPT that
+/// The inflater's INPUT reader: a `Reader.fixed` over the compressed mapping in
+/// every respect EXCEPT that
 /// running out of bytes is reported as `error.ReadFailed` instead of
 /// `error.EndOfStream`. That single difference is what makes it safe to feed a
 /// TRUNCATED or not-yet-complete stream to `std.compress.flate` at all.
@@ -345,8 +334,7 @@ const Checkpoint = struct {
 pub const Gzip = struct {
     gpa: std.mem.Allocator,
     mapping: []const u8,
-    /// never-full-download-streaming (TD4): the compressed-byte provider for a
-    /// NETWORK gzip. When set, `mapping` is the http_range spool's stable base;
+    /// The compressed-byte provider for a NETWORK gzip. When set, `mapping` is the http_range spool's stable base;
     /// the inflater fetches compressed bytes on demand via `provider` and its
     /// physical end comes from the provider (present high-water = a resumable
     /// budget stop; stream EOF = the clean/damaged terminal), NOT `mapping.len`.
@@ -428,8 +416,8 @@ pub const Gzip = struct {
         return self;
     }
 
-    /// never-full-download-streaming (TD4): build a gzip Source that inflates the
-    /// COMPRESSED bytes served on demand by `provider` (an http_range spool). The
+    /// Build a gzip Source that inflates the COMPRESSED bytes served on demand
+    /// by `provider` (an http_range spool). The
     /// spool's stable base is the `mapping`; the physical end comes from the
     /// provider, so `mapping.len` (a presized total, or the huge unknown-length
     /// reservation) is NOT the terminal. `provider` is owned by the returned Gzip
@@ -477,7 +465,7 @@ pub const Gzip = struct {
     /// The physical (compressed) END of the stream: the provider's known total
     /// (or `maxInt` while an unknown-length stream has not hit EOF) for a network
     /// gzip; `mapping.len` for a local one. Replaces `mapping.len`-as-end so a
-    /// growing/on-demand spool is never mistaken for the terminal (TD4).
+    /// growing/on-demand spool is never mistaken for the terminal.
     fn physicalLen(self: *const Gzip) u64 {
         if (self.provider) |hr| return hr.physicalTotal() orelse std.math.maxInt(u64);
         return self.mapping.len;
@@ -555,8 +543,8 @@ pub const Gzip = struct {
         //     mid-symbol and `inflateStep` KEPT its output (those bytes came from
         //     real bits), and the frontier committed rows out of it. A resumable
         //     park here would UNDO that step instead, so a behind-frontier re-lex
-        //     could not re-serve rows the frontier had already published —
-        //     measured: `netgz1`'s `landed - 64` came back as an empty cell.
+        //     could not re-serve rows the frontier had already published
+        //     (measured: a row just behind the landing came back empty).
         return hr.awaitsBytes() or self.terminal_kind.load(.acquire) == 0;
     }
 
@@ -691,7 +679,7 @@ pub const Gzip = struct {
     fn produce(self: *Gzip, s: *Session, out: []u8) usize {
         _ = self.inflate_ops.fetchAdd(1, .monotonic); // gz-filter-stream: count EVERY inflate op (0-byte spins included)
         if (out.len == 0 or self.shutdown.load(.acquire)) return 0;
-        // Network gzip (TD4): fetch compressed bytes ahead of the read cursor and
+        // Network gzip: fetch compressed bytes ahead of the read cursor and
         // lift a resumable budget stop when more arrived. The inflater consumes
         // compressed bytes strictly forward; checkpoint replay only reads already-
         // present bytes, so a single forward fetch high-water suffices.
@@ -703,8 +691,8 @@ pub const Gzip = struct {
         // (that arm returns before it).
         var demand_met = false;
         if (self.provider) |hr| {
-            // THE FETCH PERMIT (AC-e1 residual). The read-ahead below is a FIXED
-            // 256 KiB look-ahead, not a demand this row needs, so on the
+            // THE FETCH PERMIT. The read-ahead below is a FIXED 256 KiB
+            // look-ahead, not a demand this row needs, so on the
             // foreground read lane it is pure cost with a peer-shaped tail: one
             // ranged GET issued from `ls_window_set` / `ls_cell` / `ls_cell_copy`
             // / nav, on a lane those calls hold, several of them with the document
@@ -822,7 +810,7 @@ pub const Gzip = struct {
         // physical fence is the fetched compressed high-water (refreshed every
         // `produce` from the provider) — never `mapping.len` (the presized total
         // or the huge unknown-length reservation), which would read unfetched
-        // pages — so leave `input.end` at the fetched edge here (TD4).
+        // pages — so leave `input.end` at the fetched edge here.
         if (self.provider == null) self.forward.input.end = self.mapping.len;
         if (self.forward.terminal == .budget) {
             self.forward.dec.err = null;
@@ -836,7 +824,7 @@ pub const Gzip = struct {
     /// A stricter rule lived here briefly — a damaged stream also had to carry a
     /// row terminator, so a salvage shorter than one row could not present a
     /// truncated cell as a whole one. It was removed as part of the adjudicated
-    /// CHANGE-REQUEST (`review/REVIEW-flate-feed-guard.md`): it answered the
+    /// CHANGE-REQUEST: it answered the
     /// partial-tail question one salvage-end EARLIER than, and opposite to, the way
     /// the tail itself is served, and it turned a single-row garbage salvage into a
     /// clean `LS_ERROR_IO`, making that case unfalsifiable in exactly the region
@@ -1023,8 +1011,7 @@ pub const Gzip = struct {
     /// check reads as one.
     const forward_lane: usize = 0;
 
-    /// security-hardening (e) AC-e3: whether `lane`'s inflate is parked on a
-    /// RESUMABLE budget stop — it ran out of COMPRESSED bytes (`produce`:
+    /// Whether `lane`'s inflate is parked on a RESUMABLE budget stop — it ran out of COMPRESSED bytes (`produce`:
     /// `s.input.end < physicalLen() and s.input.seek >= s.input.end`) rather than
     /// reaching a clean or damaged terminus. `.budget` deliberately leaves
     /// `terminal_kind` unset precisely because it is NOT an end-of-source: for a
@@ -1124,33 +1111,24 @@ pub const Source = union(enum) {
     /// document pays a single register test, not a call, per row. Exactly the
     /// sources whose lookahead can be absent-but-fetchable answer true.
     ///
-    /// SCOPE OF THE CURE: this guard closes AC-e1 for PLAIN NET CSV ONLY. Net GZIP
-    /// stays UNCURED — `commitGuarded` is false for `.gzip`, so neither the wedge
-    /// below nor the mid-row-frontier fix in `commitSearch`/`commitFilter` applies
-    /// to it — pending the net-gz cell, which must also carry the
-    /// `g.cond.waitUncancelable` mutex-held lane acquire (:1192/:1239).
+    /// SCOPE: this guard covers PLAIN NET CSV ONLY. Net GZIP is deliberately out
+    /// of scope (`commitGuarded` is false for `.gzip`) — see the arm below.
     pub fn commitGuarded(self: Source) bool {
         return switch (self) {
             .mmap => false, // every byte is in the mapping; a peek never blocks
-            // NET GZIP IS DELIBERATELY OUT OF SCOPE HERE (net_peek_mutex 3c) and a
-            // commit-side bound cannot cover it: `produce` calls
-            // `ensureCompressed(s.input.seek + chunk_bytes)` UNCONDITIONALLY on
-            // every inflate op (:266-268), including on a REPLAY lane driven by a
-            // mutex-held re-lex. That is a fixed 256 KiB compressed READ-AHEAD, not
-            // a read of bytes the row needs, so it can demand an un-fetched chunk
-            // however far behind the frontier the re-lex sits — bounding where the
-            // frontier commits changes nothing. Its fix is `produce`-side
-            // (demand-only / non-blocking `ensureCompressed` on replay lanes) and
-            // belongs with `column.zig`'s mutex-held lane acquire (:1051, blocks on
-            // `g.cond`) in a net-gz cell of its own. LOCAL gzip needs no guard at
-            // all: `provider == null`, so every compressed byte is already mapped.
+            // NET GZIP IS DELIBERATELY OUT OF SCOPE, and a commit-side bound
+            // could not cover it anyway: `produce`'s 256 KiB compressed
+            // read-ahead is not a read of bytes the row needs, so it can demand
+            // an un-fetched chunk however far behind the frontier the re-lex
+            // sits. That one is handled `produce`-side, by THE FETCH PERMIT.
+            // LOCAL gzip needs no guard at all: `provider == null`, so every
+            // compressed byte is already mapped.
             .gzip => false,
             .http_range => true,
         };
     }
 
-    /// FRONTIER COMMIT GUARD (security-hardening (e) AC-e1 residual, cell
-    /// `net_peek_mutex`) — the ONE resolver every scan loop reads. Returns the
+    /// FRONTIER COMMIT GUARD — the ONE resolver every scan loop reads. Returns the
     /// highest LOGICAL offset at which a row may END and still be COMMITTED to the
     /// frontier; `maxInt` means unbounded. The invariant it encodes:
     ///
@@ -1165,21 +1143,16 @@ pub const Source = union(enum) {
     /// `row_end` and then call `streamUnit` to test the successor for an LF, so the
     /// deepest byte a committed row can DEMAND is `row_end + max_lookahead - 1` and
     /// the bound must reserve the FULL width, not width - 1. On a network Source
-    /// that read is an
-    /// `ensureSlice`, i.e. a BLOCKING FETCH, and on the sequential arm an
-    /// unbounded `net_source.stall_backoff_ms` spin
-    /// (`net_source.ensureSliceSequentialLocked`) — so
-    /// the whole document wedges: every poll, cancel and close blocks behind it.
-    /// Two failure modes, both cured by never committing such a row:
-    ///   * the wedge above (AC-e1 named it "One route remains UNBOUNDED");
-    ///   * SILENT WRONG DATA, reachable TODAY with no clamp anywhere: `ensureSlice`
-    ///     already returns the contiguous present PREFIX on a short/failed fetch
-    ///     (:850-863), so the decoder can receive a TRUNCATED peek. A UTF-16
-    ///     surrogate pair straddling that edge fails `off + 4 <= limit`, and the
-    ///     deferral branch is dead on the peek path (`streamUnit` passes
-    ///     `bytes.len` as `limit`), so `encoding.decodeUtf16Unit` falls through to
-    ///     `replacementUnit(2)`: an astral character silently becomes U+FFFD
-    ///     U+FFFD in served cell text.
+    /// that read is an `ensureSlice`, i.e. a BLOCKING FETCH (and on the sequential
+    /// arm an unbounded backoff spin), so the whole document wedges: every poll,
+    /// cancel and close blocks behind it. Two failure modes, both cured by never
+    /// committing such a row:
+    ///   * the wedge above;
+    ///   * SILENT WRONG DATA: `ensureSlice` returns the contiguous present PREFIX
+    ///     on a short/failed fetch, so the decoder can receive a TRUNCATED peek. A
+    ///     UTF-16 surrogate pair straddling that edge fails `off + 4 <= limit` and
+    ///     `encoding.decodeUtf16Unit` falls through to `replacementUnit(2)`: an
+    ///     astral character silently becomes U+FFFD U+FFFD in served cell text.
     ///
     /// `reach` is the highest offset the caller is about to consider — its span
     /// end, or the row end it is about to count. This call SECURES that offset's
@@ -1189,7 +1162,7 @@ pub const Source = union(enum) {
     /// re-lex. Healthy documents therefore never see a bound (`reach` is secured,
     /// so the answer is >= `reach`) and the scan does not stop `max_lookahead`
     /// bytes short at every chunk boundary; a short/failed range alone bounds it,
-    /// which is exactly AC-e3's "the un-fetched tail is never served as content".
+    /// so the un-fetched tail is never served as content.
     ///
     /// EOF IS EXEMPT: when every byte up to the true end is present the answer is
     /// unbounded, so the last row of a network document is committed normally.
@@ -1512,8 +1485,7 @@ pub const Cursor = struct {
         return @intCast(left);
     }
 
-    /// security-hardening (e) AC-e3: whether an EMPTY span at the current position
-    /// is a genuine end-of-source, vs. bytes merely NOT-YET-AVAILABLE. A NETWORK
+    /// Whether an EMPTY span at the current position is a genuine end-of-source, vs. bytes merely NOT-YET-AVAILABLE. A NETWORK
     /// short/failed range leaves un-fetched bytes BELOW the known end, so an empty
     /// span there is a retryable STALL, not EOF -- the frontier must not complete
     /// over it.
@@ -1527,18 +1499,12 @@ pub const Cursor = struct {
     ///     forever. Without this the short-body gz path reports a truncated
     ///     document as COMPLETE with a wrong row count.
     ///
-    /// VERIFICATION STATUS of the gzip arm below
-    /// (`!(g.provider != null and g.laneAtBudget(self.lane))`): REASONED-CORRECT,
-    /// NOT PROBE-CONFIRMED. It must not be written up anywhere as tested — the
-    /// 273/273 suite does not cover it either. The fixture built to discriminate
-    /// it FAILED to: `probe_gz.zig` with a FULL gzip body, `advertise_length =
-    /// true`, and `short_body_at` swept over 20-95% produced BYTE-IDENTICAL
-    /// results with and without this arm, on every cut. Advertising the full
-    /// plain length while short-circuiting delivery never parks the forward lane
-    /// on `.budget` at an empty span, so the arm is never the deciding predicate
-    /// there. A discriminating fixture must drive a network gzip to a `.budget`
-    /// stop with no compressed bytes left to hand out. Until one exists, treat
-    /// this arm as unexercised: reason about it, do not cite a test for it.
+    /// UNEXERCISED: the gzip arm below is reasoned-correct but nothing covers
+    /// it. Advertising a full plain length while short-circuiting delivery never
+    /// parks the forward lane on `.budget` at an empty span, so that arm is never
+    /// the deciding predicate for such a fixture; a discriminating one has to
+    /// drive a network gzip to a `.budget` stop with no compressed bytes left to
+    /// hand out. Reason about this arm; do not cite a test for it.
     pub fn spanTerminal(self: *const Cursor) bool {
         return switch (self.source.?) {
             .mmap => true,
@@ -1663,11 +1629,11 @@ pub fn sourceShutdown(source: *Source) void {
     }
 }
 
-// never-full-download-streaming: gzip-over-http_range construction + the
-// network-source predicates the index/poll/rowcount lanes key on.
+// gzip-over-http_range construction + the network-source predicates the
+// index/poll/rowcount lanes key on.
 
 /// Compose a gzip Source over the compressed bytes served on demand by an
-/// http_range spool (TD4). On success the returned Gzip OWNS `provider` (its
+/// http_range spool. On success the returned Gzip OWNS `provider` (its
 /// deinit frees it); on failure returns null and the CALLER frees `provider`.
 pub fn gzipOverProvider(gpa: std.mem.Allocator, provider: *HttpRange) ?*Gzip {
     return Gzip.initProvider(gpa, provider) catch null;
@@ -1683,8 +1649,7 @@ pub fn gzipDeinit(g: *Gzip) void {
     g.deinit();
 }
 
-/// security-hardening (b) AC-b2: whether more bytes can still ARRIVE FROM THE
-/// PEER for `source` (see net_source.HttpRange.awaitsBytes). Local sources own
+/// Whether more bytes can still ARRIVE FROM THE PEER for `source` (see net_source.HttpRange.awaitsBytes). Local sources own
 /// every byte they will ever have, so false.
 ///
 /// NOT the same question as `Gzip.fenceCanMove`, and deliberately not shared with
@@ -1701,7 +1666,7 @@ pub fn sourceAwaitsBytes(source: Source) bool {
 }
 
 /// True iff this Source fetches over the network (http_range, or a gzip composed
-/// over an http_range) — the lazy-frontier gate keys strictly on this (TD1).
+/// over an http_range) — the lazy-frontier gate keys strictly on this.
 pub fn sourceIsNetwork(source: Source) bool {
     return switch (source) {
         .mmap => false,

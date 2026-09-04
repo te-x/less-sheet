@@ -1,21 +1,18 @@
 //! The Reader interface: the format→rows/cells parser the format-agnostic
 //! core (window/index/nav/search/filter — the C ABI in root.zig) calls
 //! INSTEAD of a format's own parser directly (see docs/architecture/
-//! ARCH-reader-interface.md). CSV (src/csv_reader.zig) is the only member in
-//! this slice; a future Parquet or ODS/XLSX Reader would add a sibling
-//! variant to the `Reader` union below with NO change to window/index/nav/
-//! search/filter/root — see the AC5 note at the bottom of csv_reader.zig.
+//! ARCH-reader-interface.md). CSV (src/csv_reader.zig) is the only member
+//! today; a future Parquet or ODS/XLSX Reader would add a sibling variant to
+//! the `Reader` union below with NO change to window/index/nav/search/filter/
+//! root.
 //!
 //! The row `Pos` a Reader hands back (from `boundsAfter`/`materialize`) is
-//! OPAQUE to every caller outside `src/csv_reader.zig`: a non-arithmetic
-//! handle (Zig's open/non-exhaustive-enum pattern — `+`, `-`, `<`, `>` don't
-//! even compile on it) that the core only ever obtains from, and passes back
-//! to, a Reader op, or stores verbatim in a `base.Checkpoint`/`nav.SourceLoc`.
+//! OPAQUE to every caller outside `src/csv_reader.zig`: a handle the core
+//! only ever obtains from, and passes back to, a Reader op, or stores
+//! verbatim in a `base.Checkpoint`/`nav.SourceLoc`.
 //! For the CSV Reader it happens to be a byte offset into the `Source` (src/
-//! source.zig); a Parquet Reader would encode a (row-group, in-group index)
-//! pair instead, and an XML (ODS/XLSX) Reader an offset plus parser-state
-//! token — see ARCH-reader-interface AC5. Nothing outside `csv_reader.zig`
-//! may assume otherwise; every core call site treats `Pos` as a value to
+//! source.zig); nothing outside `csv_reader.zig` may assume that. Every core
+//! call site treats `Pos` as a value to
 //! store/compare-for-equality/hand back, never to compute from scratch
 //! (except via `start`/`posAtByteBudget` below, which hand back a fresh,
 //! still-opaque `Pos` for a byte BUDGET the ABI itself pins — see api/
@@ -64,16 +61,13 @@ pub const SelectedScanner = union(enum) {
 };
 
 /// A pluggable format Reader. One tagged-union variant per format — CSV is
-/// the only member in this slice (see csv_reader.CsvReader). Every op takes
-/// the `Source` explicitly (a Reader never owns one), so the same Reader
-/// value could serve different byte providers across calls (e.g. CSV over
-/// an mmap Source today, CSV over a future gzip Source for csv.gz, with no
-/// change here).
+/// the only member today (see csv_reader.CsvReader). Every op takes the
+/// `Source` explicitly (a Reader never owns one), so the same Reader value
+/// can serve different byte providers across calls.
 ///
 /// Dispatch is a single `switch` per call — no vtable, no heap indirection.
 /// With one variant this costs at most one (trivially-predicted, often
-/// wholly-elided) branch; see the reorg's perf spot-check for the measured
-/// window/index/nav hot-path cost (unchanged vs. calling `lexer` directly).
+/// wholly-elided) branch.
 pub const Reader = union(enum) {
     csv: csv_reader.CsvReader,
 
@@ -208,19 +202,10 @@ pub const Reader = union(enum) {
     }
 };
 
-// ---------------------------------------------------------------------------
-// csv-gz SEED seam stubs (ARCH-csv-gz "Internal Source/Reader contract",
-// Decision 1-C). Reader/Source capabilities the repaired seam must provide,
-// pinned in contracts/api.zig. NOT wired into the working path in the seed
-// (window/index/nav/search/filter still call the existing ops above), so
-// existing behavior is byte-identical; the implementer builds the real bounded,
-// resumable versions. Every param is discarded here -- these are shape stubs.
-// ---------------------------------------------------------------------------
-
 const source_mod2 = @import("source.zig");
 
-/// ARCH capability (2): unknown-end query in the frozen SourceEnd vocabulary --
-/// never conflate current availability with EOF. SEED STUB.
+/// Unknown-end query in the frozen SourceEnd vocabulary -- never conflate current
+/// availability with EOF.
 pub fn sourceEndAt(source: Source, pos: Pos) api.SourceEnd {
     if (source.knownEnd()) |end| return if (pos.logical >= end) switch (source) {
         .mmap => .clean_eof,
@@ -230,46 +215,38 @@ pub fn sourceEndAt(source: Source, pos: Pos) api.SourceEnd {
     return .inflating;
 }
 
-/// ARCH capability (3): bounded cursor acquisition by opaque logical position +
-/// DUAL limits (logical inflated-output + optional physical compressed-input).
-/// SEED STUB.
+/// Bounded cursor acquisition by opaque logical position + DUAL limits (logical
+/// inflated-output + optional physical compressed-input).
 pub fn sourceCursorAt(source: Source, pos: Pos, limit: api.DualLimit) source_mod2.Cursor {
     const logical_limit = if (limit.logical) |n| pos.logical +| n else null;
     return source_mod2.cursorAt(source, pos.logical, logical_limit, limit.physical);
 }
 
-/// ARCH capability (4): logical inflated-byte measurement of an actual position
-/// (row extents, per-row scan cap, oversized detection, CSV parsing). SEED: CSV
-/// Pos IS a logical byte offset (identity), matching bytesConsumed today.
+/// Logical inflated-byte measurement of a position (row extents, per-row scan
+/// cap, oversized detection, CSV parsing). CSV `Pos` IS a logical byte offset
+/// (identity), matching bytesConsumed.
 pub fn posLogicalBytes(source: Source, pos: Pos) u64 {
     _ = source;
     return pos.logical;
 }
 
-/// ARCH capability (4): physical compressed-file-byte measurement of an actual
-/// position (index/search/filter progress + the row-count estimate). SEED: for
-/// mmap this equals the logical offset (identity apart from the BOM base).
+/// Physical compressed-file-byte measurement of a position (index/search/filter
+/// progress + the row-count estimate). For mmap this equals the logical offset,
+/// apart from the BOM base.
 pub fn posPhysicalBytes(source: Source, pos: Pos) u64 {
     _ = source;
     return pos.physical;
 }
 
-/// ARCH capability (5): rebase the Source after the ONE leading BOM (only a BOM
-/// at inflated offset zero of the whole concatenated stream is stripped). SEED
-/// STUB (root.zig still rebases via the mmap content slice today).
+/// Rebase the Source after the ONE leading BOM: only a BOM at inflated offset
+/// zero of the whole concatenated stream is stripped.
 pub fn sourceRebaseBom(source: *Source, bom_len: u64) void {
     source_mod2.rebaseBom(source, bom_len);
 }
 
-/// ARCH capability (6) / req4: the streaming ROW-MATCH the Reader gains -- next
-/// opaque position + the lowest matching column/result matcher.matchRecord
-/// returns today, over ONE predicate or the composed filter+find pair, so a row
-/// is decompressed + lexed ONCE and the matcher stays O(query + fixed state)
-/// (AC13). Replaces the unbounded materialize(cap=null) in search/filter/nav.
-/// SEED STUB: returns "no match" and NOTHING calls it yet (search/filter/nav
-/// still use the existing materialize path), so AC13 stays RED until the
-/// implementer builds the streaming matcher, wires it, and increments
-/// gzStreamMatcherResidentBytes.
+/// The streaming ROW-MATCH result: next opaque position plus the lowest matching
+/// column, over ONE predicate or the composed filter+find pair, so a row is
+/// decompressed + lexed ONCE and the matcher stays O(query + fixed state).
 pub const MatchRowResult = struct {
     next: Pos,
     matched_col: ?u32,

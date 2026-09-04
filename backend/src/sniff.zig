@@ -4,8 +4,8 @@
 const api = @import("api");
 const lexer = @import("lexer.zig");
 
-/// Records the sniffer lexes per commit cycle; the sample is bounded so
-/// sniffing itself is trivially cheap regardless of file size.
+/// The sample is bounded by BOTH caps, so sniffing costs the same regardless
+/// of file size.
 const sniff_byte_cap: usize = 256 * 1024;
 const sniff_record_cap: u32 = 256;
 const max_field_hist: usize = 512;
@@ -20,7 +20,6 @@ const Score = struct {
     splits: bool,
     /// Fraction of sampled records matching the modal field count.
     consistency: f64,
-    /// The modal field count.
     mode: u32,
 };
 
@@ -110,7 +109,7 @@ fn scorePair(content: []const u8, sep: u8, quote: ?u8, encoding: u8) Score {
     }
     // Modal field count, ties broken toward the LARGER count: a candidate that
     // splits any records into multiple fields must read as "splitting" even
-    // when as many records are ragged/short (pinned: splitting beats single).
+    // when as many records are ragged/short — splitting beats single-field.
     var mode: u32 = 0;
     var mode_freq: u32 = 0;
     for (hist, 0..) |f, k| {

@@ -1,21 +1,20 @@
-//! fault_guard.zig (ARCH-security-hardening (g), Decision 5) — the SOURCE-FAULT
-//! GUARD: a scoped, chained `SIGBUS` handler over the core's own mmap regions.
+//! The SOURCE-FAULT GUARD: a scoped, chained `SIGBUS` handler over the core's
+//! own mmap regions.
 //!
 //! WHY. We map local files (`root.openWithAllocator`) and then read them lazily,
 //! so the bytes under a live mapping can stop existing: another process truncates
 //! the file, a network mount drops, a USB drive is pulled. Reading a page that no
 //! longer has backing store raises `SIGBUS`, which by default kills the process
-//! — and this core is linked INTO the frontend, so that kills the app. AC-g1
-//! requires that we instead catch the fault inside our OWN regions, recover, and
-//! report a clean truncated/faulted outcome.
+//! — and this core is linked INTO the frontend, so that kills the app. We must
+//! instead catch the fault inside our OWN regions, recover, and report a clean
+//! truncated/faulted outcome.
 //!
-//! MEASURED PLATFORM SPLIT (see tests/all_tests.zig's banner, re-confirmed here
-//! with two standalone probes on 2026-08-04): truncating under a live read-only
-//! `MAP_PRIVATE` mapping raises `SIGBUS` on Linux (all arms) but NOT on macOS 26
-//! /APFS, which keeps serving the bytes the mapping opened with. A mapping LONGER
-//! than its file faults on both. So on macOS this guard is inert insurance; on
-//! Linux — which we ship to (aarch64/x86_64-linux-musl, the GTK frontend) — it is
-//! what stands between a shrinking file and a dead app.
+//! MEASURED PLATFORM SPLIT: truncating under a live read-only `MAP_PRIVATE`
+//! mapping raises `SIGBUS` on Linux (all arms) but NOT on macOS 26/APFS, which
+//! keeps serving the bytes the mapping opened with. A mapping LONGER than its
+//! file faults on both. So on macOS this guard is inert insurance; on Linux —
+//! which we ship to (aarch64/x86_64-linux-musl, the GTK frontend) — it is what
+//! stands between a shrinking file and a dead app.
 //!
 //! ------------------------------------------------------------------ MECHANISM
 //! RECOVERY IS PAGE REPAIR, NOT `siglongjmp`. Returning from a SIGBUS handler
@@ -33,16 +32,15 @@
 //!      row, not per read.
 //!   2. SAFETY. `longjmp` out of a signal handler abandons every `defer` between
 //!      the jump target and the fault, so it would escape the document mutex a
-//!      scan holds and wedge the next `ls_close` — exactly the deadlock the
-//!      frozen tests fail on (`timed_out`). Page repair unwinds nothing: locks
-//!      release, `defer`s run, the scan finishes normally and is DISCARDED by its
-//!      caller.
+//!      scan holds and wedge the next `ls_close`. Page repair unwinds nothing:
+//!      locks release, `defer`s run, the scan finishes normally and is DISCARDED
+//!      by its caller.
 //!
 //! Zero-filling is emphatically NOT the report. It only buys a clean return; the
 //! zeroes must never be believed. Every caller brackets the work that touches a
 //! mapping with `faultCount` and throws the whole result away if the count moved
-//! (`base.goTerminalOnSourceFaultLocked`). AC-g1 wants a REPORTED error, and a
-//! repair that silently succeeded would be the silent-wrong-data failure.
+//! (`base.goTerminalOnSourceFaultLocked`); a repair that silently succeeded would
+//! be the silent-wrong-data failure.
 //!
 //! The repair covers `[faulting page, region end)`, not just the one page: a
 //! truncation removes a SUFFIX, so the whole tail is gone, and repairing it in
@@ -76,13 +74,13 @@
 //! straight to it — SA_SIGINFO handler, plain handler, `SIG_IGN`, or `SIG_DFL`
 //! (restore + return, so the instruction re-executes and the process dies
 //! properly, with the right signal and a core dump). Zig's own crash reporting
-//! keeps working for every fault outside our regions; that is AC-g2.
+//! keeps working for every fault outside our regions.
 //!
 //! ONE-SIGNAL POLICY. `install` calls `sigaction` for `.BUS` and for nothing
 //! else. SEGV/ILL/FPE stay with the host's crash reporting, and IO/PIPE stay with
 //! the network executor, which owns them deliberately and permanently
 //! (`std.Io.Threaded.init`; see src/net_source.zig's note on never deinitializing
-//! it). `sigbus_g2` asserts this mechanically.
+//! it).
 //!
 //! Installation happens ONCE per process, on the first `arm`, and is never undone
 //! — not on the last close either. Uninstalling would either hand SIGBUS back to
@@ -130,10 +128,6 @@ var prev_action: posix.Sigaction = undefined;
 /// first call, which is not something to do from a signal handler.
 var page_size: usize = 0;
 
-/// The faulting address. The two platforms put it in different places and both
-/// were checked against the installed 0.16.0 std rather than recalled:
-/// macOS `std.c.siginfo_t.addr` (std/c.zig), Linux
-/// `std.os.linux.siginfo_t.fields.sigfault.addr` (std/os/linux.zig).
 inline fn faultAddr(info: *const posix.siginfo_t) usize {
     return switch (builtin.os.tag) {
         .macos => @intFromPtr(info.addr),
@@ -209,7 +203,7 @@ fn onSigbus(sig: posix.SIG, info: *const posix.siginfo_t, ctx: ?*anyopaque) call
     chain(sig, info, ctx);
 }
 
-/// Hand the fault to whatever owned SIGBUS before us (AC-g2).
+/// Hand the fault to whatever owned SIGBUS before us.
 fn chain(sig: posix.SIG, info: *const posix.siginfo_t, ctx: ?*anyopaque) void {
     const p = prev_action; // immutable after install
     if (p.flags & posix.SA.SIGINFO != 0) {

@@ -1,5 +1,5 @@
 //! Sparse column metadata, bounded lazy CSV inference, and the additive
-//! caller-owned column ABI from ARCH-column-config.
+//! caller-owned column ABI.
 
 const std = @import("std");
 const api = @import("api");

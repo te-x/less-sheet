@@ -2,9 +2,9 @@
 //! Implements api/lesssheet.h exactly (see it and contracts/api.zig for the
 //! full semantics: format neutrality, ownership & the eviction-safe borrow
 //! rule, O(head) open cost, the scan frontier, threading lanes, dialect
-//! grammar, sniffing, header rule). contracts/ and tests/ are planner-owned.
+//! grammar, sniffing, header rule).
 //!
-//! Architecture (viewer-ui slice):
+//! Architecture:
 //!   - The source file is mmap'd read-only; nothing is copied. Cell text is
 //!     re-lexed on demand into an owned window buffer (quote-collapsing means
 //!     a cell is not always a contiguous file slice), so borrows survive the
@@ -36,8 +36,8 @@ const filter = @import("filter.zig");
 const search = @import("search.zig");
 const index = @import("index.zig");
 const window = @import("window.zig");
-// ARCH-security-hardening (g): the SOURCE-FAULT GUARD, armed over the local
-// file mapping in `openWithAllocator` before its first byte is read.
+// The SOURCE-FAULT GUARD, armed over the local file mapping in
+// `openWithAllocator` before its first byte is read.
 const fault_guard = @import("fault_guard.zig");
 const Document = base.Document;
 const CellRef = base.CellRef;
@@ -45,8 +45,8 @@ const asDoc = base.asDoc;
 const asDocMut = base.asDocMut;
 const freeDoc = base.freeDoc;
 
-/// Re-exported so `root.isNumeric` stays a stable name (moved to matcher.zig;
-/// not part of the C ABI, but was `pub` before the split).
+/// Re-exported so `root.isNumeric` stays a stable name; defined in
+/// matcher.zig. Not part of the C ABI.
 pub const isNumeric = matcher.isNumeric;
 
 /// Default allocator behind `ls_open` (thread-safe). `ls_close` returns all
@@ -106,14 +106,14 @@ pub fn openWithAllocator(gpa: std.mem.Allocator, path: [*:0]const u8, options: ?
         error.AccessDenied, error.PermissionDenied => .permission_denied,
         else => .io,
     };
-    // The fd is NOT closed here any more: the document keeps it for its whole
-    // life (base.Document.fd) so the source-fault guard can `fstat` the real
+    // The fd is NOT closed here: the document keeps it for its whole life
+    // (base.Document.fd) so the source-fault guard can `fstat` the real
     // current size when the bytes under the mapping vanish. Every failure path
     // below closes it explicitly (this function returns a status, not an error
     // union, so there is no `errdefer` to lean on); on success `freeDoc` owns it.
 
     // Portable stat via std.Io.File (0.16.0 removed the std.posix file syscalls;
-    // std.c bindings are void on linux-musl). One fstat, same as before.
+    // std.c bindings are void on linux-musl).
     const st = sysio.file(fd).stat(sysio.io()) catch {
         sysio.close(fd);
         return .io;
@@ -127,9 +127,9 @@ pub fn openWithAllocator(gpa: std.mem.Allocator, path: [*:0]const u8, options: ?
     // Map the file head-to-tail (sparse tails cost nothing; pages fault lazily
     // and the indexer madvises them away). Empty files are not mapped.
     var mapping: ?[]align(std.heap.page_size_min) const u8 = null;
-    // ARCH-security-hardening (g): arm the SOURCE-FAULT GUARD over the mapping
-    // BEFORE anything reads a byte of it — the gzip-magic peek immediately below
-    // is already a read, and from here on any page of this file can be gone.
+    // Arm the SOURCE-FAULT GUARD over the mapping BEFORE anything reads a byte
+    // of it — the gzip-magic peek immediately below is already a read, and from
+    // here on any page of this file can be gone.
     var fault_slot: ?u32 = null;
     if (file_size > 0) {
         const m = posix.mmap(null, file_size, .{ .READ = true }, .{ .TYPE = .PRIVATE }, fd, 0) catch {
@@ -232,7 +232,7 @@ pub export fn ls_index_poll(doc: *const api.Doc) callconv(.c) api.ScanProgress {
 /// the requested rows (behind the frontier) from the nearest checkpoint into
 /// the owned window buffer, evicting the previous window. Every cell is
 /// decoded through `decodeUnit` (the document's resolved encoding) and
-/// display-capped to LS_CELL_MAX_BYTES (requirement 8).
+/// display-capped to LS_CELL_MAX_BYTES.
 pub export fn ls_window_set(doc: *api.Doc, first_row: u64, row_count: u32) callconv(.c) api.RowRange {
     const d: *Document = @ptrCast(@alignCast(doc));
     const result = window.windowSet(d, first_row, row_count);
@@ -287,7 +287,7 @@ pub export fn ls_jump_poll(doc: *const api.Doc) callconv(.c) api.JumpStatus {
 }
 
 // ===========================================================================
-// Search (find-seek slice) — see src/search.zig for the streaming match-scan,
+// Search — see src/search.zig for the streaming match-scan,
 // navigation, and the ABI logic below. See api/lesssheet.h SEARCH.
 // ===========================================================================
 
@@ -315,10 +315,9 @@ pub export fn ls_search_poll(doc: *const api.Doc) callconv(.c) api.SearchStatus 
 }
 
 // ---------------------------------------------------------------------------
-// Filtered views (filtered-views slice) — see api/lesssheet.h FILTERED VIEWS
-// for the full model. ls_filter_set validates EXACTLY like ls_search_start
-// (duplicated rather than shared, so neither call site risks drifting the
-// other's already-frozen-green behavior).
+// Filtered views — see api/lesssheet.h FILTERED VIEWS for the full model.
+// ls_filter_set validates EXACTLY like ls_search_start (duplicated rather than
+// shared, so neither call site risks drifting the other's behavior).
 // ---------------------------------------------------------------------------
 
 /// See api/lesssheet.h `ls_filter_set`.
@@ -353,23 +352,14 @@ pub export fn ls_row_oversized(doc: *const api.Doc, row: u64) callconv(.c) bool 
 }
 
 // ---------------------------------------------------------------------------
-// Test-only instrumentation seam (ARCH-stream-copy AC1-AC5). NOT the C ABI:
-// plain Zig fns re-exported by contracts/api.zig for the frozen backend tests
-// ONLY (like `openWithAllocator`), so api/lesssheet.h + the ls_cell_copy ABI
-// stay BYTE-IDENTICAL. They toggle the forward COPY CURSOR and read/reset the
+// Test-only instrumentation seam. NOT the C ABI: plain Zig fns re-exported by
+// contracts/api.zig for the frozen backend tests ONLY (like
+// `openWithAllocator`), so api/lesssheet.h + the ls_cell_copy ABI stay
+// BYTE-IDENTICAL. They toggle the forward COPY CURSOR and read/reset the
 // copy-path SOURCE-ROW-ADVANCE counter (base.Document.copy_cursor_enabled /
 // copy_advances). Production always runs cursor-enabled; the tests flip it OFF
-// to obtain the byte-identical locate-from-scratch REFERENCE (AC1/AC2) and the
-// interval-costly BASELINE (AC3/AC4/AC5).
-//
-// SEED: the cursor is not built yet, so `cellCopy` locates from scratch in BOTH
-// toggle states (identical output — cc1..cc5 + the AC1/AC2 equivalence sweeps
-// stay green) and NOTHING increments `copy_advances` (copyAdvances == 0). That
-// zero is exactly what makes the AC3/AC4/AC5 count assertions RED until the
-// implementer builds the cursor AND increments `copy_advances` once per source
-// row the copy path steps forward (a boundsAfter skip in cursor-OFF mode; a
-// single cursor forward-advance in cursor-ON mode) — in BOTH the identity
-// (window.cellCopy) and filtered (window.cellCopyFiltered) paths.
+// to obtain the byte-identical locate-from-scratch REFERENCE and the
+// interval-costly BASELINE.
 // ---------------------------------------------------------------------------
 
 /// See contracts/api.zig `copyCursorSetEnabled`.
@@ -388,18 +378,17 @@ pub fn copyAdvancesReset(doc: *api.Doc) void {
 }
 
 // ---------------------------------------------------------------------------
-// Full-cell read (select-copy slice) — the bounded, window-INDEPENDENT LOSSLESS
-// cell read. Poll/control lane (asDocMut takes the frontier mutex); copies into
-// the caller buffer (no borrow); ZERO alloc; never fails. See api/lesssheet.h
-// FULL-CELL READ. ARCH-stream-copy makes window.cellCopy cursor-accelerated
-// behind this UNCHANGED ABI (byte-identical output).
+// Full-cell read — the bounded, window-INDEPENDENT LOSSLESS cell read.
+// Poll/control lane (asDocMut takes the frontier mutex); copies into the caller
+// buffer (no borrow); ZERO alloc; never fails. See api/lesssheet.h
+// FULL-CELL READ.
 // ---------------------------------------------------------------------------
 
 /// See api/lesssheet.h `ls_cell_copy`.
 pub export fn ls_cell_copy(doc: *const api.Doc, row: u64, col: u32, buf: ?[*]u8, buf_len: usize, out_len: *usize, out_truncated: *bool) callconv(.c) api.CopyResult {
     const d = asDocMut(doc);
-    // security-hardening (g) AC-g1: never hand the guard's zero-fill to the
-    // clipboard — a fault under this read reports and serves nothing.
+    // Never hand the guard's zero-fill to the clipboard — a fault under this
+    // read reports and serves nothing.
     const faults_before = base.sourceFaultCount(d);
     const res = window.cellCopy(d, row, col, buf, buf_len, out_len, out_truncated);
     if (!window.copyFaulted(d, faults_before)) return res;
@@ -417,22 +406,22 @@ pub export fn ls_window_match_flags(doc: *const api.Doc, first_col: u32, col_cou
 }
 
 // ---------------------------------------------------------------------------
-// Streaming copy (thin-frontend-shared-core Phase 2) — the core-framed TSV COPY
-// JOB (api/lesssheet.h "STREAMING COPY EXTENSION"). Poll/control lane; COPIES
-// into the caller buffer (no borrow); the job holds no background thread.
+// Streaming copy — the core-framed TSV COPY JOB (api/lesssheet.h "STREAMING
+// COPY EXTENSION"). Poll/control lane; COPIES into the caller buffer (no
+// borrow); the job holds no background thread.
 //
 // The job is a pull-model cursor over the caller's ls_copy_next calls: it sweeps
 // the rect ROW-MAJOR, reading each cell LOSSLESSLY through window.cellCopy (the
 // SAME primitive ls_cell_copy exposes, so the framing rides its forward COPY
 // CURSOR — O(1) per row-major step, no per-cell re-location, which is what kills
 // the ~80 s/100k-row stall), frames the TSV into a reused `pending` buffer
-// (TAB/LF separators, spreadsheet quoting, the single-cell raw special-case —
-// BYTE-IDENTICAL to the deleted TSVCopyBuilder), and hands the caller ≤ buf_len
-// bytes per pull. A chunk ends at a field/row boundary except a single field
-// longer than buf_len, which splits across pulls at a UTF-8 code-point boundary.
-// A row at/beyond the frontier yields STALLED (nothing written; the caller jumps
-// to stalled_row and retries). d.copy_cap_cells (0 == api.copy_max_cells) is the
-// LS_COPY_MAX_CELLS safety cap reported via budget_capped on DONE.
+// (TAB/LF separators, spreadsheet quoting, the single-cell raw special-case),
+// and hands the caller ≤ buf_len bytes per pull. A chunk ends at a field/row
+// boundary except a single field longer than buf_len, which splits across pulls
+// at a UTF-8 code-point boundary. A row at/beyond the frontier yields STALLED
+// (nothing written; the caller jumps to stalled_row and retries).
+// d.copy_cap_cells (0 == api.copy_max_cells) is the LS_COPY_MAX_CELLS safety
+// cap reported via budget_capped on DONE.
 // ---------------------------------------------------------------------------
 
 /// Transcode-expansion bound on ONE cell's lossless output: a row's SOURCE is
@@ -514,10 +503,10 @@ const StreamCopyJob = struct {
     }
 
     /// Frame ONE cell (the separator that precedes it, then the raw/quoted
-    /// content) into `pending`, byte-identical to TSVCopyBuilder. Precondition:
-    /// `pending` is empty. The separator depends on the CURRENT sel_row/sel_col
-    /// (computed before the caller advances): the very first cell gets none, a
-    /// new row (sel_col == 0) gets LF, otherwise TAB.
+    /// content) into `pending`. Precondition: `pending` is empty. The separator
+    /// depends on the CURRENT sel_row/sel_col (computed before the caller
+    /// advances): the very first cell gets none, a new row (sel_col == 0) gets
+    /// LF, otherwise TAB.
     fn frameCell(self: *StreamCopyJob, bytes: []const u8) !void {
         if (!(self.sel_row == 0 and self.sel_col == 0)) {
             try self.pending.append(self.gpa, if (self.sel_col == 0) '\n' else '\t');
@@ -539,7 +528,7 @@ const StreamCopyJob = struct {
 
 /// Spreadsheet quoting trigger, byte-exact (TAB/CR/LF/quote are single-byte
 /// ASCII; a UTF-8 continuation byte is always >= 0x80, so a raw byte scan is
-/// exact) — mirrors TSVCopyBuilder.needsQuoting.
+/// exact).
 fn needsQuoting(bytes: []const u8) bool {
     for (bytes) |b| {
         if (b == '\t' or b == '\r' or b == '\n' or b == '"') return true;
@@ -586,11 +575,11 @@ pub export fn ls_copy_open(doc: *const api.Doc, rect: *const api.CopyRect) callc
 /// borrow). See StreamCopyJob for the framing/boundary/STALLED model.
 pub export fn ls_copy_next(job: *api.CopyJob, buf: ?[*]u8, buf_len: usize) callconv(.c) api.CopyProgress {
     const self: *StreamCopyJob = @ptrCast(@alignCast(job));
-    // security-hardening (g) AC-g1: bracket the whole PULL (many cells) rather
-    // than each cell — see window.copyFaulted. If the source faulted inside the
-    // pull, everything it framed came from the guard's zero-fill, so the job ends
-    // DONE with NOTHING written: the caller never puts NULs on the clipboard.
-    // Rows framed by EARLIER pulls were read from real bytes and still count.
+    // Bracket the whole PULL (many cells) rather than each cell — see
+    // window.copyFaulted. If the source faulted inside the pull, everything it
+    // framed came from the guard's zero-fill, so the job ends DONE with NOTHING
+    // written: the caller never puts NULs on the clipboard. Rows framed by
+    // EARLIER pulls were read from real bytes and still count.
     const faults_before = base.sourceFaultCount(self.doc);
     const p = copyNext(self, buf, buf_len);
     if (!window.copyFaulted(self.doc, faults_before)) return p;
@@ -612,7 +601,6 @@ fn copyNext(self: *StreamCopyJob, buf: ?[*]u8, buf_len: usize) api.CopyProgress 
             const room = buf_len - written;
             if (room == 0) return self.progress(.more, written, 0);
             if (avail <= room) {
-                // Whole remaining field/row fits: deliver it, clear, keep going.
                 @memcpy(out[written .. written + avail], self.pending.items[self.pending_off .. self.pending_off + avail]);
                 written += avail;
                 self.pending.clearRetainingCapacity();
@@ -699,14 +687,12 @@ pub fn copyCapCellsForTest(doc: *api.Doc, cells: u64) void {
 }
 
 // ===========================================================================
-// csv-gz internal-seam re-exports + instrumentation seams (ARCH-csv-gz).
-// The re-exports below let contracts/api.zig pin the enumerated Source/Reader
-// SEAM capabilities as `core.*` (Decision 1-C) while their DEFINITIONS stay in
-// source.zig / reader.zig (implementer-owned; the af83db9 boundary). The gz*
+// csv-gz internal-seam re-exports + instrumentation seams. The re-exports below
+// let contracts/api.zig pin the enumerated Source/Reader SEAM capabilities as
+// `core.*` while their DEFINITIONS stay in source.zig / reader.zig. The gz*
 // seams are Zig-only test instrumentation (NOT the C ABI -- like copyAdvances),
 // reading DEFAULTED base.Document state, so api/lesssheet.h is byte-identical
-// and a plain-CSV document reports zeros. SEED: gzip is not wired, so these
-// report zero/false -> csv-gz quantitative ACs are RED; existing tests GREEN.
+// and a plain-CSV document reports zeros.
 // ===========================================================================
 
 const source_seam = @import("source.zig");
@@ -758,7 +744,7 @@ pub const posPhysicalBytes = reader_seam.posPhysicalBytes;
 pub const sourceRebaseBom = reader_seam.sourceRebaseBom;
 pub const readerMatchRow = reader_seam.readerMatchRow;
 
-/// See contracts/api.zig `gzOpenBudget` (AC5/AC6/AC7).
+/// See contracts/api.zig `gzOpenBudget`.
 pub fn gzOpenBudget(doc: *const api.Doc) api.OpenBudget {
     const d = asDoc(doc);
     return .{ .physical_in = d.gz_physical_in, .inflated_out = d.gz_inflated_out };
@@ -811,7 +797,7 @@ pub fn gzForceChunkBytes(doc: *api.Doc, n: u64) void {
     const d = asDocMut(doc);
     if (d.source == .gzip) d.source.gzip.force_chunk.store(n, .release);
 }
-/// See contracts/api.zig `gzStreamMatcherResidentBytes` (AC13).
+/// See contracts/api.zig `gzStreamMatcherResidentBytes`.
 pub fn gzStreamMatcherResidentBytes(doc: *const api.Doc) u64 {
     return asDoc(doc).gz_match_resident_bytes;
 }
@@ -826,23 +812,18 @@ pub fn gzCacheCopyBytes(doc: *const api.Doc) u64 {
     _ = doc;
     return 0;
 }
-/// See contracts/api.zig `gzSnapshotProbe` (AC14). SEED: the inflate-checkpoint
-/// snapshot adapter is not built yet -> report "no snapshot taken, not
-/// identical" so AC14 is RED. The comptime shape-assertion in contracts/api.zig
-/// already proves the adapter is FEASIBLE against the installed std; this seam
-/// proves it WORKS byte-for-byte once built.
+/// See contracts/api.zig `gzSnapshotProbe`.
 pub fn gzSnapshotProbe(gpa: std.mem.Allocator, gzip_bytes: []const u8, probe_logical: u64) api.SnapshotProbe {
     const identical = source_seam.snapshotProbe(gpa, gzip_bytes, probe_logical);
     return .{ .restored = identical, .identical = identical };
 }
 
-// --- gz-filter-stream regression seams (Zig-only; NOT the C ABI) ---------
+// --- Inflate-work regression seams (Zig-only; NOT the C ABI) -------------
 // Cumulative inflate WORK the gzip Source did for this document since the last
 // gzInflateWorkReset: bytes produced, and produce() invocations. A streaming
-// trailing scan is O(logical) bytes in O(logical/chunk) ops; the shipped
-// livelocking trailing scan spins produce() without bound (ops -> infinity,
-// bytes plateau). Both 0 on the mmap fast path. WIRED in the seed (source.zig),
-// so the gzfs_* tests MEASURE the real defect.
+// trailing scan is O(logical) bytes in O(logical/chunk) ops; a livelocking one
+// spins produce() without bound (ops -> infinity, bytes plateau). Both 0 on the
+// mmap fast path.
 
 /// See contracts/api.zig `gzInflatedBytes`.
 pub fn gzInflatedBytes(doc: *const api.Doc) u64 {
@@ -865,13 +846,13 @@ pub fn gzInflateWorkReset(doc: *api.Doc) void {
     }
 }
 
-// --- gz-filter-stream: deterministic single-threaded scan driver (TEST-ONLY;
-// NOT the C ABI). The frozen gzfs_*_multiblock regression tests drive a gzip
-// FILTER/SEARCH match-scan ONE 2048-row block at a time on the CALLING thread,
-// with the background worker PARKED (gzScanParkWorker), so they can interleave
-// behind-frontier ls_window_set/ls_cell_copy work between blocks and assert the
-// document-owned replay lane keeps STREAMING (bounded inflate work) instead of
-// re-inflating a 32 MiB checkpoint interval per perturbed block. Each step runs
+// --- Deterministic single-threaded scan driver (TEST-ONLY; NOT the C ABI).
+// Drives a gzip FILTER/SEARCH match-scan ONE 2048-row block at a time on the
+// CALLING thread, with the background worker PARKED (gzScanParkWorker), so a
+// test can interleave behind-frontier ls_window_set/ls_cell_copy work between
+// blocks and assert the document-owned replay lane keeps STREAMING (bounded
+// inflate work) instead of re-inflating a 32 MiB checkpoint interval per
+// perturbed block. Each step runs
 // the EXACT chunk+commit the worker's do_search/do_filter branches run (see
 // index.workerMain), only on the test thread -- exercising the production
 // retention path (base.beginMatchScan) identically, with no wall-clock races.
@@ -904,8 +885,8 @@ pub fn gzScanStep(doc: *api.Doc) api.GzScanStep {
                 search.commitSearch(d, res, filtered);
                 search.resolveNavLocked(d);
                 if (d.search_state == .scanning and !d.search_to_eof and !d.nav_pending) d.search_state = .cancelled;
-                // security-hardening (e) AC-e3: otherwise this step keeps
-                // reporting .scanning forever and its driver spins.
+                // Otherwise this step keeps reporting .scanning forever and
+                // its driver spins.
                 if (res.stalled) search.finishStalledLocked(d);
             }
         }
@@ -926,7 +907,7 @@ pub fn gzScanStep(doc: *api.Doc) api.GzScanStep {
             d.lock();
             if (d.filter_gen == gen and d.filter_state == .scanning) {
                 filter.commitFilter(d, res);
-                // security-hardening (e) AC-e3: see the search arm above.
+                // See the search arm above.
                 if (res.stalled) filter.finishStalledLocked(d);
             }
         }
@@ -955,32 +936,27 @@ pub fn gzTouchReplayLane(doc: *api.Doc, logical: u64) void {
 }
 
 // ===========================================================================
-// window-budget instrumentation seams (ARCH-window-budget). Zig-only test
-// instrumentation (NOT the C ABI -- like copyAdvances / gz*), reading DEFAULTED
-// base.Document state, so api/lesssheet.h stays BYTE-IDENTICAL (AC1) and a
-// document that has not performed source work on the corresponding synchronous
-// lane reports zero. Filtered navigation source resolution runs off-main, so its
-// synchronous latch remains independent of giant-row length.
+// Window-budget instrumentation seams. Zig-only test instrumentation (NOT the
+// C ABI -- like copyAdvances / gz*), reading DEFAULTED base.Document state, so
+// api/lesssheet.h stays BYTE-IDENTICAL and a document that has not performed
+// source work on the corresponding synchronous lane reports zero. Filtered
+// navigation source resolution runs off-main, so its synchronous latch remains
+// independent of giant-row length.
 // ===========================================================================
 
-/// See contracts/api.zig `windowChargedBytes` (AC2/AC3/AC4/AC8).
+/// See contracts/api.zig `windowChargedBytes`.
 pub fn windowChargedBytes(doc: *const api.Doc) u64 {
     return asDoc(doc).window_charged_bytes;
 }
 
-/// See contracts/api.zig `navChargedBytes` (AC11/AC12, backlog #6).
+/// See contracts/api.zig `navChargedBytes`.
 pub fn navChargedBytes(doc: *const api.Doc) u64 {
     return asDoc(doc).nav_charged_bytes;
 }
 
 // ===========================================================================
-// column-config slice (ARCH-column-config) — additive column-metadata C ABI.
-// See api/lesssheet.h "COLUMN METADATA EXTENSION". These `export fn`s delegate
-// to src/column.zig (implementer-owned); the RED SEED there validates every
-// argument and synthesizes generation-0 unknown metadata but stores/publishes
-// nothing, so every behavioral column-config AC is RED while conformance
-// (layout + signature pins in contracts/api.zig) stays green. api/lesssheet.h
-// is APPENDED-to, byte-identical above the extension block (AC1).
+// Column metadata — additive column-metadata C ABI. See api/lesssheet.h
+// "COLUMN METADATA EXTENSION". These `export fn`s delegate to src/column.zig.
 // ===========================================================================
 
 const column = @import("column.zig");
@@ -1053,16 +1029,13 @@ pub export fn ls_column_conflict_example_copy(doc: *const api.Doc, col: u32, buf
 }
 
 // ===========================================================================
-// network-source slice (ARCH-network-source) — additive network-open C ABI
-// (ls_open_url_start / ls_net_open_poll / ls_net_open_cancel /
-// ls_net_open_release) + Zig-only test seams. See api/lesssheet.h "NETWORK
-// SOURCE EXTENSION" and src/net.zig. The C exports and Zig seams below are the
-// FROZEN entry points contracts/api.zig pins as `core.*`; src/net.zig holds the
-// job logic (SEED: validates scheme/options, then fails UNREACHABLE — no
-// transport wired). The instrumentation seams read DEFAULTED base.Document
-// net_* state, so a non-network document reports zero/false and every
-// transport-dependent AC is RED until the http_range Source is built + wired.
-// api/lesssheet.h is byte-identical above its appended block (AC2).
+// Network source — additive network-open C ABI (ls_open_url_start /
+// ls_net_open_poll / ls_net_open_cancel / ls_net_open_release) + Zig-only test
+// seams. See api/lesssheet.h "NETWORK SOURCE EXTENSION" and src/net.zig. The C
+// exports and Zig seams below are the FROZEN entry points contracts/api.zig
+// pins as `core.*`; src/net.zig holds the job logic. The instrumentation seams
+// read DEFAULTED base.Document net_* state, so a non-network document reports
+// zero/false.
 // ===========================================================================
 
 const net = @import("net.zig");
@@ -1095,13 +1068,13 @@ pub export fn ls_net_open_release(job: *api.NetOpenJob) callconv(.c) void {
 
 /// See contracts/api.zig `openUrlStartFake`: the injected-transport twin of
 /// ls_open_url_start (production uses std.http.Client; tests describe the
-/// transport with a NetFixture). SEED: ignores the fixture, fails UNREACHABLE.
+/// transport with a NetFixture).
 pub fn openUrlStartFake(fixture: *const api.NetFixture, url: [*]const u8, url_len: usize, options: ?*const api.OpenOptions) ?*api.NetOpenJob {
     const job = net.startJob(default_gpa, url, url_len, options, fixture) orelse return null;
     return @ptrCast(job);
 }
 
-/// See contracts/api.zig `netRangeMode` (AC3/AC4).
+/// See contracts/api.zig `netRangeMode`.
 pub fn netRangeMode(doc: *const api.Doc) api.NetRangeMode {
     return @enumFromInt(asDoc(doc).net_range_mode);
 }
@@ -1133,14 +1106,13 @@ pub fn netSpoolStore(doc: *const api.Doc) api.NetSpoolStore {
 pub fn netForceCacheBytes(doc: *api.Doc, n: u64) void {
     if (source_mod.netProviderOf(asDocMut(doc).source)) |hr| hr.setCacheCap(n);
 }
-/// See contracts/api.zig `netJobProbe` (AC8).
+/// See contracts/api.zig `netJobProbe`.
 pub fn netJobProbe(job: *const api.NetOpenJob) api.NetJobProbe {
     return net.jobProbe(@ptrCast(@alignCast(job)));
 }
 
-/// See contracts/api.zig `decideProbe` / `parseContentRangeTotal`
-/// (never-full-download-streaming AC17 unit seams). Re-exported from
-/// net_source so the pure probe classification is unit-testable without a
+/// See contracts/api.zig `decideProbe` / `parseContentRangeTotal`. Re-exported
+/// from net_source so the pure probe classification is unit-testable without a
 /// live HTTP server.
 pub const decideProbe = net_source.decideProbe;
 pub const parseContentRangeTotal = net_source.parseContentRangeTotal;

@@ -21,21 +21,14 @@ const structural_vec_len: usize = std.simd.suggestVectorLength(u8) orelse 0;
 /// THE structural-byte scan: the offset within `hay` of the first byte that can
 /// end a CSV field — `sep`, CR or LF — or null if `hay` contains none.
 ///
-/// ONE SOURCE FOR THE BYTE-WISE SCAN — and ONLY the byte-wise scan. Both of the
-/// codebase's byte-at-a-slice UTF-8 structural scans call this, and they are the
-/// only two callers:
-///   * `storeToStructural` below (the unquoted-field store, UTF-8 arm), and
-///   * the match-scan row loop in `csv_reader.matchMmapUtf8`.
-/// Both previously called `std.mem.findAny(u8, …, &.{ sep, '\r', '\n' })` —
-/// which in Zig 0.16 resolves to `findAnyPos` (`std/mem.zig`), a plain nested
-/// scalar loop: three compares plus a bounds check for every byte of the file.
-/// That it is NOT vectorized is easy to miss because `findScalarPos` — one
-/// needle, used by the quoted-field arm — sits 80 lines above it in the same
-/// file and IS vectorized, which is why only the three-needle scan was slow.
-/// (The two call sites also passed the needles in different ORDERS,
-/// `{sep,'\r','\n'}` vs `{sep,'\n','\r'}`; immaterial, because `findAnyPos`
-/// iterates positions outer and values inner so order cannot move the returned
-/// index — but one helper now makes that unable to drift at all.)
+/// ONE SOURCE FOR THE BYTE-WISE SCAN — and ONLY the byte-wise scan. Its only two
+/// callers are `storeToStructural` below (the unquoted-field store, UTF-8 arm)
+/// and the match-scan row loop in `csv_reader.matchMmapUtf8`. Do NOT go back to
+/// `std.mem.findAny(u8, …, &.{ sep, '\r', '\n' })`: in Zig 0.16 that resolves to
+/// `findAnyPos` (`std/mem.zig`), a plain nested scalar loop of three compares
+/// plus a bounds check for every byte of the file. That it is NOT vectorized is
+/// easy to miss because `findScalarPos` — one needle, used by the quoted-field
+/// arm — sits in the same std file and IS vectorized.
 ///
 /// WHAT DOES **NOT** ROUTE THROUGH HERE — a map, so the next reader does not
 /// mistake this for "all UTF-8 structural scanning". Editing this function does
@@ -64,11 +57,9 @@ const structural_vec_len: usize = std.simd.suggestVectorLength(u8) orelse 0;
 /// BUFFER SAFETY: reads only bytes inside `hay` (never one past it, not even
 /// speculatively — the block loop's `hay.len - i >= structural_vec_len` is
 /// exactly the condition for the `hay[i..][0..N]` load) and returns only an
-/// offset into `hay`. It holds no state across calls and keeps no pointer.
-/// No CURRENT caller is a streaming one (see the map above — the cursor family
-/// does not use this), so that is a property held in advance rather than one
-/// being relied on today: should a re-filling caller ever route here, a peek
-/// invalidating the slice `hay` pointed into cannot catch anything in here out.
+/// offset into `hay`. It holds no state across calls and keeps no pointer, so
+/// even a re-filling caller could not be caught out here by a peek invalidating
+/// the slice `hay` points into.
 pub fn findStructural(hay: []const u8, sep: u8) ?usize {
     var i: usize = 0;
     // Runs shorter than one block — every field of a typical narrow CSV — go
@@ -156,7 +147,7 @@ pub fn recordBounds(content: []const u8, pos: usize, sep: u8, quote: ?u8, limit:
 
 /// Count the fields of the record at `pos` (no decode, no alloc), scanning no
 /// further than `limit`. `quoted` reports whether any field opened with the
-/// quote byte (feeds the sniffer's "active quote" signal). Used by the sniffer.
+/// quote byte (feeds the sniffer's "active quote" signal).
 pub fn countFields(content: []const u8, pos: usize, sep: u8, quote: ?u8, limit: usize, encoding: u8) struct { count: u32, next: usize, quoted: bool } {
     var i = pos;
     var count: u32 = 0;
@@ -306,8 +297,8 @@ fn storeToStructural(
 /// record/field boundary is NEVER bounded by `cap` (only by `limit`), so a
 /// field longer than `cap` is still fully accounted for. `limit` bounds how
 /// many SOURCE bytes this call may look at (<= content.len); `capped` in the
-/// result mirrors `recordBounds`: record 1's O(head) bound (requirement 9)
-/// passes a real limit, every other caller passes content.len (unbounded).
+/// result mirrors `recordBounds`: record 1's O(head) bound passes a real limit,
+/// every other caller passes content.len (unbounded).
 ///
 /// `CellRef.truncated` is true iff the field's full transcoded content is
 /// longer than the bytes stored for it: `cap` cut it, or `limit` is an

@@ -1,4 +1,4 @@
-//! Search (find-seek slice) — the streaming match-scan with O(checkpoints)
+//! Search — the streaming match-scan with O(checkpoints)
 //! per-block counts, navigation over the counted region, and the shared
 //! scan-slot state machine (jump / search / filter priority is arbitrated by
 //! the worker in src/index.zig). See api/lesssheet.h SEARCH for the pinned
@@ -29,11 +29,11 @@ const SearchChunk = struct {
     end_pos: Pos,
     end_row: u64,
     eof: bool,
-    /// security-hardening (e) AC-e3: the chunk ended because the next bytes are
-    /// NOT PRESENT (a network short/failed range below the known end), not
-    /// because the source ended. Distinct from `eof` in every way that matters:
-    /// nothing is counted, the document is NOT complete, and the caller must
-    /// stop driving instead of re-entering on a zero-progress cursor.
+    /// The chunk ended because the next bytes are NOT PRESENT (a network
+    /// short/failed range below the known end), not because the source ended.
+    /// Distinct from `eof` in every way that matters: nothing is counted, the
+    /// document is NOT complete, and the caller must stop driving instead of
+    /// re-entering on a zero-progress cursor.
     stalled: bool = false,
     checkpoint: ?Checkpoint,
     matches: u64, // rows satisfying find (AND the filter, when one is active)
@@ -112,9 +112,9 @@ pub fn searchScanChunk(doc: *Document, start_pos: Pos, start_row: u64, filtered:
             reader_mod.readerMatchRowAtScanCursor(doc.reader, cur, doc.w_ctx, if (filtered) doc.wf_ctx else null)
         else
             reader_mod.readerMatchRow(doc.reader, doc.source, pos, doc.w_ctx, if (filtered) doc.wf_ctx else null, .{});
-        // security-hardening (e) AC-e3: bail BEFORE counting this row if it
-        // consumed no bytes (base.scanStalled) — the un-fetched tail must never
-        // be counted, matched against, or staged.
+        // Bail BEFORE counting this row if it consumed no bytes
+        // (base.scanStalled) — the un-fetched tail must never be counted,
+        // matched against, or staged.
         if (base.scanStalled(doc, pos, res.next)) {
             doc.endMatchScanIf(.search, generation);
             return .{ .end_pos = pos, .end_row = row, .eof = false, .stalled = true, .checkpoint = null, .matches = matches, .filter_matches = filter_matches };
@@ -150,12 +150,12 @@ pub fn searchScanChunk(doc: *Document, start_pos: Pos, start_row: u64, filtered:
     return .{ .end_pos = pos, .end_row = row, .eof = false, .checkpoint = .{ .row = row, .pos = pos }, .matches = matches, .filter_matches = filter_matches };
 }
 
-/// security-hardening (e) AC-e3: terminate a search whose chunk STALLED on
-/// un-fetched bytes (`SearchChunk.stalled`). Call this AFTER `resolveNavLocked`
-/// at every driver, so a navigation answerable within the rows that ARE present
-/// is served first and only a nav that needed the un-fetched tail resolves to
-/// NONE. Freezes counts exactly where the delivered bytes end; never marks the
-/// document complete or the total exact. Idempotent.
+/// Terminate a search whose chunk STALLED on un-fetched bytes
+/// (`SearchChunk.stalled`). Call this AFTER `resolveNavLocked` at every driver,
+/// so a navigation answerable within the rows that ARE present is served first
+/// and only a nav that needed the un-fetched tail resolves to NONE. Freezes
+/// counts exactly where the delivered bytes end; never marks the document
+/// complete or the total exact. Idempotent.
 pub fn finishStalledLocked(d: *Document) void {
     if (d.search_state == .scanning) failSearchLocked(d);
 }
@@ -206,9 +206,9 @@ pub fn commitSearch(doc: *Document, res: SearchChunk, filtered: bool) void {
         doc.frontier_rows = res.end_row;
         if (res.checkpoint) |cp| doc.checkpoints.appendAssumeCapacity(cp);
     }
-    // ARCH-huge-row-budget: fold this chunk's staged oversized-row checkpoints
-    // in IFF this chunk was the one advancing the frontier (same `advancing`
-    // that gates the sibling `checkpoints` append above).
+    // Fold this chunk's staged oversized-row checkpoints in IFF this chunk was
+    // the one advancing the frontier (same `advancing` that gates the sibling
+    // `checkpoints` append above).
     base.drainOversized(doc, advancing);
     if (res.eof) {
         doc.complete = true;
@@ -275,15 +275,14 @@ fn setExhausted(doc: *Document) void {
 }
 
 // ---------------------------------------------------------------------------
-// Budget gate for INLINE filtered-nav resolution (ARCH-window-budget criterion
-// 12: off-main only when synchronous resolution is not provably bounded).
-// Computed purely from checkpoint offsets + per-block match counts
-// (O(checkpoints), NO re-lex), it decides whether resolveNavLockedFiltered may
-// run on the calling thread. Normal/bounded rows fit -> inline (fv16, and the
-// ABI's "synchronous after LS_SEARCH_DONE" promise); a giant-row crossing whose
-// counted-block span exceeds window_budget_max_bytes does NOT -> defer off-main
-// (wb_ac11 / wb_ac12). This mirrors the unfiltered path, which resolves a single
-// bounded checkpoint block inline.
+// Budget gate for INLINE filtered-nav resolution: off-main only when
+// synchronous resolution is not provably bounded. Computed purely from
+// checkpoint offsets + per-block match counts (O(checkpoints), NO re-lex), it
+// decides whether resolveNavLockedFiltered may run on the calling thread.
+// Normal/bounded rows fit -> inline (the ABI's "synchronous after
+// LS_SEARCH_DONE" promise); a giant-row crossing whose counted-block span
+// exceeds window_budget_max_bytes does NOT -> defer off-main. This mirrors the
+// unfiltered path, which resolves a single bounded checkpoint block inline.
 // ---------------------------------------------------------------------------
 
 /// Source logical-byte offset at the START of counted checkpoint block `b`.
@@ -348,8 +347,8 @@ fn lastCombinedBlockTo(doc: *Document, upto_block: usize) ?usize {
 /// for BACKWARD), findForward/BackwardMatch re-lexes the anchor block, finds
 /// nothing on the wanted side, and WALKS INTO the next non-empty combined block
 /// (forward: beyond `lo`; backward: below `hi`) — which may hold a giant. The
-/// bound therefore extends to that walked-into block (wb_nav_walkpast), a safe
-/// over-defer that never under-bounds the real re-lex. O(1)/O(checkpoints)
+/// bound therefore extends to that walked-into block, a safe over-defer that
+/// never under-bounds the real re-lex. O(1)/O(checkpoints)
 /// early-exit cases (no anchor row yet, nothing before filtered index 0) re-lex
 /// nothing and always "fit". Caller holds the mutex.
 fn filteredNavFitsBudget(doc: *Document) bool {
@@ -396,10 +395,10 @@ pub fn resolveNavLocked(doc: *Document) void {
         // Filtered counted-region resolution can re-lex a checkpoint block that
         // may contain giant rows. Resolve INLINE when the block span the
         // resolution would re-lex fits the synchronous budget (the normal case:
-        // api/lesssheet.h "synchronous after LS_SEARCH_DONE" — fv16); defer to
-        // the off-main worker ONLY when a giant-row crossing would exceed it
-        // (wb_ac11 / wb_ac12). The no-worker degraded mode always resolves inline
-        // (its terminating synchronous fallback).
+        // api/lesssheet.h "synchronous after LS_SEARCH_DONE"); defer to the
+        // off-main worker ONLY when a giant-row crossing would exceed it. The
+        // no-worker degraded mode always resolves inline (its terminating
+        // synchronous fallback).
         if (doc.worker == null or filteredNavFitsBudget(doc)) resolveNavLockedFiltered(doc);
         return;
     }
@@ -697,9 +696,9 @@ pub fn startSearch(d: *Document, request: *const api.SearchRequest) bool {
     if (kind_i != 0 and kind_i != 1) return false;
     if (req.value_ptr == null and req.value_len != 0) return false;
     const value: []const u8 = if (req.value_ptr) |vp| vp[0..req.value_len] else &[_]u8{};
-    // Case folding is driven SOLELY by the request flag (smart-case retired):
-    // insensitive (case_sensitive == false) folds ASCII case for the TEXT
-    // substring and predicate EQ/NE; ordering predicates ignore it.
+    // Case folding is driven SOLELY by the request flag: insensitive
+    // (case_sensitive == false) folds ASCII case for the TEXT substring and
+    // predicate EQ/NE; ordering predicates ignore it.
     const fold = !req.case_sensitive;
     if (kind_i == 0) { // TEXT
         if (value.len == 0) return false; // empty query means "no search"
@@ -768,12 +767,12 @@ pub fn startSearch(d: *Document, request: *const api.SearchRequest) bool {
         d.unlock();
         return true;
     }
-    // never-full-download-streaming (TD7): a NETWORK search launches NO to-EOF
-    // match-scan. It parks immediately (CANCELLED, nothing scanned, to_eof
-    // false); each ls_search_nav then resumes it only as far as the next match
-    // via the existing CANCELLED-resume machinery, so the full match total M is
-    // never computed over the wire (total = the scanned-prefix count;
-    // total_exact only if a nav genuinely reaches EOF). LOCAL is unchanged.
+    // A NETWORK search launches NO to-EOF match-scan. It parks immediately
+    // (CANCELLED, nothing scanned, to_eof false); each ls_search_nav then
+    // resumes it only as far as the next match via the existing
+    // CANCELLED-resume machinery, so the full match total M is never computed
+    // over the wire (total = the scanned-prefix count; total_exact only if a
+    // nav genuinely reaches EOF). LOCAL is unchanged.
     if (d.net) {
         d.search_state = .cancelled;
         d.search_to_eof = false;
@@ -800,8 +799,8 @@ pub fn startSearch(d: *Document, request: *const api.SearchRequest) bool {
         const res = searchScanChunk(d, d.search_pos, d.search_rows, filtered, generation);
         commitSearch(d, res, filtered);
         resolveNavLocked(d);
-        // security-hardening (e) AC-e3: without this the stalled chunk makes no
-        // progress and the loop never exits (an unbounded hang holding the lock).
+        // Without this the stalled chunk makes no progress and the loop never
+        // exits (an unbounded hang holding the lock).
         if (res.stalled) finishStalledLocked(d);
     }
     d.unlock();
@@ -852,20 +851,20 @@ pub fn navSearch(d: *Document, anchor_row: u64, dir: api.SearchDir) void {
         if (d.worker != null) {
             d.wakeWorker();
         } else if (d.net) {
-            // never-full-download-streaming (TD7) + security-hardening (e) AC-e1:
-            // a NETWORK document must NOT run the degraded synchronous loop below.
-            // It calls searchScanChunk WHILE HOLDING THE DOCUMENT MUTEX, and that
-            // scan is *supposed* to touch absent bytes (it fetches to advance the
-            // frontier), so no commit-side guard can help: with `search_to_eof`
-            // false it still runs until the nav resolves, i.e. potentially to EOF,
-            // fetching over the wire with the mutex held — every poll, cancel and
-            // close blocked behind it, and "No full download, ever" broken. This
-            // arm is reachable whenever `base.Document.startWorker`'s
-            // `netIo().concurrent(...)` failed at open. Park exactly as
-            // `startSearch` (:768) and `filter.startFilter` (:427) already do for
-            // the same reason: the nav resolves to NONE and the search freezes at
-            // its last consistent state, which is a clean answer rather than a
-            // wedged document. LOCAL is byte-identical (d.net == false).
+            // A NETWORK document must NOT run the degraded synchronous loop
+            // below. It calls searchScanChunk WHILE HOLDING THE DOCUMENT MUTEX,
+            // and that scan is *supposed* to touch absent bytes (it fetches to
+            // advance the frontier), so no commit-side guard can help: with
+            // `search_to_eof` false it still runs until the nav resolves, i.e.
+            // potentially to EOF, fetching over the wire with the mutex held —
+            // every poll, cancel and close blocked behind it, and "No full
+            // download, ever" broken. This arm is reachable whenever
+            // `base.Document.startWorker`'s `netIo().concurrent(...)` failed at
+            // open. Park exactly as `startSearch` and the filter's own net-park
+            // already do, for the same reason: the nav resolves to NONE and the
+            // search freezes at its last consistent state, which is a clean
+            // answer rather than a wedged document. LOCAL is byte-identical
+            // (d.net == false).
             failSearchLocked(d);
         } else {
             // Degraded (no worker): scan synchronously until the nav resolves.
@@ -882,8 +881,8 @@ pub fn navSearch(d: *Document, anchor_row: u64, dir: api.SearchDir) void {
                 commitSearch(d, res, filtered);
                 resolveNavLocked(d);
                 if (d.search_state == .scanning and !d.search_to_eof and !d.nav_pending) d.search_state = .cancelled;
-                // security-hardening (e) AC-e3: as the startSearch degraded loop
-                // — a stalled chunk would otherwise never exit this loop.
+                // As the startSearch degraded loop: a stalled chunk would
+                // otherwise never exit this loop.
                 if (res.stalled) finishStalledLocked(d);
             }
         }

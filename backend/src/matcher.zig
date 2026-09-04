@@ -187,10 +187,6 @@ pub fn compareDecimal(a: Decimal, b: Decimal) Order {
     return if (a.negative) mag.invert() else mag;
 }
 
-// ---------------------------------------------------------------------------
-// The matcher (allocation-free per row; runs inside the scan loop).
-// ---------------------------------------------------------------------------
-
 pub fn asciiLower(b: u8) u8 {
     return if (b >= 'A' and b <= 'Z') b + 32 else b;
 }
@@ -226,11 +222,9 @@ fn buildFailure(gpa: std.mem.Allocator, query: []const u8) std.mem.Allocator.Err
 /// read afterwards — by the streaming scan (`StreamCell`), the per-cell verdict
 /// (`cellMatches`), the nav re-lex and the window highlight flags.
 ///
-/// Single source of truth for the derived artifacts: the KMP table used to be
-/// built at two request sites and the comparison Decimal re-parsed at two
-/// worker-snapshot sites. Now one struct owns them and every consumer reads it
-/// through `MatchCtx.q`, so a folded query and the table describing it cannot
-/// drift apart.
+/// Single source of truth for the derived artifacts: one struct owns them and
+/// every consumer reads it through `MatchCtx.q`, so a folded query and the
+/// table describing it cannot drift apart.
 ///
 /// The empty query (`.{}` / `empty`) is legal and means "matches" for TEXT —
 /// see `textMatch` and `StreamCell.init`.
@@ -629,9 +623,6 @@ pub const StreamCell = struct {
 /// >= 0x80 stays exact (asciiLower is identity outside 'A'..'Z' — and `q.folded`
 /// is byte-identical to `q.value` when not folding).
 fn bytesEqual(cell: []const u8, q: *const Query) bool {
-    // `folded` throughout, both paths: it IS `value` byte for byte when not
-    // folding, so naming both buffers here only invited the reader to look for
-    // a difference that does not exist.
     if (cell.len != q.folded.len) return false;
     if (!q.fold) return std.mem.eql(u8, cell, q.folded);
     for (cell, q.folded) |x, y| if (asciiLower(x) != y) return false;
@@ -647,8 +638,7 @@ fn bytesEqual(cell: []const u8, q: *const Query) bool {
 /// predicate, highlight flags) — deliberately still the naive scan, since it
 /// runs over one visible cell, not over the file. It reads the SAME
 /// `Query.folded` the scan reads, so the two cannot disagree about what the
-/// query is; `tools/fuzz` (`differential_stream_vs_cell`) pins that the two
-/// verdicts agree.
+/// query is, and the two verdicts must always agree.
 fn textMatch(cell: []const u8, q: *const Query) bool {
     const query = q.folded;
     if (query.len == 0) return true;
@@ -669,8 +659,8 @@ fn textMatch(cell: []const u8, q: *const Query) bool {
 /// Per-cell match verdict: does column `col`'s decoded cell bytes satisfy the
 /// active request `ctx`? This is the single per-column decision `matchRecord`
 /// (below) is composed from, exposed so `window.matchFlags`
-/// (ls_window_match_flags, thin-frontend-shared-core Phase 1) reports the EXACT
-/// same verdict per visible cell — no re-derived grammar, no second matcher.
+/// (ls_window_match_flags) reports the EXACT same verdict per visible cell —
+/// no re-derived grammar, no second matcher.
 ///   * TEXT: 1 iff `col` is IN SCOPE (empty scope_mask == all columns) AND the
 ///     smart-case substring rule holds; an out-of-scope column is always 0.
 ///   * PREDICATE: 1 only on the target `ctx.column` (every other column 0), and

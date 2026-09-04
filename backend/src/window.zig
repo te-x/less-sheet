@@ -71,12 +71,12 @@ fn appendRowMetadata(d: *Document, source_row: u64, pos: Pos, oversized: bool, b
     return true;
 }
 
-/// ARCH-security-hardening (g) AC-g1 — the SOURCE-FAULT GUARD bracket around the
-/// window re-lex. A window re-lexes source bytes BEHIND the frontier, which makes
-/// it the one FOREGROUND (UI-thread) reader that can touch a page whose file no
-/// longer has it. If the guard repaired a fault while `windowSetInner` ran, the
-/// rows it built came from zero-fill: serve NO rows rather than rows whose cells
-/// are empty or invented, and report the terminal truncated/faulted outcome.
+/// The SOURCE-FAULT GUARD bracket around the window re-lex. A window re-lexes
+/// source bytes BEHIND the frontier, which makes it the one FOREGROUND
+/// (UI-thread) reader that can touch a page whose file no longer has it. If the
+/// guard repaired a fault while `windowSetInner` ran, the rows it built came
+/// from zero-fill: serve NO rows rather than rows whose cells are empty or
+/// invented, and report the terminal truncated/faulted outcome.
 ///
 /// The comparison is against a fault count taken around THIS call, not a sticky
 /// "has ever faulted" flag — that is what lets a truncated document keep serving
@@ -95,17 +95,16 @@ pub fn windowSet(d: *Document, first_row: u64, row_count: u32) api.RowRange {
 /// See api/lesssheet.h `ls_window_set`. Never advances the frontier; re-lexes
 /// the requested rows (behind the frontier) from the nearest checkpoint into
 /// the owned window buffer. Changed requests evict; identical requests retain
-/// and extend their completed prefix. Every cell is
-/// decoded through the Reader (the document's resolved encoding) and
-/// display-capped to LS_CELL_MAX_BYTES (requirement 8). ARCH-huge-row-budget:
-/// the SOURCE bytes scanned per row are ALSO bounded to
+/// and extend their completed prefix. Every cell is decoded through the Reader
+/// (the document's resolved encoding) and display-capped to LS_CELL_MAX_BYTES.
+/// The SOURCE bytes scanned per row are ALSO bounded to
 /// `api.window_row_scan_max_bytes`, so this stays O(min(row bytes, cap) x
 /// rows) regardless of row size (see the materialize loop below).
 fn windowSetInner(d: *Document, first_row: u64, row_count: u32) api.RowRange {
-    // MATERIALIZATION EPOCH bump (thin-frontend-shared-core Phase 1): every
-    // ls_window_set invalidates the match-flags borrow (win_gen keys the memo),
-    // exactly like it invalidates the ls_cell borrow. Window-lane serialized
-    // with matchFlags, so no lock is needed for this counter itself.
+    // MATERIALIZATION EPOCH bump: every ls_window_set invalidates the
+    // match-flags borrow (win_gen keys the memo), exactly like it invalidates
+    // the ls_cell borrow. Window-lane serialized with matchFlags, so no lock is
+    // needed for this counter itself.
     d.win_gen +%= 1;
     d.window_charged_bytes = 0;
     const clamped: u64 = @min(@as(u64, row_count), @as(u64, api.window_max_rows));
@@ -137,7 +136,7 @@ fn windowSetInner(d: *Document, first_row: u64, row_count: u32) api.RowRange {
     // special case below is an identity-view-only edge case.
     if (filtered) return windowSetFiltered(d, first_row, clamped);
 
-    // BOUNDED RECORD 1 (requirement 9): when record 1 is ALSO data row 0
+    // BOUNDED RECORD 1: when record 1 is ALSO data row 0
     // (header off) and never terminated within the O(head) budget, its
     // bounded decode was pinned at open (see buildShape) because the
     // frontier never claims a row whose true extent past the budget is
@@ -233,20 +232,19 @@ fn windowSetInner(d: *Document, first_row: u64, row_count: u32) api.RowRange {
 /// then walks forward, testing candidate rows to serve up to `clamped`
 /// consecutive filtered rows.
 ///
-/// ARCH-huge-row-filtered: the per-candidate TEST lex is bounded to
-/// `api.window_row_scan_max_bytes` SOURCE bytes, exactly like windowSet's
-/// identity path above. A candidate whose terminator isn't found within the
-/// cap is OVERSIZED, and its FULL-cell match is NEVER re-decided here — that
-/// would mean either deciding on a bounded prefix (wrong: could drop a row
-/// that only matches in its tail) or re-lexing to its true end (the hang this
-/// bounds) — it is instead taken from `d.filter_oversized_matches`, the
-/// record the background filter-scan already staged for every oversized row
-/// it crossed (see filter.filterScanChunk / base.OversizedMatch). A matching
-/// oversized row is served as a bounded PREFIX (display-capped cells,
-/// `ls_row_oversized` true), same as the identity huge-row path; either way
-/// (matched or not) the walk advances past it via the checkpoint the
-/// frontier drops immediately after it (ARCH-huge-row-budget decision 2),
-/// never by re-scanning its remaining bytes. Holds the mutex for the whole
+/// The per-candidate TEST lex is bounded to `api.window_row_scan_max_bytes`
+/// SOURCE bytes, exactly like windowSet's identity path above. A candidate
+/// whose terminator isn't found within the cap is OVERSIZED, and its FULL-cell
+/// match is NEVER re-decided here — that would mean either deciding on a
+/// bounded prefix (wrong: could drop a row that only matches in its tail) or
+/// re-lexing to its true end (the hang this bounds) — it is instead taken from
+/// `d.filter_oversized_matches`, the record the background filter-scan already
+/// staged for every oversized row it crossed (see filter.filterScanChunk /
+/// base.OversizedMatch). A matching oversized row is served as a bounded
+/// PREFIX (display-capped cells, `ls_row_oversized` true), same as the identity
+/// huge-row path; either way (matched or not) the walk advances past it via the
+/// checkpoint the frontier drops immediately after it, never by re-scanning its
+/// remaining bytes. Holds the mutex for the whole
 /// call (bounded: O(checkpoints) + O(budget) re-lex) — simpler and still safe
 /// on the caller/UI thread; see api/lesssheet.h FILTERED VIEWS.
 fn windowSetFiltered(d: *Document, first_row: u64, clamped: u64) api.RowRange {
@@ -363,10 +361,10 @@ pub fn cell(d: *const Document, row: u64, col: u32) api.Str {
     return .{ .ptr = d.win_buf.items.ptr + ref.start, .len = ref.len };
 }
 
-/// See api/lesssheet.h `ls_window_match_flags` (MATCH-FLAGS EXTENSION,
-/// thin-frontend-shared-core Phase 1). ONE flag byte per cell (1 = matches the
-/// ACTIVE search request, 0 = not) over the materialized window's rows x the
-/// requested column range [first_col, first_col + col_count), row-major with
+/// See api/lesssheet.h `ls_window_match_flags` (MATCH-FLAGS EXTENSION). ONE
+/// flag byte per cell (1 = matches the ACTIVE search request, 0 = not) over the
+/// materialized window's rows x the requested column range [first_col,
+/// first_col + col_count), row-major with
 /// stride col_count and len == win_rows * col_count. The per-cell verdict is
 /// `matcher.cellMatches` — the SAME decision `matchRecord` (and thus ls_search_*)
 /// is composed from — evaluated over the cell bytes AS MATERIALIZED IN THE
@@ -388,8 +386,7 @@ pub fn cell(d: *const Document, row: u64, col: u32) api.Str {
 /// ls_search_start mid-compute; win_buf/win_refs are window-lane state the
 /// caller already serializes with this call.
 pub fn matchFlags(d: *Document, first_col: u32, col_count: u32) api.Str {
-    // Empty / out-of-range column range -> empty ls_str (never fails). Widen to
-    // u64 so first_col + col_count can't wrap.
+    // Widen to u64 so first_col + col_count can't wrap.
     if (col_count == 0 or first_col >= d.column_count or
         @as(u64, first_col) + @as(u64, col_count) > d.column_count)
         return empty_str;
@@ -397,13 +394,11 @@ pub fn matchFlags(d: *Document, first_col: u32, col_count: u32) api.Str {
     d.lock();
     defer d.unlock();
 
-    // IDLE (no search since open, or after a reset) -> no highlights.
     if (d.search_state == .idle) return empty_str;
     const search_gen = d.search_gen;
 
     const total: usize = @intCast(d.win_rows * @as(u64, col_count));
 
-    // Memo hit: same window epoch, same search, same requested range.
     if (!(d.mf_valid and d.mf_win_gen == d.win_gen and d.mf_search_gen == search_gen and
         d.mf_first_col == first_col and d.mf_col_count == col_count))
     {
@@ -480,11 +475,8 @@ pub fn sourceRow(d: *const Document, row: u64) u64 {
 
 /// See api/lesssheet.h `ls_row_oversized`. Same window/borrow domain as ls_cell
 /// / sourceRow (win_oversized[i] is populated by ls_window_set alongside
-/// win_refs/win_source — ARCH-huge-row-budget / ARCH-huge-row-filtered).
-/// Populated identically in either view: windowSet (identity) appends one
-/// entry per materialized row, and windowSetFiltered (FILTERED VIEWS) does
-/// too — including for a giant matching row served as a bounded prefix (true)
-/// — so this reports the real per-row signal in both coordinate spaces.
+/// win_refs/win_source), in BOTH coordinate spaces — including for a giant
+/// matching row the filtered view serves as a bounded prefix (true).
 /// Total function; ZERO allocation; never fails; never scans.
 pub fn rowOversized(d: *const Document, row: u64) bool {
     if (row < d.win_first or row >= d.win_first + d.win_rows) return false;
@@ -493,39 +485,35 @@ pub fn rowOversized(d: *const Document, row: u64) bool {
     return d.win_oversized.items[idx];
 }
 
-/// ARCH-stream-copy FR3: a forward gap beyond this many rows is "implausibly
-/// large vs a checkpoint seek": a FRESH checkpoint lookup is bounded to ~one
-/// checkpoint interval, so beyond this gap re-anchoring there is guaranteed
-/// at least as cheap as stepping the cursor forward row-by-row — re-anchor
-/// instead (never slower than today, for any access pattern). Reuses the
-/// existing checkpoint spacing constant verbatim; NOT a new runtime tunable
-/// (the planner rejected a per-document interval knob — see the hand-off).
+/// A forward gap beyond this many rows is "implausibly large vs a checkpoint
+/// seek": a FRESH checkpoint lookup is bounded to ~one checkpoint interval, so
+/// beyond this gap re-anchoring there is guaranteed at least as cheap as
+/// stepping the cursor forward row-by-row — re-anchor instead (never slower,
+/// for any access pattern). Reuses the existing checkpoint spacing constant
+/// verbatim; NOT a separate runtime tunable.
 const copy_reanchor_gap_max: u64 = base.checkpoint_interval;
 
-/// ARCH-stream-copy FR1/FR3 (identity): the intended monotonic access
-/// pattern (TSVCopyBuilder: row-major, so consecutive `cellCopy` calls have
-/// `row - copy_cursor_row` == 0 -- another column of the same row -- or 1 --
-/// the next row) is trusted to use the cursor UNCONDITIONALLY, without
-/// comparing it to a fresh checkpoint: a checkpoint can beat it by at most
-/// the single row it would otherwise step, so this keeps the well-known
-/// exact "N-1 advances for an N-row row-major sweep" cost (sc3) — no "free"
-/// checkpoint-aligned shortcuts. A LARGER gap is never produced by that
-/// pattern, so it is NOT trusted blindly (review finding A) — see
-/// `cellCopy`, which compares it against a fresh `bestCheckpoint(row)` and
-/// uses whichever starts closer, for a PROVABLE never-slower-than-today
-/// guarantee on any gap, not just a small one.
+/// The intended monotonic access pattern (row-major, so consecutive `cellCopy`
+/// calls have `row - copy_cursor_row` == 0 -- another column of the same row --
+/// or 1 -- the next row) is trusted to use the cursor UNCONDITIONALLY, without
+/// comparing it to a fresh checkpoint: a checkpoint can beat it by at most the
+/// single row it would otherwise step, so this keeps the exact "N-1 advances
+/// for an N-row row-major sweep" cost — no "free" checkpoint-aligned shortcuts.
+/// A LARGER gap is never produced by that pattern, so it is NOT trusted blindly
+/// — see `cellCopy`, which compares it against a fresh `bestCheckpoint(row)`
+/// and uses whichever starts closer, for a PROVABLE never-slower guarantee on
+/// any gap, not just a small one.
 const copy_cursor_trust_gap_max: u64 = 1;
 
-/// TODAY'S locate-from-scratch skip: from (`from_row`,`from_pos`) — a
-/// checkpoint obtained fresh for the FINAL target `row` — up to `row`,
-/// counting one source-row-advance per step into `d.copy_advances` (via
-/// `advances`). Used both as the cursor-OFF reference/baseline (AC1/AC3/AC5)
-/// and as the cursor's own re-anchor fallback (FR3): SAFE by construction —
-/// an unbounded `boundsAfter` here never actually crosses an oversized row's
-/// bytes, because a FRESH `nav.bestCheckpoint(row)` never has an oversized
-/// row strictly between `from_row` and `row` (its maximality guarantees any
-/// oversized row in range would itself have produced a closer/bigger
-/// checkpoint) — identical reasoning to windowSet's own skip loop.
+/// The locate-from-scratch skip: from (`from_row`,`from_pos`) — a checkpoint
+/// obtained fresh for the FINAL target `row` — up to `row`, counting one
+/// source-row-advance per step into `d.copy_advances` (via `advances`). SAFE by
+/// construction — an unbounded `boundsAfter` here never actually crosses an
+/// oversized row's bytes, because a FRESH `nav.bestCheckpoint(row)` never has
+/// an oversized row strictly between `from_row` and `row` (its maximality
+/// guarantees any oversized row in range would itself have produced a
+/// closer/bigger checkpoint) — identical reasoning to windowSet's own skip
+/// loop.
 fn skipFromCheckpoint(d: *Document, from_row: u64, from_pos: Pos, row: u64, advances: *u64) Pos {
     var pos = from_pos;
     var r = from_row;
@@ -536,17 +524,16 @@ fn skipFromCheckpoint(d: *Document, from_row: u64, from_pos: Pos, row: u64, adva
     return pos;
 }
 
-/// ARCH-stream-copy FR1: resume the identity copy cursor forward from
-/// (`from_row`,`from_pos`) up to `row`, counting one source-row-advance per
-/// step. Unlike `skipFromCheckpoint`, `from_row` is a STALE position (not
-/// freshly anchored against `row`), so it may itself sit on an oversized row:
-/// each step is bounded to the per-row window-scan cap and, when capped
-/// (oversized), skips forward via the checkpoint the frontier already
-/// dropped immediately after it (ARCH-huge-row-budget decision 2) instead of
-/// re-scanning its remaining bytes — never crossing an oversized row's
-/// bytes, exactly like windowSet's own oversized recovery. `row == from_row`
-/// runs zero iterations: the "another column of the same row" case costs
-/// zero advances.
+/// Resume the identity copy cursor forward from (`from_row`,`from_pos`) up to
+/// `row`, counting one source-row-advance per step. Unlike
+/// `skipFromCheckpoint`, `from_row` is a STALE position (not freshly anchored
+/// against `row`), so it may itself sit on an oversized row: each step is
+/// bounded to the per-row window-scan cap and, when capped (oversized), skips
+/// forward via the checkpoint the frontier already dropped immediately after it
+/// instead of re-scanning its remaining bytes — never crossing an oversized
+/// row's bytes, exactly like windowSet's own oversized recovery.
+/// `row == from_row` runs zero iterations: the "another column of the same row"
+/// case costs zero advances.
 fn advanceCursorForward(d: *Document, from_row: u64, from_pos: Pos, row: u64, advances: *u64) Pos {
     var pos = from_pos;
     var r = from_row;
@@ -572,8 +559,8 @@ fn advanceCursorForward(d: *Document, from_row: u64, from_pos: Pos, row: u64, ad
 /// LOSSLESS full-cell read. Poll/control lane: never touches or evicts the
 /// materialized window (win_buf/win_refs/win_first/win_rows are untouched
 /// throughout — the read COPIES into the caller's buffer, so its output is
-/// unaffected by a later ls_window_set, on any thread — the cc4 no-borrow
-/// test pins this) and never scans or advances the frontier.
+/// unaffected by a later ls_window_set, on any thread) and never scans or
+/// advances the frontier.
 ///
 ///   * NO_CELL when `d.column_count == 0` or `col >= d.column_count`
 ///     (checked first, independent of `row`); else `row` at/beyond an EXACT
@@ -588,20 +575,19 @@ fn advanceCursorForward(d: *Document, from_row: u64, from_pos: Pos, row: u64, ad
 ///     pathologically "oversized" from its very first byte, so
 ///     `decodeCellAt` below naturally bounds it exactly like any other
 ///     oversized row). A filtered view defers entirely to
-///     `cellCopyFiltered`. Otherwise (ARCH-stream-copy): when the forward
-///     COPY CURSOR (`d.copy_cursor_*` on `Document`) is enabled, tagged for
-///     THIS view + filter generation, and `row` is at/ahead of it by a
-///     plausible gap, `advanceCursorForward` resumes from the cursor's last
-///     position — zero checkpoint lookups, zero advances for another column
-///     of the same row. Otherwise `nav.bestCheckpoint` (by value, under
-///     `d.lock()`) plus `skipFromCheckpoint` locate `row` exactly like
-///     today — never crosses an oversized row's bytes, for the same reason:
-///     `row < avail_end` guarantees any oversized row before it was already
-///     scanned, so `bestCheckpoint` already lands past it. This is both the
-///     cursor-OFF REFERENCE (AC1) and the cursor's own re-anchor fallback
-///     (FR3) — byte-identical either way, only the locate cost differs. A
-///     `row` at/beyond the frontier (and not pinned) is PENDING: its
-///     position isn't known yet.
+///     `cellCopyFiltered`. Otherwise: when the forward COPY CURSOR
+///     (`d.copy_cursor_*` on `Document`) is enabled, tagged for THIS view +
+///     filter generation, and `row` is at/ahead of it by a plausible gap,
+///     `advanceCursorForward` resumes from the cursor's last position — zero
+///     checkpoint lookups, zero advances for another column of the same row.
+///     Otherwise `nav.bestCheckpoint` (by value, under `d.lock()`) plus
+///     `skipFromCheckpoint` locate `row` — never crosses an oversized row's
+///     bytes, for the same reason: `row < avail_end` guarantees any oversized
+///     row before it was already scanned, so `bestCheckpoint` already lands
+///     past it. This is both the cursor-OFF REFERENCE and the cursor's own
+///     re-anchor fallback — byte-identical either way, only the locate cost
+///     differs. A `row` at/beyond the frontier (and not pinned) is PENDING:
+///     its position isn't known yet.
 ///   * `decodeCellAt` (below) then decodes ONLY column `col` from that
 ///     position — never the rest of the row — bounded to the SAME per-row
 ///     SOURCE cap `windowSet` uses (`api.window_row_scan_max_bytes`) and to
@@ -610,9 +596,9 @@ fn advanceCursorForward(d: *Document, from_row: u64, from_pos: Pos, row: u64, ad
 ///     (possibly empty or bounded) cell. ZERO heap allocation on this path
 ///     (`Reader.cell`); the filtered path's use of the shared `nav_scratch`
 ///     re-lex scratch is the one exception, mirroring `windowSetFiltered`.
-/// ARCH-security-hardening (g) AC-g1 — the SOURCE-FAULT GUARD bracket for the
-/// copy cursor, which re-lexes source bytes of its own and so could otherwise put
-/// the guard's zero-fill on the user's CLIPBOARD.
+/// The SOURCE-FAULT GUARD bracket for the copy cursor, which re-lexes source
+/// bytes of its own and so could otherwise put the guard's zero-fill on the
+/// user's CLIPBOARD.
 ///
 /// Deliberately NOT wrapped around `cellCopy` itself: the streaming job calls that
 /// once per CELL, and two atomic loads per cell is a measurable tax on a
@@ -634,12 +620,13 @@ pub fn cellCopy(d: *Document, row: u64, col: u32, buf: ?[*]u8, buf_len: usize, o
     out_truncated.* = false;
     if (d.column_count == 0 or col >= d.column_count) return .no_cell;
 
-    // FILTER DISPATCH UNDER THE LOCK. `filter_state` is mutated by `ls_filter_set`
-    // on another thread, so reading it here unsynchronized was both a data race and
-    // a TOCTOU: a filter landing between the read and the work would serve an
-    // IDENTITY row index as a FILTERED coordinate (or the reverse) — the wrong cell,
-    // reported `.ok`. ONE acquisition now covers the decision AND the work it
-    // selects, which is why the filtered path is `*Locked`.
+    // FILTER DISPATCH UNDER THE LOCK. `filter_state` is mutated by
+    // `ls_filter_set` on another thread, so reading it unsynchronized is both a
+    // data race and a TOCTOU: a filter landing between the read and the work
+    // would serve an IDENTITY row index as a FILTERED coordinate (or the
+    // reverse) — the wrong cell, reported `.ok`. ONE acquisition covers the
+    // decision AND the work it selects, which is why the filtered path is
+    // `*Locked`.
     d.lock();
     if (d.filter_state != .idle) {
         defer d.unlock();
@@ -664,17 +651,16 @@ pub fn cellCopy(d: *Document, row: u64, col: u32, buf: ?[*]u8, buf_len: usize, o
         return if (exact) .no_cell else .pending;
     }
 
-    // ARCH-stream-copy FR1/FR3 (see copy_cursor_trust_gap_max's comment): the
-    // cursor applies when it's enabled, tagged for THIS view + filter
-    // generation, and forward of `row`. Within the intended monotonic gap
-    // (<=1) it is trusted unconditionally (no checkpoint lookup at all,
-    // preserving the exact row-major N-1 cost). Beyond that, a fresh
-    // `bestCheckpoint(row)` is compared: the cursor is used only if it
-    // starts at/after the checkpoint (`copy_cursor_row >= cp.row`), so
-    // `row - copy_cursor_row <= row - cp.row` — provably never costlier than
-    // today's from-scratch locate, for ANY forward gap (review finding
-    // A: e.g. a cursor at row 100 asked for row 2048, where the checkpoint
-    // alone reaches row 2048 in zero steps).
+    // See copy_cursor_trust_gap_max's comment: the cursor applies when it's
+    // enabled, tagged for THIS view + filter generation, and forward of `row`.
+    // Within the intended monotonic gap (<=1) it is trusted unconditionally (no
+    // checkpoint lookup at all, preserving the exact row-major N-1 cost).
+    // Beyond that, a fresh `bestCheckpoint(row)` is compared: the cursor is
+    // used only if it starts at/after the checkpoint (`copy_cursor_row >=
+    // cp.row`), so `row - copy_cursor_row <= row - cp.row` — provably never
+    // costlier than a from-scratch locate, for ANY forward gap (e.g. a cursor
+    // at row 100 asked for row 2048, where the checkpoint alone reaches row
+    // 2048 in zero steps).
     const cursor_forward = d.copy_cursor_enabled and d.copy_cursor_valid and
         d.copy_cursor_view == .identity and d.copy_cursor_gen == d.filter_gen and
         row >= d.copy_cursor_row;
@@ -737,25 +723,24 @@ pub fn cellCopy(d: *Document, row: u64, col: u32, buf: ?[*]u8, buf_len: usize, o
 
 /// `ls_cell_copy` while a filter is active (FILTERED VIEWS): locate FILTERED
 /// index `row`'s ORIGINAL row/position then decode column `col` from there,
-/// exactly like the identity path. ARCH-stream-copy FR2/FR3: when the
-/// forward copy cursor is enabled, tagged `.filtered` for the ACTIVE filter
-/// generation, `row` sits at/ahead of it by a plausible gap, AND a plain
-/// `filter_block_counts` lookup (O(1), no re-lex) proves the target still
-/// falls within the cursor's OWN block, `nav.nthMatchForwardFrom` resumes the
-/// match-walk from the cursor's last match — provably no costlier than a
-/// fresh locate for the same row (it starts further along, inside the SAME
-/// block a cold locate would relex from its start), so this is NEVER a
-/// forward-attempt-plus-cold-locate double pay, for ANY match distribution
-/// (review finding 2: a clustered/sparse filter must not cost more
-/// than the baseline). Zero advances for another column of the same filtered
-/// row. Otherwise (no usable cursor, OR the target spills past the cursor's
-/// block — decided WITHOUT ever starting a doomed row-walk)
-/// `nav.nthMatchLocationCounted` — O(checkpoints) + a bounded in-block
-/// re-lex, the same machinery `windowSetFiltered` uses — is both the
-/// cursor-OFF reference (AC2) and the re-anchor fallback (FR3). Runs with the
-/// Document mutex HELD by `cellCopy` for the whole call (bounded either way),
-/// mirroring `windowSetFiltered` — the caller acquires it BEFORE deciding this is
-/// the filtered path, so the decision and the work cannot straddle an
+/// exactly like the identity path. When the forward copy cursor is enabled,
+/// tagged `.filtered` for the ACTIVE filter generation, `row` sits at/ahead of
+/// it by a plausible gap, AND a plain `filter_block_counts` lookup (O(1), no
+/// re-lex) proves the target still falls within the cursor's OWN block,
+/// `nav.nthMatchForwardFrom` resumes the match-walk from the cursor's last
+/// match — provably no costlier than a fresh locate for the same row (it starts
+/// further along, inside the SAME block a cold locate would relex from its
+/// start), so this is NEVER a forward-attempt-plus-cold-locate double pay, for
+/// ANY match distribution (a clustered or sparse filter must not cost more than
+/// the baseline). Zero advances for another column of the same filtered row.
+/// Otherwise (no usable cursor, OR the target spills past the cursor's block —
+/// decided WITHOUT ever starting a doomed row-walk)
+/// `nav.nthMatchLocationCounted` — O(checkpoints) + a bounded in-block re-lex,
+/// the same machinery `windowSetFiltered` uses — is both the cursor-OFF
+/// reference and the re-anchor fallback. Runs with the Document mutex HELD by
+/// `cellCopy` for the whole call (bounded either way), mirroring
+/// `windowSetFiltered` — the caller acquires it BEFORE deciding this is the
+/// filtered path, so the decision and the work cannot straddle an
 /// `ls_filter_set`.
 fn cellCopyFilteredLocked(d: *Document, row: u64, col: u32, buf: ?[*]u8, buf_len: usize, out_len: *usize, out_truncated: *bool) api.CopyResult {
     if (row >= d.filter_total) return if (d.filter_state == .done) .no_cell else .pending;
@@ -801,8 +786,8 @@ fn cellCopyFilteredLocked(d: *Document, row: u64, col: u32, buf: ?[*]u8, buf_len
             // locate below (never a wrong NO_CELL).
         } else {
             // Target spills past the cursor's block: RESUME the cross-block
-            // cumulative scan from `from_block` (review finding B)
-            // instead of re-walking `filter_block_counts` from block 0 --
+            // cumulative scan from `from_block` instead of re-walking
+            // `filter_block_counts` from block 0 --
             // otherwise a monotonic sparse-filter sweep (~1 match/block) pays
             // O(blocks) EVERY step it crosses a block, O(blocks x matches)
             // total. `cum_before` (matches counted in blocks [0, from_block))
@@ -862,18 +847,18 @@ fn decodeCellAt(d: *Document, pos: Pos, col: u32, buf: ?[*]u8, buf_len: usize, o
     const res = d.reader.cell(d.source, pos, col, row_limit, buf, buf_len);
     out_len.* = res.len;
     out_truncated.* = res.truncated;
-    // security-hardening (f): neutralize a formula-injection lead byte on the
-    // COPY output only. This is THE single choke point for every copy path
-    // (identity / filtered / pinned-record-1, and the streaming ls_copy_next
-    // sweep via readCell -> window.cellCopy), so it applies once, uniformly,
-    // and BEFORE any TSV framing/quoting. Display (ls_cell) and search/filter
-    // never reach here, so they keep the RAW bytes (sec_f3 scope guard).
+    // Neutralize a formula-injection lead byte on the COPY output only. This is
+    // THE single choke point for every copy path (identity / filtered /
+    // pinned-record-1, and the streaming ls_copy_next sweep via readCell ->
+    // window.cellCopy), so it applies once, uniformly, and BEFORE any TSV
+    // framing/quoting. Display (ls_cell) and search/filter never reach here, so
+    // they keep the RAW bytes.
     neutralizeCopyCell(buf, buf_len, out_len, out_truncated);
     return .ok;
 }
 
-/// security-hardening (f) AC-f1: the NUMBER-AWARE copy formula-injection
-/// decision (single source of truth; every copy path shares it). Keyed on the
+/// The NUMBER-AWARE copy formula-injection decision (single source of truth;
+/// every copy path shares it). Keyed on the
 /// COPIED cell value's first byte:
 ///   - `=` (0x3D) / `@` (0x40): ALWAYS neutralized.
 ///   - `+` (0x2B) / `-` (0x2D): neutralized ONLY when the value is NOT a plain
@@ -891,10 +876,10 @@ fn copyCellNeutralizes(value: []const u8, truncated: bool) bool {
     };
 }
 
-/// security-hardening (f) AC-f1: the plain-number grammar, DELIBERATELY stricter
-/// than the header/matcher numeric grammar (which trims whitespace and admits a
-/// bare leading/trailing `.`) — reusing that here would UNDER-neutralize `-.5` /
-/// `-3.`. `value` starts with the single leading `+`/`-` (the only callers);
+/// The plain-number grammar, DELIBERATELY stricter than the header/matcher
+/// numeric grammar (which trims whitespace and admits a bare leading/trailing
+/// `.`) — reusing that here would UNDER-neutralize `-.5` / `-3.`. `value`
+/// starts with the single leading `+`/`-` (the only callers);
 /// after consuming it, the ENTIRE remainder must match
 ///     digit+ ( '.' digit+ )? ( ('e'|'E') ('+'|'-')? digit+ )?
 /// with `digit` = ASCII 0-9 and the match consuming every remaining byte (no
@@ -903,18 +888,15 @@ fn isPlainNumber(value: []const u8) bool {
     const rest = value[1..]; // drop the single leading sign
     const n = rest.len;
     var i: usize = 0;
-    // digit+ (integer part, at least one digit)
     const int_start = i;
     while (i < n and asciiDigit(rest[i])) i += 1;
     if (i == int_start) return false;
-    // optional ( '.' digit+ )
     if (i < n and rest[i] == '.') {
         i += 1;
         const frac_start = i;
         while (i < n and asciiDigit(rest[i])) i += 1;
         if (i == frac_start) return false; // a dot needs >= 1 fractional digit
     }
-    // optional ( ('e'|'E') ('+'|'-')? digit+ )
     if (i < n and (rest[i] == 'e' or rest[i] == 'E')) {
         i += 1;
         if (i < n and (rest[i] == '+' or rest[i] == '-')) i += 1;
