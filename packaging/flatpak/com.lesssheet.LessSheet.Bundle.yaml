@@ -67,14 +67,14 @@ modules:
       # everything in.
       - type: archive
         only-arches: [x86_64]
-        url: https://github.com/te-x/less-sheet/releases/download/v0.1.1/less-sheet-0.1.1-linux-x86_64.tar.gz
-        sha256: fb6a645434cfe58f141cef324e83abe31b0237dda99903ee9de2395725e01eee
+        url: https://github.com/te-x/less-sheet/releases/download/v0.1.2/less-sheet-0.1.2-linux-x86_64.tar.gz
+        sha256: 55e04dd2e3f4078fdb3c9ae52599f7c1defee64a75e2f2a5df316857f52af795
         strip-components: 1
 
       - type: archive
         only-arches: [aarch64]
-        url: https://github.com/te-x/less-sheet/releases/download/v0.1.1/less-sheet-0.1.1-linux-aarch64.tar.gz
-        sha256: 53943c479dcba779402c7daf1df820b31db1c01c4b2fe4606e7204e4329a70d8
+        url: https://github.com/te-x/less-sheet/releases/download/v0.1.2/less-sheet-0.1.2-linux-aarch64.tar.gz
+        sha256: b99b0cb9b2267b26083031cf0d8f99dcc7a68c928ebb2ae2a11e6ecbbc8d65a4
         strip-components: 1
 
       # Shared with the other manifest and with the plain tarball — one
