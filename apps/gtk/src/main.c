@@ -1615,9 +1615,11 @@ prefetch_discard (App *app)
     {
       g_thread_join (app->prefetch_thread);
       app->prefetch_thread = NULL;
-      g_clear_pointer (&app->prefetch_sample, lsg_window_free);
-      g_clear_pointer (&app->prefetch_doc, lsg_document_close);
     }
+  /* Leaf before root: the sample window goes before the document it came
+   * from, whether or not a thread was still running. */
+  g_clear_pointer (&app->prefetch_sample, lsg_window_free);
+  g_clear_pointer (&app->prefetch_doc, lsg_document_close);
   g_clear_pointer (&app->prefetch_path, g_free);
 }
 
@@ -7873,11 +7875,11 @@ main (int argc, char *argv[])
   app.find_nav_direction = LSG_SEARCH_FORWARD;
   app.jump = lsg_jump_initial ();
   app.filter = lsg_filter_initial ();
-  /* Data cells are MONOSPACE: a uniform advance is what makes the O(1) column
-   * width arithmetic accurate. Headers and all chrome stay sans-serif. */
   /* Before gtk_init/adw_init (they run inside g_application_run): the whole
    * point is to overlap the core open with the toolkit's own start-up. */
   prefetch_start (&app, argc, argv);
+  /* Data cells are MONOSPACE: a uniform advance is what makes the O(1) column
+   * width arithmetic accurate. Headers and all chrome stay sans-serif. */
   app.font_desc = pango_font_description_from_string ("Monospace 10");
   app.header_font_desc = pango_font_description_from_string ("Sans Bold 10");
   app.gutter_font_desc = pango_font_description_from_string ("Sans 10");
