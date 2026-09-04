@@ -114,15 +114,19 @@ gh release create "$TAG" --repo "$RELEASE_REPO" \
 # ------------------------------------------------------------------ flatpak --
 # Built here because flatpak-builder does not run on macOS. It uses the BUNDLE
 # manifest: a .flatpak cannot carry extra-data (see packaging/flatpak/README.md),
-# so the payload is embedded. It downloads that payload from the release we just
-# published, which is why this runs after it and not before.
+# so the payload is embedded. The manifest names the release URL of the tarball,
+# but --extra-sources points flatpak-builder at the local dist/ copy first: same
+# file, same digest, and the build does not register as a download of the
+# asset (the release counts stay meaningful). It runs after the release exists
+# so a fallback fetch, if the local copy were missing, would still succeed.
 if command -v flatpak-builder >/dev/null; then
     say "building the Flatpak bundle"
     ARCH="$(uname -m)"
     BUNDLE="less-sheet-$VER-$ARCH.flatpak"
+    DIST_ABS="$PWD/dist"
     ( cd "$FLATPAK_DIR" \
       && flatpak-builder --force-clean --repo=repo-bundle bundle-dir \
-           com.lesssheet.LessSheet.Bundle.yaml \
+           --extra-sources="$DIST_ABS" com.lesssheet.LessSheet.Bundle.yaml \
       && flatpak build-bundle repo-bundle "$BUNDLE" com.lesssheet.LessSheet ) \
       || die "the Flatpak bundle failed to build"
     gh release upload "$TAG" --repo "$RELEASE_REPO" "$FLATPAK_DIR/$BUNDLE" \
