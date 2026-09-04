@@ -139,7 +139,7 @@ if [ -d "$TAP_DIR/Casks" ] && [ -f dist/less-sheet.rb ]; then
     say "updating the Homebrew tap"
     cp dist/less-sheet.rb "$TAP_DIR/Casks/less-sheet.rb"
     ( cd "$TAP_DIR" && git add Casks/less-sheet.rb \
-      && git commit -q -m "less-sheet $VER" && git push ) \
+      && TZ=UTC git commit -q -m "less-sheet $VER" && git push ) \
       || die "the tap did not update — brew still serves the previous version"
     echo "  tap now serves $VER"
 else

@@ -85,12 +85,12 @@ python3 tools/release/stamp --from "$HAVE" --to "$WANT"
 # ------------------------------------------------------------------- commit --
 say "committing + tagging"
 git add -A
-git commit -q -m "release $WANT
+TZ=UTC git commit -q -m "release $WANT
 
 Artifacts built and verified by running. Version stamped across the release
 surface (download links, Flatpak manifests, metainfo changelog) and checked
 for survivors of $HAVE."
-git tag -a "$TAG" -m "less-sheet $WANT"
+TZ=UTC git tag -a "$TAG" -m "less-sheet $WANT"
 echo "  $(git rev-parse --short HEAD)  tagged $TAG"
 
 # ---------------------------------------------------------------------- next --
