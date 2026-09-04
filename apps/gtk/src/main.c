@@ -78,6 +78,9 @@
 #define COPY_BUDGET_BYTES (64u * 1024u * 1024u)
 /* Per-pull chunk the copy worker frames. */
 #define COPY_CHUNK_BYTES (1u << 16)
+/* GObject data key carrying a dialect button's kind, so the ONE create-popup
+ * callback can serve both the separator and the quote dropdown. */
+#define DIALECT_KIND_KEY "lsg-kind"
 /* GSK renderer this app asks for when the environment does not name one — the
  * ONE place the default lives. The grid is painted with Cairo and Pango
  * whatever GSK does afterwards, so a GPU renderer only uploads and composites
@@ -530,6 +533,18 @@ static void open_jump_with_digit (App *app, char digit);
  * (Ctrl+G / Ctrl+L) calls it. */
 static void open_jump (App *app);
 
+/* Deferred chrome. Nothing below is on the first frame's path, so each one is
+ * built the first time something asks for it — a GtkMenuButton create-popup
+ * func for the four popovers and the menu, an explicit ensure for the two
+ * status pages and for the code paths that touch popover widgets without
+ * popping the button up (a digit typed on the grid, the capture harness).
+ * Every widget pointer they set is NULL-guarded at its use sites already,
+ * because the window teardown NULLs them all, so "not built yet" reads exactly
+ * like "window gone" everywhere else. */
+static void find_popover_ensure (App *app);
+static void jump_popover_ensure (App *app);
+static void error_page_ensure (App *app);
+
 /* Defined with the settings region below `ensure_window`; called from
  * `open_document`, the single post-adoption choke point for BOTH the local and
  * the network re-open. */
@@ -629,6 +644,9 @@ title_set_status (App *app, const char *text)
 static void
 show_error (App *app, const char *title, const char *description)
 {
+  error_page_ensure (app);
+  if (app->error_page == NULL)
+    return;
   adw_status_page_set_title (app->error_page, title);
   adw_status_page_set_description (app->error_page, description);
   gtk_stack_set_visible_child_name (app->stack, "error");
@@ -2979,6 +2997,29 @@ build_find_popover (App *app)
   gtk_widget_add_controller (entry, keys);
 }
 
+/* Build the find popover the first time the button is popped up (or the
+ * capture harness asks). It is 1.9 ms of widgets and the largest CSS subtree
+ * this window owns, and none of it is on the first frame. */
+static void
+find_popover_ensure (App *app)
+{
+  if (app->find_popover != NULL || app->find_button == NULL)
+    return;
+  build_find_popover (app);
+  gtk_menu_button_set_popover (app->find_button,
+                               GTK_WIDGET (app->find_popover));
+  /* The freshly built "Filter to matches" toggle starts insensitive; give it
+   * the current draft/filter state rather than a default. */
+  filter_update_toggle_sensitivity (app);
+}
+
+static void
+find_popover_create (GtkMenuButton *button, gpointer data)
+{
+  (void)button;
+  find_popover_ensure (data);
+}
+
 /* ------------------------------------------------------------------------- */
 /* Jump-to-row: the popover UI over lsg_jump */
 /* ------------------------------------------------------------------------- */
@@ -3114,7 +3155,8 @@ jump_poll_fold (App *app)
       /* Before the popdown, which resets the flow to idle: the only place a
        * capture can learn that the landing happened. */
       capture_note_jump (app, TRUE, app->jump.landed_row);
-      gtk_popover_popdown (app->jump_popover); /* closes -> resets to idle */
+      if (app->jump_popover != NULL)
+        gtk_popover_popdown (app->jump_popover); /* closes -> resets to idle */
       break;
     case LSG_JUMP_FLOW_REJECTED:
       if (app->jump.has_restore)
@@ -3471,7 +3513,10 @@ open_jump (App *app)
 static void
 open_jump_with_digit (App *app, char digit)
 {
-  if (app->doc == NULL || app->jump_entry == NULL)
+  if (app->doc == NULL)
+    return;
+  jump_popover_ensure (app);
+  if (app->jump_entry == NULL)
     return;
   char text[2] = { digit, '\0' };
   gtk_editable_set_text (app->jump_entry, text);
@@ -3528,6 +3573,25 @@ build_jump_popover (App *app)
   g_signal_connect (keys, "key-released",
                     G_CALLBACK (on_jump_entry_key_released), app);
   gtk_widget_add_controller (entry, keys);
+}
+
+/* Same deal as the find popover: built on first popup, or before a digit typed
+ * on the grid pre-fills its field. */
+static void
+jump_popover_ensure (App *app)
+{
+  if (app->jump_popover != NULL || app->jump_button == NULL)
+    return;
+  build_jump_popover (app);
+  gtk_menu_button_set_popover (app->jump_button,
+                               GTK_WIDGET (app->jump_popover));
+}
+
+static void
+jump_popover_create (GtkMenuButton *button, gpointer data)
+{
+  (void)button;
+  jump_popover_ensure (data);
 }
 
 /* The app's one CSS provider: the rejection shake, and the dialect dropdown's
@@ -5363,6 +5427,20 @@ build_dialect_dropdown_popover (App *app, int kind)
   return pop;
 }
 
+/* The two dialect dropdowns are built on first popup; the button carries its
+ * own kind, and the guard keeps a second popup from replacing a popover whose
+ * "Custom" field may already hold a character. */
+static void
+dialect_popover_create (GtkMenuButton *button, gpointer data)
+{
+  if (gtk_menu_button_get_popover (button) != NULL)
+    return;
+  int kind = GPOINTER_TO_INT (
+      g_object_get_data (G_OBJECT (button), DIALECT_KIND_KEY));
+  gtk_menu_button_set_popover (
+      button, GTK_WIDGET (build_dialect_dropdown_popover (data, kind)));
+}
+
 /* -------- primary menu: Preferences / Keyboard Shortcuts / About --------- */
 
 /* The shortcuts window, generated ENTIRELY from the single lsg_a11y
@@ -5465,6 +5543,16 @@ build_primary_menu (App *app)
   g_menu_append (menu, "Keyboard Shortcuts", "app.shortcuts");
   g_menu_append (menu, "About less-sheet", "app.about");
   return G_MENU_MODEL (menu);
+}
+
+static void
+primary_menu_create (GtkMenuButton *button, gpointer data)
+{
+  if (gtk_menu_button_get_menu_model (button) != NULL)
+    return;
+  GMenuModel *primary = build_primary_menu (data);
+  gtk_menu_button_set_menu_model (button, primary);
+  g_object_unref (primary); /* the button holds its own ref */
 }
 
 /* ========================================================================= */
@@ -6668,6 +6756,30 @@ settings_present (App *app)
   adw_dialog_present (dlg, GTK_WIDGET (app->window));
 }
 
+static void
+error_page_ensure (App *app)
+{
+  if (app->error_page != NULL || app->stack == NULL)
+    return;
+  GtkWidget *error = adw_status_page_new ();
+  adw_status_page_set_icon_name (ADW_STATUS_PAGE (error),
+                                 "dialog-error-symbolic");
+  app->error_page = ADW_STATUS_PAGE (error);
+  gtk_stack_add_named (app->stack, error, "error");
+}
+
+/* The launch page exists only for a run with no file: an opened document
+ * never returns to it, so a run that was given one never builds it. */
+static void
+launch_page_show (App *app)
+{
+  if (app->stack == NULL)
+    return;
+  if (gtk_stack_get_child_by_name (app->stack, "launch") == NULL)
+    gtk_stack_add_named (app->stack, build_launch_page (app), "launch");
+  gtk_stack_set_visible_child_name (app->stack, "launch");
+}
+
 /* Build the single window once (idempotent). Shared by "activate" (no file)
  * and "open" (a file passed on the command line / by the file manager). */
 static void
@@ -6776,9 +6888,8 @@ ensure_window (App *app, GtkApplication *gtk_app)
   gtk_widget_set_tooltip_text (find_btn, "Find (Ctrl+F)");
   a11y_name (find_btn, LSG_A11Y_CONTROL_FIND);
   app->find_button = GTK_MENU_BUTTON (find_btn);
-  build_find_popover (app);
-  gtk_menu_button_set_popover (GTK_MENU_BUTTON (find_btn),
-                               GTK_WIDGET (app->find_popover));
+  gtk_menu_button_set_create_popup_func (GTK_MENU_BUTTON (find_btn),
+                                         find_popover_create, app, NULL);
   /* Jump-to-row: a menu button whose popover is the jump UI (Ctrl+G / Ctrl+L,
    * or a digit typed on the grid). Its icon is the custom jump glyph, drawn
    * into a 16px GtkDrawingArea child and tinted from the theme. */
@@ -6802,9 +6913,8 @@ ensure_window (App *app, GtkApplication *gtk_app)
   gtk_widget_set_tooltip_text (jump_btn, "Jump to row (Ctrl+G)");
   a11y_name (jump_btn, LSG_A11Y_CONTROL_JUMP);
   app->jump_button = GTK_MENU_BUTTON (jump_btn);
-  build_jump_popover (app);
-  gtk_menu_button_set_popover (GTK_MENU_BUTTON (jump_btn),
-                               GTK_WIDGET (app->jump_popover));
+  gtk_menu_button_set_create_popup_func (GTK_MENU_BUTTON (jump_btn),
+                                         jump_popover_create, app, NULL);
   /* There is deliberately no Copy button in the bar; Ctrl+C on the grid copies
    * the selection. app->copy_button stays NULL, which every use guards for. */
 
@@ -6835,9 +6945,10 @@ ensure_window (App *app, GtkApplication *gtk_app)
   gtk_widget_set_tooltip_text (sep_btn, "Field separator");
   a11y_name (sep_btn, LSG_A11Y_CONTROL_SEPARATOR);
   app->sep_button = GTK_MENU_BUTTON (sep_btn);
-  gtk_menu_button_set_popover (
-      GTK_MENU_BUTTON (sep_btn),
-      GTK_WIDGET (build_dialect_dropdown_popover (app, DIALECT_KIND_SEP)));
+  g_object_set_data (G_OBJECT (sep_btn), DIALECT_KIND_KEY,
+                     GINT_TO_POINTER (DIALECT_KIND_SEP));
+  gtk_menu_button_set_create_popup_func (GTK_MENU_BUTTON (sep_btn),
+                                         dialect_popover_create, app, NULL);
 
   GtkWidget *quote_btn = gtk_menu_button_new ();
   gtk_menu_button_set_child (
@@ -6846,9 +6957,10 @@ ensure_window (App *app, GtkApplication *gtk_app)
   gtk_widget_set_tooltip_text (quote_btn, "Quote character");
   a11y_name (quote_btn, LSG_A11Y_CONTROL_QUOTE);
   app->quote_button = GTK_MENU_BUTTON (quote_btn);
-  gtk_menu_button_set_popover (
-      GTK_MENU_BUTTON (quote_btn),
-      GTK_WIDGET (build_dialect_dropdown_popover (app, DIALECT_KIND_QUOTE)));
+  g_object_set_data (G_OBJECT (quote_btn), DIALECT_KIND_KEY,
+                     GINT_TO_POINTER (DIALECT_KIND_QUOTE));
+  gtk_menu_button_set_create_popup_func (GTK_MENU_BUTTON (quote_btn),
+                                         dialect_popover_create, app, NULL);
 
   /* Settings gear: the primary menu (Preferences + Keyboard Shortcuts +
    * About). */
@@ -6857,9 +6969,8 @@ ensure_window (App *app, GtkApplication *gtk_app)
                                  "open-menu-symbolic");
   gtk_widget_set_tooltip_text (settings_btn, "Main menu");
   a11y_name (settings_btn, LSG_A11Y_CONTROL_MENU);
-  GMenuModel *primary = build_primary_menu (app);
-  gtk_menu_button_set_menu_model (GTK_MENU_BUTTON (settings_btn), primary);
-  g_object_unref (primary); /* the button holds its own ref */
+  gtk_menu_button_set_create_popup_func (GTK_MENU_BUTTON (settings_btn),
+                                         primary_menu_create, app, NULL);
 
   /* Hidden until a copy or a network open drives it. */
   build_header_progress (app);
@@ -6876,18 +6987,13 @@ ensure_window (App *app, GtkApplication *gtk_app)
   adw_header_bar_pack_end (ADW_HEADER_BAR (header), find_btn);
   adw_header_bar_pack_end (ADW_HEADER_BAR (header), app->hp_box);
 
+  /* Only the grid page is built here: it is the one the first frame paints
+   * when a file was passed. The launch page (no file) and the error page are
+   * added by their ensure helpers when something actually shows them. The
+   * grid is added first, so it is the stack's visible child by default. */
   app->stack = GTK_STACK (gtk_stack_new ());
   gtk_widget_set_vexpand (GTK_WIDGET (app->stack), TRUE);
-  gtk_stack_add_named (app->stack, build_launch_page (app), "launch");
   gtk_stack_add_named (app->stack, build_grid_page (app), "grid");
-
-  GtkWidget *error = adw_status_page_new ();
-  adw_status_page_set_icon_name (ADW_STATUS_PAGE (error),
-                                 "dialog-error-symbolic");
-  app->error_page = ADW_STATUS_PAGE (error);
-  gtk_stack_add_named (app->stack, error, "error");
-
-  gtk_stack_set_visible_child_name (app->stack, "launch");
 
   /* Toast overlay for the transient notices. The passive filter status lives
    * in the header-bar subtitle, so the stack is the overlay's sole child. */
@@ -7482,6 +7588,10 @@ capture_tick (GtkWidget *widget, GdkFrameClock *clock, gpointer data)
 static void
 capture_arm (App *app)
 {
+  /* The shots drive the find and jump fields directly, so build them here:
+   * every one of these popovers is otherwise created by its button. */
+  find_popover_ensure (app);
+  jump_popover_ensure (app);
   app->capture.shot = capture_parse_shot (app->capture.env);
   app->capture.stage = LSG_CAPTURE_STAGE_SETTLING;
   app->capture.t_arm = g_get_monotonic_time ();
@@ -7603,6 +7713,7 @@ on_activate (GtkApplication *gtk_app, gpointer data)
 {
   App *app = data;
   ensure_window (app, gtk_app);
+  launch_page_show (app);
   gtk_window_present (app->window);
 }
 
@@ -7619,9 +7730,13 @@ on_open (GApplication *gapp, GFile **files, gint n_files, const char *hint,
   (void)hint;
   App *app = data;
   ensure_window (app, GTK_APPLICATION (gapp));
-  gtk_window_present (app->window);
+  /* Open BEFORE presenting: the stack's default page is the grid, so the
+   * window's first mapped frame is the document rather than an empty grid or
+   * a launch page it is about to replace. The grid's own resize handler
+   * materializes the viewport once the area has a size. */
   if (n_files >= 1 && files != NULL && files[0] != NULL)
     open_file (app, files[0]);
+  gtk_window_present (app->window);
 }
 
 int
