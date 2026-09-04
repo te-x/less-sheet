@@ -9,7 +9,7 @@
 #
 # Configure once (or export in your shell):
 #   LESSSHEET_RELEASE_REPO=te-x/less-sheet        # releases live on the main repo
-#   LESSSHEET_TAP_DIR=$HOME/Documents/homebrew-tap
+#   LESSSHEET_TAP_DIR=$HOME/Projects/homebrew-tap
 #   LESSSHEET_SITE_URL=https://te-x.github.io/less-sheet/
 #
 # THIS SCRIPT DOES NOT BUILD THE APP. `tools/release/cut` does that on the Mac,
@@ -41,7 +41,7 @@ for a in "$@"; do
 done
 
 RELEASE_REPO="${LESSSHEET_RELEASE_REPO:-te-x/less-sheet}"
-TAP_DIR="${LESSSHEET_TAP_DIR:-$HOME/Documents/homebrew-tap}"
+TAP_DIR="${LESSSHEET_TAP_DIR:-$HOME/Projects/homebrew-tap}"
 SITE_URL="${LESSSHEET_SITE_URL:-https://te-x.github.io/less-sheet/}"
 FLATPAK_DIR="packaging/flatpak"
 
