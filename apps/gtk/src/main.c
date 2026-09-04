@@ -366,6 +366,8 @@ typedef struct
   GThread *prefetch_thread;
   char *prefetch_path; /* OWNED; the local path this prefetch is for */
   LsgDocument *prefetch_doc;
+  LsgWindow *prefetch_sample; /* head sample window, consumed by
+                               * sample_column_widths */
   LsgOpenError prefetch_err;
   gint64 prefetch_begin;
 
@@ -1375,13 +1377,21 @@ sample_column_widths (App *app)
   guint32 sample_cols
       = (app->n_cols < WIDTH_SAMPLE_COLS) ? app->n_cols : WIDTH_SAMPLE_COLS;
   double default_w = width_default (app);
+  /* The cold-start worker may have materialized this exact head window while
+   * the toolkit was starting; take it, or materialize it here. */
+  LsgWindow *sw = app->prefetch_sample;
+  app->prefetch_sample = NULL;
   for (guint32 c = 0; c < app->n_cols; c++)
     app->col_widths[c] = default_w;
   if (sample_cols == 0)
-    return;
+    {
+      g_clear_pointer (&sw, lsg_window_free);
+      return;
+    }
 
-  LsgWindow *sw = lsg_document_set_window (app->doc, 0, WIDTH_SAMPLE_ROWS, 0,
-                                           sample_cols);
+  if (sw == NULL)
+    sw = lsg_document_set_window (app->doc, 0, WIDTH_SAMPLE_ROWS, 0,
+                                  sample_cols);
   guint32 got = lsg_window_row_count (sw);
   guint32 gotc = lsg_window_col_count (sw);
 
@@ -1535,6 +1545,19 @@ prefetch_worker (gpointer data)
   App *app = data;
   app->prefetch_doc
       = lsg_document_open_local (app->prefetch_path, NULL, &app->prefetch_err);
+  if (app->prefetch_doc == NULL)
+    return NULL;
+  /* The open-time column-width sample materializes a head window of up to
+   * WIDTH_SAMPLE_COLS columns, which on a 2000-column document is 3.5 ms of
+   * parsing that has nothing to do with the viewport. Materialize it here;
+   * sample_column_widths reads the cells straight out of it, so the widths it
+   * computes are bit-for-bit the ones it computed before. */
+  guint32 n = lsg_document_column_count (app->prefetch_doc);
+  if (n == 0)
+    return NULL;
+  app->prefetch_sample = lsg_document_set_window (
+      app->prefetch_doc, 0, WIDTH_SAMPLE_ROWS, 0,
+      (n < WIDTH_SAMPLE_COLS) ? n : WIDTH_SAMPLE_COLS);
   return NULL;
 }
 
@@ -1592,6 +1615,7 @@ prefetch_discard (App *app)
     {
       g_thread_join (app->prefetch_thread);
       app->prefetch_thread = NULL;
+      g_clear_pointer (&app->prefetch_sample, lsg_window_free);
       g_clear_pointer (&app->prefetch_doc, lsg_document_close);
     }
   g_clear_pointer (&app->prefetch_path, g_free);
