@@ -281,8 +281,8 @@ public enum FindNotice: Equatable, Sendable {
 }
 
 /// The active search as the popup + grid render it. The grid shows match
-/// highlights exactly while `request` is non-nil (re-evaluating
-/// `CellMatching` over the viewport); `current` is the strong highlight.
+/// highlights exactly while `request` is non-nil (re-evaluating the match
+/// flags over the viewport); `current` is the strong highlight.
 public struct FindDisplay: Equatable, Sendable {
     /// The request behind the active search; nil = no active search
     /// (no highlights).

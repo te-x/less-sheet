@@ -19,7 +19,7 @@ public enum CopyCellStatus: Sendable, Equatable {
     /// locatable, nothing read. A PER-ROW condition (a locatable row serves every
     /// column). The builder stops at this row boundary (`.stoppedAtFrontier`);
     /// advancing the frontier (a jump over the rect) and retrying is the caller's
-    /// affair — see `CopyBuilding.build`.
+    /// affair.
     case pending
     /// `LS_COPY_NO_CELL` — no such cell (column past `columnCount`, or a row past
     /// an EXACT row count). A rect built from a real `GridExtent` should never
@@ -56,7 +56,7 @@ public struct CopiedCell: Sendable, Equatable {
 /// - `maxTotalBytes` — the ~64 MiB byte budget the BUILDER enforces over the
 ///   accumulated TSV: bytes bound cost (memory / fetch / paste-target load),
 ///   counts don't. Multi-cell accumulation stops once the next cell would exceed
-///   it (a single cell is always emitted whole — see `CopyBuilding.build`).
+///   it (a single cell is always emitted whole).
 /// - `maxCells` — the cell-count SAFETY cap the builder enforces: bounds the
 ///   number of per-cell fetches so a pathological all-EMPTY huge selection
 ///   (≈0 bytes, but 100M+ cells) cannot do O(rows) fetches. Bytes wouldn't stop

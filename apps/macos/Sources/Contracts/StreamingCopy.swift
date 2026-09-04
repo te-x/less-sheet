@@ -4,7 +4,7 @@
 /// TSV (TAB/LF separators, spreadsheet quoting, the single-cell raw special-case,
 /// lossless cells), so a frontend copies a rectangular selection with NO per-cell
 /// FFI, NO main-thread stall, and NO TSV logic of its own — replacing the O(document)
-/// per-cell `ls_cell_copy` loop the deleted `TSVCopyBuilder` drove. The concatenated
+/// per-cell `ls_cell_copy` loop the former frontend builder drove. The concatenated
 /// chunks are BYTE-IDENTICAL to that former builder (pinned by the golden bridge
 /// test + the backend `cp*` behavior suite).
 ///
@@ -33,7 +33,7 @@ public struct CopyStep: Sendable, Equatable {
     public let kind: Kind
     /// The TSV bytes framed THIS step (empty on `.stalled`). Concatenating the
     /// `bytes` of every step in call order yields the whole TSV payload —
-    /// byte-identical to the deleted `TSVCopyBuilder`. UTF-8; cut at a field/row
+    /// byte-identical to the former per-cell builder. UTF-8; cut at a field/row
     /// boundary, except that a single field longer than the chunk is split across
     /// steps at a code-point boundary (never mid-code-point).
     public let bytes: [UInt8]
@@ -44,7 +44,7 @@ public struct CopyStep: Sendable, Equatable {
     /// (`DocumentSession.startJump(to:)`); 0 otherwise.
     public let stalledRow: UInt64
     /// On `.done`: true iff the core's `LS_COPY_MAX_CELLS` safety cap cut the
-    /// selection short (mirrors the deleted `TSVCopyBuilder` cap); false otherwise.
+    /// selection short (mirrors the former builder's cap); false otherwise.
     public let budgetCapped: Bool
 
     public init(kind: Kind, bytes: [UInt8], rowsDone: UInt64, stalledRow: UInt64, budgetCapped: Bool) {

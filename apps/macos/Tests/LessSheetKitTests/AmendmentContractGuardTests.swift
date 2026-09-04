@@ -118,7 +118,12 @@ struct AmendmentContractGuardTests {
         // rebuild (no external ABI consumer). Updated through the change-authority
         // process. See docs/architecture/ARCH-security-hardening.md.
         expectEmptyDiff("api/lesssheet.h",
-                        baseline: "8cbf6e020116635295c022a673186271e84d90dd6844be34769f54218fde0de9")
+        // Baseline re-bumped for three DOCUMENTATION corrections (2026-09-04): the
+        // ls_cell_copy allocation claim now states the filtered-view exception, the
+        // LS_FILTER_CANCELLED cause list names the network park and the OOM
+        // fail-safe, and ls_search_nav states its window-budget carve-out. Comment
+        // bytes only; struct / enum / signature / constant LAYOUT BYTE-IDENTICAL.
+                        baseline: "f9c8a564265e980c4f90f08e276b75f494b15df3207dd332c0e043bb9cb2272c")
     }
 
     // AC23 — the public Swift search/layout contracts are byte-identical:

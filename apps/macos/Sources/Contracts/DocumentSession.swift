@@ -282,7 +282,7 @@ public protocol DocumentSession: AnyObject, Sendable {
     /// Open a pull-model STREAMING TSV COPY of the rectangular selection `rect`
     /// (ARCH-thin-frontend-shared-core Phase 2; mirrors `ls_copy_open`). The CORE
     /// frames the TSV — TAB/LF separators, spreadsheet quoting, the single-cell raw
-    /// special-case, lossless cells — BYTE-IDENTICAL to the deleted `TSVCopyBuilder`,
+    /// special-case, lossless cells — BYTE-IDENTICAL to the former per-cell builder,
     /// so the frontend copies a selection with NO per-cell FFI, NO main-thread stall,
     /// and NO TSV logic of its own. The frontend drives the returned `CopyStreaming`
     /// OFF the main thread (append `step.bytes`, handle `.stalled` via
@@ -338,7 +338,7 @@ public extension DocumentSession {
     /// call `ls_window_match_flags` (copy the borrowed flag bytes into a
     /// `[UInt8]`), which flips the golden bridge test from RED (this default:
     /// `[]`) to GREEN (the real per-cell verdicts, byte-identical to the
-    /// deleted CellMatcher).
+    /// former frontend-side matcher).
     func windowMatchFlags(firstColumn: Int, columnCount: Int) -> [UInt8] { [] }
 
     /// DEFAULT (RED seed) for the streaming copy: returns nil, so NOTHING copies
@@ -349,6 +349,6 @@ public extension DocumentSession {
     /// an `ls_copy_open` job wrapped as a `CopyStreaming` (driving `ls_copy_next` /
     /// `ls_copy_close`), which flips the golden streaming-copy bridge test from RED
     /// (this default: nil) to GREEN (the real core-framed TSV, byte-identical to the
-    /// deleted `TSVCopyBuilder`).
+    /// former per-cell builder).
     func openCopy(_ rect: SelectionRect) -> (any CopyStreaming)? { nil }
 }

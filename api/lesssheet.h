@@ -273,6 +273,18 @@
  *         LS_FILTER_CANCELLED until re-driven (ls_filter_set again, or a
  *         filtered jump/find that re-engages the slot and advances the
  *         frontier).
+ *       * On an http_range (network) document the filter-scan never runs on
+ *         its own: ls_filter_set parks it LS_FILTER_CANCELLED immediately (the
+ *         MODE is active and the view IS filtered; counts are firm only as far
+ *         as the fetched frontier), and it advances only while a filtered
+ *         ls_jump_start / ls_search_nav drives the frontier, re-parking
+ *         CANCELLED when that demand lands. Nothing "took" the slot here —
+ *         there is simply no unprompted drive over the wire (see NETWORK: no
+ *         full download, ever). A frontend must not read CANCELLED as a user
+ *         cancellation: it is a partial count.
+ *       * An out-of-memory condition inside the filter-scan also terminates it
+ *         LS_FILTER_CANCELLED at its last consistent state (counts and
+ *         frontier kept), never mid-update.
  *   - COUNT (ls_row_count_get and ls_filter_status.total). While a filter is
  *     active BOTH report the SAME value: the number of matching rows COUNTED SO
  *     FAR (m) — exact for the counted region, MONOTONE non-decreasing within one
@@ -1230,8 +1242,13 @@ bool ls_row_oversized(const ls_doc *doc, uint64_t row);
  * OWNERSHIP: ls_cell_copy does NOT borrow — it COPIES into the caller's buffer,
  * which the caller owns. Its output therefore has NO tie to the ls_str eviction
  * rule: a subsequent ls_window_set (on this or any thread) never affects bytes
- * already written. ZERO heap allocation; never fails (always a well-defined
- * ls_copy_result). Poll/control lane — safe from ANY thread at any time,
+ * already written. Always returns a well-defined ls_copy_result. On the
+ * UNFILTERED view: ZERO heap allocation, never fails. On a FILTERED view the
+ * target row is first located by re-lexing its block through the filter's
+ * shared scratch buffer, which may grow (one allocation, reused across calls);
+ * if that allocation fails the cell is reported LS_COPY_NO_CELL instead of
+ * aborting — the one path on which this call can fail for want of memory, and
+ * it fails closed. Poll/control lane — safe from ANY thread at any time,
  * concurrently with the window lane and background scans (see THREADING), which
  * is what lets a frontend copy a large selection off the UI thread.
  */
@@ -1339,7 +1356,12 @@ bool ls_search_start(ls_doc *doc, const ls_search_request *request);
  *     proves exhaustion — the navigation completes BEFORE this call returns
  *     (LS_SEARCH_NAV_FOUND / LS_SEARCH_NAV_EXHAUSTED; cost O(one block
  *     re-lex), never O(file)). After LS_SEARCH_DONE every navigation takes
- *     this path.
+ *     this path, with one carve-out under a FILTER: when the checkpoint span
+ *     the answer must be re-lexed from exceeds the window byte budget (a range
+ *     that straddles a giant row), the navigation is handed to the scan
+ *     machinery instead — it reports LS_SEARCH_NAV_SEARCHING for a tick and
+ *     then FOUND / EXHAUSTED — so no caller thread ever re-lexes past the
+ *     budget synchronously.
  *   - Otherwise the match-scan serves it as it advances (resuming a
  *     CANCELLED scan — see SEARCH), reporting LS_SEARCH_NAV_SEARCHING until
  *     found/exhausted. A nav that must scan takes the scan slot (cancelling
