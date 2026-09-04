@@ -14,11 +14,15 @@ if let launchDocument = LaunchArguments.documentPath(from: CommandLine.arguments
     LaunchOpenPrewarm.start(path: launchDocument, forcing: launchForcedOverride())
 }
 
-// Halve the tooltip show delay before AppKit spins up: it reads this near
-// launch, and the built-in default is around two seconds. Set on THIS app's own
-// preferences domain rather than the global one, so it wins for our tooltips
-// without ever touching the user's system-wide default on disk.
-UserDefaults.standard.set(1_000, forKey: "NSInitialToolTipDelay")
+// Halve the tooltip show delay: the built-in default is around two seconds. Set
+// on THIS app's own preferences domain rather than the global one, so it wins
+// for our tooltips without ever touching the user's system-wide default on disk.
+// Off the launch path because this is the process's first touch of the
+// preferences system and costs about 5 ms there, while nothing reads the value
+// until a pointer has rested on a control.
+DispatchQueue.global(qos: .userInitiated).async {
+    UserDefaults.standard.set(1_000, forKey: "NSInitialToolTipDelay")
+}
 
 LaunchTiming.phase("before_swiftui_main")
 LessSheetApp.main()
