@@ -78,6 +78,12 @@
 #define COPY_BUDGET_BYTES (64u * 1024u * 1024u)
 /* Per-pull chunk the copy worker frames. */
 #define COPY_CHUNK_BYTES (1u << 16)
+/* GSK renderer this app asks for when the environment does not name one — the
+ * ONE place the default lives. The grid is painted with Cairo and Pango
+ * whatever GSK does afterwards, so a GPU renderer only uploads and composites
+ * an already-CPU-drawn frame: it buys nothing at steady state here, and its
+ * context creation costs the whole launch budget. */
+#define LSG_DEFAULT_GSK_RENDERER "cairo"
 
 /* ------------------------------------------------------------------------- */
 /* Screenshot capture (LESSSHEET_GTK_CAPTURE) — the state types. The contract
@@ -7623,6 +7629,9 @@ main (int argc, char *argv[])
 {
   App app = { 0 };
   app.t_start = g_get_monotonic_time (); /* capture entry ASAP */
+  /* Renderer default, set BEFORE any GTK/GDK call so GSK reads it: overwrite
+   * FALSE, so an explicit GSK_RENDERER in the environment always wins. */
+  g_setenv ("GSK_RENDERER", LSG_DEFAULT_GSK_RENDERER, FALSE);
   app.timing = (g_getenv ("LESSSHEET_GTK_TIMING") != NULL);
   /* ONE env read, and deliberately nothing else: the value is not even PARSED
    * until after the first data-bearing paint and the other vars are not read
