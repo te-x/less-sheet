@@ -66,39 +66,6 @@ func launchForcedOverride() -> DialectOverride {
     return DialectOverride(separator: separator, quote: quote, header: header)
 }
 
-// MARK: - App
-
-struct LessSheetApp: App {
-    @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
-
-    var body: some Scene {
-        // The main window is delegate-owned, so this scene carries only the menu
-        // commands.
-        Settings { EmptyView() }
-            .commands {
-                CommandGroup(replacing: .appSettings) { }
-                CommandGroup(replacing: .newItem) {
-                    Button("Open…") { AppDelegate.openViaPanel() }
-                        .keyboardShortcut("o", modifiers: .command)
-                    Button("Open URL…") { AppDelegate.openURLViaSheet() }
-                        .keyboardShortcut("o", modifiers: [.command, .shift])
-                }
-                CommandMenu("Go") {
-                    Button("Jump to Row…") { DocumentModel.shared.requestJumpFocus() }
-                        .keyboardShortcut("j", modifiers: .command)
-                }
-                CommandMenu("Find") {
-                    Button("Find…") { DocumentModel.shared.requestFindFocus() }
-                        .keyboardShortcut("f", modifiers: .command)
-                    Button("Find Next") { DocumentModel.shared.stepFind(.forward) }
-                        .keyboardShortcut("g", modifiers: .command)
-                    Button("Find Previous") { DocumentModel.shared.stepFind(.backward) }
-                        .keyboardShortcut("g", modifiers: [.command, .shift])
-                }
-            }
-    }
-}
-
 // MARK: - Root content
 
 struct ContentView: View {

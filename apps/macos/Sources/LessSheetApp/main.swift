@@ -1,15 +1,18 @@
-// The executable entry point: mark process start as early as possible, then
-// hand off to the SwiftUI app. A `main.swift` file precludes `@main`, so calling
-// `App.main()` explicitly is the supported equivalent.
+// The executable entry point: mark process start as early as possible, then run
+// AppKit's own application lifecycle. A `main.swift` file precludes `@main`, and
+// there is no SwiftUI `App` to hand off to — the single window and the Settings
+// window are both delegate-owned NSWindows, so an `App` would have contributed
+// nothing but its bring-up cost.
+import AppKit
 import Foundation
 
 LaunchTiming.begin()
 LaunchTiming.phase("main_entry")
 
 // Start the launch document's core open HERE when the path arrived on argv, so
-// it overlaps AppKit and SwiftUI bring-up instead of queuing behind them. A
-// bundle launch carries no path in argv — it gets one from an Apple Event about
-// 90 ms in, and the delegate starts the same prewarm there. Idempotent either way.
+// it overlaps AppKit bring-up instead of queuing behind it. A bundle launch
+// carries no path in argv — it gets one from an Apple Event about 90 ms in, and
+// the delegate starts the same prewarm there. Idempotent either way.
 if let launchDocument = LaunchArguments.documentPath(from: CommandLine.arguments) {
     LaunchOpenPrewarm.start(path: launchDocument, forcing: launchForcedOverride())
 }
@@ -24,5 +27,8 @@ DispatchQueue.global(qos: .userInitiated).async {
     UserDefaults.standard.set(1_000, forKey: "NSInitialToolTipDelay")
 }
 
-LaunchTiming.phase("before_swiftui_main")
-LessSheetApp.main()
+LaunchTiming.phase("before_app_run")
+let application = NSApplication.shared
+let appDelegate = AppDelegate()
+application.delegate = appDelegate
+application.run()

@@ -35,7 +35,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillFinishLaunching(_ notification: Notification) {
+        LaunchTiming.phase("will_finish_launching")
         NSApp.setActivationPolicy(.regular)
+        installMainMenu()
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -65,6 +67,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // `open -a`, Finder double-click, drag onto the icon.
     func application(_ application: NSApplication, open urls: [URL]) {
+        LaunchTiming.phase("launch_event")
         routedLaunchOpen = true
         for url in urls { route(url.path(percentEncoded: false)) }
     }
