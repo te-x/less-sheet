@@ -265,7 +265,7 @@ tools/release/cut 0.1.1
 git push origin master --tags
 
 # dist/ is gitignored, so the artifacts do NOT travel with the repo
-rsync -av dist/ <linux-box>:~/less-sheet-dist/
+rsync -av dist/ <linux-box>:~/less-sheet/dist/      # into the clone: publish.sh reads ./dist
 
 # on the Linux box (a plain clone of the repository) — releases, builds the
 # Flatpak bundle, updates the tap, and verifies all of it logged out. The page

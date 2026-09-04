@@ -101,7 +101,7 @@ cat <<EOF
   box that publishes:
 
     git push origin master --tags
-    rsync -av dist/ <linux-box>:~/less-sheet-dist/
+    rsync -av dist/ <linux-box>:~/less-sheet/dist/    # into the clone: publish.sh reads ./dist
 
   then, on the Linux box (a plain clone of the repository, pulled to this tag):
 
