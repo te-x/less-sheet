@@ -189,6 +189,7 @@
   .cmp.grid7 td:first-child { width: 5.5em; padding-top: 11px; }
   .cmp.grid7 thead tr:first-child th { border-bottom: 0; padding-bottom: 2px; }
   .cmp.grid7 thead tr:first-child th[colspan] { color: var(--ink); }
+  .cmp.grid7 td[rowspan] { vertical-align: middle; color: var(--dim); }
 
   /* ---- download ---- */
   /* A command to copy. NOT monospace — the page has no mono face anywhere, and
@@ -257,12 +258,12 @@
 
       <div class="ledger">
         <div class="only-mac">
-          <div class="row"><span class="size">10 MB</span><span class="time">180 ms</span></div>
-          <div class="row"><span class="size">10 GB</span><span class="time">182 ms</span></div>
+          <div class="row"><span class="size">10 MB</span><span class="time">~180 ms</span></div>
+          <div class="row"><span class="size">10 GB</span><span class="time">~180 ms</span></div>
         </div>
         <div class="only-linux">
-          <div class="row"><span class="size">10 MB</span><span class="time">76 ms</span></div>
-          <div class="row"><span class="size">10 GB</span><span class="time">75 ms</span></div>
+          <div class="row"><span class="size">10 MB</span><span class="time">~75 ms</span></div>
+          <div class="row"><span class="size">10 GB</span><span class="time">~75 ms</span></div>
         </div>
         <div class="note">cold launch to data on screen</div>
       </div>
@@ -302,11 +303,10 @@
         the file grows.<sup>*</sup></p>
       <p class="quiet" style="font-size:14.5px">* Very wide CSVs — thousands of
         columns — do add to the load time.</p>
-      <p>Memory is quoted as <b>engine + window</b>. Only the first number is
-        about your file, and it is the small one: ten gigabytes, a hundred and
-        thirty-five million rows, rests in a few megabytes. The second is what
-        the toolkit allocates to draw the window; it depends on the display and on
-        how wide the sheet is, not on how long the file is.</p>
+      <p>Memory is the whole app at rest with the file open, as Activity Monitor
+        or a task manager shows it. It stays in one band from ten kilobytes to ten
+        gigabytes: the band is set by the toolkit and the display, not by the data.
+        Times are medians of ten cold launches, rounded to what the runs agree on.</p>
     </div>
     <div class="figs cmp-wrap">
       <div class="only-mac">
@@ -316,9 +316,9 @@
             <tr><th>size</th><th>open</th><th>memory</th><th>open</th><th>memory</th><th>open</th><th>memory</th></tr>
           </thead>
           <tbody>
-            <tr><td>10 KB</td><td>180 ms</td><td>1.4 + 57 MiB</td><td>—</td><td>—</td><td>188 ms</td><td>8.6 + 57 MiB</td></tr>
-            <tr><td>10 MB</td><td>180 ms</td><td>1.4 + 35 MiB</td><td>228 ms</td><td>8.2 + 95 MiB</td><td>215 ms</td><td>8.6 + 40 MiB</td></tr>
-            <tr><td>10 GB</td><td>182 ms</td><td>8.6 + 40 MiB</td><td>218 ms</td><td>13.3 + 80 MiB</td><td>256 ms</td><td>13.8 + 49 MiB</td></tr>
+            <tr><td>10 KB</td><td>~180 ms</td><td rowspan="3">35–60 MiB</td><td>—</td><td rowspan="3">95–105 MiB</td><td>~190 ms</td><td rowspan="3">50–65 MiB</td></tr>
+            <tr><td>10 MB</td><td>~180 ms</td><td>~225 ms</td><td>~215 ms</td></tr>
+            <tr><td>10 GB</td><td>~180 ms</td><td>~225 ms</td><td>~255 ms</td></tr>
           </tbody>
         </table>
         <p class="reqs" style="margin-top:14px">MacBook Pro, Apple M2 Pro, macOS 26</p>
@@ -330,9 +330,9 @@
             <tr><th>size</th><th>open</th><th>memory</th><th>open</th><th>memory</th><th>open</th><th>memory</th></tr>
           </thead>
           <tbody>
-            <tr><td>10 KB</td><td>74 ms</td><td>0.8 + 17 MiB</td><td>—</td><td>—</td><td>76 ms</td><td>7.9 + 17 MiB</td></tr>
-            <tr><td>10 MB</td><td>76 ms</td><td>0.8 + 17 MiB</td><td>78 ms</td><td>6.9 + 16 MiB</td><td>106 ms</td><td>7.9 + 16 MiB</td></tr>
-            <tr><td>10 GB</td><td>75 ms</td><td>2.3 + 16 MiB</td><td>77 ms</td><td>6.9 + 15 MiB</td><td>104 ms</td><td>9.5 + 15 MiB</td></tr>
+            <tr><td>10 KB</td><td>~75 ms</td><td rowspan="3">17–18 MiB</td><td>—</td><td rowspan="3">22–23 MiB</td><td>~75 ms</td><td rowspan="3">~24 MiB</td></tr>
+            <tr><td>10 MB</td><td>~75 ms</td><td>~80 ms</td><td>~105 ms</td></tr>
+            <tr><td>10 GB</td><td>~75 ms</td><td>~80 ms</td><td>~105 ms</td></tr>
           </tbody>
         </table>
         <p class="reqs" style="margin-top:14px">Arch Linux, Intel Core i7-12700, Samsung 980 PRO</p>
