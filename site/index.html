@@ -258,12 +258,12 @@
 
       <div class="ledger">
         <div class="only-mac">
-          <div class="row"><span class="size">10 MB</span><span class="time">~180 ms</span></div>
-          <div class="row"><span class="size">10 GB</span><span class="time">~180 ms</span></div>
+          <div class="row"><span class="size">10 MB</span><span class="time">180 ms</span></div>
+          <div class="row"><span class="size">10 GB</span><span class="time">180 ms</span></div>
         </div>
         <div class="only-linux">
-          <div class="row"><span class="size">10 MB</span><span class="time">~75 ms</span></div>
-          <div class="row"><span class="size">10 GB</span><span class="time">~75 ms</span></div>
+          <div class="row"><span class="size">10 MB</span><span class="time">75 ms</span></div>
+          <div class="row"><span class="size">10 GB</span><span class="time">75 ms</span></div>
         </div>
         <div class="note">cold launch to data on screen</div>
       </div>
@@ -306,7 +306,8 @@
       <p>Memory is the whole app at rest with the file open, as Activity Monitor
         or a task manager shows it. It stays in one band from ten kilobytes to ten
         gigabytes: the band is set by the toolkit and the display, not by the data.
-        Times are medians of ten cold launches, rounded to what the runs agree on.</p>
+        Times are medians of ten cold launches; memory is the highest value seen
+        across the three file sizes.</p>
     </div>
     <div class="figs cmp-wrap">
       <div class="only-mac">
@@ -316,9 +317,9 @@
             <tr><th>size</th><th>open</th><th>memory</th><th>open</th><th>memory</th><th>open</th><th>memory</th></tr>
           </thead>
           <tbody>
-            <tr><td>10 KB</td><td>~180 ms</td><td rowspan="3">35–60 MiB</td><td>—</td><td rowspan="3">95–105 MiB</td><td>~190 ms</td><td rowspan="3">50–65 MiB</td></tr>
-            <tr><td>10 MB</td><td>~180 ms</td><td>~225 ms</td><td>~215 ms</td></tr>
-            <tr><td>10 GB</td><td>~180 ms</td><td>~225 ms</td><td>~255 ms</td></tr>
+            <tr><td>10 KB</td><td>180 ms</td><td rowspan="3">60 MiB</td><td>—</td><td rowspan="3">105 MiB</td><td>190 ms</td><td rowspan="3">65 MiB</td></tr>
+            <tr><td>10 MB</td><td>180 ms</td><td>225 ms</td><td>215 ms</td></tr>
+            <tr><td>10 GB</td><td>180 ms</td><td>225 ms</td><td>255 ms</td></tr>
           </tbody>
         </table>
         <p class="reqs" style="margin-top:14px">MacBook Pro, Apple M2 Pro, macOS 26</p>
@@ -330,9 +331,9 @@
             <tr><th>size</th><th>open</th><th>memory</th><th>open</th><th>memory</th><th>open</th><th>memory</th></tr>
           </thead>
           <tbody>
-            <tr><td>10 KB</td><td>~75 ms</td><td rowspan="3">17–18 MiB</td><td>—</td><td rowspan="3">22–23 MiB</td><td>~75 ms</td><td rowspan="3">~24 MiB</td></tr>
-            <tr><td>10 MB</td><td>~75 ms</td><td>~80 ms</td><td>~105 ms</td></tr>
-            <tr><td>10 GB</td><td>~75 ms</td><td>~80 ms</td><td>~105 ms</td></tr>
+            <tr><td>10 KB</td><td>75 ms</td><td rowspan="3">18 MiB</td><td>—</td><td rowspan="3">23 MiB</td><td>75 ms</td><td rowspan="3">24 MiB</td></tr>
+            <tr><td>10 MB</td><td>75 ms</td><td>80 ms</td><td>105 ms</td></tr>
+            <tr><td>10 GB</td><td>75 ms</td><td>80 ms</td><td>105 ms</td></tr>
           </tbody>
         </table>
         <p class="reqs" style="margin-top:14px">Arch Linux, Intel Core i7-12700, Samsung 980 PRO</p>
@@ -491,7 +492,7 @@
         <div>
           <h3>macOS</h3>
           <p style="margin:0"><a class="btn" href="https://github.com/te-x/less-sheet/releases/download/v0.1.2/less-sheet-0.1.2-macos-arm64.dmg">Download 0.1.2 · .dmg</a></p>
-          <p class="reqs">macOS 26.0+ · Apple silicon · ~3&nbsp;MB</p>
+          <p class="reqs">macOS 26.0+ · Apple silicon · 3&nbsp;MB</p>
 
           <div class="dl-way">Homebrew</div>
           <pre class="cmd"><code>brew tap te-x/tap
@@ -525,7 +526,7 @@ flatpak run com.lesssheet.LessSheet</code></pre>
           <div class="dl-way">tarball</div>
           <pre class="cmd"><code>curl -fsSL https://github.com/te-x/less-sheet/releases/download/v0.1.2/less-sheet-0.1.2-linux-x86_64.tar.gz | tar -xz
 ./less-sheet/install.sh</code></pre>
-          <p class="reqs">x86_64 and aarch64 · ~0.8&nbsp;MB · installs to
+          <p class="reqs">x86_64 and aarch64 · 0.8&nbsp;MB · installs to
             ~/.local/bin, no root<br>
             Uses your system’s GNOME libraries, so it follows your theme —
             but needs glibc 2.34+, GTK 4.20 and libadwaita 1.8.<br>
