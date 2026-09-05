@@ -518,10 +518,12 @@ brew install --cask less-sheet</code></pre>
           <p class="reqs">x86_64 · runs on any distribution</p>
 
           <div class="dl-way">Flatpak</div>
-          <pre class="cmd"><code>flatpak install ./less-sheet-0.1.2-x86_64.flatpak
+          <pre class="cmd"><code>flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+flatpak install ./less-sheet-0.1.2-x86_64.flatpak
 flatpak run com.lesssheet.LessSheet</code></pre>
           <p class="reqs">Uses the GNOME 49 runtime, which Flatpak fetches from
-            Flathub if you don’t already have it.</p>
+            Flathub if you don’t already have it. The first line only adds Flathub
+            as a source; on most desktops it is already there.</p>
 
           <div class="dl-way">tarball</div>
           <pre class="cmd"><code>curl -fsSL https://github.com/te-x/less-sheet/releases/download/v0.1.2/less-sheet-0.1.2-linux-x86_64.tar.gz | tar -xz

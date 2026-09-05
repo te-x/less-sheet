@@ -248,7 +248,7 @@ Build + test locally:
 ```
 flatpak-builder --force-clean --repo=repo build-dir com.lesssheet.LessSheet.yaml
 flatpak-builder --run build-dir com.lesssheet.LessSheet.yaml less-sheet   # smoke-run
-flatpak build-bundle repo less-sheet.flatpak com.lesssheet.LessSheet       # self-host artifact
+flatpak build-bundle --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo repo less-sheet.flatpak com.lesssheet.LessSheet   # self-host artifact; the runtime repo lets a Flathub-less machine resolve the GNOME runtime
 ```
 > The orchestrator can draft this manifest, but it must be **built + smoke-tested on your Linux box** (flatpak-builder isn't available on the macOS dev host). **Not written yet.**
 

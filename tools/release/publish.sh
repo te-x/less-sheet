@@ -42,6 +42,10 @@ done
 
 RELEASE_REPO="${LESSSHEET_RELEASE_REPO:-te-x/less-sheet}"
 TAP_DIR="${LESSSHEET_TAP_DIR:-$HOME/Projects/homebrew-tap}"
+# Written into the bundle so `flatpak install ./x.flatpak` can offer to add the remote
+# that carries the GNOME runtime. Without it, a machine with no Flathub configured
+# (stock Ubuntu) fails with "runtime org.gnome.Platform/x86_64/49 not found".
+RUNTIME_REPO="${LESSSHEET_RUNTIME_REPO:-https://dl.flathub.org/repo/flathub.flatpakrepo}"
 SITE_URL="${LESSSHEET_SITE_URL:-https://te-x.github.io/less-sheet/}"
 FLATPAK_DIR="packaging/flatpak"
 
@@ -127,7 +131,7 @@ if command -v flatpak-builder >/dev/null; then
     ( cd "$FLATPAK_DIR" \
       && flatpak-builder --force-clean --repo=repo-bundle bundle-dir \
            --extra-sources="$DIST_ABS" com.lesssheet.LessSheet.Bundle.yaml \
-      && flatpak build-bundle repo-bundle "$BUNDLE" com.lesssheet.LessSheet ) \
+      && flatpak build-bundle --runtime-repo="$RUNTIME_REPO" repo-bundle "$BUNDLE" com.lesssheet.LessSheet ) \
       || die "the Flatpak bundle failed to build"
     gh release upload "$TAG" --repo "$RELEASE_REPO" "$FLATPAK_DIR/$BUNDLE" \
       || die "uploading the bundle failed"
