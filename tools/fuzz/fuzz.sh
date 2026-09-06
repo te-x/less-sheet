@@ -159,13 +159,32 @@ echo "  Sentinels are NON-ZERO on purpose: 93 of the 219 csv seeds carry w0 == 0
 echo "  so a zero-valued shape selector would make the >8 MiB shape the default."
 echo
 
-echo "--- stray ephemeral temp files BEFORE (AC-s13: none may survive ls_close) ---"
-# The core's scratch — gzip checkpoints, the net spool, and the sort's runs /
+# Count the core's EPHEMERAL scratch files still VISIBLE in the temp directory.
+# Its scratch — gzip checkpoints, the net spool, and the sort's runs /
 # permutation / inverse mapping — is created 0600 and UNLINKED immediately, so a
-# name still visible here means a create-without-unlink leak. Counted either side
-# of the campaign rather than per iteration: the leak is a process-level property
-# and a per-iteration scan would cost more than it finds.
-stray_before="$(ls -1d /tmp/lesssheet-* 2>/dev/null | wc -l | tr -d ' ')"
+# name that is still visible means a create-without-unlink leak. Counted either
+# side of the campaign rather than per iteration: the leak is a process-level
+# property and a per-iteration scan would cost more than it finds.
+#
+# GLOB, NEVER `ls`, and the reason is not style. `ls /tmp/lesssheet-*` exits
+# NON-ZERO when nothing matches; under `set -euo pipefail` (top of this script)
+# pipefail adopts that status and `set -e` kills the script — before the seed
+# replay, before the campaign, before anything. It therefore failed in exactly
+# the GOOD case (a clean /tmp with no leaked files), which is the worst possible
+# time and the reason it went unnoticed: a direct `zig build --fuzz` invocation
+# never runs this line. Bash leaves an unmatched glob as its own literal, so the
+# count is the array length unless the single element does not exist.
+count_stray() {
+  local -a found=(/tmp/lesssheet-*)
+  if [ "${#found[@]}" -eq 1 ] && [ ! -e "${found[0]}" ]; then
+    printf '0'
+  else
+    printf '%s' "${#found[@]}"
+  fi
+}
+
+echo "--- stray ephemeral temp files BEFORE (AC-s13: none may survive ls_close) ---"
+stray_before="$(count_stray)"
 echo "  /tmp/lesssheet-*: $stray_before"
 echo
 
@@ -355,7 +374,7 @@ set -e
 
 echo
 echo "--- stray ephemeral temp files AFTER ---"
-stray_after="$(ls -1d /tmp/lesssheet-* 2>/dev/null | wc -l | tr -d ' ')"
+stray_after="$(count_stray)"
 echo "  /tmp/lesssheet-*: $stray_after (was $stray_before)"
 stray_status=0
 if [ "$stray_after" -gt "$stray_before" ]; then

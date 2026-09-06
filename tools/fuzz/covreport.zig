@@ -163,6 +163,16 @@ pub fn main(init: std.process.Init) !void {
             const f = coverage.fileAt(@enumFromInt(e.key_ptr.*));
             const base = coverage.stringAt(f.basename);
             if (!matchesModule(base, name)) continue;
+            // PROJECT FILES ONLY — the same `in_project` rule the per-file table
+            // below uses. `matchesModule` compares BASENAME STEMS, and the Zig
+            // standard library has a `sort.zig` too: without this filter the
+            // `sort` requirement was satisfiable by std's sorting code alone
+            // (measured: 5/17 PCs there, entirely from the harness's own
+            // std.mem.sort calls), which would have made a required-module check
+            // pass while src/sort.zig was never entered. Cheap to add, and it
+            // hardens the other seven names against the same collision.
+            const dir = coverage.stringAt(coverage.directories.keys()[f.directory_index]);
+            if (std.mem.indexOf(u8, dir, "less-sheet") == null) continue;
             files += 1;
             total += e.value_ptr.total;
             seen += e.value_ptr.seen;
