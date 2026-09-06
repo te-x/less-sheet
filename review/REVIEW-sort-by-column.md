@@ -7,7 +7,7 @@ Amendment 1 "latency over throughput", both signed by the author on 2026-09-06).
 profiles) preceded the build. This record is written per converged cell; the frontend cells and the
 planner's `tools/fuzz` entry are appended as they converge.
 
-## Backend cell — `build-sort-by-column-backend` — **PASS (round 3)**
+## Backend cell — `build-sort-by-column-backend` — **PASS (round 3; reopened and PASSED again in round 4)**
 
 Roles: implementer + reviewer (native runner, the configured models), orchestrator as switchboard; every
 handoff relayed by reference and journaled (`verify-relay`: PASS, 13 ledgered turns, byte-exact). The
@@ -71,3 +71,31 @@ byte-identical to the freeze. Reviewed tree: workspace digest `9b88c202…`, bac
 - **Pending (not against this cell):** the `tools/fuzz` sort entry (AC-s13's campaign half) is the
   planner's, per the author's decision; it must iterate type overrides per column or it only re-walks the
   text path.
+
+### Round 4 — reopened by the fuzzer, closed the same day
+After the round-3 PASS and the `cd28b40` commit, the planner added the `tools/fuzz` sort target (AC-s13's
+campaign half, iterating all seven type overrides per column), reconciled the header's slot prose with the two
+accepted deviations, re-pinned the macOS header-SHA guard, and the architect added the signed Amendment 2
+(§4 / AC-s9: the build-time memory bound is on anonymous residency and excludes file-backed pages of the
+scratch mappings). The fuzz target's FIRST campaign found **F2**: `ls_sort_set` decided keep-or-replace,
+waited for the scan slot (releasing the mutex), then unwrapped the build pointer; a pass failing from disk-full
+or out-of-memory in that window had already torn the build down, so a clean FAILED became a ReleaseSafe panic.
+Reproduced independently by the orchestrator (`zig build --fuzz=800 -Donly="fuzz sort"`, panic at
+`sort.zig:888`). The planner froze `srt_failure_race`, a forked-child race driver that reproduces the
+interleaving 6/6 and turns the panic into a failing assertion (RED 330/331 on both legs); all of it committed
+as `b12d51a`. The implementer's fix (round 4, `backend/src/sort.zig` only): `awaitScanIdle` returns the build
+as it stands after the wait, `keepableBuild` re-decides under one continuous hold of the mutex, the merge
+re-validates generation and pointer locally, `sort_build.?` no longer appears anywhere in `backend/src`, and
+the worker no longer holds a build pointer across its pause. Gate 331/331 on both legs; the fuzz target clean
+over 2,801 runs with the crashing input preserved in the corpus. Reviewer: PASS, "fixes the class rather than
+the instance". Acceptance gate with the relay-chain check: PASS.
+
+Digest note: the per-component tree digest embeds the repository-wide `git status`, so the backend digest
+moved during the review while the planner edited `tools/fuzz` concurrently; no file under `backend/` changed
+(the fixed file predates the gate run and the review, same blob), so the verdict binds to the reviewed content.
+
+### Carried forward for the frontend cells and the record
+- The 20-minute fuzz campaign (`bash tools/fuzz/fuzz.sh --minutes 20 --fresh`) is the AC-s13 campaign record;
+  the reviewer asked that its log be attached here when it lands and that the cell reopen if it finds a crash.
+- `tools/fuzz/fuzz.sh` aborted on a clean `/tmp` under `set -euo pipefail` (an `ls` glob with no match); the
+  implementer diagnosed it, the planner replaced the pipeline with a glob-safe count.
