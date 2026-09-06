@@ -881,30 +881,50 @@ pub fn setSort(d: *Document, col: u32, direction: api.SortDirection) bool {
     // pass that is re-driven continues from its own cursor rather than paying
     // for the rows it has already keyed. Both RESET search and jump — the
     // coordinate space changed, or is about to.
-    const keeps_build = same_column and d.sort_build != null and
-        (d.sort_state == .active or d.sort_state == .building or d.sort_state == .parked);
-    if (keeps_build) {
-        awaitScanIdle(d);
-        const b = d.sort_build.?;
-        if (d.sort_direction != direction) {
-            d.sort_direction = direction;
-            b.dir = direction;
-            if (d.sort_state != .active and !rebuildPrefix(d, b)) {
-                failBuild(d, .memory);
-                resetForSortChange(d);
-                return true;
+    if (keepableBuild(d, col) != null) {
+        // `awaitScanIdle` RELEASES the mutex while it waits, and the worker can
+        // take it and END the pass in that window — its Storage / allocation
+        // failure arms call failBuild, which destroys this very Build. So the
+        // decision is taken AGAIN on the far side of the wait, from the pointer
+        // the wait itself hands back; nothing read before it is trusted after
+        // it. (Found by the tools/fuzz sort target as F2: the old code decided
+        // before the wait and unwrapped after it.) If the pass did fail while
+        // we waited, falling through to startPass is exactly right — a request
+        // on a FAILED sort re-runs it (api/lesssheet.h §4).
+        if (awaitScanIdle(d)) |b| if (keepableBuild(d, col) != null) {
+            if (d.sort_direction != direction) {
+                d.sort_direction = direction;
+                b.dir = direction;
+                if (d.sort_state != .active and !rebuildPrefix(d, b)) {
+                    failBuild(d, .memory);
+                    resetForSortChange(d);
+                    return true;
+                }
             }
-        }
-        if (d.sort_state == .parked) {
-            d.sort_state = .building;
-            if (d.worker != null) d.wakeWorker() else driveDegraded(d);
-        }
-        bumpGen(d);
-        resetForSortChange(d);
-        return true;
+            if (d.sort_state == .parked) {
+                d.sort_state = .building;
+                if (d.worker != null) d.wakeWorker() else driveDegraded(d);
+            }
+            bumpGen(d);
+            resetForSortChange(d);
+            return true;
+        };
     }
 
     return startPass(d, col, direction);
+}
+
+/// The build a request for `col` may KEEP (flip / re-drive) rather than
+/// replace, or null when it must start a fresh pass. Returns the POINTER, so
+/// no caller has to unwrap an optional it decided about earlier — the decision
+/// and the pointer come from the same read, under one hold of the mutex.
+/// Caller holds the mutex.
+fn keepableBuild(d: *Document, col: u32) ?*Build {
+    if (d.sort_state == .idle or d.sort_column != col) return null;
+    return switch (d.sort_state) {
+        .active, .building, .parked => d.sort_build,
+        .idle, .failed => null,
+    };
 }
 
 /// Both generations move together on a state change. `sort_view_gen` ALSO
@@ -950,16 +970,27 @@ fn resetForSortChange(d: *Document) void {
 /// worker publishes `sort_scan_busy` under the mutex and broadcasts when it
 /// clears — and its per-row `stop`/generation checks bound the wait to one
 /// row's work. Caller holds the mutex.
-fn awaitScanIdle(d: *Document) void {
-    if (!d.sort_scan_busy) return;
+///
+/// IT RELEASES THE MUTEX WHILE IT WAITS. Every pointer into the sort's state
+/// read BEFORE a call to this is stale afterwards: the worker can take the
+/// mutex in that window and end the pass, and its Storage / allocation failure
+/// arms destroy the `Build` outright (`failBuild` -> `dropBuild`). That is the
+/// F2 defect the fuzz sort target found, and it is why this RETURNS the build
+/// as it stands AFTER the wait — a caller that wants the pointer has to take
+/// it from here, and Zig makes ignoring the result an explicit `_ =`.
+fn awaitScanIdle(d: *Document) ?*Build {
+    if (!d.sort_scan_busy) return d.sort_build;
     d.sort_scan_interrupt.store(true, .release);
     while (d.sort_scan_busy) d.waitWork();
     d.sort_scan_interrupt.store(false, .release);
+    return d.sort_build;
 }
 
 /// Start (or replace) the key pass. Caller holds the mutex.
 fn startPass(d: *Document, col: u32, direction: api.SortDirection) bool {
-    awaitScanIdle(d);
+    // Discarded on purpose: `dropBuild` re-reads the field itself and is
+    // null-safe, so there is no pointer to go stale here.
+    _ = awaitScanIdle(d);
     dropBuild(d);
 
     const cfg = captureConfig(d, col) catch {
@@ -1058,8 +1089,8 @@ fn driveDegraded(d: *Document) void {
         return;
     }
     while (d.sort_state == .building) {
-        const b = d.sort_build orelse break;
-        if (pausedAt(d, b)) break; // a test pause: leave it building, as asked
+        const b = d.sort_build orelse break; // re-read every iteration
+        if (pausedAt(d)) break; // a test pause: leave it building, as asked
         if (!runChunkLocked(d, b)) break;
     }
 }
@@ -1100,7 +1131,7 @@ pub fn clearSort(d: *Document) void {
     d.lock();
     defer d.unlock();
     if (d.sort_state == .idle and d.sort_build == null) return;
-    awaitScanIdle(d);
+    _ = awaitScanIdle(d); // see startPass: dropBuild re-reads the field
     dropBuild(d);
     d.sort_state = .idle;
     d.sort_err = .ok;
@@ -1186,7 +1217,8 @@ pub fn pauseAfterRows(d: *Document, rows: u64) void {
 // The key pass.
 // ===========================================================================
 
-fn pausedAt(d: *Document, b: *Build) bool {
+fn pausedAt(d: *Document) bool {
+    const b = d.sort_build orelse return false;
     return b.row >= d.sort_pause_after_rows;
 }
 
@@ -1212,12 +1244,16 @@ pub fn parkForSlot(d: *Document) void {
 /// One step of the pass, driven by the worker with the mutex HELD on entry and
 /// on return. Returns false when the pass reached a terminal state.
 pub fn workerStep(d: *Document) bool {
-    const b = d.sort_build orelse return false;
-    if (pausedAt(d, b)) {
+    if (d.sort_build == null) return false;
+    // `waitWork` RELEASES the mutex, so no build pointer is held across it:
+    // the pause test reads the field itself, and the pointer used below is
+    // taken only once no wait can intervene (F2's class — see awaitScanIdle).
+    if (pausedAt(d)) {
         d.waitWork();
         return true;
     }
     if (d.sort_state == .parked) d.sort_state = .building;
+    const b = d.sort_build orelse return false;
     return runChunk(d, b, true);
 }
 
@@ -1647,6 +1683,7 @@ fn mergeBufferBytes(chunk_limit: u64, runs: usize) usize {
 /// pass is over) in every case.
 fn finishPass(d: *Document, b: *Build, release: bool) bool {
     const chunk_limit = chunkBytes(d);
+    const gen = d.sort_gen;
     if (release) {
         d.sort_scan_busy = true;
         d.unlock();
@@ -1656,6 +1693,11 @@ fn finishPass(d: *Document, b: *Build, release: bool) bool {
         d.lock();
         d.sort_scan_busy = false;
         d.wakeWorker();
+        // The busy flag is what makes `b` safe across the release above (every
+        // teardown waits for it), but the invariant is re-checked LOCALLY
+        // rather than inherited from the caller — the F2 class is exactly a
+        // pointer trusted across a window someone else was supposed to guard.
+        if (d.sort_gen != gen or d.sort_build != b) return false;
     }
     if (outcome) |_| {
         b.rows_total = b.view_rows;
@@ -2087,7 +2129,7 @@ pub const NavPlan = struct {
 /// direction (EXHAUSTED). Caller holds the mutex.
 pub fn navPlanLocked(d: *Document, anchor: u64, forward: bool) ?NavPlan {
     const nav_idx = navReady(d) orelse return null;
-    const b = d.sort_build.?;
+    const b = d.sort_build orelse return null;
     const nblocks = nav_idx.counts.items.len;
     if (nblocks == 0) return null;
     var before: u64 = 0;
@@ -2140,7 +2182,7 @@ pub fn navCachedBlock(d: *Document, plan: NavPlan) ?struct { positions: []const 
 /// Publish a freshly scanned block. Caller holds the mutex.
 pub fn navPublishBlock(d: *Document, plan: NavPlan, positions: []const u64, columns: []const u32) void {
     const nav_idx = navReady(d) orelse return;
-    const b = d.sort_build.?;
+    const b = d.sort_build orelse return;
     nav_idx.positions.clearRetainingCapacity();
     nav_idx.columns.clearRetainingCapacity();
     nav_idx.positions.appendSlice(b.gpa, positions) catch return;
