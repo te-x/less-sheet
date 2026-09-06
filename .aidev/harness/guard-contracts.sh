@@ -30,6 +30,14 @@ if [ -f "$root/.aidev/profile.sh" ]; then
     "$root"|"$root/"*) : ;;
     *) deny "Outside the current aidev project — implementers may write only configured in-project implementation paths." ;;
   esac
+  # Polyglot workspaces: a nested component carries its own profile. Judge the target by the
+  # NEAREST enclosing profile at or below the current project root (never above it), so a hook
+  # running from the workspace root applies the component's rules inside the component.
+  nested="$(dirname "$abs")"
+  while [ "$nested" != "$root" ] && [ "${nested#"$root"/}" != "$nested" ]; do
+    if [ -f "$nested/.aidev/profile.sh" ]; then root="$nested"; break; fi
+    nested="$(dirname "$nested")"
+  done
 else
   root="$(dirname "$abs")"
   while [ "$root" != "/" ] && [ ! -f "$root/.aidev/profile.sh" ]; do root="$(dirname "$root")"; done
