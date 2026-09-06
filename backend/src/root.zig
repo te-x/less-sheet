@@ -36,6 +36,8 @@ const filter = @import("filter.zig");
 const search = @import("search.zig");
 const index = @import("index.zig");
 const window = @import("window.zig");
+const sort = @import("sort.zig");
+const tempdir = @import("tempdir.zig");
 // The SOURCE-FAULT GUARD, armed over the local file mapping in
 // `openWithAllocator` before its first byte is read.
 const fault_guard = @import("fault_guard.zig");
@@ -349,6 +351,76 @@ pub export fn ls_source_row(doc: *const api.Doc, row: u64) callconv(.c) u64 {
 /// served cells). Total function; ZERO allocation; never fails; never scans.
 pub export fn ls_row_oversized(doc: *const api.Doc, row: u64) callconv(.c) bool {
     return window.rowOversized(asDoc(doc), row);
+}
+
+// ---------------------------------------------------------------------------
+// SORTED VIEWS -- see api/lesssheet.h SORTED VIEWS for the full model (the
+// comparator, the key pass, flip-only-at-ACTIVE, sorted coordinates, jump/find
+// under a sort, the four-way scan slot, rebuilds, RESET, failure, laziness).
+// ---------------------------------------------------------------------------
+
+/// See api/lesssheet.h `ls_sort_set`.
+pub export fn ls_sort_set(doc: *api.Doc, col: u32, direction: api.SortDirection) callconv(.c) bool {
+    const d: *Document = @ptrCast(@alignCast(doc));
+    return sort.setSort(d, col, direction);
+}
+
+/// See api/lesssheet.h `ls_sort_clear`. ZERO allocation; never fails.
+pub export fn ls_sort_clear(doc: *api.Doc) callconv(.c) void {
+    const d: *Document = @ptrCast(@alignCast(doc));
+    sort.clearSort(d);
+}
+
+/// See api/lesssheet.h `ls_sort_poll`. ZERO allocation; never fails.
+pub export fn ls_sort_poll(doc: *const api.Doc) callconv(.c) api.SortStatus {
+    return sort.pollSort(asDocMut(doc));
+}
+
+// --- sort test seams (Zig-only; NOT the C ABI -- see contracts/api.zig) -----
+
+/// See contracts/api.zig `sortChunkBytes` (THE resolver for the one knob).
+pub fn sortChunkBytes(doc: *const api.Doc) u64 {
+    return sort.chunkBytes(asDoc(doc));
+}
+
+/// See contracts/api.zig `sortChunkBytesSetForTest`.
+pub fn sortChunkBytesSetForTest(doc: *api.Doc, bytes: u64) void {
+    const d: *Document = @ptrCast(@alignCast(doc));
+    sort.chunkBytesSetForTest(d, bytes);
+}
+
+/// See contracts/api.zig `sortTempStore`.
+pub fn sortTempStore(doc: *const api.Doc) api.SortTempStore {
+    return sort.tempStore(asDoc(doc));
+}
+
+/// See contracts/api.zig `sortTempFailAfter`.
+pub fn sortTempFailAfter(doc: *api.Doc, ops: u64) void {
+    const d: *Document = @ptrCast(@alignCast(doc));
+    sort.tempFailAfter(d, ops);
+}
+
+/// See contracts/api.zig `sortAllocFailAfter`.
+pub fn sortAllocFailAfter(doc: *api.Doc, allocs: u64) void {
+    const d: *Document = @ptrCast(@alignCast(doc));
+    sort.allocFailAfter(d, allocs);
+}
+
+/// See contracts/api.zig `sortResidentBytes`.
+pub fn sortResidentBytes(doc: *const api.Doc) u64 {
+    return sort.residentBytes(asDoc(doc));
+}
+
+/// See contracts/api.zig `sortResidentReset`.
+pub fn sortResidentReset(doc: *api.Doc) void {
+    const d: *Document = @ptrCast(@alignCast(doc));
+    sort.residentReset(d);
+}
+
+/// See contracts/api.zig `tempSpillDirSetForTest` -- the process-wide override
+/// of THE ONE ephemeral-temp resolver (src/tempdir.zig).
+pub fn tempSpillDirSetForTest(dir: ?[]const u8) void {
+    tempdir.setForTest(dir);
 }
 
 // ---------------------------------------------------------------------------

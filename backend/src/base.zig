@@ -537,6 +537,39 @@ pub const Document = struct {
     // test code ever sets it.
     scan_park: std.atomic.Value(bool) = .init(false),
 
+    // --- sort-by-column state (SORTED VIEWS) --------------------------------
+    // ALL DEFAULTED (like copy_cursor_* / gz_* above) so openWithAllocator's
+    // literal need not mention them AND a document nobody sorts costs exactly
+    // nothing: idle state, no thread, no allocation, no temp file (the
+    // laziness pin in api/lesssheet.h SORTED VIEWS §12). The C ABI reaches
+    // these only through src/sort.zig; the instrumentation fields are read
+    // only through the Zig-only seams in contracts/api.zig (sort* -> root.zig).
+    sort_state: api.SortState = .idle,
+    sort_err: api.SortError = .ok,
+    /// The REQUESTED column/direction. Valid in every state but `.idle`, so a
+    /// frontend keeps its header indicator and its retry target while the pass
+    /// is building, parked, or failed.
+    sort_column: u32 = 0,
+    sort_direction: api.SortDirection = .ascending,
+    sort_progress: f64 = 0.0,
+    /// THE ONE CHUNK KNOB, per document. 0 == the single named default
+    /// (contracts/api.zig `sort_chunk_default_bytes`); a test seam overrides it.
+    /// Read ONLY through sort.chunkBytes -- the pair buffer, the run writer, the
+    /// k-way merge read-buffers, and the permutation writer all resolve through
+    /// that one function, so the number exists in exactly one place.
+    sort_chunk_override: u64 = 0,
+    /// Fault injection for the AC-s7 graceful-failure locks (maxInt == never).
+    sort_temp_fail_after: u64 = std.math.maxInt(u64),
+    sort_alloc_fail_after: u64 = std.math.maxInt(u64),
+    /// AC-s9 temp-storage witness (contracts/api.zig `SortTempStore`).
+    sort_temp_files: u32 = 0,
+    sort_temp_live_bytes: u64 = 0,
+    sort_temp_peak_bytes: u64 = 0,
+    sort_temp_mode: u32 = 0,
+    sort_temp_unlinked: bool = false,
+    /// AC-s9 peak sort-owned resident bytes since the last reset.
+    sort_resident_peak: u64 = 0,
+
     // --- window-budget instrumentation state --------------------------------
     // DEFAULTED (like copy_cursor_* / gz_* above) so openWithAllocator's literal
     // need not mention them. Read ONLY via contracts/api.zig's

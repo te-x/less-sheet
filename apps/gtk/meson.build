@@ -56,6 +56,7 @@ lsg_sources = files(
   'src/lsg_dialect.c',
   'src/lsg_column.c',
   'src/lsg_a11y.c',
+  'src/lsg_sort.c',
 )
 lsgkit = static_library('lsgkit',
   lsg_sources,
@@ -265,3 +266,23 @@ test_a11y = executable('test-a11y',
   install : false,
 )
 test('a11y', test_a11y)
+
+# Sort by column (sort-by-column slice): PURE display-free view-model -- the
+# three-state cycle (the ONE decision behind a header click, Ctrl+Shift+S, and
+# the progress affordance's Cancel), the header indicator (including PENDING,
+# because a building sort does NOT re-order the grid), and the accessible
+# description -- plus the single-declaration check on the frozen
+# lsg_a11y_shortcuts table, plus the sort bridge over the real core (set /
+# clear / poll, descending, composition with a filter, rejection, session-only).
+# Reuses the find.csv fixture -- the SAME settled rows find and filter pin
+# against -- so no new fixture is needed. The header-cell DRAWING, the progress
+# chrome, and the error banner are the author's GUI pass, not this gate.
+test_sort = executable('test-sort',
+  'tests/test_sort.c',
+  dependencies : test_deps,
+  link_with : lsgkit,
+  include_directories : core_inc,
+  c_args : ['-DFIND_FIXTURE_PATH="' + find_fixture + '"'],
+  install : false,
+)
+test('sort', test_sort)

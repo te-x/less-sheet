@@ -247,6 +247,8 @@ typedef enum
   LSG_A11Y_GROUP_FIND,
   LSG_A11Y_GROUP_NAVIGATION,
   LSG_A11Y_GROUP_SELECTION,
+  /* sort-by-column slice: the one Sorting group in the shortcuts surface. */
+  LSG_A11Y_GROUP_SORTING,
 } LsgA11yShortcutGroup;
 
 /*
@@ -293,6 +295,9 @@ typedef enum
   LSG_A11Y_CMD_EXTEND,     /* Shift + arrows extend the selection */
   LSG_A11Y_CMD_SELECT_ALL,
   LSG_A11Y_CMD_COPY,
+  /* sort-by-column slice: cycle the sort on the keyboard CURSOR's column
+   * (ascending -> descending -> off), the same cycle a header click runs. */
+  LSG_A11Y_CMD_SORT,
   LSG_A11Y_CMD_N, /* count sentinel — NOT a command */
 } LsgA11yCommand;
 

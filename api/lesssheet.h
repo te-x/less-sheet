@@ -34,7 +34,12 @@
  * (e.g. -3, +2.5 copy raw), is emitted with a single leading apostrophe, so
  * a copied cell can never become a live formula when pasted into Excel / Sheets
  * / Numbers. Display (ls_cell) and search are byte-for-byte unaffected — see
- * COPY OUTPUT SAFETY. The
+ * COPY OUTPUT SAFETY. sort-by-column adds a THIRD view kind on top of the
+ * identity and filter views: ls_sort_set / ls_sort_clear / ls_sort_poll order
+ * the current view by ONE column, ascending or descending, after one
+ * progress-reported, cancellable KEY PASS over the data; while it is active
+ * every row-addressing accessor speaks SORTED coordinates, composing with a
+ * filter — see SORTED VIEWS. The
  * walking-skeleton head-window surface is superseded.
  *
  * csv-hardening adds two things to the delimited-text path without changing
@@ -67,7 +72,8 @@
  *     valid until the NEXT ls_window_set() call on that document or until
  *     ls_close(), whichever comes first. ls_window_set may evict; nothing
  *     else invalidates borrows — in particular the core's own background
- *     scanning (indexing, jump-scans, match-scans, AND filter-scans) NEVER
+ *     scanning (indexing, jump-scans, match-scans, filter-scans, AND sort key
+ *     passes) NEVER
  *     invalidates a
  *     borrow. Callers copy at their own boundary; they never free anything
  *     obtained from the core. ls_cell_copy is the exception that proves the
@@ -75,28 +81,34 @@
  *     buffer, so its output is owned by the caller and is NOT invalidated by a
  *     later ls_window_set (on any thread). See FULL-CELL READ.
  *   - Allocation discipline: ls_open, ls_window_set, ls_search_start,
- *     ls_search_nav, and ls_filter_set are the only CALLS that may allocate
+ *     ls_search_nav, ls_filter_set, and ls_sort_set are the only CALLS that
+ *     may allocate
  *     (running background
  *     scans may also allocate internally for index/count storage). Every
  *     accessor and poll (ls_dialect_get, ls_column_count, ls_row_count_get,
  *     ls_index_poll, ls_cell, ls_cell_truncated, ls_header_cell,
  *     ls_header_cell_truncated, ls_jump_poll, ls_search_poll, ls_filter_poll,
+ *     ls_sort_poll,
  *     ls_source_row, ls_row_oversized, ls_cell_copy) and ls_jump_cancel / ls_search_cancel /
- *     ls_filter_clear
+ *     ls_filter_clear / ls_sort_clear
  *     performs ZERO heap allocation and
  *     never fails; out-of-range access returns the empty string / a
  *     well-defined value. Additionally, once every scan has reported a
  *     terminal state (index complete or idle, jump slot not LS_JUMP_SCANNING,
- *     search not LS_SEARCH_SCANNING, filter not LS_FILTER_SCANNING), the core
+ *     search not LS_SEARCH_SCANNING, filter not LS_FILTER_SCANNING, sort not
+ *     LS_SORT_BUILDING), the core
  *     performs no further internal allocation on that document until the next
  *     mutating call (ls_window_set, ls_jump_start, ls_search_start,
- *     ls_search_nav, ls_filter_set).
+ *     ls_search_nav, ls_filter_set, ls_sort_set).
  *   - Source files are read-only to the core: never modified, locked, or
  *     copied. Steady-state memory is O(materialized window + index
  *     checkpoints), never O(file) and never O(rows). A search adds
  *     O(index checkpoints) count storage + O(1) job state — see SEARCH. A
  *     filter adds the same O(index checkpoints) counter storage + O(1) mode
- *     state (never a match-row list) — see FILTERED VIEWS.
+ *     state (never a match-row list) — see FILTERED VIEWS. A SORT adds O(1)
+ *     process memory in steady state: its permutation and inverse mapping live
+ *     in EPHEMERAL TEMP STORAGE, and its build is bounded by one fixed chunk,
+ *     never by the row count — see SORTED VIEWS.
  *
  * OPEN COST (the cold-start contract)
  *   - ls_open performs O(head) work regardless of file size: it consumes at
@@ -109,7 +121,9 @@
  *     the column-count / record-1 rule and LS_CELL_MAX_BYTES). The search
  *     machinery is lazy: it costs nothing (no storage, no threads, no scan
  *     work) until the first ls_search_start on the document. The filter
- *     machinery is likewise lazy: nothing until the first ls_filter_set.
+ *     machinery is likewise lazy: nothing until the first ls_filter_set, and
+ *     the SORT machinery nothing (no thread, no allocation, no temp file, no
+ *     network byte) until the first ls_sort_set.
  *   - After a successful open the scan frontier covers at least
  *     min(total rows, LS_OPEN_READY_MIN_ROWS) rows, provided those rows fit
  *     within LS_OPEN_HEAD_MAX_BYTES — so a window at the top of the document
@@ -333,9 +347,11 @@
  * THREADING
  *   - ls_open / ls_close: exclusive. Do not call anything on a document
  *     concurrently with its open or close. ls_close may be called while
- *     scans are running (jump-scans, match-scans, AND filter-scans): it
+ *     scans are running (jump-scans, match-scans, filter-scans, AND sort key
+ *     passes): it
  *     cancels and joins
- *     all core-owned threads for that document before releasing storage.
+ *     all core-owned threads for that document before releasing storage, and
+ *     removes every ephemeral temp file the document created.
  *   - Window lane — ls_window_set, ls_cell, ls_source_row, ls_row_oversized,
  *     ls_header_cell:
  *     one caller
@@ -345,7 +361,8 @@
  *   - Poll/control lane — ls_dialect_get, ls_column_count, ls_row_count_get,
  *     ls_index_poll, ls_jump_start, ls_jump_cancel, ls_jump_poll,
  *     ls_search_start, ls_search_nav, ls_search_cancel, ls_search_poll,
- *     ls_filter_set, ls_filter_clear, ls_filter_poll, ls_cell_copy: safe from
+ *     ls_filter_set, ls_filter_clear, ls_filter_poll, ls_sort_set,
+ *     ls_sort_clear, ls_sort_poll, ls_cell_copy: safe from
  *     any thread at any time (internally synchronized), except
  *     concurrently with ls_open/ls_close on the same document. ls_cell_copy in
  *     particular is safe on a background (copy) worker WHILE the window lane
@@ -1048,7 +1065,8 @@ ls_status ls_open(const char *path, const ls_open_options *options, ls_doc **out
 /*
  * Release the document and all storage owned by it, first cancelling and
  * joining any core-owned scan threads (background index, jump-scans,
- * match-scans, and filter-scans — calling ls_close during any is safe). Every ls_str
+ * match-scans, filter-scans, and sort key passes — calling ls_close during any
+ * is safe) and deleting every ephemeral temp file it created. Every ls_str
  * borrowed from this document becomes invalid. `doc` must be a handle
  * returned by a successful ls_open, closed exactly once.
  */
@@ -2308,6 +2326,17 @@ void ls_net_open_release(ls_net_open_job *job);
  *     A network FILTER (ls_filter_*) is likewise demand-bounded: its filter-scan
  *     advances only while serving a demand, then parks LS_FILTER_CANCELLED (the
  *     view stays filtered; counts firm only as the user navigates).
+ *
+ * (d) SORT IS AN EXPLICIT FULL-PASS DEMAND — ls_sort_set (sort-by-column
+ *     slice; the full statement is amendment (d) in SORTED VIEWS below). A
+ *     sort cannot be answered from a prefix, so on a network source
+ *     ls_sort_set is itself the user's explicit demand: its key pass drives
+ *     the fetch/scan to EOF with pollable progress and a working cancel
+ *     (ls_sort_clear). Sorting an HTTP document downloads the resource — on
+ *     click, visibly, cancellably. This JOINS deep-jump / find-last / wrap on
+ *     the demand list; the invariant is unweakened: still NEVER an unprompted
+ *     background network scan, and a document nobody sorts fetches exactly
+ *     what it fetched before this slice existed.
  */
 
 /*
@@ -2615,6 +2644,418 @@ ls_copy_progress ls_copy_next(ls_copy_job *job, uint8_t *buf, size_t buf_len);
  * ls_copy_close at a time).
  */
 void ls_copy_close(ls_copy_job *job);
+
+/* =========================================================================
+ * SORTED VIEWS (sort-by-column slice) — A THIRD VIEW KIND.
+ * FROZEN-SURFACE AMENDMENT (v1, lock-step rebuild)
+ * =========================================================================
+ * (sort-by-column slice — ONE new enum triple + ONE snapshot struct + THREE
+ * function prototypes, PLUS a documented reinterpretation of every existing
+ * row-addressing accessor while a sort is active, PLUS amendment (d) to the
+ * NEVER-FULL-DOWNLOAD STREAMING block's demand list. This block is therefore
+ * NOT byte-identical-additive the way the match-flags / streaming-copy blocks
+ * were: it is an audited, lock-step frozen-surface edit in the sense of the
+ * FROZEN-SURFACE AMENDMENT note near the top of the COLUMN METADATA EXTENSION
+ * — sound because the whole workspace statically links this core and rebuilds
+ * from this one header, with no external pinned-binary consumer and no compat
+ * path. No existing struct, enum, constant, or prototype changes SHAPE; only
+ * the meaning of a row INDEX changes, and only while a sort is active.
+ * Root-planner freeze; the author's sign-off is recorded 2026-09-06. See
+ * docs/architecture/ARCH-sort-by-column.md.)
+ *
+ * WHY IT IS HONEST ABOUT COST. Nothing sorted can be shown until ONE full pass
+ * over the data has extracted every row's key — the smallest value can live on
+ * the last row. That pass is the price search-to-EOF and a filter-scan already
+ * pay, with the same progress + cancel affordances. Once it completes, the
+ * sorted view is served from an on-disk permutation and every position in it is
+ * O(1)-addressable. RAM never becomes O(rows).
+ *
+ * A SORT IS A VIEW MODE, NOT A JOB. Like a filter, it PERSISTS until cleared or
+ * the document is re-opened, across scan-slot contention and across automatic
+ * rebuilds. Unlike a filter, a PARTIAL sort is never served (see THE FLIP).
+ *
+ * ---- 1. THE REQUEST -------------------------------------------------------
+ *   - A document has at most ONE sort: an absolute column ID plus a direction,
+ *     set by ls_sort_set and removed by ls_sort_clear. Sort state is
+ *     SESSION-ONLY: nothing is persisted and a re-open starts LS_SORT_IDLE.
+ *   - ls_sort_set REJECTS (returns false, changes NOTHING — no slot taken, no
+ *     reset, the current view untouched) when `column >= ls_column_count()`
+ *     (so every column of an empty document rejects) or `direction` is outside
+ *     its enum domain. This mirrors ls_search_start / ls_filter_set validation.
+ *
+ * ---- 2. THE ORDER (the signed comparator; this IS the definition) ----------
+ * The key is derived from the sort column's EFFECTIVE type — override >
+ * inferred > declared > unknown, exactly ls_column_metadata.effective — and its
+ * null policy, both CAPTURED at the ls_sort_set that started the build (see
+ * REBUILDS for what a later configuration change does). Matching is over the
+ * cell's FULL transcoded UTF-8 text, exactly as SEARCH matches it: quoting
+ * removed, the column-count truncate/pad rule applied, NEVER the
+ * LS_CELL_MAX_BYTES display-capped bytes.
+ *
+ * ASCENDING order is the total order below. Rows are partitioned into three
+ * GROUPS, which never interleave:
+ *     A. CONFORMING values — the cell parses under the effective type's pinned
+ *        grammar and is not null. Ordered per kind (below).
+ *     B. NON-CONFORMING values — not null, and the cell does not parse under
+ *        that grammar. Ordered among themselves by the TEXT rule below.
+ *     C. NULLS — the cell is null under the column's null policy
+ *        (LS_COLUMN_NULL_SENTINEL: byte-exact equality with the sentinel;
+ *        LS_COLUMN_NULL_NONE: no cell is ever null, so this group is empty).
+ *        All nulls compare EQUAL to each other.
+ *   Group A comes first, then B, then C. For an effective kind of
+ *   LS_COLUMN_TYPE_TEXT or LS_COLUMN_TYPE_UNKNOWN — and for any other kind this
+ *   client cannot read (LS_COLUMN_TYPE_UNSUPPORTED) — every non-null value
+ *   conforms, so group B is empty and the whole column sorts as TEXT.
+ *
+ * Within group A, by kind:
+ *   - LS_COLUMN_TYPE_INTEGER / LS_COLUMN_TYPE_DECIMAL: EXACT numeric order —
+ *     the SAME total order the ordering predicates already compute (see
+ *     ls_search_op LT/GT/LE/GE): sign, digits, and exponent compared
+ *     arithmetically, NEVER through binary floating point. Values past 2^53,
+ *     40-digit integers, and equal-prefix decimals order correctly, and
+ *     "2" == "2.0" == "+2e0" is a TIE, not an ordering.
+ *   - LS_COLUMN_TYPE_DATE: chronological (which, for the pinned YYYY-MM-DD
+ *     grammar, is byte order).
+ *   - LS_COLUMN_TYPE_DATETIME: chronological. Under
+ *     LS_COLUMN_DATETIME_ZONED the order is by INSTANT (offsets normalized, so
+ *     2020-01-01T00:00:00Z and 2020-01-01T01:00:00+01:00 are a TIE); under
+ *     LS_COLUMN_DATETIME_NAIVE it is by wall clock. Fractional seconds compare
+ *     by VALUE (".5" == ".50"). A value whose zonedness DIFFERS from the
+ *     column's datetime_semantics is NON-CONFORMING (group B) — a naive value
+ *     in a zoned column, or a zoned value in a naive column.
+ *   - LS_COLUMN_TYPE_BOOLEAN: false < true (the pinned ASCII-case-insensitive
+ *     true/false grammar; "TRUE" and "true" are a TIE).
+ *   - LS_COLUMN_TYPE_TEXT / UNKNOWN / UNSUPPORTED, and all of group B: the TEXT
+ *     rule — compare byte-by-byte with ASCII case FOLDED (bytes 0x41..0x5A fold
+ *     to their lowercase forms; every byte >= 0x80 compares exactly), which is
+ *     search's pinned v1 folding rule verbatim; the shorter value sorts first
+ *     when one is a prefix of the other.
+ *
+ * TIEBREAKS, in order: (1) the kind rule above; (2) for TEXT/group B only, a
+ * BYTE-EXACT comparison of the same bytes (so "Ab" and "aB" are ordered, and
+ * deterministically); (3) SOURCE ORDER — the original data-row number. The sort
+ * is therefore STABLE and the total order is TOTAL: no two distinct rows ever
+ * compare equal.
+ *
+ * EXACTNESS PIN. This comparator is the DEFINITION. An implementation may
+ * accelerate with fixed-width keys, but any two keys that compare equal and
+ * MAY be lossy (text past the key width, numerics past the encoding's
+ * exactness) MUST be resolved by re-lexing the full values. A HASH is NEVER
+ * used to conclude equality — a collision would silently misorder rows, which
+ * this project's never-silent-wrong-data bar forbids. Adversarial common-prefix
+ * data therefore gets SLOWER, never WRONG.
+ *
+ * DESCENDING is the ascending permutation READ BACKWARDS. Consequence, stated
+ * plainly because it is user-visible: rows that compare equal appear in source
+ * order ascending and in REVERSE source order descending; nulls come LAST
+ * ascending and FIRST descending. Flipping direction on an ACTIVE sort is O(1)
+ * — see THE FLIP.
+ *
+ * ---- 3. THE KEY PASS ------------------------------------------------------
+ *   - A successful ls_sort_set that is not a no-op (see THE FLIP) starts the
+ *     KEY PASS: one sequential sweep of the data rows in the document's SINGLE
+ *     scan slot which, per row, evaluates the active filter predicate and
+ *     extracts the sort key of matching rows. It advances the SHARED frontier
+ *     exactly like a match-scan or filter-scan (paid once, gains kept), so on
+ *     completion the index is complete and ls_row_count_get is EXACT; and it
+ *     drives an incomplete filter's counters to LS_FILTER_DONE as a side
+ *     effect.
+ *   - Never blocks: the pass is asynchronous and observable through
+ *     ls_sort_poll (state LS_SORT_BUILDING, or already LS_SORT_ACTIVE for a
+ *     document with nothing to scan). ls_sort_status.progress is the fraction
+ *     of the pass's work covered so far, in [0.0, 1.0] — MONOTONE
+ *     non-decreasing within one build, exactly 1.0 at LS_SORT_ACTIVE, and
+ *     frozen at its last value when PARKED or FAILED (the measurement axis is
+ *     implementation detail, as for jumps and searches).
+ *   - MEMORY / DISK. (key, source row) pairs accumulate in ONE fixed-size
+ *     memory chunk; a full chunk is sorted and spilled as a RUN to ephemeral
+ *     temp storage, and a k-way merge then writes the final permutation AND the
+ *     source->sorted inverse mapping. Process memory is bounded by that chunk
+ *     (merge read-buffers are derived from the same one knob), NEVER O(rows). A
+ *     document whose pairs fit one chunk touches no disk for runs. The chunk
+ *     size is deliberately NOT an ABI constant: it is a core-internal knob with
+ *     one named default and one resolver (see backend/contracts/api.zig
+ *     `sort_chunk_default_bytes`), like the window budget.
+ *   - TEMP STORAGE HYGIENE. Runs, the permutation, and the inverse mapping live
+ *     in the platform temp directory under EXACTLY the discipline of the gzip
+ *     checkpoint spill and the network spool, through the SAME resolver: mode
+ *     0600, UNLINKED immediately on creation (never visible in its directory),
+ *     never a persistent cache, never reused across opens, and fully gone after
+ *     ls_close / process exit. No new caller-supplied cache-directory knob
+ *     exists or will be added.
+ *
+ * ---- 4. THE FLIP (a building sort never changes what you see) -------------
+ *   - While LS_SORT_BUILDING the view keeps its CURRENT order: source order if
+ *     nothing was sorted, or the OLD sorted order when a still-valid previous
+ *     sort is being replaced by a new column/direction. When the previous
+ *     permutation was invalidated because the ROW SET changed (a filter was set
+ *     or cleared — see REBUILDS) the view serves the new row set in SOURCE
+ *     order while the rebuild runs. A PARTIAL sort is NEVER served.
+ *   - The view flips to the new order exactly at LS_SORT_ACTIVE.
+ *   - DIRECTION FLIP. ls_sort_set with the SAME column and the OTHER direction
+ *     on an LS_SORT_ACTIVE sort completes BEFORE the call returns: the poll
+ *     never leaves LS_SORT_ACTIVE, no scan slot is taken, and no pass runs (the
+ *     permutation is simply read backwards). It is still a coordinate change,
+ *     so it RESETS search and jump (see RESET).
+ *   - NO-OP. ls_sort_set with the SAME column AND the SAME direction on an
+ *     LS_SORT_ACTIVE sort returns true and does NOTHING AT ALL — no pass, and
+ *     NO reset of search or jump. (On a PARKED or FAILED sort the identical
+ *     request RE-RUNS the pass; that is how a frontend retries.)
+ *
+ * ---- 5. SORTED COORDINATES (what every accessor means) --------------------
+ * While a sort is ACTIVE the document presents its rows in SORTED order, and
+ * ALL row-addressing accessors reinterpret their row arguments AND results in
+ * these SORTED coordinates — composing with a filter, whose row SET they use:
+ *     * ls_window_set / ls_cell / ls_cell_truncated / ls_row_oversized /
+ *       ls_cell_copy / ls_window_match_flags / the ls_copy_open rect — address
+ *       and serve the rows of the (filtered) row set in sort order. Every cell
+ *       rule is unchanged (quoting, truncate/pad, the display cap and its flag,
+ *       the copy-output neutralization).
+ *     * ls_source_row(doc, i) — the ORIGINAL data-row number of sorted row i
+ *       (the gutter value): an O(1) permutation lookup for servable rows,
+ *       LS_NO_ROW otherwise. The gutter therefore keeps showing SOURCE numbers,
+ *       which is why jump keeps taking them.
+ *     * ls_row_count_get — UNCHANGED. A sort does not change the row set, so it
+ *       still reports m (the filtered count, or all data rows). After the key
+ *       pass it is exact, because the pass reached EOF.
+ *     * ls_jump_* — target_row stays an ORIGINAL data-row number (see JUMP).
+ *     * ls_search_* — anchors and found_row are SORTED positions (see FIND).
+ *   The effective HEADER record is not a data row and is UNAFFECTED, exactly as
+ *   under a filter.
+ *   COST NOTE: a sorted window is SCATTERED over the file, so materializing it
+ *   costs O(window) block re-lexes rather than one contiguous walk. The
+ *   existing aggregate window budget applies UNCHANGED, so a sorted
+ *   ls_window_set may return a SHORTER contiguous prefix — the same short
+ *   ls_row_range signal a filtered window already uses; the caller re-issues.
+ *
+ * ---- 6. JUMP UNDER A SORT -------------------------------------------------
+ *   ls_jump_start's target_row is an ORIGINAL data-row number (the filter
+ *   precedent: the gutter shows source numbers, so the number the user types is
+ *   the number they see). The landing is that row's SORTED position, reported
+ *   as ls_jump_status.landed_row — an O(1) inverse-mapping lookup on an ACTIVE
+ *   sort, so such a jump completes BEFORE the call returns and disturbs no
+ *   scan. Composition rules are unchanged and applied in SOURCE space FIRST,
+ *   then mapped: under a filter the target resolves to the first MATCHING
+ *   source row >= target_row, and a target at/past EOF clamps to the last
+ *   (matching) source row; 0 for a view with no rows.
+ *
+ * ---- 7. FIND UNDER A SORT -------------------------------------------------
+ *   ls_search_* operates entirely in SORTED coordinates: ls_search_nav anchors
+ *   and ls_search_status.found_row are SORTED positions, and "next" means next
+ *   in SORT order. `total` is unchanged in VALUE — the matching row SET does
+ *   not depend on the order — and `position` is the 1-based rank of found_row
+ *   among all matching rows IN SORTED ORDER.
+ *   THE ONE BEHAVIORAL COST: because a match at any sorted position can come
+ *   from anywhere in the file, a navigation under a sort can only be answered
+ *   once the match-scan has covered EVERY row. Until then it reports
+ *   LS_SEARCH_NAV_SEARCHING (with progress), and it resolves to FOUND /
+ *   EXHAUSTED when coverage is complete — one full pass, the same cost class as
+ *   setting the sort. After LS_SEARCH_DONE every navigation is fast again. The
+ *   counting mechanism is unchanged in KIND (per-block counters, never a
+ *   match-row list, memory O(index checkpoints)); only the blocks are indexed
+ *   by sorted position. ls_window_match_flags is per-served-row and is
+ *   unaffected.
+ *
+ * ---- 8. THE SINGLE SCAN SLOT (now four contenders) ------------------------
+ *   The key pass shares the document's one background-scan slot with
+ *   jump-scans, match-scans, and filter-scans:
+ *     * ls_sort_set TAKES the slot for the key pass: a jump in
+ *       LS_JUMP_SCANNING is cancelled (LS_JUMP_IDLE, frontier gains kept), a
+ *       running filter-scan yields the slot (LS_FILTER_CANCELLED, counts and
+ *       mode kept — and the key pass will complete those counts anyway), and
+ *       any active search is RESET (see RESET).
+ *     * An ls_jump_start / ls_search_start / ls_search_nav that must SCAN takes
+ *       the slot from a building key pass: the sort goes LS_SORT_PARKED, its
+ *       progress frozen, the REQUEST kept, and the view still unsorted (or
+ *       still in the old order). LS_SORT_PARKED is the sort analog of
+ *       LS_FILTER_CANCELLED and is likewise NOT a user cancellation — but note
+ *       the difference: a cancelled FILTER still serves its (partial) view,
+ *       whereas a parked SORT serves no sorted view at all. It is named PARKED
+ *       rather than CANCELLED for exactly that reason (the signed design's
+ *       "cancelled" state).
+ *     * Under LS_INDEX_AUTO on a LOCAL document the key pass is a background
+ *       view-completion job: from LS_SORT_PARKED it RESUMES on its own and
+ *       converges to LS_SORT_ACTIVE without further caller input, whatever
+ *       jumps/finds intervene (mirroring the AUTO filter-scan). Under
+ *       LS_INDEX_MANUAL it stays LS_SORT_PARKED until re-driven by another
+ *       ls_sort_set.
+ *     * On a NETWORK document there is no unprompted drive, so a parked pass
+ *       stays parked in BOTH index modes until an ls_sort_set re-drives it.
+ *     * ls_sort_clear stops a running pass, drops the request, and leaves the
+ *       view exactly as it was: ls_sort_poll then reports LS_SORT_IDLE. It is
+ *       both "remove the sort" and "cancel the build" — there is no separate
+ *       cancel verb, and no user-cancelled terminal state.
+ *
+ * ---- 9. REBUILDS (your sort intent survives its inputs changing) ----------
+ *   These calls INVALIDATE a built or building permutation, and the sort
+ *   request PERSISTS and re-runs the pass automatically (progress + cancel; on
+ *   a network document that is another full fetch):
+ *     * ls_filter_set and ls_filter_clear (the row SET changed — while the
+ *       rebuild runs the view serves the NEW row set in SOURCE order);
+ *     * ls_column_override_set / ls_column_override_clear on the SORT COLUMN;
+ *     * ls_column_null_sentinel_set / ls_column_null_sentinel_clear on the SORT
+ *       COLUMN.
+ *   Nothing else does. In particular a background INFERENCE publication or an
+ *   accepted proposal does NOT re-order a built sort: the effective type and
+ *   null policy are captured at ls_sort_set, so the order a user is looking at
+ *   never changes under them because a worker finished sampling. A DIALECT or
+ *   ENCODING change is a re-open, which clears the sort (a fresh handle polls
+ *   LS_SORT_IDLE).
+ *
+ * ---- 10. RESET ------------------------------------------------------------
+ *   Every sort change the user can make — a successful non-no-op ls_sort_set
+ *   (including a direction flip), an automatic rebuild, and ls_sort_clear —
+ *   RESETS any active search to LS_SEARCH_IDLE (all-zero snapshot) and returns
+ *   the jump slot to LS_JUMP_IDLE, because the coordinate space changed. This
+ *   is the filter's RESET rule applied to the third view kind. Setting or
+ *   clearing a FILTER continues to reset search and jump as documented in
+ *   FILTERED VIEWS, and now also triggers the sort rebuild above.
+ *
+ * ---- 11. FAILURE (works, or fails gracefully) ------------------------------
+ *   A key pass that cannot finish because ephemeral temp storage failed (disk
+ *   full, create/write/read error) or because an allocation failed ends
+ *   LS_SORT_FAILED at a consistent point, with ls_sort_status.error saying
+ *   which. The view is UNCHANGED (the previous order is still served), the
+ *   request is retained so the frontend can render it and retry with an
+ *   identical ls_sort_set, no temp file or thread is leaked, and NO partially
+ *   sorted view is ever served. There is no partial-success state.
+ *
+ * ---- 12. LAZINESS ---------------------------------------------------------
+ *   The sort machinery costs NOTHING until the first ls_sort_set on a document:
+ *   no thread, no allocation, no temp file, and — on a network document — not
+ *   one extra byte fetched. Open, first paint, and the cold-start budget are
+ *   untouched.
+ *
+ * ---- 13. AMENDMENT (d) TO NEVER-FULL-DOWNLOAD STREAMING -------------------
+ *   SORT IS AN EXPLICIT FULL-PASS DEMAND. On a network source, ls_sort_set is
+ *   itself the user's explicit demand: its key pass drives the fetch/scan to
+ *   EOF with pollable progress and a working cancel (ls_sort_clear). Sorting an
+ *   HTTP document therefore DOWNLOADS the resource — on click, visibly,
+ *   cancellably. This JOINS deep-jump / find-last / wrap on the demand list of
+ *   the NEVER-FULL-DOWNLOAD STREAMING EXTENSION above; the invariant it does
+ *   NOT weaken is the important one: there is still NEVER an unprompted
+ *   background network scan, and a document with no sort demand fetches exactly
+ *   what it fetched before this slice existed.
+ */
+
+/* Sort direction (ls_sort_set / ls_sort_status.direction). Descending is the
+ * ascending permutation read backwards — see DESCENDING above. */
+typedef enum ls_sort_direction {
+    LS_SORT_ASCENDING = 0,
+    LS_SORT_DESCENDING = 1,
+} ls_sort_direction;
+
+/* State of the document's (single) sort. */
+typedef enum ls_sort_state {
+    /* No sort: the document's rows are in file order (within the current view).
+     * The whole snapshot is zero. */
+    LS_SORT_IDLE = 0,
+    /* A sort is requested and its key pass is advancing. The view is NOT yet
+     * sorted (see THE FLIP). */
+    LS_SORT_BUILDING = 1,
+    /* A sort is active: the view IS sorted, progress is exactly 1.0, and every
+     * row accessor speaks sorted coordinates. */
+    LS_SORT_ACTIVE = 2,
+    /* A sort is requested but its key pass stopped before EOF because a
+     * jump/find took the single scan slot. Progress is frozen, the request is
+     * kept, and the view is UNSORTED (or still in the previous order) — no
+     * partial sort is ever served. NOT a user cancellation (ls_sort_clear
+     * yields LS_SORT_IDLE, not this): the analog of LS_FILTER_CANCELLED. Under
+     * LS_INDEX_AUTO on a local document it resumes and converges to
+     * LS_SORT_ACTIVE on its own; otherwise another ls_sort_set re-drives it. */
+    LS_SORT_PARKED = 3,
+    /* The key pass failed (see `error`). The view is unchanged, the request is
+     * retained, nothing leaked. An identical ls_sort_set retries. */
+    LS_SORT_FAILED = 4,
+} ls_sort_state;
+
+/* Why a key pass FAILED (ls_sort_status.error). Meaningful only when the state
+ * is LS_SORT_FAILED; LS_SORT_OK in every other state. Distinct, stable values:
+ * the two causes never collapse, because a frontend says different things about
+ * "your disk is full" and "out of memory". */
+typedef enum ls_sort_error {
+    LS_SORT_OK = 0,
+    /* Ephemeral temp storage failed: the run/permutation file could not be
+     * created, written, or read back (disk full, I/O error, an unusable temp
+     * directory). */
+    LS_SORT_ERROR_STORAGE = 1,
+    /* An allocation the pass needed failed. */
+    LS_SORT_ERROR_MEMORY = 2,
+} ls_sort_error;
+
+/*
+ * Sort snapshot (see the SORTED VIEWS section for the full model). 24 bytes.
+ *   state     — LS_SORT_IDLE means "no sort" and every other field is zero.
+ *   error     — LS_SORT_OK unless state == LS_SORT_FAILED.
+ *   column    — the REQUESTED sort column; valid whenever state != LS_SORT_IDLE
+ *               (including BUILDING, PARKED and FAILED, so the frontend can
+ *               keep the indicator and the retry target on screen).
+ *   direction — the REQUESTED direction; same validity as `column`.
+ *   progress  — key-pass work fraction in [0.0, 1.0]; monotone within one
+ *               build; exactly 1.0 at LS_SORT_ACTIVE; frozen when PARKED or
+ *               FAILED; 0.0 when IDLE.
+ */
+typedef struct ls_sort_status {
+    ls_sort_state state;
+    ls_sort_error error;
+    uint32_t column;
+    ls_sort_direction direction;
+    double progress;
+} ls_sort_status;
+
+/*
+ * Set (or replace) the document's SORT: order the current view by `column`
+ * (an absolute column index) in `direction`. See SORTED VIEWS above for the
+ * full model; the essentials:
+ *
+ *   returns false — REJECTED, and NOTHING changes (no slot taken, no reset, the
+ *   current view / search / jump / filter all untouched) — when
+ *   `column >= ls_column_count(doc)` or `direction` is outside its enum domain.
+ *
+ *   returns true — one of three things happened:
+ *     - NO-OP: the sort was already LS_SORT_ACTIVE on this exact column AND
+ *       direction. Nothing at all changed (search and jump are NOT reset).
+ *     - INSTANT FLIP: the sort was LS_SORT_ACTIVE on this column in the OTHER
+ *       direction. The view is already re-ordered when this call returns, the
+ *       poll never left LS_SORT_ACTIVE, and no scan ran. Search and jump ARE
+ *       reset (the coordinate space changed).
+ *     - BUILD: otherwise the KEY PASS starts, taking the single scan slot
+ *       (cancelling a scanning jump, yielding a running filter-scan, resetting
+ *       any search). The call NEVER blocks; observe it with ls_sort_poll
+ *       (LS_SORT_BUILDING, or already LS_SORT_ACTIVE for a document with
+ *       nothing to scan). The view keeps its CURRENT order until the pass
+ *       completes.
+ *
+ * ON A NETWORK DOCUMENT this call is an explicit demand to fetch the whole
+ * resource (amendment (d) above): the pass drives the transfer to EOF with
+ * progress, and ls_sort_clear cancels it.
+ *
+ * May allocate (the key chunk and the pass's own state — sized by the core's
+ * chunk knob, never by the row count). On failure the pass reports
+ * LS_SORT_FAILED with LS_SORT_ERROR_MEMORY rather than aborting.
+ */
+bool ls_sort_set(ls_doc *doc, uint32_t column, ls_sort_direction direction);
+
+/*
+ * Remove the sort, restoring FILE ORDER within the current view (no-op when
+ * ls_sort_poll already reports LS_SORT_IDLE). This is ALSO the cancel verb: a
+ * running key pass is stopped and its request dropped, with all frontier gains
+ * KEPT, and the view is left exactly as it was (a building sort was never
+ * serving anything new, and an active one reverts to file order). Afterwards
+ * ls_sort_poll reports LS_SORT_IDLE.
+ *
+ * Clearing RESETS any active search to LS_SEARCH_IDLE and returns the jump slot
+ * to LS_JUMP_IDLE (the coordinate space changed) — the ls_filter_clear rule.
+ * Re-anchoring the viewport near the row the user was looking at is the
+ * caller's affair (capture ls_source_row of the top visible row BEFORE
+ * clearing). ZERO allocation; never fails.
+ */
+void ls_sort_clear(ls_doc *doc);
+
+/* Current sort snapshot (see ls_sort_status and SORTED VIEWS). Before any
+ * ls_sort_set on this handle, and after ls_sort_clear: LS_SORT_IDLE with every
+ * other field zero. ZERO allocation; never fails; never scans. */
+ls_sort_status ls_sort_poll(const ls_doc *doc);
 
 #ifdef __cplusplus
 }

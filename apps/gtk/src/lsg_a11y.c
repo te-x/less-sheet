@@ -234,6 +234,10 @@ lsg_a11y_shortcuts (guint *out_n)
       "Select all", NULL, "<Control>a", NULL },
     { LSG_A11Y_CMD_COPY, LSG_A11Y_GROUP_SELECTION, LSG_A11Y_SCOPE_GRID, "Copy",
       NULL, "<Control>c", NULL },
+    /* sort-by-column: GRID scope, so it never steals a focused GtkText's own
+     * Ctrl+Shift+S; it acts on the keyboard cursor's column. */
+    { LSG_A11Y_CMD_SORT, LSG_A11Y_GROUP_SORTING, LSG_A11Y_SCOPE_GRID,
+      "Sort by column", NULL, "<Control><Shift>s", NULL },
   };
 
   if (out_n != NULL)

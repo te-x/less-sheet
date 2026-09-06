@@ -1650,3 +1650,213 @@ comptime {
     if (@TypeOf(core.sourceDeinit) != fn (*core.Source) void)
         @compileError("F1 seam drift: sourceDeinit must be fn(*Source) void");
 }
+
+// ===========================================================================
+// sort-by-column slice (ARCH-sort-by-column) — SORTED VIEWS, the third view
+// kind. Mirrors api/lesssheet.h "SORTED VIEWS" EXACTLY: the direction / state /
+// error enums, the `ls_sort_status` snapshot, and the three `ls_sort_*` export
+// fns; the comptime block at the bottom pins the LAYOUT and the SIGNATURES.
+// Planner-owned; amended only together with the C header.
+//
+// The full normative model is in api/lesssheet.h (the comparator's total order,
+// the key pass, the flip-only-at-ACTIVE rule, sorted coordinates, jump/find
+// under a sort, the four-way scan slot, rebuild triggers, RESET, failure, and
+// laziness). Implementation obligations this contract adds on top:
+//   - `ls_sort_set` is the ONLY new call that may allocate, and what it may
+//     allocate is bounded by the CHUNK KNOB below, never by the row count.
+//     `ls_sort_clear` / `ls_sort_poll` perform ZERO allocator calls and never
+//     fail. Once the sort is not `.building`, no further sort allocation
+//     happens until the next mutating call.
+//   - Every heap allocation the sort makes goes through the document's
+//     allocator (`openWithAllocator`), so the frozen tests can count it and
+//     detect leaks; every temp file it creates is deleted by `ls_close`.
+//   - The permutation and the inverse mapping live on EPHEMERAL TEMP STORAGE,
+//     never in an O(rows) in-process array.
+// ===========================================================================
+
+/// Mirrors `ls_sort_direction`. Descending is the ascending permutation read
+/// backwards (instant flip; equal values appear in REVERSE source order).
+pub const SortDirection = enum(c_int) {
+    ascending = 0,
+    descending = 1,
+};
+
+/// Mirrors `ls_sort_state`. `idle` == no sort (the whole snapshot is zero);
+/// `building` == the key pass is advancing and the view is NOT yet re-ordered;
+/// `active` == the view IS sorted; `parked` == the pass yielded the single scan
+/// slot (request kept, progress frozen, NO partial sort served — the analog of
+/// `FilterState.cancelled`, and never a user cancellation); `failed` == the
+/// pass could not finish (see `SortError`), view unchanged.
+pub const SortState = enum(c_int) {
+    idle = 0,
+    building = 1,
+    active = 2,
+    parked = 3,
+    failed = 4,
+};
+
+/// Mirrors `ls_sort_error`: why a key pass FAILED. Meaningful only when the
+/// state is `.failed`. The two causes never collapse — a frontend says
+/// different things about a full disk and an out-of-memory.
+pub const SortError = enum(c_int) {
+    ok = 0,
+    storage = 1,
+    memory = 2,
+};
+
+/// Mirrors `ls_sort_status` (24 bytes; see it for every field's validity rule).
+/// `column` / `direction` are the REQUESTED ones and are valid in every state
+/// but `.idle`, so a frontend keeps its indicator and its retry target on
+/// screen while building, parked, or failed. `progress` is in [0,1], monotone
+/// within one build, exactly 1.0 at `.active`, frozen when parked/failed.
+pub const SortStatus = extern struct {
+    state: SortState,
+    err: SortError,
+    column: u32,
+    direction: SortDirection,
+    progress: f64,
+};
+
+/// C ABI — see api/lesssheet.h SORTED VIEWS for the full contract of each.
+pub const ls_sort_set = core.ls_sort_set;
+pub const ls_sort_clear = core.ls_sort_clear;
+pub const ls_sort_poll = core.ls_sort_poll;
+
+// --- The ONE chunk knob (ARCH-sort-by-column §4 "Memory") -------------------
+// A tunable is ONE named default plus ONE resolver; every consumer reads the
+// resolver. Deliberately NOT an ABI constant (api/lesssheet.h says so
+// explicitly), exactly like `window_budget_max_bytes`: a frontend has no say in
+// it, and putting it in the C header would freeze an implementation detail into
+// the cross-component boundary.
+
+/// The DEFAULT size, in bytes, of the ONE in-memory chunk of (key, source row)
+/// pairs a key pass accumulates before sorting and spilling it as a run — and
+/// therefore the single number that bounds the build's process memory. Merge
+/// read-buffers are DERIVED from the resolver below, never independently sized:
+/// changing the sort's memory footprint must be one edit in one place.
+/// 32 MiB (ARCH-sort-by-column §4, planner-tunable).
+pub const sort_chunk_default_bytes: u64 = 32 * 1024 * 1024;
+
+/// THE RESOLVER: the chunk size in force for THIS document — `sort_chunk_default_bytes`
+/// unless a test overrode it. Every consumer inside the sort (the pair buffer,
+/// the run writer, the k-way merge read-buffers, the permutation writer) reads
+/// THIS, so a second hard-coded copy of the number cannot exist: the two-value
+/// test below drives the SAME fixture through a one-run build and a many-run
+/// external merge purely by changing it.
+pub const sortChunkBytes = core.sortChunkBytes;
+
+/// TEST-ONLY (Zig; NOT the C ABI): override this document's chunk knob.
+/// `bytes == 0` restores `sort_chunk_default_bytes`. A tiny value forces the
+/// external-merge path (many spilled runs) on a small deterministic fixture; a
+/// huge value forces the single-chunk, no-run-file path. Both must produce the
+/// byte-identical order.
+pub const sortChunkBytesSetForTest = core.sortChunkBytesSetForTest;
+
+// --- Test-only instrumentation seams (ARCH-sort-by-column) ------------------
+// Zig-level seams (NOT C ABI — like `openWithAllocator` / `copyAdvances` /
+// `gz*` / `net*`), so api/lesssheet.h carries no test-only surface. Each reads
+// implementer-owned state DEFAULTED to zero, so the SEED reports zeros and
+// every quantitative sort AC is RED until the key pass, the external merge, and
+// the permutation are built and wired.
+
+/// `sortTempStore` result: the sort's EPHEMERAL temp-storage witness for AC-s9
+/// (the shape of the gzip `CheckpointStore` / `NetSpoolStore` seams).
+///   present   — at least one sort temp file exists right now.
+///   files     — how many sort temp files are open (runs + permutation +
+///               inverse mapping); 0 when `present` is false.
+///   live_bytes— bytes currently held across those files.
+///   peak_bytes— the high-water total since the document opened (the ARCH's
+///               "<= 48 bytes per data row transient" bound is measured here).
+///   mode      — the POSIX mode every sort temp file was created with (0o600).
+///   unlinked  — every sort temp file was unlinked at creation (invisible in
+///               its directory for its whole life).
+pub const SortTempStore = struct {
+    present: bool,
+    files: u32,
+    live_bytes: u64,
+    peak_bytes: u64,
+    mode: u32,
+    unlinked: bool,
+};
+
+/// AC-s9: the sort's ephemeral temp-storage witness (see `SortTempStore`).
+pub const sortTempStore = core.sortTempStore;
+
+/// AC-s7: inject temp-storage failure into the SORT path after `ops` successful
+/// store operations (0 == fail on the very first; maxInt == never, the default).
+/// Mirrors `gzCheckpointStoreFailAfter`.
+pub const sortTempFailAfter = core.sortTempFailAfter;
+
+/// AC-s7: inject ALLOCATION failure into the SORT path after `allocs`
+/// successful sort allocations (0 == fail on the very first; maxInt == never,
+/// the default). The pass must end `.failed` with `.memory`, not abort.
+pub const sortAllocFailAfter = core.sortAllocFailAfter;
+
+/// AC-s9: PEAK sort-owned RESIDENT bytes since the last `sortResidentReset` —
+/// the key chunk plus the merge read-buffers plus the pass's own state. The
+/// bound is `2 * sortChunkBytes(doc)`, and it must be INDEPENDENT of the row
+/// count (that independence, not the absolute number, is the O(rows) lock).
+/// Deliberately a core-owned counter rather than process RSS: RSS is not
+/// deterministic enough to gate on, and the allocator's own arenas are not the
+/// thing under test.
+pub const sortResidentBytes = core.sortResidentBytes;
+/// Zero the sort residency peak (before a measured build).
+pub const sortResidentReset = core.sortResidentReset;
+
+/// TEST-ONLY (Zig; NOT the C ABI): the PROCESS-WIDE override for the directory
+/// every EPHEMERAL core temp file is created in — the gzip checkpoint spill,
+/// the network spool, AND the sort's runs/permutation/inverse mapping. `null`
+/// restores the platform default.
+///
+/// THIS IS THE SINGLE-SOURCE LOCK, not a convenience. ARCH-sort-by-column
+/// decision 4 chose "the EXISTING platform-temp spill resolver" over a new
+/// cache-dir knob; today's `/tmp/lesssheet-*` path construction is duplicated
+/// between the gzip spill and the net spool, and the sort would have made three
+/// copies. The frozen `srt_temp_single_source` test points this at an UNUSABLE
+/// directory and requires BOTH the gzip checkpoint spill AND a sort build to
+/// notice — so a sort (or a future feature) that hard-codes its own temp path
+/// fails the gate instead of quietly diverging. `null` and a bad directory are
+/// the two values of the one knob.
+///
+/// The borrowed slice must outlive every subsequent core temp-file creation
+/// (tests pass a static or test-scoped buffer and restore `null` at the end).
+pub const tempSpillDirSetForTest = core.tempSpillDirSetForTest;
+
+comptime {
+    // --- Layout: ls_sort_status is 24 bytes with these exact offsets on every
+    // supported 64-bit target (verified against the C header with a compiled
+    // probe at freeze time).
+    if (@sizeOf(SortStatus) != 24) @compileError("layout drift: ls_sort_status size != 24");
+    if (@alignOf(SortStatus) != 8) @compileError("layout drift: ls_sort_status align != 8");
+    if (@offsetOf(SortStatus, "state") != 0) @compileError("layout drift: SortStatus.state");
+    if (@offsetOf(SortStatus, "err") != 4) @compileError("layout drift: SortStatus.err (ls_sort_status.error)");
+    if (@offsetOf(SortStatus, "column") != 8) @compileError("layout drift: SortStatus.column");
+    if (@offsetOf(SortStatus, "direction") != 12) @compileError("layout drift: SortStatus.direction");
+    if (@offsetOf(SortStatus, "progress") != 16) @compileError("layout drift: SortStatus.progress");
+
+    // --- C ABI signatures.
+    if (@TypeOf(core.ls_sort_set) != fn (*Doc, u32, SortDirection) callconv(.c) bool)
+        @compileError("signature drift: ls_sort_set");
+    if (@TypeOf(core.ls_sort_clear) != fn (*Doc) callconv(.c) void)
+        @compileError("signature drift: ls_sort_clear");
+    if (@TypeOf(core.ls_sort_poll) != fn (*const Doc) callconv(.c) SortStatus)
+        @compileError("signature drift: ls_sort_poll");
+
+    // --- Zig-only seams (no callconv).
+    if (@TypeOf(core.sortChunkBytes) != fn (*const Doc) u64)
+        @compileError("signature drift: sortChunkBytes");
+    if (@TypeOf(core.sortChunkBytesSetForTest) != fn (*Doc, u64) void)
+        @compileError("signature drift: sortChunkBytesSetForTest");
+    if (@TypeOf(core.sortTempStore) != fn (*const Doc) SortTempStore)
+        @compileError("signature drift: sortTempStore");
+    if (@TypeOf(core.sortTempFailAfter) != fn (*Doc, u64) void)
+        @compileError("signature drift: sortTempFailAfter");
+    if (@TypeOf(core.sortAllocFailAfter) != fn (*Doc, u64) void)
+        @compileError("signature drift: sortAllocFailAfter");
+    if (@TypeOf(core.sortResidentBytes) != fn (*const Doc) u64)
+        @compileError("signature drift: sortResidentBytes");
+    if (@TypeOf(core.sortResidentReset) != fn (*Doc) void)
+        @compileError("signature drift: sortResidentReset");
+    if (@TypeOf(core.tempSpillDirSetForTest) != fn (?[]const u8) void)
+        @compileError("signature drift: tempSpillDirSetForTest");
+}

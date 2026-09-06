@@ -12030,3 +12030,1129 @@ test "eofcap_controls: the honesty assertions are SATISFIABLE and the fixtures a
         try std.testing.expectEqualStrings("h1,QQQ", hdr);
     }
 }
+
+// ===========================================================================
+// SORT-BY-COLUMN (ARCH-sort-by-column, signed 2026-09-06) — SORTED VIEWS, the
+// THIRD view kind. The normative model is api/lesssheet.h "SORTED VIEWS"; these
+// tests bind ONLY to the public C ABI through the contract module, plus the
+// Zig-only sort seams (contracts/api.zig `sort*` / `tempSpillDirSetForTest`)
+// for the memory / disk / fault-injection facts the C ABI cannot express.
+//
+// AC MAP (ARCH §8; [RED] = fails on the seed, [GUARD] = green at freeze and
+// must STAY green, [RM] = reviewer-measured, not gate-enforceable):
+//   AC-s1  typed exact order .......... srt_text_order, srt_text_oracle,
+//                                       srt_numeric_order, srt_numeric_oracle,
+//                                       srt_temporal_boolean_order,
+//                                       srt_groups_and_nulls               [RED]
+//   AC-s2  descending ................. srt_descending_is_reversed         [RED]
+//   AC-s3  sorted coordinates ......... srt_coordinates                    [RED]
+//   AC-s4  filter composition ......... srt_filter_composition             [RED]
+//   AC-s5  find in a sorted view ...... srt_find_sorted                    [RED]
+//   AC-s6  flip only at DONE / rebuild  srt_flip_only_at_done,
+//                                       srt_rebuild_triggers,
+//                                       srt_noop_and_reset                 [RED]
+//   AC-s7  failure + cancel ........... srt_failure_modes, srt_clear_cancels [RED]
+//   AC-s8  laziness + open cost ....... srt_lazy_until_first_set          [GUARD]
+//   AC-s9  memory + disk, measured .... srt_chunk_knob_two_values,
+//                                       srt_temp_single_source,
+//                                       srt_temp_hygiene, srt_memory_bound  [RED]
+//   AC-s10 speed, measured ............ srt_measurement_obligations        [RM]
+//   AC-s11 sources .................... srt_gzip_same_order, srt_network   [RED]
+//   AC-s12 slot rules ................. srt_slot_rules                     [RED]
+//   AC-s13 fuzz / hostile input ....... srt_corpus_hostile_sweep           [RED]
+//                                       (+ the out-of-gate tools/fuzz entry,
+//                                        srt_measurement_obligations)
+//   validation / ABI shape ............ srt_reject, srt_abi              [GUARD]
+//
+// RED SEED (src/sort.zig): request validation and the poll snapshot are real,
+// so every rejection/laziness/ABI GUARD is green from the start — but a valid
+// ls_sort_set starts NO key pass and the poll stays LS_SORT_IDLE, so
+// `waitSortActive` returns error.SortNotStarted (mirroring waitFilterDone over
+// the column-config seed) and every ordering, coordinate, composition, slot,
+// bound, and failure assertion FAILS instead of hanging.
+//
+// WHY AN ORACLE AND NOT ONLY GOLDEN ARRAYS. ARCH AC-s1 asks for "the reference
+// order computed by an independent oracle". Two of the tests below generate a
+// few hundred adversarial rows and sort them with a comparator written HERE, in
+// the test, from the header's prose — so an implementation that special-cases
+// the hand-written fixtures has nowhere to hide.
+// ===========================================================================
+
+// --- helpers ---------------------------------------------------------------
+
+fn setSort(doc: *api.Doc, col: u32, dir: api.SortDirection) !void {
+    try std.testing.expectEqual(true, api.ls_sort_set(doc, col, dir));
+}
+
+fn expectSortRejected(doc: *api.Doc, col: u32, dir: api.SortDirection) !void {
+    try std.testing.expectEqual(false, api.ls_sort_set(doc, col, dir));
+}
+
+/// Poll until the sort is ACTIVE (<= 15 s). Errors on IDLE — a set sort never
+/// polls IDLE, so the seed fails HERE with a clear error instead of hanging —
+/// and on FAILED/PARKED, which are separate, deliberately-provoked outcomes.
+fn waitSortActive(doc: *api.Doc) !api.SortStatus {
+    const io = std.testing.io;
+    const t0: std.Io.Clock.Timestamp = .now(io, .awake);
+    while (true) {
+        const s = api.ls_sort_poll(doc);
+        switch (s.state) {
+            .active => return s,
+            .idle => return error.SortNotStarted,
+            .failed => return error.SortFailed,
+            .parked => return error.SortParked,
+            .building => {},
+        }
+        if (elapsedMs(t0) > 15_000) return error.SortTimeout;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+}
+
+/// Poll until the sort reaches ANY terminal state (active / parked / failed).
+/// Errors on IDLE for the same fail-fast reason as `waitSortActive`.
+fn waitSortTerminal(doc: *api.Doc) !api.SortStatus {
+    const io = std.testing.io;
+    const t0: std.Io.Clock.Timestamp = .now(io, .awake);
+    while (true) {
+        const s = api.ls_sort_poll(doc);
+        switch (s.state) {
+            .active, .parked, .failed => return s,
+            .idle => return error.SortNotStarted,
+            .building => {},
+        }
+        if (elapsedMs(t0) > 15_000) return error.SortTimeout;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+}
+
+/// Set `col`'s session type override to `kind` (the call that gives the type
+/// override its behavioral job — see api/lesssheet.h SORTED VIEWS §2).
+fn sortOverride(doc: *api.Doc, col: u32, kind: api.ColumnTypeKind) !void {
+    var t = ccIntType();
+    t.kind = kind;
+    try std.testing.expectEqual(api.ColumnResult.ok, api.ls_column_override_set(doc, col, &t));
+}
+
+fn sortOverrideDatetime(doc: *api.Doc, col: u32, semantics: api.ColumnDatetimeSemantics) !void {
+    var t = ccIntType();
+    t.kind = .datetime;
+    t.datetime_semantics = semantics;
+    try std.testing.expectEqual(api.ColumnResult.ok, api.ls_column_override_set(doc, col, &t));
+}
+
+/// Sort by `col` in `dir`, wait for ACTIVE, and assert the view's source-row
+/// sequence — the one assertion every ordering test is built out of.
+fn expectSortedBy(doc: *api.Doc, col: u32, dir: api.SortDirection, sources: []const u64) !void {
+    try setSort(doc, col, dir);
+    _ = try waitSortActive(doc);
+    try expectSourceRows(doc, sources);
+}
+
+// --- AC-s1 (ordering): TEXT ------------------------------------------------
+
+/// Fold pairs, an empty cell, a prefix extension, and non-ASCII bytes on both
+/// sides of the fold. Data rows 0..8.
+const srt_text_fixture =
+    "name\n" ++
+    "banana\n" ++ //  0
+    "Apple\n" ++ //   1
+    "apple\n" ++ //   2
+    "APPLE\n" ++ //   3
+    "café\n" ++ //    4  (c3 a9 tail)
+    "cafe\n" ++ //    5
+    "\n" ++ //        6  empty cell
+    "apples\n" ++ //  7  prefix extension of "apple"
+    "Ápple\n"; //     8  leads with a non-ASCII byte (c3 81)
+
+test "srt_text_order: TEXT/UNKNOWN sorts ASCII-case-folded, byte-exact tiebreak, then source order" {
+    var od = try openBytes(srt_text_fixture);
+    defer od.deinit();
+    // No override, no inference: the effective type is UNKNOWN, which sorts as
+    // TEXT (api/lesssheet.h SORTED VIEWS §2).
+    //   ""(6) < APPLE(3) < Apple(1) < apple(2)  [one fold class, byte tiebreak]
+    //         < apples(7) < banana(0) < cafe(5) < café(4) < Ápple(8)
+    try expectSortedBy(od.doc, 0, .ascending, &.{ 6, 3, 1, 2, 7, 0, 5, 4, 8 });
+    // The cells really are in that order (not just the gutter mapping).
+    try expectCell(od.doc, 0, 0, "");
+    try expectCell(od.doc, 1, 0, "APPLE");
+    try expectCell(od.doc, 3, 0, "apple");
+    try expectCell(od.doc, 8, 0, "Ápple");
+    // The header is not a data row and is untouched by the sort.
+    try expectHeaderCell(od.doc, 0, "name");
+    // The row set is unchanged: same count, still exact.
+    const rc = api.ls_row_count_get(od.doc);
+    try std.testing.expectEqual(@as(u64, 9), rc.count);
+    try std.testing.expectEqual(true, rc.exact);
+}
+
+/// The header's TEXT rule, written HERE from its prose: ASCII case folded, then
+/// a byte-exact tiebreak. Returns .lt/.eq/.gt so the oracle and the source-order
+/// tiebreak stay separable.
+fn oracleTextOrder(a: []const u8, b: []const u8) std.math.Order {
+    const n = @min(a.len, b.len);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const fa = std.ascii.toLower(a[i]);
+        const fb = std.ascii.toLower(b[i]);
+        if (fa != fb) return if (fa < fb) .lt else .gt;
+    }
+    if (a.len != b.len) return if (a.len < b.len) .lt else .gt;
+    return std.mem.order(u8, a, b); // byte-exact tiebreak within the fold class
+}
+
+const OracleRow = struct { key: []const u8, source: u64 };
+
+fn oracleTextLess(_: void, x: OracleRow, y: OracleRow) bool {
+    return switch (oracleTextOrder(x.key, y.key)) {
+        .lt => true,
+        .gt => false,
+        .eq => x.source < y.source, // final tiebreak: source order (stable)
+    };
+}
+
+test "srt_text_oracle: 400 adversarial generated rows match an independent in-test comparator" {
+    const gpa = std.testing.allocator;
+    // A tiny alphabet with both cases and one multi-byte character produces
+    // dense fold collisions, long common prefixes, and prefix extensions —
+    // exactly the cases a fixed-width accelerator key must fall back from.
+    const alphabet = [_][]const u8{ "a", "A", "b", "B", "é", "z" };
+    var prng: std.Random.DefaultPrng = .init(0x5017_5EED_1234_0001);
+    const rnd = prng.random();
+
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(gpa);
+    var keys: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (keys.items) |k| gpa.free(k);
+        keys.deinit(gpa);
+    }
+    try text.appendSlice(gpa, "k\n");
+    const rows: usize = 400;
+    for (0..rows) |_| {
+        var cell: std.ArrayList(u8) = .empty;
+        errdefer cell.deinit(gpa);
+        const len = rnd.intRangeLessThan(usize, 0, 7);
+        // A shared 3-symbol prefix on half the rows forces prefix collisions.
+        if (rnd.boolean()) try cell.appendSlice(gpa, "aAb");
+        for (0..len) |_| try cell.appendSlice(gpa, alphabet[rnd.intRangeLessThan(usize, 0, alphabet.len)]);
+        const owned = try cell.toOwnedSlice(gpa);
+        try keys.append(gpa, owned);
+        try text.appendSlice(gpa, owned);
+        try text.append(gpa, '\n');
+    }
+
+    var od = try openWith(text.items, .{ .separator = ',', .header = api.header_on, .index_mode = api.index_manual });
+    defer od.deinit();
+    try std.testing.expectEqual(@as(u64, rows), api.ls_row_count_get(od.doc).count);
+
+    var oracle = try gpa.alloc(OracleRow, rows);
+    defer gpa.free(oracle);
+    for (keys.items, 0..) |k, i| oracle[i] = .{ .key = k, .source = @intCast(i) };
+    std.mem.sort(OracleRow, oracle, {}, oracleTextLess);
+
+    var expected = try gpa.alloc(u64, rows);
+    defer gpa.free(expected);
+    for (oracle, 0..) |o, i| expected[i] = o.source;
+
+    try expectSortedBy(od.doc, 0, .ascending, expected);
+
+    // ... and DESCENDING is that permutation read backwards, ties included.
+    var reversed = try gpa.alloc(u64, rows);
+    defer gpa.free(reversed);
+    for (expected, 0..) |v, i| reversed[rows - 1 - i] = v;
+    try expectSortedBy(od.doc, 0, .descending, reversed);
+}
+
+// --- AC-s1 (ordering): numeric ---------------------------------------------
+
+/// Adversarial numerics: past 2^53, equal-prefix neighbours, exponents past
+/// f64, scale-normalizing ties, a negative, and two NON-CONFORMING values.
+const srt_num_fixture =
+    "v\n" ++
+    "10\n" ++ //                0
+    "9\n" ++ //                 1   (text order would put "10" before "9")
+    "9007199254740993\n" ++ //  2   2^53 + 1
+    "9007199254740992\n" ++ //  3   2^53   (equal-prefix neighbour of row 2)
+    "1e2\n" ++ //               4   == 100
+    "100\n" ++ //               5   == 100 (tie with 4)
+    "-3\n" ++ //                6
+    "2.0\n" ++ //               7
+    "2\n" ++ //                 8   (tie with 7)
+    "0.30\n" ++ //              9
+    "0.3\n" ++ //              10   (tie with 9)
+    "abc\n" ++ //              11   NON-CONFORMING
+    "\n" ++ //                 12   NON-CONFORMING (empty text, not null)
+    "1e400\n" ++ //            13   beyond f64
+    "1e399\n"; //              14   beyond f64, adjacent to row 13
+
+test "srt_numeric_order: DECIMAL is EXACT — never through f64 — and non-conforming values follow" {
+    var od = try openBytes(srt_num_fixture);
+    defer od.deinit();
+    try sortOverride(od.doc, 0, .decimal);
+    //  -3 < 0.3{9,10} < 2{7,8} < 9 < 10 < 100{4,5} < 2^53 < 2^53+1 < 1e399 < 1e400
+    //  then group B (non-conforming) in TEXT order: "" then "abc".
+    try expectSortedBy(od.doc, 0, .ascending, &.{ 6, 9, 10, 7, 8, 1, 0, 4, 5, 3, 2, 14, 13, 12, 11 });
+    // The two discriminating facts, spelled out:
+    //   numeric (not text) order  -> "9" precedes "10";
+    //   exact (not f64) order     -> 2^53 precedes 2^53+1, and 1e399 precedes 1e400.
+    try expectCell(od.doc, 5, 0, "9");
+    try expectCell(od.doc, 6, 0, "10");
+    try expectCell(od.doc, 9, 0, "9007199254740992");
+    try expectCell(od.doc, 10, 0, "9007199254740993");
+    try expectCell(od.doc, 11, 0, "1e399");
+    try expectCell(od.doc, 12, 0, "1e400");
+    // INTEGER resolves the SAME order on this data (the grammar differs, the
+    // comparator does not): the pure integers conform, the rest fall to group B.
+    try sortOverride(od.doc, 0, .integer);
+    try setSort(od.doc, 0, .ascending);
+    _ = try waitSortActive(od.doc);
+    try expectCell(od.doc, 0, 0, "-3");
+    try expectCell(od.doc, 1, 0, "2");
+}
+
+const OracleNumRow = struct { key: i64, source: u64 };
+
+fn oracleNumLess(_: void, x: OracleNumRow, y: OracleNumRow) bool {
+    if (x.key != y.key) return x.key < y.key;
+    return x.source < y.source; // final tiebreak: source order (stable)
+}
+
+test "srt_numeric_oracle: 400 generated decimals, written at random scales, match an i64 oracle" {
+    const gpa = std.testing.allocator;
+    var prng: std.Random.DefaultPrng = .init(0xC0FFEE);
+    const rnd = prng.random();
+    const rows: usize = 400;
+
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(gpa);
+    try text.appendSlice(gpa, "v\n");
+    var oracle = try gpa.alloc(OracleNumRow, rows);
+    defer gpa.free(oracle);
+
+    var line: [64]u8 = undefined;
+    for (0..rows) |i| {
+        // Small magnitudes with MANY duplicates, each written in one of four
+        // exactly-equal spellings — so the comparator must normalize scale and
+        // exponent rather than compare bytes, and ties must fall to source order.
+        const v = rnd.intRangeLessThan(i64, -20, 20);
+        const spelling = rnd.intRangeLessThan(u8, 0, 4);
+        const s = switch (spelling) {
+            0 => try std.fmt.bufPrint(&line, "{d}", .{v}),
+            1 => try std.fmt.bufPrint(&line, "{d}.0", .{v}),
+            2 => try std.fmt.bufPrint(&line, "{d}.000", .{v}),
+            else => try std.fmt.bufPrint(&line, "{d}e0", .{v}),
+        };
+        try text.appendSlice(gpa, s);
+        try text.append(gpa, '\n');
+        oracle[i] = .{ .key = v, .source = @intCast(i) };
+    }
+    std.mem.sort(OracleNumRow, oracle, {}, oracleNumLess);
+
+    var expected = try gpa.alloc(u64, rows);
+    defer gpa.free(expected);
+    for (oracle, 0..) |o, i| expected[i] = o.source;
+
+    var od = try openWith(text.items, .{ .separator = ',', .header = api.header_on, .index_mode = api.index_manual });
+    defer od.deinit();
+    try sortOverride(od.doc, 0, .decimal);
+    try expectSortedBy(od.doc, 0, .ascending, expected);
+}
+
+// --- AC-s1 (ordering): date / datetime / boolean ---------------------------
+
+const srt_temporal_fixture =
+    "d,ts,b\n" ++
+    "2020-01-02,2020-01-01T00:00:00Z,true\n" ++ //        0
+    "2019-12-31,2020-01-01T01:00:00+01:00,FALSE\n" ++ //  1  (same instant as 0)
+    "2020-01-02,2020-01-01T00:00:00.500Z,True\n" ++ //    2
+    "not-a-date,2020-01-01T00:00:00,false\n" ++ //        3  (naive ts, non-date d)
+    "2020-01-10,2019-12-31T23:59:59Z,TRUE\n"; //          4
+
+test "srt_temporal_boolean_order: DATE / zoned DATETIME (by instant) / BOOLEAN, wrong-zonedness excluded" {
+    var od = try openBytes(srt_temporal_fixture);
+    defer od.deinit();
+    // DATE: chronological; "not-a-date" is non-conforming and follows.
+    try sortOverride(od.doc, 0, .date);
+    try expectSortedBy(od.doc, 0, .ascending, &.{ 1, 0, 2, 4, 3 });
+    // DATETIME declared ZONED: order by INSTANT, so 00:00:00Z and 01:00:00+01:00
+    // are a TIE resolved by source order; the NAIVE value (row 3) has the wrong
+    // zonedness and is NON-CONFORMING, so it sorts after every conforming value.
+    try sortOverrideDatetime(od.doc, 1, .zoned);
+    try expectSortedBy(od.doc, 1, .ascending, &.{ 4, 0, 1, 2, 3 });
+    // BOOLEAN: false < true, case-insensitive, ties in source order.
+    try sortOverride(od.doc, 2, .boolean);
+    try expectSortedBy(od.doc, 2, .ascending, &.{ 1, 3, 0, 2, 4 });
+}
+
+// --- AC-s1 (ordering): the three groups + nulls ----------------------------
+
+const srt_groups_fixture =
+    "v\n" ++
+    "7\n" ++ //    0  conforming
+    "NA\n" ++ //   1  null (sentinel)
+    "zz\n" ++ //   2  non-conforming
+    "3\n" ++ //    3  conforming
+    "NA\n" ++ //   4  null (sentinel)
+    "aa\n"; //     5  non-conforming
+
+test "srt_groups_and_nulls: conforming, then non-conforming, then nulls — each group in its own order" {
+    var od = try openBytes(srt_groups_fixture);
+    defer od.deinit();
+    try sortOverride(od.doc, 0, .integer);
+    try std.testing.expectEqual(api.ColumnResult.ok, api.ls_column_null_sentinel_set(od.doc, 0, "NA", 2));
+    // A: 3(3) < 7(0)   B: "aa"(5) < "zz"(2)   C: nulls in source order 1, 4.
+    try expectSortedBy(od.doc, 0, .ascending, &.{ 3, 0, 5, 2, 1, 4 });
+    // DESCENDING reverses the WHOLE permutation, so nulls come FIRST and their
+    // mutual order reverses too (the stated consequence of "read backwards").
+    try expectSortedBy(od.doc, 0, .descending, &.{ 4, 1, 2, 5, 0, 3 });
+    // Without a null policy the SAME cells are ordinary non-conforming text.
+    try std.testing.expectEqual(api.ColumnResult.ok, api.ls_column_null_sentinel_clear(od.doc, 0));
+    try expectSortedBy(od.doc, 0, .ascending, &.{ 3, 0, 5, 1, 4, 2 });
+}
+
+// --- AC-s2 descending / the instant flip -----------------------------------
+
+/// 5 rows, 3 columns; sorted by name ascending the permutation is [1,3,2,0,4].
+const srt_fixture =
+    "name,qty,note\n" ++
+    "delta,3,x\n" ++ //          0
+    "alpha,1,y needle\n" ++ //   1
+    "charlie,2,z\n" ++ //        2
+    "bravo,5,w needle\n" ++ //   3
+    "echo,4,v\n"; //             4
+
+test "srt_descending_is_reversed: descending is the ascending permutation read backwards, flipped in O(1)" {
+    var od = try openBytes(srt_fixture);
+    defer od.deinit();
+    try expectSortedBy(od.doc, 0, .ascending, &.{ 1, 3, 2, 0, 4 });
+    const before = api.ls_index_poll(od.doc);
+    // The FLIP: the poll must never re-enter BUILDING, and no scan may run.
+    try setSort(od.doc, 0, .descending);
+    const s = api.ls_sort_poll(od.doc); // read IMMEDIATELY, with no wait at all
+    try std.testing.expectEqual(api.SortState.active, s.state);
+    try std.testing.expectEqual(api.SortDirection.descending, s.direction);
+    try std.testing.expectEqual(@as(f64, 1.0), s.progress);
+    try std.testing.expectEqual(api.JumpState.idle, api.ls_jump_poll(od.doc).state);
+    try expectSourceRows(od.doc, &.{ 4, 0, 2, 3, 1 });
+    // No scan-slot activity: the frontier did not move.
+    const after = api.ls_index_poll(od.doc);
+    try std.testing.expectEqual(before.bytes_scanned, after.bytes_scanned);
+    // And flipping back is equally instant and exactly the original order.
+    try setSort(od.doc, 0, .ascending);
+    try std.testing.expectEqual(api.SortState.active, api.ls_sort_poll(od.doc).state);
+    try expectSourceRows(od.doc, &.{ 1, 3, 2, 0, 4 });
+}
+
+// --- AC-s3 sorted coordinates ----------------------------------------------
+
+test "srt_coordinates: source_row, jump, cell_copy and the copy rect all speak sorted coordinates" {
+    const gpa = std.testing.allocator;
+    var od = try openBytes(srt_fixture);
+    defer od.deinit();
+    try expectSortedBy(od.doc, 0, .ascending, &.{ 1, 3, 2, 0, 4 });
+
+    // JUMP takes an ORIGINAL row number and lands on that row's SORTED position.
+    // Source 0 ("delta") is sorted position 3.
+    api.ls_jump_start(od.doc, 0);
+    const j = try waitJumpDone(od.doc);
+    try std.testing.expectEqual(@as(u64, 3), j.landed_row);
+    // Source 4 ("echo") is the last sorted position; a target at/past EOF clamps
+    // in SOURCE space first and then maps (source 4 -> sorted 4).
+    api.ls_jump_start(od.doc, std.math.maxInt(u64));
+    try std.testing.expectEqual(@as(u64, 4), (try waitJumpDone(od.doc)).landed_row);
+
+    // The full-cell read addresses the SORTED row.
+    winAll(od.doc);
+    var buf: [64]u8 = undefined;
+    const cc = copyCell(od.doc, 0, 0, &buf);
+    try std.testing.expectEqual(api.CopyResult.ok, cc.result);
+    try std.testing.expectEqualStrings("alpha", buf[0..cc.len]);
+
+    // The streaming copy rect reads rows in SORTED view order.
+    var d = try driveCopy(gpa, od.doc, copyRect(0, 5, 0, 1), 256);
+    defer d.deinit(gpa);
+    try std.testing.expectEqualStrings("alpha\nbravo\ncharlie\ndelta\necho", d.bytes.items);
+}
+
+// --- AC-s4 composition with the filter -------------------------------------
+
+test "srt_filter_composition: the sorted set IS the filtered set, and the key pass completes its counts" {
+    var od = try openWith(srt_fixture, .{ .index_mode = api.index_manual });
+    defer od.deinit();
+    try setFilter(od.doc, predReq(1, .ge, "3")); // qty >= 3 -> sources 0, 3, 4
+    // Do NOT wait for the filter-scan: the key pass must drive it to DONE.
+    try setSort(od.doc, 0, .ascending);
+    _ = try waitSortActive(od.doc);
+    // bravo(3) < delta(0) < echo(4)
+    try expectSourceRows(od.doc, &.{ 3, 0, 4 });
+    const rc = api.ls_row_count_get(od.doc);
+    try std.testing.expectEqual(@as(u64, 3), rc.count);
+    try std.testing.expectEqual(true, rc.exact);
+    const f = api.ls_filter_poll(od.doc);
+    try std.testing.expectEqual(api.FilterState.done, f.state);
+    try std.testing.expectEqual(@as(u64, 3), f.total);
+    try std.testing.expectEqual(true, f.total_exact);
+    // The pass reached EOF, so the shared index is complete (paid once).
+    try std.testing.expectEqual(true, api.ls_index_poll(od.doc).complete);
+    // A jump under sort+filter still takes an ORIGINAL row: source 1 is hidden,
+    // so it resolves to the next MATCHING source (3) — sorted position 0.
+    api.ls_jump_start(od.doc, 1);
+    try std.testing.expectEqual(@as(u64, 0), (try waitJumpDone(od.doc)).landed_row);
+}
+
+// --- AC-s5 find inside a sorted view ---------------------------------------
+
+test "srt_find_sorted: totals match, nav walks SORT order with exact positions, sort changes reset it" {
+    var od = try openBytes(srt_fixture);
+    defer od.deinit();
+    // Unsorted reference: "needle" matches sources 1 and 3.
+    try startSearch(od.doc, textReq("needle"));
+    const unsorted = try waitSearchDone(od.doc);
+    try std.testing.expectEqual(@as(u64, 2), unsorted.total);
+
+    try expectSortedBy(od.doc, 0, .ascending, &.{ 1, 3, 2, 0, 4 });
+    // Setting the sort RESET the search (the coordinate space changed).
+    try std.testing.expectEqual(api.SearchState.idle, api.ls_search_poll(od.doc).state);
+
+    try startSearch(od.doc, textReq("needle"));
+    const sorted = try waitSearchDone(od.doc);
+    try std.testing.expectEqual(@as(u64, 2), sorted.total); // same SET, same total
+    try std.testing.expectEqual(true, sorted.total_exact);
+    // alpha (source 1) is sorted row 0; bravo (source 3) is sorted row 1.
+    var nav = try navAndWait(od.doc, 0, .forward);
+    try std.testing.expectEqual(api.SearchNavState.found, nav.nav);
+    try std.testing.expectEqual(@as(u64, 0), nav.found_row);
+    try std.testing.expectEqual(@as(u64, 1), nav.position);
+    nav = try navAndWait(od.doc, 1, .forward);
+    try std.testing.expectEqual(@as(u64, 1), nav.found_row);
+    try std.testing.expectEqual(@as(u64, 2), nav.position);
+    // BACKWARD is strictly-before in SORTED coordinates.
+    nav = try navAndWait(od.doc, 1, .backward);
+    try std.testing.expectEqual(@as(u64, 0), nav.found_row);
+    nav = try navAndWait(od.doc, 0, .backward);
+    try std.testing.expectEqual(api.SearchNavState.exhausted, nav.nav);
+    // Match flags are per SERVED row, so they follow the sorted window.
+    winAll(od.doc);
+    const flags = api.ls_window_match_flags(od.doc, 0, 3).slice();
+    try std.testing.expectEqual(@as(usize, 15), flags.len);
+    try std.testing.expectEqual(@as(u8, 1), flags[0 * 3 + 2]); // sorted row 0 (alpha) note
+    try std.testing.expectEqual(@as(u8, 1), flags[1 * 3 + 2]); // sorted row 1 (bravo) note
+    try std.testing.expectEqual(@as(u8, 0), flags[2 * 3 + 2]); // sorted row 2 (charlie)
+    // A direction FLIP is a coordinate change too: it resets the search.
+    try setSort(od.doc, 0, .descending);
+    try std.testing.expectEqual(api.SearchState.idle, api.ls_search_poll(od.doc).state);
+    // ... and so does clearing.
+    try startSearch(od.doc, textReq("needle"));
+    _ = try waitSearchDone(od.doc);
+    api.ls_sort_clear(od.doc);
+    try std.testing.expectEqual(api.SearchState.idle, api.ls_search_poll(od.doc).state);
+    try std.testing.expectEqual(api.SortState.idle, api.ls_sort_poll(od.doc).state);
+    try expectSourceRows(od.doc, &.{ 0, 1, 2, 3, 4 }); // identity view restored
+}
+
+// --- AC-s6 the flip happens only at DONE; inputs trigger a rebuild ---------
+
+/// Rows of "{i:0>8},{2i:0>8}" -- 18 bytes each, column 0 strictly ascending
+/// with source order (so DESCENDING is exactly "source order reversed", the
+/// cheapest possible order oracle).
+fn srtBigDoc(gpa: std.mem.Allocator, rows: usize) ![]u8 {
+    return genFixedRows(gpa, rows);
+}
+
+/// 300k rows == 5.4 MB: PAST the 4 MiB open head budget, so a MANUAL open
+/// leaves it unindexed and the key pass has real scanning to do. That is what
+/// makes BUILDING observable and makes the "a jump takes the slot" contention
+/// deterministic (tens of milliseconds of pass work versus a microsecond-scale
+/// gap between the two calls), rather than a race the gate would flake on.
+const srt_big_rows: usize = 300_000;
+
+test "srt_flip_only_at_done: a building sort serves the OLD order, never a partial one" {
+    const gpa = std.testing.allocator;
+    const body = try srtBigDoc(gpa, srt_big_rows);
+    defer gpa.free(body);
+    var od = try openWith(body, .{ .separator = ',', .header = api.header_off, .index_mode = api.index_manual });
+    defer od.deinit();
+    // Column 0 ascends with source order, so sort it DESCENDING: any partial
+    // publication would be instantly visible as a non-source, non-reversed order.
+    try setSort(od.doc, 0, .descending);
+    var saw_building = false;
+    while (true) {
+        const s = api.ls_sort_poll(od.doc);
+        if (s.state == .active) break;
+        if (s.state == .idle) return error.SortNotStarted;
+        saw_building = true;
+        // While BUILDING the view is still the identity view, exactly.
+        _ = api.ls_window_set(od.doc, 0, 4);
+        try std.testing.expectEqual(@as(u64, 0), api.ls_source_row(od.doc, 0));
+        try std.testing.expectEqual(@as(u64, 1), api.ls_source_row(od.doc, 1));
+        try std.testing.expect(s.progress >= 0.0 and s.progress <= 1.0);
+    }
+    try std.testing.expectEqual(true, saw_building);
+    // At ACTIVE — and only then — the order flips.
+    _ = api.ls_window_set(od.doc, 0, 4);
+    try std.testing.expectEqual(@as(u64, srt_big_rows - 1), api.ls_source_row(od.doc, 0));
+    try std.testing.expectEqual(@as(f64, 1.0), api.ls_sort_poll(od.doc).progress);
+}
+
+test "srt_rebuild_triggers: a filter change and a sort-column override change each re-run the pass" {
+    var od = try openBytes(srt_num_fixture);
+    defer od.deinit();
+    // UNKNOWN -> sorts as TEXT: "" < "-3" < "0.3" < "0.30" < "1e2" < "1e399" ...
+    try expectSortedBy(od.doc, 0, .ascending, &.{ 12, 6, 10, 9, 0, 5, 4, 14, 13, 8, 7, 1, 3, 2, 11 });
+    // Overriding the SORT COLUMN's type re-runs the pass automatically and the
+    // order becomes numeric — the sort REQUEST survived the input change.
+    try sortOverride(od.doc, 0, .decimal);
+    const s = try waitSortActive(od.doc);
+    try std.testing.expectEqual(@as(u32, 0), s.column);
+    try std.testing.expectEqual(api.SortDirection.ascending, s.direction);
+    try expectSourceRows(od.doc, &.{ 6, 9, 10, 7, 8, 1, 0, 4, 5, 3, 2, 14, 13, 12, 11 });
+    // A FILTER change also re-runs it, over the new row set.
+    try setFilter(od.doc, predReq(0, .ge, "9"));
+    _ = try waitSortActive(od.doc);
+    // qty >= 9: sources 0(10), 2, 3, 4(1e2), 5(100), 13(1e400), 14(1e399), 1(9)
+    try expectSourceRows(od.doc, &.{ 1, 0, 4, 5, 3, 2, 14, 13 });
+    try std.testing.expectEqual(api.SortState.active, api.ls_sort_poll(od.doc).state);
+    // Clearing the filter re-runs it again, back over every row.
+    api.ls_filter_clear(od.doc);
+    _ = try waitSortActive(od.doc);
+    try expectSourceRows(od.doc, &.{ 6, 9, 10, 7, 8, 1, 0, 4, 5, 3, 2, 14, 13, 12, 11 });
+    // A NULL-SENTINEL change on the sort column is the third trigger: "0.3"
+    // (source 10) becomes NULL and moves from the front of group A to the very
+    // end, behind the non-conforming group.
+    try std.testing.expectEqual(api.ColumnResult.ok, api.ls_column_null_sentinel_set(od.doc, 0, "0.3", 3));
+    _ = try waitSortActive(od.doc);
+    try expectSourceRows(od.doc, &.{ 6, 9, 7, 8, 1, 0, 4, 5, 3, 2, 14, 13, 12, 11, 10 });
+}
+
+test "srt_noop_and_reset: an identical re-request changes NOTHING; every real change resets search + jump" {
+    var od = try openBytes(srt_fixture);
+    defer od.deinit();
+    try expectSortedBy(od.doc, 0, .ascending, &.{ 1, 3, 2, 0, 4 });
+    try startSearch(od.doc, textReq("needle"));
+    _ = try waitSearchDone(od.doc);
+    api.ls_jump_start(od.doc, 2);
+    _ = try waitJumpDone(od.doc);
+    // NO-OP: same column, same direction, on an ACTIVE sort. Nothing moves —
+    // not even the search or the jump slot.
+    try setSort(od.doc, 0, .ascending);
+    try std.testing.expectEqual(api.SortState.active, api.ls_sort_poll(od.doc).state);
+    try std.testing.expectEqual(api.SearchState.done, api.ls_search_poll(od.doc).state);
+    try std.testing.expectEqual(api.JumpState.done, api.ls_jump_poll(od.doc).state);
+    // A REAL change (different column) resets both.
+    try setSort(od.doc, 1, .ascending);
+    try std.testing.expectEqual(api.SearchState.idle, api.ls_search_poll(od.doc).state);
+    try std.testing.expectEqual(api.JumpState.idle, api.ls_jump_poll(od.doc).state);
+    _ = try waitSortActive(od.doc);
+    // qty as UNKNOWN/TEXT: "1"(1) < "2"(2) < "3"(0) < "4"(4) < "5"(3)
+    try expectSourceRows(od.doc, &.{ 1, 2, 0, 4, 3 });
+}
+
+// --- AC-s7 graceful failure and cancel -------------------------------------
+
+test "srt_failure_modes: injected storage and allocation failure each FAIL cleanly, view unchanged" {
+    inline for (.{
+        .{ api.SortError.storage, true },
+        .{ api.SortError.memory, false },
+    }) |arm| {
+        var od = try openBytes(srt_fixture);
+        defer od.deinit();
+        try expectSortedBy(od.doc, 0, .ascending, &.{ 1, 3, 2, 0, 4 });
+        // Break the NEXT pass, then force one by changing the column.
+        if (arm[1]) api.sortTempFailAfter(od.doc, 0) else api.sortAllocFailAfter(od.doc, 0);
+        try setSort(od.doc, 1, .ascending);
+        const s = try waitSortTerminal(od.doc);
+        try std.testing.expectEqual(api.SortState.failed, s.state);
+        try std.testing.expectEqual(arm[0], s.err);
+        // The REQUEST is retained so the frontend can render and retry it ...
+        try std.testing.expectEqual(@as(u32, 1), s.column);
+        // ... and the view is UNCHANGED: still the previous (name) order, still
+        // fully servable, with no partial sort anywhere.
+        try expectSourceRows(od.doc, &.{ 1, 3, 2, 0, 4 });
+        try expectCell(od.doc, 0, 0, "alpha");
+        // Nothing leaked: no temp file survives the failed pass.
+        try std.testing.expectEqual(false, api.sortTempStore(od.doc).present);
+        // An identical re-request RETRIES (a failed sort is not a no-op) and,
+        // with the injection lifted, succeeds.
+        api.sortTempFailAfter(od.doc, std.math.maxInt(u64));
+        api.sortAllocFailAfter(od.doc, std.math.maxInt(u64));
+        try setSort(od.doc, 1, .ascending);
+        _ = try waitSortActive(od.doc);
+        try expectSourceRows(od.doc, &.{ 1, 2, 0, 4, 3 });
+    }
+}
+
+test "srt_clear_cancels: clearing mid-pass stops it, polls IDLE, and leaves the view untouched" {
+    const gpa = std.testing.allocator;
+    const body = try srtBigDoc(gpa, srt_big_rows);
+    defer gpa.free(body);
+    var od = try openWith(body, .{ .separator = ',', .header = api.header_off, .index_mode = api.index_manual });
+    defer od.deinit();
+    try setSort(od.doc, 0, .descending);
+    try std.testing.expect(api.ls_sort_poll(od.doc).state != .idle); // it really started
+    api.ls_sort_clear(od.doc);
+    const s = api.ls_sort_poll(od.doc);
+    try std.testing.expectEqual(api.SortState.idle, s.state);
+    try std.testing.expectEqual(@as(f64, 0.0), s.progress);
+    // The view never changed, and no sort temp file survives the cancel.
+    _ = api.ls_window_set(od.doc, 0, 4);
+    try std.testing.expectEqual(@as(u64, 0), api.ls_source_row(od.doc, 0));
+    try std.testing.expectEqual(false, api.sortTempStore(od.doc).present);
+    // Clearing again is a no-op, and a document is closable mid-pass.
+    api.ls_sort_clear(od.doc);
+    try std.testing.expectEqual(api.SortState.idle, api.ls_sort_poll(od.doc).state);
+}
+
+// --- AC-s8 laziness --------------------------------------------------------
+
+test "srt_lazy_until_first_set: a document nobody sorts pays nothing (GUARD)" {
+    var od = try openWith(srt_fixture, .{}); // AUTO: the indexer runs to EOF
+    defer od.deinit();
+    try scanToEnd(od.doc);
+    try setFilter(od.doc, textReq("needle"));
+    _ = try waitFilterDone(od.doc);
+    try startSearch(od.doc, textReq("needle"));
+    _ = try waitSearchDone(od.doc);
+    winAll(od.doc);
+    // A full open + index + filter + find + window cycle with NO ls_sort_set:
+    // idle poll, no temp file, no sort residency at all.
+    const s = api.ls_sort_poll(od.doc);
+    try std.testing.expectEqual(api.SortState.idle, s.state);
+    try std.testing.expectEqual(api.SortError.ok, s.err);
+    try std.testing.expectEqual(@as(u32, 0), s.column);
+    try std.testing.expectEqual(api.SortDirection.ascending, s.direction);
+    try std.testing.expectEqual(@as(f64, 0.0), s.progress);
+    const t = api.sortTempStore(od.doc);
+    try std.testing.expectEqual(false, t.present);
+    try std.testing.expectEqual(@as(u32, 0), t.files);
+    try std.testing.expectEqual(@as(u64, 0), t.peak_bytes);
+    try std.testing.expectEqual(@as(u64, 0), api.sortResidentBytes(od.doc));
+    // The knob resolver answers the ONE default before anyone overrides it.
+    try std.testing.expectEqual(api.sort_chunk_default_bytes, api.sortChunkBytes(od.doc));
+}
+
+// --- AC-s9 the one chunk knob, the one temp resolver, memory + disk --------
+
+test "srt_chunk_knob_two_values: ONE knob drives both the single-chunk and the external-merge path" {
+    const gpa = std.testing.allocator;
+    const rows: usize = 20_000;
+    const body = try srtBigDoc(gpa, rows);
+    defer gpa.free(body);
+
+    // Value 1: a chunk far larger than the whole key set -> ONE in-memory chunk,
+    // so no RUN file is ever spilled (only the permutation + inverse mapping).
+    var big = try openWith(body, .{ .separator = ',', .header = api.header_off, .index_mode = api.index_manual });
+    defer big.deinit();
+    api.sortChunkBytesSetForTest(big.doc, 64 * 1024 * 1024);
+    try std.testing.expectEqual(@as(u64, 64 * 1024 * 1024), api.sortChunkBytes(big.doc));
+    try setSort(big.doc, 0, .descending);
+    _ = try waitSortActive(big.doc);
+    const big_store = api.sortTempStore(big.doc);
+
+    // Value 2: a chunk that holds only a few hundred pairs -> MANY spilled runs
+    // and a real k-way merge, on the same bytes.
+    var small = try openWith(body, .{ .separator = ',', .header = api.header_off, .index_mode = api.index_manual });
+    defer small.deinit();
+    api.sortChunkBytesSetForTest(small.doc, 8 * 1024);
+    try std.testing.expectEqual(@as(u64, 8 * 1024), api.sortChunkBytes(small.doc));
+    try setSort(small.doc, 0, .descending);
+    _ = try waitSortActive(small.doc);
+    const small_store = api.sortTempStore(small.doc);
+
+    // THE KNOB IS REAL: the tiny chunk spilled strictly more scratch than the
+    // huge one. (A re-derived, hard-coded chunk size makes these equal.)
+    try std.testing.expect(small_store.peak_bytes > big_store.peak_bytes);
+    // AND the order is byte-identical either way — the merge is not a shortcut.
+    _ = api.ls_window_set(big.doc, 0, 64);
+    _ = api.ls_window_set(small.doc, 0, 64);
+    for (0..64) |i| {
+        const r: u64 = @intCast(i);
+        try std.testing.expectEqual(@as(u64, rows - 1 - i), api.ls_source_row(big.doc, r));
+        try std.testing.expectEqual(api.ls_source_row(big.doc, r), api.ls_source_row(small.doc, r));
+    }
+    // Restoring the knob restores the one named default.
+    api.sortChunkBytesSetForTest(small.doc, 0);
+    try std.testing.expectEqual(api.sort_chunk_default_bytes, api.sortChunkBytes(small.doc));
+}
+
+test "srt_temp_single_source: ONE resolver decides where EVERY ephemeral core temp file lives" {
+    const gpa = std.testing.allocator;
+    // 40 MiB of inflate forces the gzip Source to spill inflate checkpoints.
+    const g = try gzHighExpansion(gpa, "aaaa,bbbb\n", (40 * 1024 * 1024) / 10);
+    defer gpa.free(g);
+
+    // ARM 1 — an UNUSABLE temp directory. BOTH subsystems must notice: the gzip
+    // checkpoint spill degrades to memory-only, and a sort fails with STORAGE.
+    // A subsystem that builds its own "/tmp/..." path keeps working and FAILS
+    // this arm, which is the point (ARCH-sort-by-column decision 4: reuse the
+    // existing resolver, do not add a third copy of it).
+    api.tempSpillDirSetForTest("/nonexistent-lesssheet-temp-probe");
+    defer api.tempSpillDirSetForTest(null);
+    {
+        var gzd = try openWith(g, .{ .separator = ',', .index_mode = api.index_manual });
+        defer gzd.deinit();
+        try scanToEnd(gzd.doc);
+        try std.testing.expectEqual(false, api.gzCheckpointStore(gzd.doc).present);
+    }
+    {
+        var od = try openBytes(srt_fixture);
+        defer od.deinit();
+        try setSort(od.doc, 0, .ascending);
+        const s = try waitSortTerminal(od.doc);
+        try std.testing.expectEqual(api.SortState.failed, s.state);
+        try std.testing.expectEqual(api.SortError.storage, s.err);
+        try expectSourceRows(od.doc, &.{ 0, 1, 2, 3, 4 }); // view unchanged
+    }
+
+    // ARM 2 — the platform default. Both subsystems work again.
+    api.tempSpillDirSetForTest(null);
+    {
+        var gzd = try openWith(g, .{ .separator = ',', .index_mode = api.index_manual });
+        defer gzd.deinit();
+        try scanToEnd(gzd.doc);
+        try std.testing.expectEqual(true, api.gzCheckpointStore(gzd.doc).present);
+    }
+    {
+        var od = try openBytes(srt_fixture);
+        defer od.deinit();
+        try expectSortedBy(od.doc, 0, .ascending, &.{ 1, 3, 2, 0, 4 });
+    }
+}
+
+test "srt_temp_hygiene: sort scratch is 0600, unlinked on create, and gone at close" {
+    const gpa = std.testing.allocator;
+    const rows: usize = 20_000;
+    const body = try srtBigDoc(gpa, rows);
+    defer gpa.free(body);
+    var od = try openWith(body, .{ .separator = ',', .header = api.header_off, .index_mode = api.index_manual });
+    defer od.deinit();
+    api.sortChunkBytesSetForTest(od.doc, 64 * 1024); // force real runs
+    try setSort(od.doc, 0, .descending);
+    _ = try waitSortActive(od.doc);
+
+    const t = api.sortTempStore(od.doc);
+    try std.testing.expectEqual(true, t.present); // the permutation lives on disk
+    try std.testing.expect(t.files > 0);
+    try std.testing.expectEqual(@as(u32, 0o600), t.mode);
+    try std.testing.expectEqual(true, t.unlinked); // already unlinked while open
+    // Per-row bounds (ARCH §4): <= 48 B/row transient, <= 16 B/row retained,
+    // plus one chunk / one page of fixed overhead.
+    try std.testing.expect(t.peak_bytes <= 48 * @as(u64, rows) + 64 * 1024);
+    try std.testing.expect(t.live_bytes <= 16 * @as(u64, rows) + 4096);
+    // Clearing the sort releases the scratch immediately.
+    api.ls_sort_clear(od.doc);
+    try std.testing.expectEqual(false, api.sortTempStore(od.doc).present);
+    try std.testing.expectEqual(@as(u32, 0), api.sortTempStore(od.doc).files);
+}
+
+test "srt_memory_bound: build residency stays within 2x the chunk knob and does NOT grow with rows" {
+    const gpa = std.testing.allocator;
+    const chunk: u64 = 64 * 1024;
+    var peaks: [2]u64 = undefined;
+    inline for (.{ 2_000, 40_000 }, 0..) |rows, i| {
+        const body = try srtBigDoc(gpa, rows);
+        defer gpa.free(body);
+        var od = try openWith(body, .{ .separator = ',', .header = api.header_off, .index_mode = api.index_manual });
+        defer od.deinit();
+        api.sortChunkBytesSetForTest(od.doc, chunk);
+        api.sortResidentReset(od.doc);
+        try setSort(od.doc, 0, .descending);
+        _ = try waitSortActive(od.doc);
+        peaks[i] = api.sortResidentBytes(od.doc);
+        try std.testing.expect(peaks[i] > 0); // RED seed: 0
+        try std.testing.expect(peaks[i] <= 2 * chunk);
+    }
+    // 20x the rows must not move the peak: the bound is the KNOB, never O(rows).
+    // (The merge read-buffers are derived from the same knob — one resolver.)
+    try std.testing.expect(peaks[1] <= 2 * chunk);
+}
+
+// --- AC-s11 sources: gzip and network --------------------------------------
+
+test "srt_gzip_same_order: a .csv.gz sorts to exactly the order its plain bytes do" {
+    const gpa = std.testing.allocator;
+    const rows: usize = 4_000;
+    const plain = try srtBigDoc(gpa, rows);
+    defer gpa.free(plain);
+    const g = try gz(gpa, plain);
+    defer gpa.free(g);
+
+    var pd = try openNamed(plain, "fixture.csv", .{ .separator = ',', .header = api.header_off, .index_mode = api.index_manual });
+    defer pd.deinit();
+    var gd = try openNamed(g, "fixture.csv.gz", .{ .separator = ',', .header = api.header_off, .index_mode = api.index_manual });
+    defer gd.deinit();
+    try setSort(pd.doc, 1, .descending); // column 1 is 2*i: distinct, reverse order
+    try setSort(gd.doc, 1, .descending);
+    _ = try waitSortActive(pd.doc);
+    _ = try waitSortActive(gd.doc);
+    _ = api.ls_window_set(pd.doc, 0, 128);
+    _ = api.ls_window_set(gd.doc, 0, 128);
+    for (0..128) |i| {
+        const r: u64 = @intCast(i);
+        try std.testing.expectEqual(@as(u64, rows - 1 - i), api.ls_source_row(pd.doc, r));
+        try std.testing.expectEqual(api.ls_source_row(pd.doc, r), api.ls_source_row(gd.doc, r));
+        try std.testing.expectEqualStrings(api.ls_cell(pd.doc, r, 0).slice(), api.ls_cell(gd.doc, r, 0).slice());
+    }
+}
+
+test "srt_network: no sort work without a demand; a sort IS the demand, and cancel works" {
+    const gpa = std.testing.allocator;
+    const rows: usize = 40_000;
+    const body = try srtBigDoc(gpa, rows);
+    defer gpa.free(body);
+    var fx: api.NetFixture = .{ .body = body, .honor_ranges = true, .advertise_length = true };
+
+    // (a) LAZY: an open + scroll + settle with NO sort fetches nothing extra and
+    // leaves the sort idle (the never-full-download invariant is unweakened).
+    {
+        const doc = try openFakeToDone(&fx);
+        defer api.ls_close(doc);
+        winAll(doc);
+        const before = api.netFetchCount(doc);
+        _ = settleIndex(doc, 200);
+        try std.testing.expectEqual(api.SortState.idle, api.ls_sort_poll(doc).state);
+        try std.testing.expectEqual(false, api.sortTempStore(doc).present);
+        try std.testing.expectEqual(before, api.netFetchCount(doc));
+        try std.testing.expectEqual(false, api.ls_index_poll(doc).complete);
+    }
+    // (b) THE DEMAND: ls_sort_set drives the fetch to EOF with monotone progress
+    // and produces the correct order.
+    {
+        const doc = try openFakeToDone(&fx);
+        defer api.ls_close(doc);
+        try setSort(doc, 1, .descending);
+        var last: f64 = -1.0;
+        while (true) {
+            const s = api.ls_sort_poll(doc);
+            if (s.state == .idle) return error.SortNotStarted;
+            try std.testing.expect(s.progress >= last);
+            last = s.progress;
+            if (s.state == .active) break;
+            if (s.state != .building) return error.SortNotBuilding;
+            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        }
+        try std.testing.expectEqual(@as(f64, 1.0), api.ls_sort_poll(doc).progress);
+        try std.testing.expectEqual(true, api.ls_index_poll(doc).complete);
+        _ = api.ls_window_set(doc, 0, 4);
+        try std.testing.expectEqual(@as(u64, rows - 1), api.ls_source_row(doc, 0));
+    }
+    // (c) CANCEL mid-fetch leaves an unsorted, still-usable document.
+    {
+        const doc = try openFakeToDone(&fx);
+        defer api.ls_close(doc);
+        try setSort(doc, 1, .descending);
+        api.ls_sort_clear(doc);
+        try std.testing.expectEqual(api.SortState.idle, api.ls_sort_poll(doc).state);
+        _ = api.ls_window_set(doc, 0, 4);
+        try std.testing.expectEqual(@as(u64, 0), api.ls_source_row(doc, 0));
+    }
+}
+
+// --- AC-s12 the single scan slot -------------------------------------------
+
+test "srt_slot_rules: sort takes the slot; a jump parks it; AUTO converges, MANUAL waits" {
+    const gpa = std.testing.allocator;
+    const body = try srtBigDoc(gpa, srt_big_rows);
+    defer gpa.free(body);
+
+    // (a) MANUAL: a jump that must scan takes the slot -> PARKED, and it STAYS
+    //     parked until another ls_sort_set re-drives it.
+    {
+        var od = try openWith(body, .{ .separator = ',', .header = api.header_off, .index_mode = api.index_manual });
+        defer od.deinit();
+        try setSort(od.doc, 0, .descending);
+        api.ls_jump_start(od.doc, srt_big_rows - 1_000); // must scan: takes the slot
+        _ = try waitJumpDone(od.doc);
+        const parked = api.ls_sort_poll(od.doc);
+        try std.testing.expectEqual(api.SortState.parked, parked.state);
+        try std.testing.expectEqual(@as(u32, 0), parked.column); // request KEPT
+        try std.testing.expectEqual(api.SortDirection.descending, parked.direction);
+        // Still parked after a wait: MANUAL never resumes on its own.
+        try std.testing.io.sleep(.fromMilliseconds(50), .awake);
+        try std.testing.expectEqual(api.SortState.parked, api.ls_sort_poll(od.doc).state);
+        // Re-driving it converges.
+        try setSort(od.doc, 0, .descending);
+        _ = try waitSortActive(od.doc);
+        _ = api.ls_window_set(od.doc, 0, 2);
+        try std.testing.expectEqual(@as(u64, srt_big_rows - 1), api.ls_source_row(od.doc, 0));
+    }
+    // (b) AUTO: the same contention resolves on its own — the pass resumes and
+    //     converges to ACTIVE with no further caller input.
+    {
+        var od = try openWith(body, .{ .separator = ',', .header = api.header_off });
+        defer od.deinit();
+        try setSort(od.doc, 0, .descending);
+        api.ls_jump_start(od.doc, srt_big_rows - 1_000);
+        _ = try waitJumpDone(od.doc);
+        _ = try waitSortActive(od.doc);
+        _ = api.ls_window_set(od.doc, 0, 2);
+        try std.testing.expectEqual(@as(u64, srt_big_rows - 1), api.ls_source_row(od.doc, 0));
+    }
+    // (c) The other direction: ls_sort_set cancels a SCANNING jump (gains kept)
+    //     and yields nothing of the frontier.
+    {
+        var od = try openWith(body, .{ .separator = ',', .header = api.header_off, .index_mode = api.index_manual });
+        defer od.deinit();
+        api.ls_jump_start(od.doc, srt_big_rows - 1_000);
+        const before = api.ls_index_poll(od.doc).bytes_scanned;
+        try setSort(od.doc, 0, .ascending);
+        try std.testing.expectEqual(api.JumpState.idle, api.ls_jump_poll(od.doc).state);
+        _ = try waitSortActive(od.doc);
+        try std.testing.expect(api.ls_index_poll(od.doc).bytes_scanned >= before);
+    }
+}
+
+// --- AC-s13 hostile input (the in-gate half of the fuzz criterion) ---------
+
+test "srt_corpus_hostile_sweep: every corpus case sorts on every column without a panic" {
+    const gpa = std.testing.allocator;
+    var cx = try loadCorpus(gpa);
+    defer cx.deinit();
+    var seen: usize = 0;
+    for (cx.cases()) |case| {
+        if (mBool(case, "heavy")) continue;
+        const file = mStr(case, "file") orelse return error.MalformedManifest;
+        const name = mStr(case, "name") orelse return error.MalformedManifest;
+        errdefer std.debug.print("\n[sort] hostile case: {s} ({s})\n", .{ name, file });
+        const path = try std.fs.path.joinZ(gpa, &.{ corpus.dir, file });
+        defer gpa.free(path);
+        const opts = forcedOptions(case);
+        var doc_opt: ?*api.Doc = null;
+        if (api.ls_open(path.ptr, &opts, &doc_opt) != .ok) continue;
+        const doc = doc_opt.?;
+        defer api.ls_close(doc);
+        seen += 1;
+        const cols = @min(api.ls_column_count(doc), 4);
+        var col: u32 = 0;
+        while (col < cols) : (col += 1) {
+            inline for (.{ api.SortDirection.ascending, api.SortDirection.descending }) |dir| {
+                try std.testing.expectEqual(true, api.ls_sort_set(doc, col, dir));
+                const s = try waitSortTerminal(doc);
+                // Whatever the outcome, the snapshot is WELL-DEFINED and the
+                // document is still readable — never a panic, a hang, or a
+                // half-sorted view (this is the ReleaseSafe no-crash lock the
+                // out-of-gate tools/fuzz sort entry extends).
+                try std.testing.expect(s.progress >= 0.0 and s.progress <= 1.0);
+                if (s.state == .active) try std.testing.expectEqual(@as(f64, 1.0), s.progress);
+                if (s.state != .failed) try std.testing.expectEqual(api.SortError.ok, s.err);
+                try sampleServableBounded(doc);
+            }
+        }
+        api.ls_sort_clear(doc);
+        try std.testing.expectEqual(api.SortState.idle, api.ls_sort_poll(doc).state);
+    }
+    try std.testing.expect(seen >= 5);
+}
+
+test "srt_oversized_and_capped: a sort keys on the FULL cell, never the display-capped bytes" {
+    const gpa = std.testing.allocator;
+    // Three rows whose sort cells share a 5000-byte prefix (past the 4 KiB
+    // display cap) and differ only AFTER it. Text order must follow the tail, so
+    // an implementation that keys on ls_cell's capped bytes ties all three and
+    // falls back to source order — visibly wrong here.
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(gpa);
+    try body.appendSlice(gpa, "k\n");
+    for ([_]u8{ 'c', 'a', 'b' }) |tail| {
+        try body.appendNTimes(gpa, 'x', 5000);
+        try body.append(gpa, tail);
+        try body.append(gpa, '\n');
+    }
+    var od = try openWith(body.items, .{ .separator = ',', .header = api.header_on, .index_mode = api.index_manual });
+    defer od.deinit();
+    try expectSortedBy(od.doc, 0, .ascending, &.{ 1, 2, 0 });
+    // The served cells are still display-capped — the cap is presentation-only.
+    winAll(od.doc);
+    try std.testing.expectEqual(true, api.ls_cell_truncated(od.doc, 0, 0));
+}
+
+test "srt_degenerate_documents: empty, header-only, and single-row documents sort cleanly" {
+    // An EMPTY document has no columns, so every sort request is rejected.
+    {
+        var od = try openBytes("");
+        defer od.deinit();
+        try std.testing.expectEqual(@as(u32, 0), api.ls_column_count(od.doc));
+        try expectSortRejected(od.doc, 0, .ascending);
+        try std.testing.expectEqual(api.SortState.idle, api.ls_sort_poll(od.doc).state);
+    }
+    // A HEADER-ONLY document has a column and zero data rows: the sort succeeds
+    // immediately over an empty row set.
+    {
+        var od = try openWith("a,b\n", .{ .header = api.header_on, .index_mode = api.index_manual });
+        defer od.deinit();
+        try std.testing.expectEqual(@as(u64, 0), api.ls_row_count_get(od.doc).count);
+        try setSort(od.doc, 1, .descending);
+        const s = try waitSortActive(od.doc);
+        try std.testing.expectEqual(@as(f64, 1.0), s.progress);
+        try std.testing.expectEqual(@as(u64, 0), api.ls_window_set(od.doc, 0, 8).row_count);
+        try expectHeaderCell(od.doc, 0, "a");
+    }
+    // A SINGLE data row sorts to itself in both directions.
+    {
+        var od = try openWith("a\nonly\n", .{ .header = api.header_on, .index_mode = api.index_manual });
+        defer od.deinit();
+        try expectSortedBy(od.doc, 0, .ascending, &.{0});
+        try expectSortedBy(od.doc, 0, .descending, &.{0});
+    }
+}
+
+// --- validation + ABI guards (green at freeze; must STAY green) ------------
+
+test "srt_reject: an out-of-range column is rejected and changes absolutely nothing (GUARD)" {
+    var od = try openBytes(srt_fixture);
+    defer od.deinit();
+    try std.testing.expectEqual(@as(u32, 3), api.ls_column_count(od.doc));
+    try startSearch(od.doc, textReq("needle"));
+    _ = try waitSearchDone(od.doc);
+    try expectSortRejected(od.doc, 3, .ascending);
+    try expectSortRejected(od.doc, std.math.maxInt(u32), .descending);
+    // Nothing moved: no sort, no reset of the search, identity view intact.
+    try std.testing.expectEqual(api.SortState.idle, api.ls_sort_poll(od.doc).state);
+    try std.testing.expectEqual(api.SearchState.done, api.ls_search_poll(od.doc).state);
+    try expectSourceRows(od.doc, &.{ 0, 1, 2, 3, 4 });
+}
+
+const c_linked_sort = struct {
+    extern fn ls_sort_set(doc: *api.Doc, column: u32, direction: api.SortDirection) bool;
+    extern fn ls_sort_clear(doc: *api.Doc) void;
+    extern fn ls_sort_poll(doc: *const api.Doc) api.SortStatus;
+};
+
+test "srt_abi: the sort symbols link through extern linkage; enum values and layout pinned (GUARD)" {
+    try std.testing.expectEqual(@as(c_int, 0), @intFromEnum(api.SortDirection.ascending));
+    try std.testing.expectEqual(@as(c_int, 1), @intFromEnum(api.SortDirection.descending));
+    try std.testing.expectEqual(@as(c_int, 0), @intFromEnum(api.SortState.idle));
+    try std.testing.expectEqual(@as(c_int, 1), @intFromEnum(api.SortState.building));
+    try std.testing.expectEqual(@as(c_int, 2), @intFromEnum(api.SortState.active));
+    try std.testing.expectEqual(@as(c_int, 3), @intFromEnum(api.SortState.parked));
+    try std.testing.expectEqual(@as(c_int, 4), @intFromEnum(api.SortState.failed));
+    try std.testing.expectEqual(@as(c_int, 0), @intFromEnum(api.SortError.ok));
+    try std.testing.expectEqual(@as(c_int, 1), @intFromEnum(api.SortError.storage));
+    try std.testing.expectEqual(@as(c_int, 2), @intFromEnum(api.SortError.memory));
+    try std.testing.expectEqual(@as(usize, 24), @sizeOf(api.SortStatus));
+    var od = try openBytes(srt_fixture);
+    defer od.deinit();
+    // Reached through the C symbol table, exactly as a frontend reaches them.
+    try std.testing.expectEqual(false, c_linked_sort.ls_sort_set(od.doc, 99, .ascending));
+    c_linked_sort.ls_sort_clear(od.doc);
+    try std.testing.expectEqual(api.SortState.idle, c_linked_sort.ls_sort_poll(od.doc).state);
+}
+
+test "srt_measurement_obligations: the sort criteria this gate CANNOT prove (RM — review record)" {
+    // Recorded here so they appear in the test list and cannot be forgotten.
+    // The reviewer must see NUMBERS for each, measured in ONE build session,
+    // before-and-after, on the target host:
+    //   AC-s10a  key-pass wall time on the 10-col / 10 GB local reference is
+    //            <= 3x the SAME-SESSION full-file search scan.
+    //   AC-s10b  gzip sorted-scroll latency, COLD and WARM, on the reference
+    //            .csv.gz — ship-and-measure: no pass/fail bar, but the numbers
+    //            must exist in the review record.
+    //   AC-s8    the launch / cold-open benches are unregressed (before/after).
+    //   AC-s9    the 200M-row disk projection (<= ~9.6 GB peak, ~3.2 GB
+    //            retained) follows from the per-row bounds locked by
+    //            srt_temp_hygiene; the reviewer sanity-checks the arithmetic.
+    //   AC-s13   `tools/fuzz` gains a sort entry point (open corpus file ->
+    //            ls_sort_set -> poll to terminal -> window reads in sorted
+    //            coordinates) and a campaign runs with ZERO ReleaseSafe panics.
+    //            The in-gate half is srt_corpus_hostile_sweep above.
+    try std.testing.expect(true);
+}

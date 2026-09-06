@@ -295,6 +295,43 @@ public protocol DocumentSession: AnyObject, Sendable {
     /// a `CopyStreaming`.
     func openCopy(_ rect: SelectionRect) -> (any CopyStreaming)?
 
+    /// Set (or replace) the document's SORT: order the current view by
+    /// `column` in `direction` (ARCH-sort-by-column; mirrors `ls_sort_set`).
+    /// A sort is a THIRD VIEW KIND on top of the identity and filter views:
+    /// once it lands, every row accessor, jump, find, and copy on this session
+    /// speaks SORTED coordinates, composing with an active filter — see
+    /// api/lesssheet.h SORTED VIEWS.
+    ///
+    /// Returns false iff the core REJECTS the request (`column` outside
+    /// `0..<columnCount`); NOTHING changes then. Returning true means one of
+    /// three things happened, all observable through `sortStatus()`:
+    ///   * NO-OP — the same column and direction were already active. Nothing
+    ///     changed at all, including the active search and jump.
+    ///   * INSTANT FLIP — the same column in the OTHER direction on an active
+    ///     sort: the view is already re-ordered when this returns (the
+    ///     permutation is read backwards), and the search/jump ARE reset.
+    ///   * BUILD — otherwise the key pass starts, taking the core's single scan
+    ///     slot (cancelling a scanning jump, resetting any search). The view
+    ///     keeps its CURRENT order until the pass completes: a building sort
+    ///     NEVER shows a partial order.
+    /// Never blocks (poll `sortStatus`). On a NETWORK document this call is the
+    /// user's explicit demand to fetch the whole resource, with progress and a
+    /// working cancel — the app must surface that before issuing it.
+    func setSort(column: Int, direction: SortDirection) -> Bool
+    /// Remove the sort, restoring file order within the current view (mirrors
+    /// `ls_sort_clear`; no-op when no sort is active). This is ALSO the cancel
+    /// verb: a running key pass stops and its request is dropped, with the view
+    /// left exactly as it was. Resets any active search and returns the jump
+    /// slot to idle (the coordinate space changed). Re-anchoring the viewport is
+    /// the caller's affair (capture `sourceRow` of the top visible row BEFORE
+    /// clearing). Never blocks.
+    func clearSort()
+    /// Current sort snapshot (mirrors `ls_sort_poll`), or nil when no sort is
+    /// active — a fresh session or a dialect RE-OPEN is nil (the sort dies with
+    /// the old handle; sort state is session-only and never persisted). Poll;
+    /// never blocks.
+    func sortStatus() -> SortSnapshot?
+
     /// Release the core handle. Idempotent; nothing else may be called
     /// afterwards.
     func close()

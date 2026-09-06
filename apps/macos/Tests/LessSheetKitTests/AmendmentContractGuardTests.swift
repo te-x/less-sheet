@@ -118,12 +118,16 @@ struct AmendmentContractGuardTests {
         // rebuild (no external ABI consumer). Updated through the change-authority
         // process. See docs/architecture/ARCH-security-hardening.md.
         expectEmptyDiff("api/lesssheet.h",
-        // Baseline re-bumped for three DOCUMENTATION corrections (2026-09-04): the
-        // ls_cell_copy allocation claim now states the filtered-view exception, the
-        // LS_FILTER_CANCELLED cause list names the network park and the OOM
-        // fail-safe, and ls_search_nav states its window-budget carve-out. Comment
-        // bytes only; struct / enum / signature / constant LAYOUT BYTE-IDENTICAL.
-                        baseline: "f9c8a564265e980c4f90f08e276b75f494b15df3207dd332c0e043bb9cb2272c")
+        // Baseline re-bumped for the ARCH-sort-by-column freeze (authorized: signed
+        // ARCH, user sign-off 2026-09-06, root-planner freeze). The header gains the
+        // SORTED VIEWS block — ls_sort_direction / ls_sort_state / ls_sort_error /
+        // ls_sort_status and ls_sort_set / _clear / _poll — plus amendment (d) to the
+        // never-full-download demand list and the prose that a row INDEX means a
+        // SORTED position while a sort is active. No EXISTING struct, enum, constant,
+        // or prototype changes shape; a v1 frozen-surface edit under lock-step rebuild
+        // (no external ABI consumer). Updated through the change-authority process,
+        // exactly as this guard provides for an approved header amendment.
+                        baseline: "fe9183577543060db97e1f69a4192a8822d691f18b2cfeacc946f01008d43817")
     }
 
     // AC23 — the public Swift search/layout contracts are byte-identical:
