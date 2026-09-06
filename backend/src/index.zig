@@ -14,6 +14,7 @@ const posix = std.posix;
 const base = @import("base.zig");
 const filter = @import("filter.zig");
 const search = @import("search.zig");
+const sort = @import("sort.zig");
 const column = @import("column.zig");
 const source_mod = @import("source.zig");
 const net_source = @import("net_source.zig");
@@ -148,9 +149,19 @@ pub fn workerMain(doc: *Document) void {
         // else a scanning (or, under AUTO, cancelled-but-resumable) filter-scan;
         // else the AUTO background indexer. See api/lesssheet.h FILTERED VIEWS
         // "the single scan slot".
-        const do_jump = doc.jump_state == .scanning and (doc.filter_state != .idle or !doc.complete);
-        const do_search = !do_jump and doc.search_state == .scanning;
-        const do_nav = !do_jump and !do_search and doc.filter_state != .idle and
+        // A key pass that is still BUILDING keeps the slot ahead of a jump.
+        // This is not a re-ordering of the signed slot rules: a call that takes
+        // the slot from a building pass PARKS it first (sort.parkForSlot /
+        // sort.jumpStartSorted), and a parked pass is not `.building`, so it
+        // never outranks the caller that parked it. What this does rule out is
+        // the one case where the old order would waste a whole pass: a jump
+        // under a sort cannot land until the sort is ACTIVE (there is no
+        // partial answer for a sorted position), so letting its frontier scan
+        // run first would scan the file twice for the same landing.
+        const sort_first = doc.sort_state == .building and doc.sort_build != null;
+        const do_jump = !sort_first and doc.jump_state == .scanning and (doc.filter_state != .idle or !doc.complete);
+        const do_search = !sort_first and !do_jump and doc.search_state == .scanning;
+        const do_nav = !sort_first and !do_jump and !do_search and !sort.presented(doc) and doc.filter_state != .idle and
             doc.nav_pending and doc.search_nav == .searching and
             doc.search_state == .done and doc.filter_total_exact;
         // A NETWORK document has NO background frontier drive — neither the
@@ -159,14 +170,27 @@ pub fn workerMain(doc: *Document) void {
         // (viewport jump / search nav / filtered jump), all on this same worker
         // but never as an unbidden to-EOF scan over the wire. LOCAL docs
         // (doc.net == false) are byte-identical.
-        const do_filter = !do_jump and !do_search and !do_nav and !doc.net and
+        // The SORT's key pass (api/lesssheet.h SORTED VIEWS §8): it yields to a
+        // jump/find that must scan (which PARKS it) and outranks the
+        // filter-scan, whose counters it completes on its way. Unlike the
+        // filter it drives on a NETWORK document too — ls_sort_set IS the
+        // user's explicit full-pass demand (amendment (d)).
+        // FIND UNDER A SORT: the navigation's own slot work — examine one
+        // sorted-position block (see search.resolveSortedNavOffMain). It runs
+        // HERE rather than on the caller's thread because it is window-sized
+        // work, and ls_search_nav must not block for it.
+        const do_sort_nav = !do_jump and !do_search and !do_nav and
+            doc.nav_pending and doc.search_nav == .searching and
+            doc.search_state == .done and doc.sort_state == .active and doc.sort_build != null;
+        const do_sort = !do_jump and !do_search and !do_nav and !do_sort_nav and sort.wantsSlot(doc);
+        const do_filter = !do_jump and !do_search and !do_nav and !do_sort and !doc.net and
             (doc.filter_state == .scanning or (doc.filter_state == .cancelled and doc.auto));
         // Column inference is deliberately behind every interactive scan
         // owner, but ahead of the opportunistic AUTO frontier indexer. Its
         // bounded sampler only re-reads the already-known head.
-        const do_column = !do_jump and !do_search and !do_nav and !do_filter and
+        const do_column = !do_jump and !do_search and !do_nav and !do_sort_nav and !do_sort and !do_filter and
             doc.column_store.job_state == .queued;
-        const do_index = !do_jump and !do_search and !do_nav and !do_filter and !do_column and doc.auto and !doc.complete and !doc.net;
+        const do_index = !do_jump and !do_search and !do_nav and !do_sort_nav and !do_sort and !do_filter and !do_column and doc.auto and !doc.complete and !doc.net;
         const wanted_scan: base.MatchScanOwner = if (do_jump and doc.filter_state != .idle)
             .filter
         else if (do_search)
@@ -176,8 +200,25 @@ pub fn workerMain(doc: *Document) void {
         else
             .none;
         if (doc.match_scan_owner != wanted_scan) doc.endMatchScan();
-        if (!(do_jump or do_search or do_nav or do_filter or do_column or do_index)) {
+        if (!(do_jump or do_search or do_nav or do_sort_nav or do_sort or do_filter or do_column or do_index)) {
             doc.waitWork();
+            continue;
+        }
+
+        if (do_sort_nav) {
+            search.resolveSortedNavOffMain(doc);
+            continue; // lock still held
+        }
+
+        if (do_sort) {
+            // One key-pass chunk. `workerStep` releases the mutex for the scan
+            // itself and re-takes it to commit, exactly like the filter-scan
+            // below; it returns with the lock held either way.
+            _ = sort.workerStep(doc);
+            const advanced = doc.reader.physicalBytes(doc.source, doc.frontier_pos);
+            doc.unlock();
+            releaseBehind(doc, advanced, &released);
+            doc.lock();
             continue;
         }
 
@@ -386,11 +427,15 @@ pub fn workerMain(doc: *Document) void {
             const gen = doc.search_gen;
             const start_pos = doc.search_pos;
             const start_row = doc.search_rows;
+            // Snapshotted under the mutex like `filtered` and `gen`: the chunk
+            // runs with the lock RELEASED, so it must not read a flag another
+            // thread writes under the lock (see SearchChunk.staged).
+            const tally = doc.sort_nav_tally;
             const faults_before = base.sourceFaultCount(doc);
             doc.unlock();
 
             // Lex + match a chunk of rows lock-free (worker snapshot only).
-            const res = search.searchScanChunk(doc, start_pos, start_row, filtered, gen);
+            const res = search.searchScanChunk(doc, start_pos, start_row, filtered, tally, gen);
 
             doc.lock();
             // The source faulted under this chunk: discard it (matches
@@ -565,6 +610,12 @@ fn scanChunk(doc: *Document, start_pos: Pos, start_row: u64) ChunkResult {
 
 /// Fold the current frontier into the active jump slot (mutex held).
 fn updateJump(doc: *Document) void {
+    // UNDER A SORT the landing is a SORTED position, which only the finished
+    // inverse mapping can give: there is no honest partial answer, so the jump
+    // reports SCANNING with progress and resolves when the sort reaches
+    // LS_SORT_ACTIVE (api/lesssheet.h SORTED VIEWS §6). The frontier work this
+    // scan does is still kept.
+    if (sort.presented(doc) and doc.sort_state != .active) return;
     if (doc.frontier_rows > doc.jump_target or doc.complete) {
         doc.jump_state = .done;
         doc.jump_landed = if (doc.jump_target < doc.frontier_rows)
@@ -708,6 +759,10 @@ pub fn indexPoll(d: *Document) api.ScanProgress {
 pub fn jumpStart(d: *Document, target_row: u64) void {
     d.lock();
     defer d.unlock();
+    // A sorted view lands on a SORTED position: O(1) through the inverse
+    // mapping once ACTIVE, and otherwise a scan that PARKS the build (see
+    // sort.jumpStartSorted / api/lesssheet.h SORTED VIEWS §6, §8).
+    if (sort.jumpStartSorted(d, target_row)) return;
     if (d.filter_state != .idle) {
         filter.jumpStartFiltered(d, target_row);
         return;

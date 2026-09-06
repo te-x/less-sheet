@@ -244,7 +244,7 @@ pub export fn ls_window_set(doc: *api.Doc, first_row: u64, row_count: u32) callc
 
 /// See api/lesssheet.h `ls_cell`. Zero allocation; total function.
 pub export fn ls_cell(doc: *const api.Doc, row: u64, col: u32) callconv(.c) api.Str {
-    return window.cell(asDoc(doc), row, col);
+    return window.cell(asDocMut(doc), row, col);
 }
 
 /// See api/lesssheet.h `ls_header_cell`. Zero allocation; total function.
@@ -257,7 +257,7 @@ pub export fn ls_header_cell(doc: *const api.Doc, col: u32) callconv(.c) api.Str
 /// display cap cut the served cell (set alongside the cell's CellRef by
 /// lexInto). Zero allocation; total function; never fails.
 pub export fn ls_cell_truncated(doc: *const api.Doc, row: u64, col: u32) callconv(.c) bool {
-    return window.cellTruncated(asDoc(doc), row, col);
+    return window.cellTruncated(asDocMut(doc), row, col);
 }
 
 /// See api/lesssheet.h `ls_header_cell_truncated`. Same semantics as
@@ -342,15 +342,18 @@ pub export fn ls_filter_poll(doc: *const api.Doc) callconv(.c) api.FilterStatus 
 /// See api/lesssheet.h `ls_source_row`. Same window/borrow domain as ls_cell
 /// (win_source[i] is populated by ls_window_set alongside win_refs). Total
 /// function; ZERO allocation; never fails; never scans.
+/// Under a SORT the gutter value comes from the sort's own O(1) mapping rather
+/// than the materialized window, so this takes the frontier mutex through
+/// asDocMut exactly like the other poll/control-lane reads.
 pub export fn ls_source_row(doc: *const api.Doc, row: u64) callconv(.c) u64 {
-    return window.sourceRow(asDoc(doc), row);
+    return window.sourceRow(asDocMut(doc), row);
 }
 
 /// See api/lesssheet.h `ls_row_oversized`. Same window/borrow domain as ls_cell
 /// / ls_source_row (the per-row flag is set by ls_window_set alongside the
 /// served cells). Total function; ZERO allocation; never fails; never scans.
 pub export fn ls_row_oversized(doc: *const api.Doc, row: u64) callconv(.c) bool {
-    return window.rowOversized(asDoc(doc), row);
+    return window.rowOversized(asDocMut(doc), row);
 }
 
 // ---------------------------------------------------------------------------
@@ -966,8 +969,11 @@ pub fn gzScanStep(doc: *api.Doc) api.GzScanStep {
             const gen = d.search_gen;
             const start_pos = d.search_pos;
             const start_row = d.search_rows;
+            // Snapshotted under the mutex alongside `filtered`/`gen` — the
+            // chunk runs with the lock released (see SearchChunk.staged).
+            const tally = d.sort_nav_tally;
             d.unlock();
-            const res = search.searchScanChunk(d, start_pos, start_row, filtered, gen);
+            const res = search.searchScanChunk(d, start_pos, start_row, filtered, tally, gen);
             d.lock();
             if (d.search_gen == gen and d.search_state == .scanning) {
                 search.commitSearch(d, res, filtered);

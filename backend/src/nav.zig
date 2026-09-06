@@ -159,8 +159,17 @@ fn findCheckpoint(checkpoints: []const Checkpoint, row: u64) Checkpoint {
 /// scanning it. Caller holds the document mutex (reads `d.checkpoints` /
 /// `d.oversized_checkpoints`).
 pub fn bestCheckpoint(d: *Document, row: u64) Checkpoint {
-    var best = findCheckpoint(d.checkpoints.items, row);
-    if (checkpointAtOrBefore(d.oversized_checkpoints.items, row)) |alt| {
+    return bestCheckpointIn(d.checkpoints.items, d.oversized_checkpoints.items, row);
+}
+
+/// `bestCheckpoint` over EXPLICIT lists, for the one caller that works with the
+/// document mutex released over stable tables (search.zig's sorted-navigation
+/// block scan: the search is DONE, so the frontier is complete and no scan is
+/// appending). Same rule, same result — the document-taking form above is a
+/// one-line wrapper so there is only one implementation.
+pub fn bestCheckpointIn(cps: []const Checkpoint, oversized: []const Checkpoint, row: u64) Checkpoint {
+    var best = findCheckpoint(cps, row);
+    if (checkpointAtOrBefore(oversized, row)) |alt| {
         if (alt.row > best.row) best = alt;
     }
     return best;

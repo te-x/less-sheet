@@ -25,6 +25,9 @@ const net_source = @import("net_source.zig");
 // The SOURCE-FAULT GUARD over the document's own mmap region. See
 // src/fault_guard.zig for the mechanism.
 const fault_guard = @import("fault_guard.zig");
+// For `Document.sort_build` only — a POINTER to the sort's build state, so
+// this is a file cycle (sort.zig imports base.zig back), not a layout one.
+const sort_mod = @import("sort.zig");
 
 const posix = std.posix;
 const sysio = @import("sysio.zig");
@@ -138,7 +141,7 @@ pub const Decimal = struct {
 /// (window.cellCopy) and filtered (window.cellCopyFiltered) occupy disjoint
 /// coordinate spaces, so a switch between them must never reuse the other
 /// view's cursor state.
-pub const CopyView = enum { identity, filtered };
+pub const CopyView = enum { identity, filtered, sorted };
 pub const MatchScanOwner = enum { none, filter, search };
 pub const ColumnSampleKind = enum { head, window };
 pub const ColumnWindowRow = struct { row: u64, pos: Pos, oversized: bool };
@@ -305,6 +308,20 @@ pub const Document = struct {
     nav_scratch: std.ArrayList(u8),
     nav_refs: std.ArrayList(CellRef),
 
+    // FIND UNDER A SORT (ARCH FR7). `search_match_stage` is the lock-free
+    // staging area of ONE match-scan chunk: the PRE-SORT view index of every
+    // row that satisfied find (and the filter), drained by `commitSearch` into
+    // the sort's per-SORTED-block counters. Bounded by one index block — never
+    // a document-wide match-row list. `search_filter_cum` is the running count
+    // of FILTER matches over the rows already committed, which is what turns a
+    // row number into that pre-sort view index while filtered; both reset with
+    // the search. `sort_nav_tally` is the single test that keeps all of this
+    // off the unsorted hot path. All DEFAULTED, so openWithAllocator's literal
+    // is undisturbed.
+    search_match_stage: std.ArrayList(u64) = .empty,
+    search_filter_cum: u64 = 0,
+    sort_nav_tally: bool = false,
+
     // Filter — a persistent VIEW MODE, not a transient
     // job: it PERSISTS (scanning/done/cancelled) until cleared or re-opened,
     // regardless of scan-slot contention (see api/lesssheet.h FILTERED VIEWS).
@@ -399,6 +416,11 @@ pub const Document = struct {
     win_request_count: u64 = 0,
     win_request_filtered: bool = false,
     win_request_filter_gen: u64 = 0,
+    // The same identity test for the third view kind: a window materialized in
+    // SORTED coordinates must not be extended after the sort changed (or went
+    // away), and a converging prefix that refined under it must re-materialize.
+    win_request_sorted: bool = false,
+    win_request_sort_gen: u64 = 0,
     win_cursor_valid: bool = false,
     win_cursor_pos: Pos = .{ .logical = 0, .physical = 0 },
     win_cursor_row: u64 = 0,
@@ -503,6 +525,14 @@ pub const Document = struct {
     // the next ls_window_set / ls_close. All DEFAULTED (like the copy cursor),
     // so openWithAllocator's literal need not mention them and a doc that never
     // paints highlights pays nothing. mf_flags is freed in freeDoc.
+    // Indices into `win_source` ordered by the source row they carry, so a
+    // SORTED view can find "which materialized row is at view position i"
+    // without a linear scan (see window.windowSlot). Memoized on `win_gen`
+    // exactly like the match-flags buffer, and freed in freeDoc.
+    win_src_index: std.ArrayList(u32) = .empty,
+    win_src_valid: bool = false,
+    win_src_gen: u64 = 0,
+
     mf_flags: std.ArrayList(u8) = .empty,
     mf_valid: bool = false,
     mf_win_gen: u64 = 0,
@@ -577,6 +607,31 @@ pub const Document = struct {
     /// applied to the sort. Read/written only through the Zig-only seams.
     sort_scanned_rows: u64 = 0,
     sort_pause_after_rows: u64 = std.math.maxInt(u64),
+    /// Everything ONE key pass owns — the captured key configuration, the scan
+    /// cursor, the chunk, the runs, the converging prefix, and (once ACTIVE)
+    /// the on-disk permutation + inverse mapping. Null until the first
+    /// `ls_sort_set`, so a document nobody sorts allocates nothing (the
+    /// laziness pin). Created/destroyed only under the mutex, and only when no
+    /// chunk is running (`sort_scan_busy`). See src/sort.zig.
+    sort_build: ?*sort_mod.Build = null,
+    /// Bumped by every sort state change (set / flip / clear / rebuild /
+    /// failure). A worker chunk whose generation no longer matches is
+    /// discarded, and the window lane re-materializes rather than extending a
+    /// window addressed in a coordinate space that has since changed.
+    sort_gen: u64 = 0,
+    /// Bumped by every change to what the sorted view SHOWS — every sort state
+    /// change AND every refinement of the converging prefix. The window lane
+    /// and the copy cursor key on this: while a pass builds, a served row can
+    /// be DISPLACED by a smaller value found later, so a window materialized
+    /// before that must not be extended, it must be rebuilt.
+    sort_view_gen: u64 = 0,
+    /// True while the key pass is INSIDE a chunk with the mutex released. The
+    /// handshake that lets `ls_sort_clear` / `ls_sort_set` take the build apart
+    /// without racing the worker: the mutating call raises
+    /// `sort_scan_interrupt`, waits for this to clear on the condition, and
+    /// only then touches the build.
+    sort_scan_busy: bool = false,
+    sort_scan_interrupt: std.atomic.Value(bool) = .init(false),
 
     // --- window-budget instrumentation state --------------------------------
     // DEFAULTED (like copy_cursor_* / gz_* above) so openWithAllocator's literal
@@ -775,6 +830,9 @@ pub fn asDocMut(doc: *const api.Doc) *Document {
 /// safe to destroy.
 pub fn freeDoc(doc: *Document) void {
     doc.endMatchScan();
+    // The sort's temp files (runs, permutation, inverse mapping) and its
+    // bounded prefix go with the document — nothing survives ls_close.
+    sort_mod.freeSort(doc);
     if (doc.column_scanner) |*scanner| scanner.deinit();
     source_mod.sourceShutdown(&doc.source);
     doc.checkpoints.deinit(doc.gpa);
@@ -786,11 +844,13 @@ pub fn freeDoc(doc: *Document) void {
     doc.win_pos.deinit(doc.gpa);
     doc.win_oversized.deinit(doc.gpa);
     doc.mf_flags.deinit(doc.gpa);
+    doc.win_src_index.deinit(doc.gpa);
     doc.block_counts.deinit(doc.gpa);
     doc.search_scratch.deinit(doc.gpa);
     doc.search_refs.deinit(doc.gpa);
     doc.w_query.deinit(doc.gpa);
     doc.w_mask.deinit(doc.gpa);
+    doc.search_match_stage.deinit(doc.gpa);
     doc.nav_scratch.deinit(doc.gpa);
     doc.nav_refs.deinit(doc.gpa);
     doc.filter_block_counts.deinit(doc.gpa);

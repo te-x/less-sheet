@@ -11,12 +11,14 @@
 //! imports `lexer.zig`/`encoding.zig` and never assumes a row `Pos` is a
 //! byte offset (reader.zig's module doc).
 
+const std = @import("std");
 const api = @import("api");
 const base = @import("base.zig");
 const matcher = @import("matcher.zig");
 const nav = @import("nav.zig");
 const filter = @import("filter.zig");
 const search = @import("search.zig");
+const sort = @import("sort.zig");
 
 const Document = base.Document;
 const Checkpoint = base.Checkpoint;
@@ -112,23 +114,33 @@ fn windowSetInner(d: *Document, first_row: u64, row_count: u32) api.RowRange {
     d.lock();
     const filtered = d.filter_state != .idle;
     const filter_gen = d.filter_gen;
+    // A PRESENTED sort (building, parked, or active) makes the row arguments
+    // SORTED coordinates — composing with a filter, whose row SET it uses.
+    const sorted = sort.presented(d);
+    const sort_gen = d.sort_view_gen;
     d.unlock();
 
     const identical = d.win_request_valid and
         d.win_first == first_row and
         d.win_request_count == clamped and
         d.win_request_filtered == filtered and
-        d.win_request_filter_gen == filter_gen;
+        d.win_request_filter_gen == filter_gen and
+        d.win_request_sorted == sorted and
+        d.win_request_sort_gen == sort_gen;
     if (!identical) {
         clearWindow(d, first_row);
         d.win_request_valid = true;
         d.win_request_count = clamped;
         d.win_request_filtered = filtered;
         d.win_request_filter_gen = filter_gen;
+        d.win_request_sorted = sorted;
+        d.win_request_sort_gen = sort_gen;
     }
 
     if (d.column_count == 0 or clamped == 0)
         return .{ .first_row = first_row, .row_count = 0 };
+
+    if (sorted) return windowSetSorted(d, first_row, clamped);
 
     // While filtered, first_row/row_count are FILTERED coordinates and rows
     // are served by counting into the filter's per-block counters + a bounded
@@ -222,6 +234,103 @@ fn windowSetInner(d: *Document, first_row: u64, row_count: u32) api.RowRange {
             d.win_cursor_row = cp.row;
         }
     }
+    return .{ .first_row = first_row, .row_count = d.win_rows };
+}
+
+/// Locate the SOURCE position of data row `src`, charging the walk to the
+/// aggregate window meter. Reuses the window's forward cursor when it starts
+/// no earlier than a fresh checkpoint would (so this is never costlier than a
+/// from-scratch locate) and never crosses an oversized row's bytes: a capped
+/// step skips forward via the checkpoint the frontier drops immediately after
+/// such a row. `unbounded` ignores the meter, which the FIRST row of a call
+/// uses so a window whose single locate costs more than the whole budget still
+/// makes progress instead of stalling forever. Caller holds the mutex.
+fn locateSourceRow(d: *Document, src: u64, unbounded: bool) ?Pos {
+    const cp = nav.bestCheckpoint(d, src);
+    var row = cp.row;
+    var pos = cp.pos;
+    if (d.win_cursor_valid and d.win_cursor_row <= src and d.win_cursor_row >= cp.row) {
+        row = d.win_cursor_row;
+        pos = d.win_cursor_pos;
+    }
+    while (row < src) {
+        if (!unbounded and remainingBudget(d) == 0) return null;
+        const row_limit = d.reader.posAtByteBudget(d.source, pos, api.window_row_scan_max_bytes);
+        const b = d.reader.boundsAfter(d.source, pos, row_limit);
+        charge(d, pos, b.next);
+        if (!b.capped) {
+            pos = b.next;
+            row += 1;
+            continue;
+        }
+        const skip = nav.bestCheckpoint(d, row + 1);
+        if (skip.row <= row) return null; // no way past this row: serve what we have
+        pos = skip.pos;
+        row = skip.row;
+    }
+    d.win_cursor_valid = true;
+    d.win_cursor_row = src;
+    d.win_cursor_pos = pos;
+    return pos;
+}
+
+/// ls_window_set while a SORT is PRESENTED: `first_row`/`clamped` are SORTED
+/// coordinates (view row i = the i-th row in the requested order, over the
+/// filtered row set when a filter is active). The mapping is O(1) — the
+/// converging prefix while the pass builds, the on-disk permutation once it is
+/// ACTIVE — and each mapped row is then materialized exactly like the identity
+/// path.
+///
+/// A sorted window is SCATTERED over the file, so materializing it costs
+/// O(window) block re-lexes rather than one contiguous walk (api/lesssheet.h §5
+/// COST NOTE). The existing aggregate window budget applies UNCHANGED, so this
+/// may return a SHORTER contiguous prefix — the same short ls_row_range signal
+/// a filtered window already uses, and the caller re-issues. Rows at or past
+/// the servable region (the prefix depth while building, the row count once
+/// active) are simply not served. Holds the mutex for the whole call, like
+/// windowSetFiltered.
+fn windowSetSorted(d: *Document, first_row: u64, clamped: u64) api.RowRange {
+    d.lock();
+    defer d.unlock();
+    if (d.win_rows >= clamped) return .{ .first_row = first_row, .row_count = d.win_rows };
+    const servable = sort.servableRows(d);
+    const avail_end = if (d.complete) d.total_rows else d.frontier_rows;
+    // PROGRESS GUARANTEE. One scattered row can cost more than the whole
+    // aggregate budget (a wide document's rows are hundreds of kilobytes, and
+    // locating one walks up to a checkpoint interval of them), so the FIRST row
+    // of every call is served regardless of the meter. Without it a caller that
+    // dutifully re-issues the same request would spin forever on a window that
+    // can never afford its first row; with it every re-issue delivers at least
+    // one more row, so the documented "the caller re-issues" loop terminates.
+    var served_here: u64 = 0;
+    while (d.win_rows < clamped) {
+        const view_row = first_row +| d.win_rows;
+        if (view_row >= servable) break;
+        const src = sort.sourceRowAt(d, view_row) orelse break;
+        if (src >= avail_end) break; // a keyed row is always behind the frontier
+        const first_of_call = served_here == 0;
+        if (!first_of_call and remainingBudget(d) == 0) break;
+        const pos = locateSourceRow(d, src, first_of_call) orelse break;
+
+        const allowance = if (first_of_call)
+            @as(u64, api.window_row_scan_max_bytes)
+        else
+            @min(remainingBudget(d), @as(u64, api.window_row_scan_max_bytes));
+        const row_limit = d.reader.posAtByteBudget(d.source, pos, allowance);
+        const buf_mark = d.win_buf.items.len;
+        const refs_mark = d.win_refs.items.len;
+        const res = d.reader.materialize(d.source, pos, d.column_count, api.cell_max_bytes, row_limit, &d.win_buf, &d.win_refs, d.gpa) catch break;
+        charge(d, pos, res.next);
+        if (res.capped and allowance < api.window_row_scan_max_bytes) {
+            d.win_buf.items.len = buf_mark;
+            d.win_refs.items.len = refs_mark;
+            break;
+        }
+        if (!appendRowMetadata(d, src, pos, res.capped, buf_mark, refs_mark)) break;
+        d.win_rows += 1;
+        served_here += 1;
+    }
+    buildSourceIndex(d);
     return .{ .first_row = first_row, .row_count = d.win_rows };
 }
 
@@ -350,11 +459,79 @@ fn windowSetFiltered(d: *Document, first_row: u64, clamped: u64) api.RowRange {
     return .{ .first_row = first_row, .row_count = d.win_rows };
 }
 
+/// The materialized-window slot serving view row `row`, or null when that row
+/// is not in the window.
+///
+/// UNDER A SORT this is NOT `row - win_first`. `row` is a view-relative index
+/// in the CURRENT order, and a sorted view can be re-ordered under a
+/// materialized window — the converging prefix refines as the pass advances,
+/// and a rebuild re-orders the same row SET outright. Serving by stale offset
+/// would then hand back a different row's text under the caller's index, which
+/// is exactly the silently-wrong-data outcome this project forbids. So the view
+/// row is mapped to its ORIGINAL row through the sort's O(1) mapping and that
+/// original row is looked up among the materialized ones (binary search over a
+/// memoized by-source index — no scan, no allocation beyond the one reused
+/// index buffer). A row the window does not hold is simply not served, exactly
+/// like any row outside the window.
+fn windowSlot(d: *Document, row: u64) ?usize {
+    if (d.win_rows == 0) return null;
+    // `win_request_sorted` is window-lane state (set by the ls_window_set that
+    // built this window), so an UNSORTED view answers here exactly as it always
+    // did: no lock, no mapping, byte-identical cost.
+    if (!d.win_request_sorted) {
+        if (row < d.win_first or row >= d.win_first + d.win_rows) return null;
+        return @intCast(row - d.win_first);
+    }
+    d.lock();
+    defer d.unlock();
+    const src = sort.sourceRowAt(d, row) orelse return null;
+    // ZERO ALLOCATOR CALLS on this path: the by-source index was built by the
+    // ls_window_set that materialized this window (a call the contract lets
+    // allocate). If that build failed, fall back to a linear scan over the
+    // materialized rows rather than answering "" for a row we hold — slower,
+    // but never a wrong answer.
+    if (d.win_src_valid and d.win_src_gen == d.win_gen) {
+        const order = d.win_src_index.items;
+        var lo: usize = 0;
+        var hi: usize = order.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const v = d.win_source.items[order[mid]];
+            if (v == src) return order[mid];
+            if (v < src) lo = mid + 1 else hi = mid;
+        }
+        return null;
+    }
+    for (d.win_source.items, 0..) |v, i| if (v == src) return i;
+    return null;
+}
+
+/// Build the by-source index for the window just materialized: indices into
+/// `win_source` ordered by the source row they carry. Called ONLY from
+/// ls_window_set (where allocation is permitted); every reader then binary-
+/// searches it without touching the allocator. Best-effort — a failure costs a
+/// linear scan per accessor call, never a wrong cell.
+fn buildSourceIndex(d: *Document) void {
+    d.win_src_valid = false;
+    d.win_src_index.clearRetainingCapacity();
+    d.win_src_index.ensureTotalCapacity(d.gpa, d.win_source.items.len) catch return;
+    for (0..d.win_source.items.len) |i| d.win_src_index.appendAssumeCapacity(@intCast(i));
+    const Ctx = struct {
+        src: []const u64,
+        fn less(self: @This(), a: u32, b: u32) bool {
+            return self.src[a] < self.src[b];
+        }
+    };
+    std.mem.sort(u32, d.win_src_index.items, Ctx{ .src = d.win_source.items }, Ctx.less);
+    d.win_src_valid = true;
+    d.win_src_gen = d.win_gen;
+}
+
 /// See api/lesssheet.h `ls_cell`. Zero allocation; total function.
-pub fn cell(d: *const Document, row: u64, col: u32) api.Str {
+pub fn cell(d: *Document, row: u64, col: u32) api.Str {
     if (col >= d.column_count) return empty_str;
-    if (row < d.win_first or row >= d.win_first + d.win_rows) return empty_str;
-    const idx = (row - d.win_first) * d.column_count + col;
+    const slot = windowSlot(d, row) orelse return empty_str;
+    const idx = @as(u64, slot) * d.column_count + col;
     if (idx >= d.win_refs.items.len) return empty_str;
     const ref = d.win_refs.items[@intCast(idx)];
     if (ref.len == 0) return empty_str;
@@ -395,6 +572,12 @@ pub fn matchFlags(d: *Document, first_col: u32, col_count: u32) api.Str {
     defer d.unlock();
 
     if (d.search_state == .idle) return empty_str;
+    // Under a sort the flags are computed per MATERIALIZED row, while the cell
+    // path maps each view row through the CURRENT order. If the order moved
+    // since this window was built (a converging prefix refining, a rebuild),
+    // the two would disagree — so serve no flags at all rather than flags that
+    // label the wrong rows. The caller's next ls_window_set restores them.
+    if (d.win_request_sorted and d.win_request_sort_gen != d.sort_view_gen) return empty_str;
     const search_gen = d.search_gen;
 
     const total: usize = @intCast(d.win_rows * @as(u64, col_count));
@@ -447,10 +630,10 @@ pub fn headerCell(d: *const Document, col: u32) api.Str {
 /// window/borrow rules as ls_cell; reports whether the LS_CELL_MAX_BYTES
 /// display cap cut the served cell (set alongside the cell's CellRef by
 /// the Reader's `materialize`). Zero allocation; total function; never fails.
-pub fn cellTruncated(d: *const Document, row: u64, col: u32) bool {
+pub fn cellTruncated(d: *Document, row: u64, col: u32) bool {
     if (col >= d.column_count) return false;
-    if (row < d.win_first or row >= d.win_first + d.win_rows) return false;
-    const idx = (row - d.win_first) * d.column_count + col;
+    const slot = windowSlot(d, row) orelse return false;
+    const idx = @as(u64, slot) * d.column_count + col;
     if (idx >= d.win_refs.items.len) return false;
     return d.win_refs.items[@intCast(idx)].truncated;
 }
@@ -466,7 +649,20 @@ pub fn headerCellTruncated(d: *const Document, col: u32) bool {
 /// See api/lesssheet.h `ls_source_row`. Same window/borrow domain as ls_cell
 /// (win_source[i] is populated by ls_window_set alongside win_refs). Total
 /// function; ZERO allocation; never fails; never scans.
-pub fn sourceRow(d: *const Document, row: u64) u64 {
+///
+/// UNDER A SORT the gutter value is NOT tied to the materialized window: the
+/// ORIGINAL data-row number of sorted row `i` is an O(1) lookup for every
+/// SERVABLE row — the converging prefix while building, the permutation once
+/// active — and LS_NO_ROW otherwise (api/lesssheet.h SORTED VIEWS §5). That is
+/// what lets a frontend paint gutter numbers for the whole servable region
+/// without paying the scattered re-lex for rows it is not showing.
+pub fn sourceRow(d: *Document, row: u64) u64 {
+    d.lock();
+    if (sort.presented(d)) {
+        defer d.unlock();
+        return sort.sourceRowAt(d, row) orelse api.no_row;
+    }
+    d.unlock();
     if (row < d.win_first or row >= d.win_first + d.win_rows) return api.no_row;
     const idx: usize = @intCast(row - d.win_first);
     if (idx >= d.win_source.items.len) return api.no_row;
@@ -478,11 +674,10 @@ pub fn sourceRow(d: *const Document, row: u64) u64 {
 /// win_refs/win_source), in BOTH coordinate spaces — including for a giant
 /// matching row the filtered view serves as a bounded prefix (true).
 /// Total function; ZERO allocation; never fails; never scans.
-pub fn rowOversized(d: *const Document, row: u64) bool {
-    if (row < d.win_first or row >= d.win_first + d.win_rows) return false;
-    const idx: usize = @intCast(row - d.win_first);
-    if (idx >= d.win_oversized.items.len) return false;
-    return d.win_oversized.items[idx];
+pub fn rowOversized(d: *Document, row: u64) bool {
+    const slot = windowSlot(d, row) orelse return false;
+    if (slot >= d.win_oversized.items.len) return false;
+    return d.win_oversized.items[slot];
 }
 
 /// A forward gap beyond this many rows is "implausibly large vs a checkpoint
@@ -628,6 +823,14 @@ pub fn cellCopy(d: *Document, row: u64, col: u32, buf: ?[*]u8, buf_len: usize, o
     // decision AND the work it selects, which is why the filtered path is
     // `*Locked`.
     d.lock();
+    // SORT DISPATCH, ahead of the filter one for the same TOCTOU reason: while
+    // a sort is presented `row` is a SORTED position over the (filtered) row
+    // set, so the mapping and the read it selects must happen under ONE
+    // acquisition.
+    if (sort.presented(d)) {
+        defer d.unlock();
+        return cellCopySortedLocked(d, row, col, buf, buf_len, out_len, out_truncated);
+    }
     if (d.filter_state != .idle) {
         defer d.unlock();
         return cellCopyFilteredLocked(d, row, col, buf, buf_len, out_len, out_truncated);
@@ -718,6 +921,55 @@ pub fn cellCopy(d: *Document, row: u64, col: u32, buf: ?[*]u8, buf_len: usize, o
     }
     d.unlock();
 
+    return decodeCellAt(d, pos, col, buf, buf_len, out_len, out_truncated);
+}
+
+/// `ls_cell_copy` while a SORT is presented: `row` is a SORTED position. Map it
+/// to its ORIGINAL row in O(1) (the converging prefix while building, the
+/// permutation once active), locate that row, and decode column `col` from
+/// there exactly like the identity path.
+///
+/// A row at or past the SERVABLE region answers LS_COPY_PENDING while the pass
+/// is still running — the same convention a row past the scan frontier already
+/// uses, and the reason the streaming copy's cure for a stall under a building
+/// sort is to WAIT for LS_SORT_ACTIVE rather than to jump. Once the sort is
+/// ACTIVE a row past the (now exact) row count is LS_NO_CELL. Runs with the
+/// mutex HELD by `cellCopy` for the whole call, mirroring
+/// `cellCopyFilteredLocked`.
+fn cellCopySortedLocked(d: *Document, row: u64, col: u32, buf: ?[*]u8, buf_len: usize, out_len: *usize, out_truncated: *bool) api.CopyResult {
+    const servable = sort.servableRows(d);
+    if (row >= servable) return if (d.sort_state == .active) .no_cell else .pending;
+    const src = sort.sourceRowAt(d, row) orelse return .pending;
+    const avail_end = if (d.complete) d.total_rows else d.frontier_rows;
+    if (src >= avail_end) return .pending;
+
+    // The forward COPY CURSOR, tagged for the SORTED view and the sort
+    // generation: a row-major sweep over a sorted rect walks SOURCE rows in
+    // whatever order the permutation dictates, so it is reused only when it
+    // starts no earlier than a fresh checkpoint for this row would — provably
+    // never costlier than a from-scratch locate.
+    const cp = nav.bestCheckpoint(d, src);
+    var from_row = cp.row;
+    var from_pos = cp.pos;
+    const cursor_ok = d.copy_cursor_enabled and d.copy_cursor_valid and
+        d.copy_cursor_view == .sorted and d.copy_cursor_gen == d.sort_view_gen and
+        d.copy_cursor_source_row <= src and d.copy_cursor_source_row >= cp.row;
+    if (cursor_ok) {
+        from_row = d.copy_cursor_source_row;
+        from_pos = d.copy_cursor_pos;
+    }
+    var advances: u64 = 0;
+    const pos = skipFromCheckpoint(d, from_row, from_pos, src, &advances);
+    d.copy_advances += advances;
+    if (d.copy_cursor_enabled) {
+        d.copy_cursor_valid = true;
+        d.copy_cursor_view = .sorted;
+        d.copy_cursor_gen = d.sort_view_gen;
+        d.copy_cursor_row = row;
+        d.copy_cursor_pos = pos;
+        d.copy_cursor_source_row = src;
+        d.copy_cursor_block_consumed = 0;
+    }
     return decodeCellAt(d, pos, col, buf, buf_len, out_len, out_truncated);
 }
 

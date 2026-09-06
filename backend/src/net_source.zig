@@ -20,6 +20,8 @@ const source_mod = @import("source.zig");
 
 const posix = std.posix;
 const sysio = @import("sysio.zig");
+// THE resolver for every ephemeral core temp path — see src/tempdir.zig.
+const tempdir = @import("tempdir.zig");
 
 /// The ONE stall backoff: how long any waiter sleeps before re-checking for
 /// bytes that have not arrived. Three consumers, all reading this const — the two
@@ -826,8 +828,8 @@ pub const HttpRange = struct {
     }
 
     fn createSpoolFd(self: *HttpRange) ?posix.fd_t {
-        var path_buf: [160]u8 = undefined;
-        const path = std.fmt.bufPrintZ(&path_buf, "/tmp/lesssheet-net-{x}-{x}.spool", .{ sysio.uniqueToken(), @intFromPtr(self) }) catch return null;
+        var path_buf: [256]u8 = undefined;
+        const path = std.fmt.bufPrintZ(&path_buf, "{s}/lesssheet-net-{x}-{x}.spool", .{ tempdir.resolve(), sysio.uniqueToken(), @intFromPtr(self) }) catch return null;
         const fd = posix.openatZ(posix.AT.FDCWD, path.ptr, .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true }, 0o600) catch return null;
         sysio.unlinkAbsolute(path) catch {
             sysio.close(fd);

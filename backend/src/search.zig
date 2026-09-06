@@ -7,11 +7,15 @@
 //! docs/architecture/ARCH-reader-interface.md) — this module never imports
 //! `lexer.zig`.
 
+const std = @import("std");
 const api = @import("api");
 const base = @import("base.zig");
 const matcher = @import("matcher.zig");
 const nav = @import("nav.zig");
 const filter = @import("filter.zig");
+// FIND UNDER A SORT (api/lesssheet.h SORTED VIEWS §7): anchors and found_row
+// are SORTED positions, resolved through the sort's inverse mapping.
+const sort = @import("sort.zig");
 
 const Document = base.Document;
 const Checkpoint = base.Checkpoint;
@@ -38,6 +42,14 @@ const SearchChunk = struct {
     checkpoint: ?Checkpoint,
     matches: u64, // rows satisfying find (AND the filter, when one is active)
     filter_matches: u64, // rows satisfying the filter alone; meaningful only when filtered
+    /// FIND UNDER A SORT: this chunk staged its matches for the per-sorted-block
+    /// tally (the flag was on when the chunk STARTED — snapshotted under the
+    /// mutex by the caller, never re-read mid-chunk), and every one of them was
+    /// staged successfully. Either being false means the counters cannot be
+    /// complete, and the commit turns the tally off rather than keeping a
+    /// tally that is short by an unknown amount.
+    staged: bool = false,
+    stage_dropped: bool = false,
 };
 
 /// Build the matcher context from the document (caller holds the mutex).
@@ -87,26 +99,28 @@ pub fn refreshWorkerCtx(doc: *Document) bool {
 /// lesssheet.h FILTERED VIEWS FIND); `filter_matches` tallies the filter
 /// alone, letting the caller re-drive the filter's own counted region as a
 /// side effect (maybeAdvanceFilterFromSearch).
-pub fn searchScanChunk(doc: *Document, start_pos: Pos, start_row: u64, filtered: bool, generation: u64) SearchChunk {
+pub fn searchScanChunk(doc: *Document, start_pos: Pos, start_row: u64, filtered: bool, tally: bool, generation: u64) SearchChunk {
     var pos = start_pos;
     var row = start_row;
     var matches: u64 = 0;
     var filter_matches: u64 = 0;
+    var stage_dropped = false;
     const reader_mod = @import("reader.zig");
     const scan = doc.beginMatchScan(.search, generation, start_pos);
     const target = ((start_row / checkpoint_interval) + 1) * checkpoint_interval;
     base.beginOversizedChunk(doc);
+    doc.search_match_stage.clearRetainingCapacity();
     // FRONTIER COMMIT GUARD (source.Source.commitBound), hoisted out of the row
     // loop: a LOCAL document pays one register test per row, no call.
     const guarded = doc.source.commitGuarded();
     while (row < target) {
         if (doc.stop_atomic.load(.monotonic)) {
             doc.endMatchScanIf(.search, generation);
-            return .{ .end_pos = pos, .end_row = row, .eof = false, .checkpoint = null, .matches = matches, .filter_matches = filter_matches };
+            return .{ .end_pos = pos, .end_row = row, .eof = false, .checkpoint = null, .matches = matches, .filter_matches = filter_matches, .staged = tally, .stage_dropped = stage_dropped };
         }
         if (doc.reader.atEnd(doc.source, pos)) {
             doc.endMatchScanIf(.search, generation);
-            return .{ .end_pos = pos, .end_row = row, .eof = true, .checkpoint = null, .matches = matches, .filter_matches = filter_matches };
+            return .{ .end_pos = pos, .end_row = row, .eof = true, .checkpoint = null, .matches = matches, .filter_matches = filter_matches, .staged = tally, .stage_dropped = stage_dropped };
         }
         const res = if (scan) |cur|
             reader_mod.readerMatchRowAtScanCursor(doc.reader, cur, doc.w_ctx, if (filtered) doc.wf_ctx else null)
@@ -117,7 +131,7 @@ pub fn searchScanChunk(doc: *Document, start_pos: Pos, start_row: u64, filtered:
         // matched against, or staged.
         if (base.scanStalled(doc, pos, res.next)) {
             doc.endMatchScanIf(.search, generation);
-            return .{ .end_pos = pos, .end_row = row, .eof = false, .stalled = true, .checkpoint = null, .matches = matches, .filter_matches = filter_matches };
+            return .{ .end_pos = pos, .end_row = row, .eof = false, .stalled = true, .checkpoint = null, .matches = matches, .filter_matches = filter_matches, .staged = tally, .stage_dropped = stage_dropped };
         }
         // FRONTIER COMMIT GUARD (source.Source.commitBound): withhold a row whose
         // LOOKAHEAD is not present -- counting it would let a later MUTEX-HELD
@@ -133,21 +147,39 @@ pub fn searchScanChunk(doc: *Document, start_pos: Pos, start_row: u64, filtered:
             const row_end = doc.reader.logicalBytes(doc.source, res.next);
             if (row_end > doc.source.commitBound(row_end)) {
                 doc.endMatchScanIf(.search, generation);
-                return .{ .end_pos = pos, .end_row = row, .eof = false, .stalled = true, .checkpoint = null, .matches = matches, .filter_matches = filter_matches };
+                return .{ .end_pos = pos, .end_row = row, .eof = false, .stalled = true, .checkpoint = null, .matches = matches, .filter_matches = filter_matches, .staged = tally, .stage_dropped = stage_dropped };
             }
         }
         if (filtered and res.filter_matched) filter_matches += 1;
-        if (res.matched_col != null) matches += 1;
+        if (res.matched_col != null) {
+            matches += 1;
+            // FIND UNDER A SORT (ARCH FR7): stage this match's PRE-SORT view
+            // index so the commit can tally it into the sorted-position block
+            // counters through the inverse mapping. Bounded by the chunk (one
+            // index block), never a document-wide match list, and skipped
+            // entirely when no sort is presented.
+            if (tally) {
+                const base_index = if (filtered) doc.search_filter_cum + filter_matches - 1 else row;
+                // A DROPPED match would leave that sorted block's counter short
+                // — every later `position` off by one, and a block whose only
+                // match was dropped skipped outright, which is a wrong answer
+                // rather than a slow one. Record the drop; the commit throws
+                // the whole tally away and the navigation rebuilds it.
+                doc.search_match_stage.append(doc.gpa, base_index) catch {
+                    stage_dropped = true;
+                };
+            }
+        }
         base.stageOversized(doc, row, pos, res.next);
         pos = res.next;
         row += 1;
         if (doc.source == .gzip) doc.gz_match_resident_bytes = @max(doc.gz_match_resident_bytes, 2 * @sizeOf(matcher.StreamCell));
         if (doc.reader.atEnd(doc.source, pos)) {
             doc.endMatchScanIf(.search, generation);
-            return .{ .end_pos = pos, .end_row = row, .eof = true, .checkpoint = null, .matches = matches, .filter_matches = filter_matches };
+            return .{ .end_pos = pos, .end_row = row, .eof = true, .checkpoint = null, .matches = matches, .filter_matches = filter_matches, .staged = tally, .stage_dropped = stage_dropped };
         }
     }
-    return .{ .end_pos = pos, .end_row = row, .eof = false, .checkpoint = .{ .row = row, .pos = pos }, .matches = matches, .filter_matches = filter_matches };
+    return .{ .end_pos = pos, .end_row = row, .eof = false, .checkpoint = .{ .row = row, .pos = pos }, .matches = matches, .filter_matches = filter_matches, .staged = tally, .stage_dropped = stage_dropped };
 }
 
 /// Terminate a search whose chunk STALLED on un-fetched bytes
@@ -198,6 +230,16 @@ pub fn commitSearch(doc: *Document, res: SearchChunk, filtered: bool) void {
     };
 
     doc.block_counts.appendAssumeCapacity(res.matches);
+    // ARCH FR7: fold this chunk's matches into the per-SORTED-block counters
+    // (O(index blocks) memory, never a match list). Done here, inside the scan
+    // that was already visiting these rows, so no navigation ever has to pay a
+    // second pass for it. `doc.search_rows` is still this chunk's START row,
+    // which is what lets the tally verify it has seen every row before it — a
+    // gap (a dropped match, a chunk that ran while the flag was off, a
+    // re-entered cursor) turns the tally OFF instead of leaving counters that
+    // are short by an unknown amount.
+    sort.navTallyLocked(doc, doc.search_match_stage.items, res.staged and !res.stage_dropped, doc.search_rows, res.end_row);
+    doc.search_filter_cum += res.filter_matches;
     doc.search_rows = res.end_row;
     doc.search_pos = res.end_pos;
     doc.search_total +%= res.matches;
@@ -391,6 +433,25 @@ fn filteredNavFitsBudget(doc: *Document) bool {
 /// are FILTERED indices").
 pub fn resolveNavLocked(doc: *Document) void {
     if (!doc.nav_pending) return;
+    if (sort.presented(doc)) {
+        // FIND UNDER A SORT. Full coverage is the precondition on BOTH axes —
+        // every row counted, and the order final — and neither has an honest
+        // partial answer in sorted space, so until then the navigation stays
+        // LS_SEARCH_NAV_SEARCHING and this returns. The resolution itself is
+        // the WORKER's job (src/index.zig `do_sort_nav`): it examines a whole
+        // sorted-position block, which is window-sized work, and doing it on
+        // the caller's thread with the mutex held would block every poll and
+        // window read behind it — the same freeze the key pass's merge avoids.
+        // The degraded no-worker mode resolves inline, as every other lane's
+        // fallback does, because nothing else ever would.
+        if (doc.sort_state != .active or doc.search_state != .done) return;
+        if (doc.worker != null) {
+            doc.wakeWorker();
+            return;
+        }
+        resolveSortedNavOffMain(doc);
+        return;
+    }
     if (doc.filter_state != .idle) {
         // Filtered counted-region resolution can re-lex a checkpoint block that
         // may contain giant rows. Resolve INLINE when the block span the
@@ -420,6 +481,339 @@ pub fn resolveNavLocked(doc: *Document) void {
             if (nav.findBackwardMatch(doc, doc.block_counts.items, null, docCtx(doc), upper)) |m| setFound(doc, m) else setExhausted(doc);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// FIND UNDER A SORT (api/lesssheet.h SORTED VIEWS §7). Anchors and found_row
+// are SORTED positions and "next" means next IN SORT ORDER. `total` is
+// unchanged in VALUE — the matching row SET does not depend on the order — and
+// `position` is the 1-based rank of found_row among all matching rows in
+// SORTED order.
+//
+// THE ONE BEHAVIORAL COST the header pins: because a match at any sorted
+// position can come from anywhere in the file, a navigation can only be
+// answered once the match-scan has covered EVERY row AND the sort has reached
+// LS_SORT_ACTIVE (only BROWSING converges — jump and find wait). Until then the
+// navigation stays LS_SEARCH_NAV_SEARCHING and this function simply returns;
+// the match-scan's commit and the key pass's completion both re-enter here.
+//
+// The resolution itself walks the matching rows in SOURCE order — skipping
+// whole blocks with no combined match through the SAME per-block counters the
+// unsorted path uses, never a materialized match-row list — and maps each one
+// through the sort's INVERSE mapping to its sorted position. Memory stays
+// O(index checkpoints).
+// ---------------------------------------------------------------------------
+
+/// Everything the off-lock sorted-navigation work reads from the document,
+/// snapshotted under the mutex. The predicates are the WORKER's own copies
+/// (`w_ctx` / `wf_ctx`), never the document's request buffers, so a concurrent
+/// ls_search_start cannot free them under the walk — the same rule every other
+/// lock-free scan in this core follows. The three tables are stable for the
+/// duration: this work only runs once the search is DONE, which means the
+/// frontier is complete and no scan is appending to them.
+const SortedNavCtx = struct {
+    pctx: MatchCtx,
+    fctx: ?MatchCtx,
+    filtered: bool,
+    checkpoints: []const Checkpoint,
+    oversized: []const Checkpoint,
+    block_counts: []const u64,
+    filter_block_counts: []const u64,
+    counted: u64,
+};
+
+fn sortedNavCtx(doc: *Document) SortedNavCtx {
+    const filtered = doc.filter_state != .idle;
+    return .{
+        .pctx = doc.w_ctx,
+        .fctx = if (filtered) doc.wf_ctx else null,
+        .filtered = filtered,
+        .checkpoints = doc.checkpoints.items,
+        .oversized = doc.oversized_checkpoints.items,
+        .block_counts = doc.block_counts.items,
+        .filter_block_counts = doc.filter_block_counts.items,
+        .counted = doc.search_rows,
+    };
+}
+
+/// FALLBACK counter builder: the counted region walked ONCE, in source order,
+/// tallying every match into the sort's per-SORTED-block counters. Normally the
+/// match-scan tallies as it goes (see `commitSearch`), so this never runs; it
+/// exists for the corner case where the search finished while the sort was
+/// still BUILDING, so no inverse mapping existed at the time. Whole blocks with
+/// no combined match are skipped through the same per-block counters the
+/// unsorted path uses.
+///
+/// Runs with the mutex RELEASED (the caller holds the sort's busy flag),
+/// re-taking it only to fold each finished block's tally in — a few
+/// microseconds per 2048 rows.
+fn buildSortedCounters(doc: *Document, c: SortedNavCtx) bool {
+    var stage: std.ArrayList(u64) = .empty;
+    defer stage.deinit(doc.gpa);
+    var cum_filtered: u64 = 0;
+    var b: usize = 0;
+    var ok = true;
+    while (b < c.block_counts.len) : (b += 1) {
+        const block_start = @as(u64, b) * checkpoint_interval;
+        if (block_start >= c.counted) break;
+        if (c.block_counts[b] == 0) {
+            // No combined match here — but the FILTERED index still has to
+            // advance, and the filter's own per-block counter says by how much
+            // with no re-lex at all.
+            if (c.filtered and b < c.filter_block_counts.len) cum_filtered += c.filter_block_counts[b];
+            continue;
+        }
+        if (b >= c.checkpoints.len) break;
+        if (doc.stop_atomic.load(.monotonic) or doc.sort_scan_interrupt.load(.acquire)) return false;
+        const cp = c.checkpoints[b];
+        var pos = cp.pos;
+        var row = cp.row;
+        const block_hi = @min(block_start + checkpoint_interval, c.counted);
+        stage.clearRetainingCapacity();
+        while (row < block_hi and !doc.reader.atEnd(doc.source, pos)) : (row += 1) {
+            const res = @import("reader.zig").readerMatchRow(doc.reader, doc.source, pos, c.pctx, c.fctx, .{});
+            pos = res.next;
+            const in_view = !c.filtered or res.filter_matched;
+            const base_index = if (c.filtered) cum_filtered else row;
+            if (in_view and c.filtered) cum_filtered += 1;
+            if (!in_view or res.matched_col == null) continue;
+            stage.append(doc.gpa, base_index) catch return false;
+        }
+        doc.lock();
+        ok = sort.navTallyRebuildLocked(doc, stage.items);
+        doc.unlock();
+        if (!ok) return false;
+    }
+    doc.lock();
+    sort.navMarkReadyLocked(doc);
+    doc.unlock();
+    return true;
+}
+
+/// Test the rows of ONE sorted-position block and report which of its positions
+/// match. The block's positions map to source rows scattered over the whole
+/// file, so they are visited in ASCENDING SOURCE order behind a forward cursor:
+/// that makes the walk no costlier than materializing a window of the same
+/// rows, and much cheaper whenever several share a checkpoint block. Runs with
+/// the mutex RELEASED.
+fn scanSortedBlock(doc: *Document, c: SortedNavCtx, plan: sort.NavPlan, positions: *std.ArrayList(u64), columns: *std.ArrayList(u32)) bool {
+    positions.clearRetainingCapacity();
+    columns.clearRetainingCapacity();
+
+    const Pair = struct { a: u64, b: u64 };
+    var pairs: std.ArrayList(Pair) = .empty;
+    defer pairs.deinit(doc.gpa);
+    {
+        // The mapping read is the one part that touches the sort's build; the
+        // busy flag the caller holds is what keeps it alive.
+        doc.lock();
+        defer doc.unlock();
+        var p = plan.lo;
+        while (p < plan.hi) : (p += 1) {
+            const src = sort.sourceRowOfPosition(doc, p) orelse continue;
+            pairs.append(doc.gpa, .{ .a = src, .b = p }) catch return false;
+        }
+    }
+    const BySrc = struct {
+        fn less(_: void, x: Pair, y: Pair) bool {
+            return x.a < y.a;
+        }
+    };
+    std.mem.sort(Pair, pairs.items, {}, BySrc.less);
+
+    var hits: std.ArrayList(Pair) = .empty;
+    defer hits.deinit(doc.gpa);
+    var cursor_row: u64 = 0;
+    var cursor_pos: Pos = doc.data_start;
+    var cursor_valid = false;
+    for (pairs.items) |pair| {
+        if (doc.stop_atomic.load(.monotonic) or doc.sort_scan_interrupt.load(.acquire)) return false;
+        const cp = nav.bestCheckpointIn(c.checkpoints, c.oversized, pair.a);
+        var row = cp.row;
+        var at = cp.pos;
+        if (cursor_valid and cursor_row <= pair.a and cursor_row >= cp.row) {
+            row = cursor_row;
+            at = cursor_pos;
+        }
+        while (row < pair.a and !doc.reader.atEnd(doc.source, at)) : (row += 1) {
+            at = doc.reader.boundsAfter(doc.source, at, null).next;
+        }
+        if (row != pair.a) continue;
+        cursor_valid = true;
+        cursor_row = row;
+        cursor_pos = at;
+        const res = @import("reader.zig").readerMatchRow(doc.reader, doc.source, at, c.pctx, c.fctx, .{});
+        const in_view = !c.filtered or res.filter_matched;
+        if (in_view) if (res.matched_col) |col| {
+            hits.append(doc.gpa, .{ .a = col, .b = pair.b }) catch return false;
+        };
+    }
+    const ByPos = struct {
+        fn less(_: void, x: Pair, y: Pair) bool {
+            return x.b < y.b;
+        }
+    };
+    std.mem.sort(Pair, hits.items, {}, ByPos.less);
+    for (hits.items) |h| {
+        positions.append(doc.gpa, h.b) catch return false;
+        columns.append(doc.gpa, @intCast(h.a)) catch return false;
+    }
+    return true;
+}
+
+/// A sorted-navigation answer, computed off-lock and published under the mutex.
+const SortedNavOutcome = struct {
+    found: bool,
+    pos: u64 = 0,
+    col: u32 = 0,
+    position: u64 = 0,
+};
+
+/// Walk the per-SORTED-block counters outward from the anchor, examining one
+/// block at a time until an answer is found or the counters are exhausted.
+/// Enters and leaves with the mutex RELEASED; it re-takes it only for the O(1)
+/// counter lookups and the block-cache publish.
+fn resolveFromSortedCounters(doc: *Document, c: SortedNavCtx, anchor: u64, forward: bool) ?SortedNavOutcome {
+    var positions: std.ArrayList(u64) = .empty;
+    defer positions.deinit(doc.gpa);
+    var columns: std.ArrayList(u32) = .empty;
+    defer columns.deinit(doc.gpa);
+    var probe = anchor;
+    while (true) {
+        doc.lock();
+        const plan_opt = sort.navPlanLocked(doc, probe, forward);
+        var pos_slice: []const u64 = &.{};
+        var col_slice: []const u32 = &.{};
+        var cached = false;
+        if (plan_opt) |plan| {
+            if (sort.navCachedBlock(doc, plan)) |hit| {
+                pos_slice = hit.positions;
+                col_slice = hit.columns;
+                cached = true;
+            }
+        }
+        // A cached block's slices belong to the build, so the answer is taken
+        // from them while the mutex is still held.
+        if (plan_opt) |plan| {
+            if (cached) {
+                const answer = pickInBlock(pos_slice, col_slice, plan, anchor, forward);
+                doc.unlock();
+                if (answer) |a| return a;
+                if (!advanceProbe(&probe, plan, forward)) return .{ .found = false };
+                continue;
+            }
+        }
+        doc.unlock();
+        const plan = plan_opt orelse return .{ .found = false }; // no non-empty block that way
+        if (!scanSortedBlock(doc, c, plan, &positions, &columns)) return null;
+        doc.lock();
+        sort.navPublishBlock(doc, plan, positions.items, columns.items);
+        doc.unlock();
+        if (pickInBlock(positions.items, columns.items, plan, anchor, forward)) |a| return a;
+        if (!advanceProbe(&probe, plan, forward)) return .{ .found = false };
+    }
+}
+
+/// The answer inside one fully examined block, or null when the block holds no
+/// match on the wanted side of the anchor.
+fn pickInBlock(positions: []const u64, columns: []const u32, plan: sort.NavPlan, anchor: u64, forward: bool) ?SortedNavOutcome {
+    if (forward) {
+        for (positions, 0..) |p, i| {
+            if (p < anchor) continue;
+            return .{ .found = true, .pos = p, .col = if (i < columns.len) columns[i] else 0, .position = plan.before + i + 1 };
+        }
+        return null;
+    }
+    var i: usize = positions.len;
+    while (i > 0) {
+        i -= 1;
+        if (positions[i] >= anchor) continue;
+        return .{ .found = true, .pos = positions[i], .col = if (i < columns.len) columns[i] else 0, .position = plan.before + i + 1 };
+    }
+    return null;
+}
+
+/// Move the block probe past a block that held no answer. False == there is no
+/// further block in that direction (EXHAUSTED).
+fn advanceProbe(probe: *u64, plan: sort.NavPlan, forward: bool) bool {
+    if (forward) {
+        if (plan.hi <= plan.lo) return false;
+        probe.* = plan.hi;
+        return true;
+    }
+    if (plan.lo == 0) return false;
+    probe.* = plan.lo;
+    return true;
+}
+
+/// The worker's sorted-navigation step (src/index.zig `do_sort_nav`), entered
+/// and left with the mutex HELD.
+///
+/// The expensive parts — the fallback counter build, and examining one
+/// sorted-position block — run with the mutex RELEASED under the sort's
+/// `sort_scan_busy` handshake, so polls, window reads and ls_close never queue
+/// behind them and an ls_sort_clear / ls_sort_set still finds a consistent
+/// point (it waits for the flag exactly as it does for a key-pass chunk, and
+/// the interrupt flag keeps that wait short). The predicates are the WORKER's
+/// snapshots, and every result is discarded unless the navigation, search,
+/// filter and sort generations are all still the ones it was computed for.
+pub fn resolveSortedNavOffMain(doc: *Document) void {
+    if (doc.search_gen != doc.w_gen) {
+        if (!refreshWorkerCtx(doc)) {
+            failSearchLocked(doc);
+            return;
+        }
+        doc.w_gen = doc.search_gen;
+    }
+    const filtered = doc.filter_state != .idle;
+    if (filtered and doc.filter_gen != doc.wf_gen) {
+        if (!filter.refreshFilterWorkerCtx(doc)) {
+            failSearchLocked(doc);
+            return;
+        }
+        doc.wf_gen = doc.filter_gen;
+    }
+    const c = sortedNavCtx(doc);
+    const nav_gen = doc.nav_gen;
+    const search_gen = doc.search_gen;
+    const filter_gen = doc.filter_gen;
+    const sort_gen = doc.sort_gen;
+    const anchor = doc.nav_anchor;
+    const forward = doc.nav_dir == .forward;
+    const have_counters = sort.navHasCounters(doc);
+
+    doc.sort_scan_busy = true;
+    doc.unlock();
+    var outcome: ?SortedNavOutcome = null;
+    const built = if (have_counters) true else buildSortedCounters(doc, c);
+    if (built) outcome = resolveFromSortedCounters(doc, c, anchor, forward);
+    doc.lock();
+    doc.sort_scan_busy = false;
+    doc.wakeWorker();
+
+    if (doc.nav_gen != nav_gen or doc.search_gen != search_gen or
+        doc.filter_gen != filter_gen or doc.sort_gen != sort_gen or !doc.nav_pending)
+    {
+        return; // superseded (or cancelled) while we worked
+    }
+    const res = outcome orelse {
+        // An allocation failure or an interrupt. Report NONE rather than leave
+        // the caller polling a navigation that will never resolve; a cancel
+        // path has already cleared the slot, and the generation check above
+        // means this only fires for the still-current request.
+        doc.search_nav = .none;
+        doc.nav_pending = false;
+        return;
+    };
+    if (!res.found) {
+        setExhausted(doc);
+        return;
+    }
+    doc.search_found_row = res.pos;
+    doc.search_found_col = res.col;
+    doc.search_position = res.position;
+    doc.search_nav = .found;
+    doc.nav_pending = false;
 }
 
 /// resolveNavLocked's filtered-coordinate variant: `doc.nav_anchor` is a
@@ -758,6 +1152,9 @@ pub fn startSearch(d: *Document, request: *const api.SearchRequest) bool {
     d.search_nav = .none;
     d.nav_pending = false;
     d.search_to_eof = true;
+    // FIND UNDER A SORT (ARCH FR7): point the per-sorted-block counters at this
+    // search, so its own match-scan tallies them as it goes.
+    sort.navResetLocked(d, d.search_gen);
 
     if (d.reader.atEnd(d.source, d.data_start) or d.column_count == 0) {
         // Nothing to scan: already DONE with total 0.
@@ -780,6 +1177,10 @@ pub fn startSearch(d: *Document, request: *const api.SearchRequest) bool {
         return true;
     }
     d.search_state = .scanning;
+    // A find that must SCAN takes the single slot from a building key pass:
+    // the sort goes LS_SORT_PARKED with its request kept and its converging
+    // prefix frozen at what it had reached (api/lesssheet.h SORTED VIEWS §8).
+    sort.parkForSlot(d);
     if (d.worker != null) {
         d.wakeWorker();
         d.unlock();
@@ -796,7 +1197,7 @@ pub fn startSearch(d: *Document, request: *const api.SearchRequest) bool {
     }
     const generation = d.search_gen;
     while (d.search_state == .scanning) {
-        const res = searchScanChunk(d, d.search_pos, d.search_rows, filtered, generation);
+        const res = searchScanChunk(d, d.search_pos, d.search_rows, filtered, d.sort_nav_tally, generation);
         commitSearch(d, res, filtered);
         resolveNavLocked(d);
         // Without this the stalled chunk makes no progress and the loop never
@@ -841,13 +1242,18 @@ pub fn navSearch(d: *Document, anchor_row: u64, dir: api.SearchDir) void {
     // Must scan to answer: ensure the match-scan runs and owns the slot.
     if (d.search_state == .cancelled) {
         d.search_state = .scanning;
-        d.search_to_eof = false; // resume only as far as the nav needs
+        // Under a sort the navigation needs FULL coverage (a match at any
+        // sorted position can come from anywhere), so a resume there runs to
+        // EOF rather than stopping at the next match.
+        d.search_to_eof = sort.presented(d);
     }
     if (d.search_state == .scanning) {
         if (d.jump_state == .scanning) { // re-take the slot from a scanning jump
             d.jump_state = .idle;
             d.jump_progress = 0.0;
         }
+        sort.parkForSlot(d); // see startSearch: the same slot rule
+
         if (d.worker != null) {
             d.wakeWorker();
         } else if (d.net) {
@@ -877,7 +1283,7 @@ pub fn navSearch(d: *Document, anchor_row: u64, dir: api.SearchDir) void {
             }
             const generation = d.search_gen;
             while (d.nav_pending and d.search_state == .scanning) {
-                const res = searchScanChunk(d, d.search_pos, d.search_rows, filtered, generation);
+                const res = searchScanChunk(d, d.search_pos, d.search_rows, filtered, d.sort_nav_tally, generation);
                 commitSearch(d, res, filtered);
                 resolveNavLocked(d);
                 if (d.search_state == .scanning and !d.search_to_eof and !d.nav_pending) d.search_state = .cancelled;

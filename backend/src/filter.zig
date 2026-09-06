@@ -11,6 +11,9 @@ const api = @import("api");
 const base = @import("base.zig");
 const matcher = @import("matcher.zig");
 const nav = @import("nav.zig");
+// A filter change is a ROW-SET change, so it re-runs an active key pass
+// (api/lesssheet.h SORTED VIEWS §9 REBUILDS).
+const sort = @import("sort.zig");
 
 const Document = base.Document;
 const Checkpoint = base.Checkpoint;
@@ -406,6 +409,7 @@ pub fn setFilter(d: *Document, request: *const api.SearchRequest) bool {
         d.filter_state = .done;
         d.filter_total_exact = true;
         d.filter_progress = 1.0;
+        sort.rebuildForInputChange(d, null);
         d.unlock();
         return true;
     }
@@ -422,11 +426,16 @@ pub fn setFilter(d: *Document, request: *const api.SearchRequest) bool {
     // byte-identical (doc.net == false).
     if (d.net) {
         d.filter_state = .cancelled;
+        sort.rebuildForInputChange(d, null);
         d.unlock();
         return true;
     }
     d.filter_state = .scanning;
     if (d.worker != null) {
+        // An active sort re-runs its key pass over the NEW row set and takes
+        // the slot back from the filter-scan started above; the pass completes
+        // the filter's counters on its way (api/lesssheet.h §3).
+        sort.rebuildForInputChange(d, null);
         d.wakeWorker();
         d.unlock();
         return true;
@@ -443,6 +452,7 @@ pub fn setFilter(d: *Document, request: *const api.SearchRequest) bool {
         // exits.
         if (res.stalled) finishStalledLocked(d);
     }
+    sort.rebuildForInputChange(d, null);
     d.unlock();
     return true;
 }
@@ -475,6 +485,11 @@ pub fn clearFilter(d: *Document) void {
     d.search_total = 0;
     d.search_total_exact = false;
     d.nav_pending = false;
+
+    // The row SET changed, so an active sort re-runs its pass over every row
+    // (api/lesssheet.h SORTED VIEWS §9) — the view keeps presenting the
+    // rebuild's converging prefix rather than falling back to file order.
+    sort.rebuildForInputChange(d, null);
 }
 
 /// See api/lesssheet.h `ls_filter_poll`. ZERO allocation; never fails.

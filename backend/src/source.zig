@@ -9,6 +9,10 @@ const Reader = std.Io.Reader;
 const Decompress = flate.Decompress;
 const posix = std.posix;
 const sysio = @import("sysio.zig");
+// THE resolver for every ephemeral core temp path (src/tempdir.zig): the gzip
+// checkpoint spill below, the network spool, and the sort's scratch all build
+// their paths from it, so the directory is decided in exactly one place.
+const tempdir = @import("tempdir.zig");
 
 const net_source = @import("net_source.zig");
 /// The network `http_range` Source state — a genuinely
@@ -841,8 +845,8 @@ pub const Gzip = struct {
 
     fn createSpill(self: *Gzip) void {
         if (self.spill_fd != null or self.spill_fail_after.load(.acquire) == 0) return;
-        var path_buf: [160]u8 = undefined;
-        const path = std.fmt.bufPrintZ(&path_buf, "/tmp/lesssheet-gz-{x}-{x}.ckpt", .{ sysio.uniqueToken(), @intFromPtr(self) }) catch return;
+        var path_buf: [256]u8 = undefined;
+        const path = std.fmt.bufPrintZ(&path_buf, "{s}/lesssheet-gz-{x}-{x}.ckpt", .{ tempdir.resolve(), sysio.uniqueToken(), @intFromPtr(self) }) catch return;
         const fd = posix.openatZ(posix.AT.FDCWD, path.ptr, .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true }, 0o600) catch return;
         sysio.unlinkAbsolute(path) catch {
             sysio.close(fd);

@@ -7,6 +7,9 @@ const base = @import("base.zig");
 const matcher = @import("matcher.zig");
 const nav = @import("nav.zig");
 const state_mod = @import("column_state.zig");
+// A type-override or null-sentinel change ON THE SORT COLUMN re-runs the key
+// pass (api/lesssheet.h SORTED VIEWS §9 REBUILDS).
+const sort = @import("sort.zig");
 
 const Document = base.Document;
 const State = state_mod.State;
@@ -344,6 +347,7 @@ pub fn overrideSet(doc: *Document, column: u32, ty: *const api.ColumnType) api.C
     state.resetConflicts();
     validateSamplesAgainstOverride(state, ty.*);
     commitOne(doc, state);
+    sort.rebuildForInputChange(doc, column);
     return .ok;
 }
 
@@ -356,6 +360,7 @@ pub fn overrideClear(doc: *Document, column: u32) api.ColumnResult {
     state.override_type = null;
     state.resetConflicts();
     commitOne(doc, state);
+    sort.rebuildForInputChange(doc, column);
     return .ok;
 }
 
@@ -383,6 +388,7 @@ pub fn nullSentinelSet(doc: *Document, column: u32, bytes: ?[*]const u8, len: us
         drainDegradedLocked(doc);
     }
     commitOne(doc, state);
+    sort.rebuildForInputChange(doc, column);
     return .ok;
 }
 
@@ -402,6 +408,7 @@ pub fn nullSentinelClear(doc: *Document, column: u32) api.ColumnResult {
         drainDegradedLocked(doc);
     }
     commitOne(doc, state);
+    sort.rebuildForInputChange(doc, column);
     return .ok;
 }
 
@@ -536,6 +543,37 @@ fn classify(raw: []const u8) api.ColumnType {
     if (validDate(raw)) return typeOf(.date);
     if (datetimeType(raw)) |ty| return ty;
     return typeOf(.text);
+}
+
+/// The pinned per-value grammar, for the ONE caller outside this file: the
+/// sort's key extraction (src/sort.zig), which asks "does this cell conform to
+/// the column's effective type?" and must get exactly the answer the inference
+/// would give — one definition of "parses as a DATE" in the core, not two.
+pub fn classifyCell(raw: []const u8) api.ColumnType {
+    return classify(raw);
+}
+
+/// The exact slice `classifyCell` judges the ASCII grammars on (boolean and
+/// numeric are decided after trimming). The sort's key extraction reads it so a
+/// key can never be taken from bytes the conformance decision ignored — " true"
+/// must key as TRUE, not as the space.
+pub fn trimmedCell(raw: []const u8) []const u8 {
+    return trimAscii(raw);
+}
+
+/// Column `col`'s EFFECTIVE type — override > published inference > declared >
+/// unknown, exactly `ls_column_metadata.effective`. Caller holds the mutex.
+pub fn effectiveType(doc: *Document, col: u32) api.ColumnType {
+    const state = doc.column_store.find(col) orelse return unknownType();
+    return snapshot(state).effective;
+}
+
+/// Column `col`'s null sentinel, or null under LS_COLUMN_NULL_NONE. Borrowed
+/// from the column state; caller holds the mutex and copies what it keeps.
+pub fn nullSentinelOf(doc: *Document, col: u32) ?[]const u8 {
+    const state = doc.column_store.find(col) orelse return null;
+    if (!state.has_sentinel) return null;
+    return state.sentinel[0..state.sentinel_len];
 }
 
 fn mergeTypes(a: api.ColumnType, b: api.ColumnType) api.ColumnType {
