@@ -46,7 +46,11 @@ const SeenPcsHeader = extern struct {
     pcs_len: usize,
 };
 
-const default_required = "csv_reader,source,net_source,window,index,search,encoding";
+// `sort` joins the wave (c) list with the sort-by-column slice: the `fuzz sort`
+// target exists to reach its seven key encoders, and a campaign in which
+// src/sort.zig was never entered has not tested them — that is exactly what this
+// check is for, and it would otherwise pass silently.
+const default_required = "csv_reader,source,net_source,window,index,search,encoding,sort";
 
 const Tally = struct { total: u32, seen: u32 };
 
@@ -337,7 +341,7 @@ fn coldReport(
         if (s.total == 0) continue;
         const c = s.total - s.seen;
         p("  {s:<34} {d:>4}-{d:<4} {d:>5}/{d:<5} {d:>6}{s}\n", .{
-            s.name, s.start, s.end, s.seen, s.total, c,
+            s.name,                                      s.start, s.end, s.seen, s.total, c,
             if (s.seen == 0) "   NEVER ENTERED" else "",
         });
     }

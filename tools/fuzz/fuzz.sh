@@ -136,6 +136,20 @@ echo "--- quarantines in force ---"
 grep -nE '^const quarantine_[a-z0-9_]+ = (true|false);' harness.zig || echo "  (none declared)"
 echo
 
+echo "--- targets ---"
+echo "  csv / gz_raw / gz_trunc / net   crash-oriented, security-hardening wave (c)"
+echo "  sort                            every sort KEY ENCODER over a fuzzed CSV"
+echo "                                  (ARCH-sort-by-column AC-s13). Shares the csv"
+echo "                                  seed pack — the fuzzer keys its mutable corpus"
+echo "                                  on the TEST NAME — and ITERATES all seven"
+echo "                                  ls_column_override_set kinds rather than"
+echo "                                  drawing one, because a drawn 1-in-7 collapses"
+echo "                                  to a single kind on the 93 csv seeds carrying"
+echo "                                  w0 == 0. Reads the window MID-BUILD through the"
+echo "                                  sortPauseAfterRows seam, without which those"
+echo "                                  reads are a race the fuzzer loses every time."
+echo
+
 echo "--- document shapes (csv target) — why iterations are not a constant unit ---"
 grep -nE '^const (deep_shape|many_rows_shape_min|base_rows) = ' harness.zig || true
 echo "  ordinary  <=1 MiB (rep amplifier)          ~1-5 ms/iteration"
@@ -143,6 +157,16 @@ echo "  many_rows >2048 rows, ~166 KiB             8/64 of draws, 15/219 csv see
 echo "  deep      >8 MiB, forces off-main nav      1/64 of draws,  2/219 csv seeds, ~82 ms"
 echo "  Sentinels are NON-ZERO on purpose: 93 of the 219 csv seeds carry w0 == 0,"
 echo "  so a zero-valued shape selector would make the >8 MiB shape the default."
+echo
+
+echo "--- stray ephemeral temp files BEFORE (AC-s13: none may survive ls_close) ---"
+# The core's scratch — gzip checkpoints, the net spool, and the sort's runs /
+# permutation / inverse mapping — is created 0600 and UNLINKED immediately, so a
+# name still visible here means a create-without-unlink leak. Counted either side
+# of the campaign rather than per iteration: the leak is a process-level property
+# and a per-iteration scan would cost more than it finds.
+stray_before="$(ls -1d /tmp/lesssheet-* 2>/dev/null | wc -l | tr -d ' ')"
+echo "  /tmp/lesssheet-*: $stray_before"
 echo
 
 echo "--- corpus ---"
@@ -330,6 +354,19 @@ cov_status=$?
 set -e
 
 echo
+echo "--- stray ephemeral temp files AFTER ---"
+stray_after="$(ls -1d /tmp/lesssheet-* 2>/dev/null | wc -l | tr -d ' ')"
+echo "  /tmp/lesssheet-*: $stray_after (was $stray_before)"
+stray_status=0
+if [ "$stray_after" -gt "$stray_before" ]; then
+  echo "  LEAK: the campaign left $((stray_after - stray_before)) ephemeral file(s) behind."
+  echo "  Every one of them should have been unlinked at creation; a visible name"
+  echo "  means a create-without-unlink path. List them before deleting:"
+  ls -l /tmp/lesssheet-* 2>/dev/null || true
+  stray_status=1
+fi
+
+echo
 echo "--- triage (AC-c2) ---"
 if [ -f .zig-cache/f/crash ]; then
   echo "A CRASHING INPUT WAS SAVED: .zig-cache/f/crash ($(wc -c <.zig-cache/f/crash) bytes)"
@@ -341,4 +378,6 @@ else
   echo "no crashing input saved"
 fi
 
-exit $(( replay_status != 0 ? replay_status : (status != 0 ? status : cov_status) ))
+exit $(( replay_status != 0 ? replay_status \
+        : (status != 0 ? status \
+        : (stray_status != 0 ? stray_status : cov_status)) ))

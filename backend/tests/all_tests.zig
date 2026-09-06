@@ -12915,6 +12915,231 @@ test "srt_failure_modes: injected storage and allocation failure each FAIL clean
     }
 }
 
+// --- AC-s7, the interleaving `srt_failure_modes` cannot reach (finding F2) ---
+//
+// `srt_failure_modes` injects a failure and then WAITS for a terminal state, so
+// it only ever calls `ls_sort_set` when nothing is in flight. The dangerous
+// moment is the other one: a request issued WHILE a failing pass is unwinding.
+// The core drops the document mutex inside that window (the scan runs unlocked,
+// and a waiting caller sleeps on the condition variable), so "the build still
+// exists" is a fact that can expire between the caller checking it and using it.
+//
+// WHY IT RUNS IN A FORKED CHILD. The failure mode is a ReleaseSafe PANIC, and a
+// panic aborts the whole test binary — the suite would die instead of reporting.
+// The fork machinery at the top of this file exists for exactly that (the
+// sigbus arms): the child drives the interleaving, the parent turns its death
+// into a VALUE and asserts on it, so a crash is a FAILING TEST with a
+// diagnostic, never a lost run. The child's stderr is deliberately NOT silenced:
+// when this is red, the panic trace naming the offending line is the evidence.
+//
+// WHY IT IS A BOUNDED RACE DRIVER AND NOT A FIXED INTERLEAVING, stated plainly.
+// The window is "a caller is parked waiting for the scan to go idle at the exact
+// moment that scan's chunk commit fails". No seam in the contract pins those two
+// to one order — `sortPauseAfterRows` controls where the scan STOPS, not where a
+// concurrent caller is — so the child DRIVES the race instead, and three
+// measured choices are what make it land rather than nearly land:
+//
+//   * WIDE ROWS. A scan chunk is a fixed 2048 ROWS. Over 18-byte rows a chunk is
+//     36 KB and finishes in microseconds, so another lane essentially never
+//     arrives inside one. At `f2_row_width` the same chunk is a megabyte and
+//     lasts long enough to be interrupted mid-flight.
+//   * A PACED FLIPPER, not a tight one. Each `ls_sort_set` raises the scan
+//     interrupt, so a flipper that never pauses aborts every chunk before it has
+//     staged enough to spill — and a chunk that never spills never reaches the
+//     temp-storage operation that can fail. A tight loop provably races nothing
+//     (measured: green against the defect). The spin between flips lets chunks
+//     accumulate and commit.
+//   * A LATE ARMING POINT, swept across attempts. Failing on the second temp
+//     operation fails before the flipper lane exists; `f2_arm_base` puts the
+//     failure well inside the pass and the sweep covers the timing spread.
+//
+// Reproduces 6 runs out of 6 on this tree (and the `fuzz sort` target hit the
+// same line 4 of 4). It is bounded, it cannot hang the suite, and a green run
+// additionally asserts the CONTRACT — a clean FAILED, the view back in file
+// order, no surviving scratch — with `f2_never_failed` guarding against a fix
+// that merely stopped failing and let this pass vacuously.
+
+/// `rows` rows of "{i:0>8},<filler>" at `width` bytes each. A scan chunk is a
+/// fixed 2048 ROWS, so the only way to make one last long enough for another
+/// lane to arrive inside it is to make the rows WIDE.
+fn genWideRows(gpa: std.mem.Allocator, rows: usize, width: usize) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(gpa);
+    var line: [32]u8 = undefined;
+    for (0..rows) |i| {
+        const head = try std.fmt.bufPrint(&line, "{d:0>8},", .{i});
+        try buf.appendSlice(gpa, head);
+        try buf.appendNTimes(gpa, 'x', width - head.len - 1);
+        try buf.append(gpa, '\n');
+    }
+    return buf.toOwnedSlice(gpa);
+}
+
+/// The F2 child's document: 20k rows x 512 bytes = ~10 MB, so one 2048-row scan
+/// chunk is ~1 MB and lasts long enough for the flipper lane to arrive inside it
+/// (see the note above — this is the load-bearing part of the fixture, not a
+/// size chosen for coverage).
+const f2_rows: usize = 20_000;
+const f2_row_width: usize = 512;
+/// Attempts, each arming the temp-storage failure a little later in the pass, so
+/// one sweep covers the timing spread rather than betting on a single point.
+const f2_attempts: u32 = 12;
+/// The first arming point, in temp-storage operations. Late enough that the
+/// flipper lane is established before the pass can fail.
+const f2_arm_base: u64 = 40;
+/// How long the flipper lane runs per attempt. It has to SPAN the pass, not
+/// merely start during it: a bounded count of flips completes in microseconds.
+const f2_race_ms: u64 = 120;
+
+/// Child exit codes. Anything other than `fg_ok` is a contract violation the
+/// child SURVIVED; a signal is the crash itself.
+const f2_rejected: u8 = 91; // a valid ls_sort_set was refused
+const f2_never_failed: u8 = 92; // the injection never bit — the test proved nothing
+const f2_view_not_restored: u8 = 93; // FAILED, but the view was not back in file order
+const f2_temp_leaked: u8 = 94; // FAILED, but sort scratch survived
+const f2_wrong_error: u8 = 95; // FAILED with something other than .storage
+
+fn f2Name(code: u8) []const u8 {
+    return switch (code) {
+        f2_rejected => "a valid ls_sort_set was rejected",
+        f2_never_failed => "the injected temp-storage failure never fired (nothing was proven)",
+        f2_view_not_restored => "FAILED, but the view did not return to file order",
+        f2_temp_leaked => "FAILED, but sort scratch survived",
+        f2_wrong_error => "FAILED with an error other than .storage",
+        fg_setup_failed => "the child could not set up (broken fixture, not a verdict)",
+        else => "unexpected exit code",
+    };
+}
+
+/// The FLIPPER lane. `ls_sort_set` on the sort's own column keeps the build,
+/// which is the path that waits for the scan to go idle and then uses the build
+/// it checked for BEFORE waiting. Running it on its own thread for the whole
+/// duration of the pass is what puts a caller inside that wait for most of the
+/// pass — a single-threaded flip loop finishes in microseconds, long before the
+/// worker has scanned anything, and races nothing at all (measured).
+const F2Flipper = struct {
+    doc: *api.Doc,
+    stop: std.atomic.Value(bool) = .init(false),
+    flips: u64 = 0,
+
+    fn run(ctx: *F2Flipper) void {
+        var i: u64 = 0;
+        while (!ctx.stop.load(.acquire)) : (i += 1) {
+            const dir: api.SortDirection = if (i % 2 == 0) .descending else .ascending;
+            _ = api.ls_sort_set(ctx.doc, 0, dir);
+            // PACED, not tight. A flip sets the scan interrupt, so a flipper
+            // that never pauses aborts every chunk before it has staged enough
+            // to spill — and a chunk that never spills never reaches the
+            // temp-storage operation that can fail. The pause lets chunks run,
+            // accumulate and commit; the flips then arrive inside them.
+            var spin: u32 = 0;
+            while (spin < 4096) : (spin += 1) std.atomic.spinLoopHint();
+        }
+        ctx.flips = i;
+    }
+};
+
+fn f2Child(path: [*:0]const u8) noreturn {
+    // AUTO: the core's own worker drives the key pass, so the flips below race a
+    // real background pass rather than one this thread is driving.
+    const opts: api.OpenOptions = .{ .separator = ',', .header = api.header_off };
+    var doc_opt: ?*api.Doc = null;
+    if (api.ls_open(path, &opts, &doc_opt) != .ok) _exit(fg_setup_failed);
+    const doc = doc_opt orelse _exit(fg_setup_failed);
+
+    var saw_failed = false;
+    var attempt: u32 = 0;
+    while (attempt < f2_attempts) : (attempt += 1) {
+        api.ls_sort_clear(doc);
+        // A tiny key chunk means many runs and therefore many temp operations,
+        // so the arming point below lands INSIDE the pass rather than past its
+        // end. Armed before the request: the pass captures the limit at start.
+        api.sortChunkBytesSetForTest(doc, 4096);
+        api.sortTempFailAfter(doc, f2_arm_base + attempt * 12);
+        if (!api.ls_sort_set(doc, 0, .ascending)) _exit(f2_rejected);
+
+        var ctx: F2Flipper = .{ .doc = doc };
+        const t = std.Thread.spawn(.{}, F2Flipper.run, .{&ctx}) catch _exit(fg_setup_failed);
+        // Flip for long enough to cover the pass, then stop and read the
+        // verdict. Deliberately NOT "until the poll says failed": by contract an
+        // ls_sort_set on a failed sort RE-RUNS the pass, so the flipper keeps
+        // restarting it and there is no terminal state to see until it stops.
+        std.testing.io.sleep(.fromMilliseconds(f2_race_ms), .awake) catch {};
+        ctx.stop.store(true, .release);
+        t.join();
+
+        var spins: u32 = 0;
+        var st = api.ls_sort_poll(doc);
+        while (st.state == .building and spins < 20_000) : (spins += 1) {
+            std.testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+            st = api.ls_sort_poll(doc);
+        }
+        if (st.state == .failed) {
+            saw_failed = true;
+            if (st.err != .storage) _exit(f2_wrong_error);
+            // THE CONTRACT (api/lesssheet.h SORTED VIEWS §11): the view is back
+            // in its pre-sort FILE order and fully servable, and no scratch
+            // survives.
+            _ = api.ls_window_set(doc, 0, 4);
+            if (api.ls_source_row(doc, 0) != 0 or api.ls_source_row(doc, 1) != 1)
+                _exit(f2_view_not_restored);
+            if (api.sortTempStore(doc).present) _exit(f2_temp_leaked);
+        }
+        api.sortTempFailAfter(doc, std.math.maxInt(u64));
+    }
+    api.ls_sort_clear(doc);
+    api.ls_close(doc);
+    if (!saw_failed) _exit(f2_never_failed);
+    _exit(fg_ok);
+}
+
+test "srt_failure_race: a request issued WHILE a failing pass unwinds must not crash (AC-s7, finding F2)" {
+    const gpa = std.testing.allocator;
+    const bytes = try genWideRows(gpa, f2_rows, f2_row_width);
+    defer gpa.free(bytes);
+    var fx = try makeFixture(bytes, 0o644);
+    defer fx.deinit();
+
+    const pid = fork();
+    try std.testing.expect(pid >= 0);
+    if (pid == 0) f2Child(fx.path);
+
+    const end = waitChild(pid, 60_000);
+    switch (end) {
+        .exited => |code| {
+            errdefer std.debug.print(
+                "\n[F2] the child survived but broke the contract: exit {d} — {s}\n",
+                .{ code, f2Name(code) },
+            );
+            try std.testing.expectEqual(@as(u8, fg_ok), code);
+        },
+        .signalled => |sig| {
+            std.debug.print(
+                "\n[F2] REPRODUCED: the child died with signal {d} while flipping the sort\n" ++
+                    "     direction during a failing key pass. A ReleaseSafe panic IS a crash\n" ++
+                    "     (the panic trace is above). The contract's answer here is a clean\n" ++
+                    "     LS_SORT_FAILED with the view back in file order — see api/lesssheet.h\n" ++
+                    "     SORTED VIEWS §11 — never a fault. Root cause at the time of freezing:\n" ++
+                    "     the request checks that a build exists, then WAITS for the scan to go\n" ++
+                    "     idle (which releases the document mutex), then uses the build it\n" ++
+                    "     checked for — and the worker's storage/OOM arm destroys that build\n" ++
+                    "     inside the window. Re-validate after the wait, not before it.\n",
+                .{sig},
+            );
+            return error.SortFailureRaceCrashed;
+        },
+        .timed_out => {
+            std.debug.print(
+                "\n[F2] the child never terminated: a deadlock on the failing-pass teardown\n" ++
+                    "     (a caller waiting for a scan that will never publish idle) counts\n" ++
+                    "     exactly like the crash — no silent stalls.\n",
+                .{},
+            );
+            return error.SortFailureRaceHung;
+        },
+    }
+}
+
 test "srt_clear_cancels: clearing mid-pass stops it, polls IDLE, and restores the pre-sort order" {
     const gpa = std.testing.allocator;
     const body = try srtBigDoc(gpa, srt_big_rows);

@@ -4,8 +4,12 @@ Status: SIGNED — interviewed and converged with the user (batches 1–2, run `
 technology decisions and acceptance criteria explicitly approved by the user 2026-09-06.
 AMENDMENT 1 (converging sorted prefix, 100 ms first-window bound) — SIGNED by the user 2026-09-06:
 interview-approved after the first contract freeze, amended wording (FR2/FR3/FR6/FR11,
-AC-s2/s6/s7/s14/s15, new AC-s16, §1/§2/§4 serving rules) explicitly re-signed. This document as it
-stands is the signed design.
+AC-s2/s6/s7/s14/s15, new AC-s16, §1/§2/§4 serving rules) explicitly re-signed.
+AMENDMENT 2 — SIGNED by the user 2026-09-06: clarification after the backend cell's review — the §4
+build-time memory bound (and AC-s9's restatement) is on the core's ANONYMOUS residency and excludes
+file-backed, evictable pages of the scratch mappings; measured `ru_maxrss` counts those pages and
+may exceed the figure while the protected property (bounded, row-independent anonymous memory)
+holds. No behavioral change.
 Changes the frozen `api/lesssheet.h` — root-planner freeze, lock-step edit (no compat layer, per the
 FROZEN-SURFACE AMENDMENT precedent).
 
@@ -207,10 +211,14 @@ immediately (pass completes within the call's normal async flow). Re-requesting 
   whatever has been scanned by then, not on coverage: open already guarantees ≥
   LS_OPEN_READY_MIN_ROWS rows behind the frontier, so there is always real content within the
   bound.) Network documents are exempt from wall-clock guarantees, as everywhere.
-- **Memory (RAM).** Never O(rows) in process memory. Build-time RSS delta ≤ 2× the chunk knob at
-  the reference workload (one named const, default 32 MiB, planner-tunable; merge read-buffers are
-  derived from it — one knob, one resolver) plus the O(K) prefix structure (K reads
-  LS_WINDOW_MAX_ROWS through one resolver — no second constant). Steady sorted-view RSS is
+- **Memory (RAM).** Never O(rows) of anonymous process memory. Build-time ANONYMOUS-residency delta
+  ≤ 2× the chunk knob at the reference workload (one named const, default 32 MiB, planner-tunable;
+  merge read-buffers are derived from it — one knob, one resolver) plus the O(K) prefix structure
+  (K reads LS_WINDOW_MAX_ROWS through one resolver — no second constant), and row-independent.
+  Amendment 2: this bound EXCLUDES file-backed, evictable pages of the scratch mappings (runs /
+  permutation / inverse mapping) — those are disk-resident by design and reclaimable by the OS
+  under pressure (the net-spool "disk-resident, not RAM-resident" precedent), so a raw `ru_maxrss`
+  reading may exceed the figure while the protected property holds. Steady sorted-view RSS is
   O(window + checkpoints + sorted-block counters), as today.
 - **Disk (ephemeral).** Runs + permutation + inverse mapping live in temp storage under the same
   discipline as the gzip checkpoint spill and the net spool: platform temp dir via ONE shared
@@ -306,10 +314,11 @@ technology.
 ## 8. Acceptance criteria
 
 Approved by the user at sign-off (2026-09-06); AC-s2/s6/s7/s14/s15 as amended and AC-s16 as added
-by Amendment 1, explicitly re-signed 2026-09-06. The surfaced consequences stand: HTTP sort is a
-full download on click; descending shows equal values in reverse source order; up to 48 B/row
-scratch disk during the pass; while a build runs the top rows refine live under a visible progress
-affordance.
+by Amendment 1, explicitly re-signed 2026-09-06; AC-s9's memory clause clarified by Amendment 2
+(anonymous residency; scratch-mapping pages excluded), signed 2026-09-06. The surfaced consequences
+stand: HTTP sort is a full download on click; descending shows equal values in reverse source
+order; up to 48 B/row scratch disk during the pass; while a build runs the top rows refine live
+under a visible progress affordance.
 
 Backend (contract tests unless marked otherwise):
 
@@ -347,9 +356,11 @@ Backend (contract tests unless marked otherwise):
 - **AC-s8 (laziness + open cost).** No sort call ⇒ no sort thread, allocation, or temp file
   (idle-state allocation discipline holds); the open/first-window path is unchanged (existing open
   determinism and launch-bench guards stay green, before/after measured).
-- **AC-s9 (memory + disk bounds, measured).** Sorting a generated ≥ 10M-row fixture: build-time RSS
-  delta ≤ 2× the chunk knob (+ the O(K) prefix structure); temp-storage footprint within the §4
-  per-row bounds; all temp files unlinked-on-create; nothing remains after ls_close.
+- **AC-s9 (memory + disk bounds, measured).** Sorting a generated ≥ 10M-row fixture: build-time
+  ANONYMOUS-residency delta ≤ 2× the chunk knob (+ the O(K) prefix structure) and row-independent —
+  per Amendment 2 this bound excludes file-backed, evictable pages of the scratch mappings, which a
+  raw `ru_maxrss` reading counts; temp-storage footprint within the §4 per-row bounds; all temp
+  files unlinked-on-create; nothing remains after ls_close.
 - **AC-s10 (speed, measured).** On the 10-col/10 GB local reference, key-pass wall time ≤ 3× the
   same-session full-file search scan; reported as a before/after table to the reviewer. Gzip sorted
   scrolling: cold and warm sorted-window latencies on the reference `.csv.gz` measured and reported
@@ -393,3 +404,4 @@ user):
 None — all interview points were resolved in batches 1–2, the sign-off, and the Amendment 1
 interview and re-sign-off (converging prefix confirmed; K = 4096 via LS_WINDOW_MAX_ROWS; 100 ms
 first-window bound chosen by the user over 500/250/200 ms; find/jump scope guard confirmed).
+Amendment 2 (the §4/AC-s9 anonymous-residency clarification) is SIGNED (2026-09-06).

@@ -2911,13 +2911,24 @@ void ls_copy_close(ls_copy_job *job);
  *   not knowable from a prefix — so the jump reports LS_JUMP_SCANNING with
  *   pollable progress and completes only when the sort reaches LS_SORT_ACTIVE
  *   (the deliberate scope guard: only BROWSING converges; jump and find wait).
- *   If that jump's own scan takes the slot the build PARKS (section 8), and
- *   then: under LS_INDEX_AUTO the build resumes on its own and BOTH converge;
- *   under LS_INDEX_MANUAL both stay parked — the jump keeps reporting
- *   LS_JUMP_SCANNING with frozen progress and the sort LS_SORT_PARKED — until
- *   an ls_sort_set re-drives the pass. That is MANUAL's documented
- *   advance-only-while-driven semantics, observable through both polls and
- *   never a silent stall; interactive frontends run AUTO.
+ *
+ *   AND THE KEY PASS KEEPS THE SLOT WHILE IT IS ADVANCING. A jump under a sort
+ *   cannot be answered until the inverse mapping exists, and the key pass is
+ *   exactly the work that produces it, so letting the jump's own frontier scan
+ *   run FIRST would be pure waste — it would finish still unable to answer, and
+ *   the pass would then have to run anyway. So on a LOCAL document under
+ *   LS_INDEX_AUTO, where the pass is always being driven, ls_jump_start does
+ *   NOT park it: ls_sort_poll stays LS_SORT_BUILDING (you will not observe
+ *   LS_SORT_PARKED there), ls_jump_poll reports LS_JUMP_SCANNING, and BOTH
+ *   resolve at LS_SORT_ACTIVE with no further caller input.
+ *
+ *   Where the pass is NOT being driven — LS_INDEX_MANUAL between drives, and a
+ *   NETWORK document, which has no background drive at all — there is nothing
+ *   to outrank: the demand takes the slot, the build PARKS (section 8), and both
+ *   stay put — the jump reporting LS_JUMP_SCANNING with frozen progress and the
+ *   sort LS_SORT_PARKED — until an ls_sort_set re-drives the pass. That is the
+ *   documented advance-only-while-driven semantics, observable through both
+ *   polls and never a silent stall; interactive frontends run AUTO.
  *
  * ---- 7. FIND UNDER A SORT -------------------------------------------------
  *   ls_search_* operates entirely in SORTED coordinates: ls_search_nav anchors
@@ -2944,22 +2955,34 @@ void ls_copy_close(ls_copy_job *job);
  *       running filter-scan yields the slot (LS_FILTER_CANCELLED, counts and
  *       mode kept — and the key pass will complete those counts anyway), and
  *       any active search is RESET (see RESET).
- *     * An ls_jump_start / ls_search_start / ls_search_nav that must SCAN takes
- *       the slot from a building key pass: the sort goes LS_SORT_PARKED with
- *       its progress frozen, its REQUEST kept, and its CONVERGING PREFIX frozen
- *       at the content it had converged to — still served, still exact for the
- *       region scanned so far, simply no longer refining. LS_SORT_PARKED is the
- *       sort analog of LS_FILTER_CANCELLED and is likewise NOT a user
- *       cancellation (ls_sort_clear yields LS_SORT_IDLE, not this): it is a
- *       partial result, and a frontend keeps showing it under the progress
- *       affordance. It is named PARKED rather than CANCELLED so no one reads it
- *       as the user's doing (it is the signed design's "cancelled" state).
+ *     * An ls_jump_start / ls_search_start / ls_search_nav that must SCAN
+ *       contends with a key pass for the slot, and WHICH ONE WINS depends on
+ *       whether the pass is actually ADVANCING:
+ *         - AN ADVANCING KEY PASS KEEPS THE SLOT. A jump under a sort needs the
+ *           inverse mapping the pass is building, so running the jump's scan
+ *           first would finish unable to answer and leave the pass still to do
+ *           (see JUMP). On a LOCAL document under LS_INDEX_AUTO the pass is
+ *           always being driven, so ls_sort_poll stays LS_SORT_BUILDING through
+ *           the contention and LS_SORT_PARKED is simply not observable there.
+ *         - A PASS THAT IS NOT ADVANCING YIELDS, and that is where
+ *           LS_SORT_PARKED shows up: under LS_INDEX_MANUAL between drives, and
+ *           on a NETWORK document (no background drive at all), the demand takes
+ *           the slot and the sort goes LS_SORT_PARKED with its progress frozen,
+ *           its REQUEST kept, and its CONVERGING PREFIX frozen at the content it
+ *           had converged to — still served, still exact for the region scanned
+ *           so far, simply no longer refining.
+ *       LS_SORT_PARKED is the sort analog of LS_FILTER_CANCELLED and is likewise
+ *       NOT a user cancellation (ls_sort_clear yields LS_SORT_IDLE, not this):
+ *       it is a partial result, and a frontend keeps showing it under the
+ *       progress affordance. It is named PARKED rather than CANCELLED so no one
+ *       reads it as the user's doing (it is the signed design's "cancelled"
+ *       state).
  *     * Under LS_INDEX_AUTO on a LOCAL document the key pass is a background
- *       view-completion job: from LS_SORT_PARKED it RESUMES on its own and
- *       converges to LS_SORT_ACTIVE without further caller input, whatever
- *       jumps/finds intervene (mirroring the AUTO filter-scan). Under
- *       LS_INDEX_MANUAL it stays LS_SORT_PARKED until re-driven by another
- *       ls_sort_set.
+ *       view-completion job: it converges to LS_SORT_ACTIVE without further
+ *       caller input, whatever jumps/finds intervene (mirroring the AUTO
+ *       filter-scan) — either by never yielding the slot at all (above) or, if
+ *       it did park, by resuming on its own. Under LS_INDEX_MANUAL a parked pass
+ *       stays LS_SORT_PARKED until re-driven by another ls_sort_set.
  *     * On a NETWORK document there is no unprompted drive, so a parked pass
  *       stays parked in BOTH index modes until an ls_sort_set re-drives it.
  *     * ls_sort_clear stops a running pass, drops the request, and leaves the
@@ -3058,9 +3081,14 @@ typedef enum ls_sort_state {
      * kept, and the CONVERGING PREFIX is frozen at the content it had reached —
      * still served, still exact for the region scanned so far, simply no longer
      * refining. NOT a user cancellation (ls_sort_clear yields LS_SORT_IDLE, not
-     * this): the analog of LS_FILTER_CANCELLED. Under LS_INDEX_AUTO on a local
-     * document it resumes and converges to LS_SORT_ACTIVE on its own;
-     * otherwise another ls_sort_set re-drives it. */
+     * this): the analog of LS_FILTER_CANCELLED.
+     *
+     * WHERE YOU WILL AND WILL NOT SEE IT (see THE SINGLE SCAN SLOT): an
+     * ADVANCING pass keeps the slot, so on a LOCAL document under LS_INDEX_AUTO
+     * — the mode both frontends run — a jump does not park the sort and this
+     * state does not arise. It is reachable where the pass is not being driven:
+     * LS_INDEX_MANUAL between drives, and NETWORK documents. There, another
+     * ls_sort_set re-drives it. */
     LS_SORT_PARKED = 3,
     /* The key pass failed (see `error`). The view is RESTORED to its pre-sort
      * file order and fully servable, the request is retained, nothing leaked.

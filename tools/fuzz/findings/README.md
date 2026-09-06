@@ -125,3 +125,82 @@ terminate. Lifting it is one line and is the intended first step of triage.
    goes RED the moment the quarantine is lifted.
 4. `zig build test` — the replay must be clean.
 5. Re-run the campaign per AC-c2.
+
+---
+
+## F2 — `ls_sort_set` panics on a null build: `sort_build` is re-read across a lock drop
+
+**Status: OPEN. Found by the `fuzz sort` target on its first campaign, 4 runs out
+of 4, at the same instruction. Not a hang — a ReleaseSafe panic, so the campaign
+reports it and stops rather than wedging.**
+
+### What it is
+
+```
+thread N panic: attempt to use null value
+backend/src/sort.zig:888:31: in setSort
+        const b = d.sort_build.?;
+backend/src/root.zig:368:24: in ls_sort_set
+```
+
+`setSort` decides whether it can keep the existing build, then waits, then uses
+the decision:
+
+```zig
+const keeps_build = same_column and d.sort_build != null and       // :884  CHECK
+    (d.sort_state == .active or d.sort_state == .building or d.sort_state == .parked);
+if (keeps_build) {
+    awaitScanIdle(d);                                              // :886  DROPS THE LOCK
+    const b = d.sort_build.?;                                      // :888  ACT
+```
+
+`awaitScanIdle` (`:953`) spins on `while (d.sort_scan_busy) d.waitWork();`, and
+`waitWork` is `cond.waitUncancelable(io, &self.mutex)` — it **releases the
+document mutex**. The scan worker takes that mutex, and on a failing chunk its
+`error.Storage` / `error.OutOfMemory` arms (`:1708-1709`) call `failBuild` →
+`dropBuild` → `d.sort_build = null` before clearing `sort_scan_busy`. `setSort`
+then wakes, re-takes the mutex, and unwraps the optional it validated **before**
+the wait. Check-then-act across a lock drop.
+
+The neighbouring call sites are already safe by shape, which is why this one
+stands out: `clearSort` (`:1104`) and `startPass` (`:962-963`) both do
+`awaitScanIdle(d); dropBuild(d);` and never unwrap. The worker's own
+`error.Interrupted` arm even reasons about this window explicitly — *"a cancel or
+a replacement is already waiting on the mutex we just re-took; it owns the
+teardown"* — but the Storage/OOM arms tear the build down regardless, and
+`setSort` does not re-validate.
+
+### Why it matters
+
+This is the AC-s7 path — *"injected temp-storage failure and injected allocation
+failure during the pass each yield FAILED with the documented reason, the view
+RESTORED to its pre-sort order"*. A full disk or an OOM landing in that window
+while the user flips the sort direction is a **crash**, not a clean FAILED, and
+against the standing bar (*works, or fails gracefully*) a ReleaseSafe panic is a
+crash. The frozen `srt_failure_modes` test does not catch it because it injects
+the failure and then waits for a terminal state; it never calls `ls_sort_set`
+*while the failing pass is being interrupted*, which is the whole window.
+
+### Reproducing
+
+```sh
+cd tools/fuzz && zig build --fuzz=800 -Donly="fuzz sort"
+```
+
+Hit on 4 of 4 runs here, each within a couple of minutes, always at `sort.zig:888`.
+The harness reaches it because `oneSort` arms `sortTempFailAfter` /
+`sortAllocFailAfter` (drawn from `w0`) and then flips the direction repeatedly on
+the same column — nothing else in the harness exercises the failure arms at all.
+
+### Closing this finding
+
+1. Fix it in `backend/src/sort.zig`: re-validate after the wait rather than
+   before it — `awaitScanIdle(d); const b = d.sort_build orelse { ...treat as a
+   fresh start / return... };` — and check whether the state read at `:884` needs
+   the same treatment, since the worker can also have moved `sort_state` to
+   `.failed` during the drop.
+2. Add a frozen backend test for the interleaving (it belongs in the `srt_*`
+   suite, not only here): arm `sortTempFailAfter`, start a pass, and call
+   `ls_sort_set` with the other direction while the failing chunk unwinds.
+3. `cd tools/fuzz && zig build test` — the replay must stay clean.
+4. Re-run the campaign per AC-c2.

@@ -1,12 +1,14 @@
 //! less-sheet coverage-guided fuzz harness — security-hardening wave (c), AC-c1/AC-c3.
 //!
-//! WHAT THIS IS. Four coverage-guided fuzz targets over the SHIPPED C ABI, built
+//! WHAT THIS IS. Five coverage-guided fuzz targets over the SHIPPED C ABI, built
 //! `ReleaseSafe` (the mode we ship), driven by Zig 0.16.0's builtin fuzzer:
 //!
 //!   csv       — a fuzzed local file through ls_open + the whole read surface
 //!   gz_raw    — fuzzed .csv.gz FILE BYTES (the inflater's own error space)
 //!   gz_trunc  — structure-aware: a REAL deflate stream cut at a fuzzed offset
 //!   net       — the net-source reducer over the injected fake transport
+//!   sort      — every sort KEY ENCODER over a fuzzed CSV, read mid-build and
+//!               after ACTIVE (ARCH-sort-by-column AC-s13; see `oneSort`)
 //!
 //! THE BAR. This project ships ReleaseSafe, so a Zig safety panic IS a crash.
 //! Every target therefore asserts NOTHING about the returned values: the property
@@ -1345,6 +1347,328 @@ fn oneNet(sb: *Sandbox, smith: *Smith) anyerror!void {
 }
 
 // ---------------------------------------------------------------------------
+// SORT target (ARCH-sort-by-column AC-s13, "the fuzzer's new sort entry runs
+// the existing corpus with zero crashes/panics in ReleaseSafe, including window
+// reads taken while BUILDING").
+//
+// WHY IT IS ITS OWN TARGET AND NOT A LIMB OF `oneCsv`. The sort's comparator has
+// SEVEN key encoders behind `ls_column_metadata.effective.kind`, and a fuzzed
+// document reaches exactly ONE of them by itself: nothing is inferred unless
+// inference is requested, so every column is UNKNOWN and every sort re-walks the
+// TEXT path. The only way into the numeric / date / datetime / boolean encoders
+// and their non-conforming fallbacks is to SET the override, and the only way to
+// cover all seven reliably is to ITERATE them rather than draw one — 93 of the
+// 219 committed csv seeds carry `w0 == 0`, so a drawn 1-in-7 collapses to
+// whichever kind maps to zero for 43% of the corpus (the same zeroed-entropy
+// hazard the shape sentinels above document). Folding fourteen sort passes into
+// `oneCsv` would also have multiplied that target's cost per iteration; a
+// separate test keeps the two budgets independent and gives the sort its own
+// evolving corpus.
+//
+// IT NEEDS NO NEW SEED PACK. `std.testing.fuzz` keys its mutable corpus on the
+// TEST NAME, so this target accumulates its own inputs while REPLAYING the same
+// committed `seeds.csv` entries — which are already the csvgen catalog plus the
+// adversarial set, i.e. exactly the documents a sort should be attacked with.
+// The blob format is `oneCsv`'s, unchanged.
+//
+// DETERMINISM, NOT LUCK, FOR THE MID-BUILD READS. The interesting window reads
+// happen while the key pass is still running, and on a small document the pass
+// is over before the next line executes. So the harness parks the pass at a
+// drawn row depth with `sortPauseAfterRows` (the same seam the frozen
+// `srt_prefix_oracle` family uses) and reads there. Without it "read while
+// BUILDING" would be a race the fuzzer loses almost every time.
+//
+// THE BAR IS THIS FILE'S BAR. Nothing here asserts a value: the property is that
+// the process survives and the API stays callable. Order correctness belongs to
+// the frozen suite.
+// ---------------------------------------------------------------------------
+
+/// The seven effective TYPE KINDS the sort's key encoders branch on, as
+/// `ls_column_override_set` inputs. DATETIME appears twice because its two
+/// semantics are different encoders AND different non-conforming sets (a naive
+/// value in a zoned column does not conform, and vice versa) — the header calls
+/// that out, and it is the one pair a `kind`-only list would miss.
+///
+/// UNKNOWN and UNSUPPORTED are absent on purpose: both are rejected overrides,
+/// and UNKNOWN is already what an un-overridden column reports, so the TEXT path
+/// is covered by the first entry and by the pre-override sort below.
+const SortKind = struct { kind: api.ColumnTypeKind, semantics: api.ColumnDatetimeSemantics };
+const sort_kinds = [_]SortKind{
+    .{ .kind = .text, .semantics = .none },
+    .{ .kind = .integer, .semantics = .none },
+    .{ .kind = .decimal, .semantics = .none },
+    .{ .kind = .date, .semantics = .none },
+    .{ .kind = .datetime, .semantics = .naive },
+    .{ .kind = .datetime, .semantics = .zoned },
+    .{ .kind = .boolean, .semantics = .none },
+};
+
+fn sortOverride(k: SortKind) api.ColumnType {
+    return .{
+        .struct_size = @sizeOf(api.ColumnType),
+        .abi_version = api.column_metadata_abi_version,
+        .kind = k.kind,
+        .flags = 0,
+        // An override may not carry inferred metadata; these must be the
+        // unspecified sentinels or the call is INVALID_ARGUMENT.
+        .decimal_precision = api.column_type_precision_unspecified,
+        .decimal_scale = api.column_type_scale_unspecified,
+        .datetime_semantics = k.semantics,
+        .datetime_fraction_digits = api.column_type_fraction_digits_unspecified,
+        .reserved = 0,
+    };
+}
+
+/// Bounded wait for the key pass to reach a TERMINAL state. Like every wait in
+/// this file it gives up rather than waiting for a state a fuzzed document may
+/// never reach — and unlike `settle`, it must also tolerate `parked`, which on a
+/// MANUAL document is terminal until something re-drives the pass.
+fn settleSort(doc: *api.Doc, spins: u32) api.SortStatus {
+    const max_yields = 2;
+    var yields: u32 = 0;
+    var i: u32 = 0;
+    while (i < spins) : (i += 1) {
+        const s = api.ls_sort_poll(doc);
+        switch (s.state) {
+            .active, .failed, .idle, .parked => return s,
+            .building => {},
+        }
+        if (i % 256 == 255 and yields < max_yields) {
+            yields += 1;
+            std.testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+        } else {
+            std.atomic.spinLoopHint();
+        }
+    }
+    return api.ls_sort_poll(doc);
+}
+
+/// Read the sorted view the way a frontend does: the top of the window (the
+/// converging prefix while BUILDING, the whole view once ACTIVE), the rows AT
+/// and PAST the prefix depth (the not-yet-servable arms), the gutter mapping,
+/// and a full-cell copy. Called at every phase of every pass, which is where the
+/// mid-build window path gets its hostile bytes.
+fn sortReads(doc: *api.Doc, cols: u32) void {
+    const k = api.sortPrefixRows(doc);
+    std.mem.doNotOptimizeAway(api.sortScannedRows(doc));
+    const store = api.sortTempStore(doc);
+    std.mem.doNotOptimizeAway(store.files);
+    std.mem.doNotOptimizeAway(store.peak_bytes);
+
+    // The top of the view, then a window that STRADDLES the prefix depth, then
+    // one wholly past it — the three shapes the servable-range clamp has to get
+    // right while the prefix is still growing. The sweeps are deliberately
+    // NARROW (`sortReads` runs sixteen times per iteration, once per phase per
+    // pass): what is under test here is the servable-range arithmetic and the
+    // key encoders, not the cell sweep, which `oneCsv` already exhausts.
+    const narrow = @min(cols, 8);
+    const top = api.ls_window_set(doc, 0, 24);
+    sweepWindow(doc, top, narrow);
+    if (k >= 8) {
+        const straddle = api.ls_window_set(doc, k - 8, 16);
+        sweepWindow(doc, straddle, narrow);
+    }
+    const past = api.ls_window_set(doc, k, 8);
+    sweepWindow(doc, past, narrow);
+
+    // Rows AT and PAST the prefix must answer with the not-yet-servable values,
+    // never a fault. Read them through both accessors that can say so.
+    std.mem.doNotOptimizeAway(api.ls_source_row(doc, k));
+    std.mem.doNotOptimizeAway(api.ls_source_row(doc, k + 5));
+    var len: usize = 0;
+    var truncated: bool = false;
+    _ = api.ls_cell_copy(doc, k, 0, &copy_buf, copy_buf.len, &len, &truncated);
+    _ = api.ls_cell_copy(doc, 0, 0, &copy_buf, copy_buf.len, &len, &truncated);
+}
+
+/// One complete pass for one (column, kind): park the scan at a drawn depth,
+/// sort, read mid-build, FLIP the direction while still building (the amendment's
+/// re-converge path, which costs no re-scan), read again, release the park, let
+/// it converge, read, then flip once more on the ACTIVE sort (the O(1) reverse).
+/// Both directions are therefore covered by ONE key pass instead of two.
+fn sortPass(doc: *api.Doc, col: u32, kind: SortKind, cols: u32, pause: u64, dir0: api.SortDirection, clear_mid: bool) void {
+    const dir1: api.SortDirection = if (dir0 == .ascending) .descending else .ascending;
+    var t = sortOverride(kind);
+    _ = api.ls_column_override_set(doc, col, &t);
+
+    api.sortPauseAfterRows(doc, pause);
+    if (!api.ls_sort_set(doc, col, dir0)) return; // rejected: nothing changed
+    sortReads(doc, cols); // the first direction's converging prefix ...
+    _ = api.ls_sort_set(doc, col, dir1); // flip WHILE BUILDING: re-converge, no re-scan
+    sortReads(doc, cols); // ... and the re-converged one, from the same keys
+
+    if (clear_mid) {
+        // Cancel mid-build: the view must come back in its pre-sort order and
+        // the scratch must be gone.
+        api.ls_sort_clear(doc);
+        sortReads(doc, cols);
+        api.sortPauseAfterRows(doc, std.math.maxInt(u64));
+        return;
+    }
+
+    api.sortPauseAfterRows(doc, std.math.maxInt(u64));
+    const s = settleSort(doc, 1024);
+    std.mem.doNotOptimizeAway(s.progress);
+    _ = api.ls_sort_set(doc, col, dir0); // flip on an ACTIVE sort: O(1), no pass
+    _ = api.ls_sort_set(doc, col, dir0); // and the no-op arm
+    sortReads(doc, cols);
+}
+
+fn oneSort(sb: *Sandbox, smith: *Smith) anyerror!void {
+    @disableInstrumentation();
+    const in: Input = .draw(smith, &doc_buf);
+    var w0 = in.w0;
+    // A DELIBERATELY SMALL amplifier. This target runs seven key passes per
+    // iteration, so its cost is seven times the document's scan cost; `repFor`'s
+    // ceiling would make a single iteration dominate a whole campaign. Coverage
+    // here comes from the seven encoders and the phase matrix, not from size —
+    // the csv target owns the large shapes.
+    const rep = 1 + @as(usize, @intCast(take(&w0, 2)));
+    // THE CHUNK KNOB, and the reason this target reaches the external merge at
+    // all. The shipped default is 32 MiB, so every (key, row) pair of a fuzzed
+    // document fits ONE chunk and the run-spill + k-way merge — the bulk of the
+    // new module — would never execute. Shrinking it forces many runs out of a
+    // few KiB of input. Zero-valued entropy maps to the DEFAULT (the cheapest,
+    // most ordinary path), per the zeroed-seed rule the shape sentinels
+    // document; the aggressive sizes need bits a zeroed seed cannot produce.
+    const chunk_bytes: u64 = switch (take(&w0, 2)) {
+        1 => 256,
+        2 => 4 * 1024,
+        3 => 64 * 1024,
+        else => 0, // 0 == restore the one named default
+    };
+    // FAULT INJECTION into the graceful-failure paths: a pass that cannot reach
+    // its temp storage, or cannot allocate, must end FAILED with the view back
+    // in file order — never a crash and never a half-sorted view. Nothing else
+    // in the harness can reach those arms.
+    const fail_after = take(&w0, 3);
+    const fail_mode = take(&w0, 2);
+    // Where the key pass parks, so the mid-build reads are deterministic rather
+    // than a race the fuzzer loses. Zero is a legal, interesting depth: an empty
+    // converging prefix with the view already in sorted coordinates.
+    const pause = take(&w0, 11);
+    const col_pick: u32 = @intCast(take(&w0, 6));
+    const dir0: api.SortDirection = if (take(&w0, 1) == 0) .ascending else .descending;
+    const clear_mid_at: u32 = @intCast(take(&w0, 3));
+    const rebuild_mode = take(&w0, 2);
+    const do_search = take(&w0, 1) != 0;
+
+    try sb.place(in.data, rep);
+
+    var doc_opt: ?*api.Doc = null;
+    const opts = in.dialect.opts;
+    const st = api.ls_open(sb.path.ptr, &opts, &doc_opt);
+    if (st != .ok) {
+        std.debug.assert(doc_opt == null);
+        return;
+    }
+    const doc = doc_opt orelse return;
+    defer api.ls_close(doc);
+
+    api.sortChunkBytesSetForTest(doc, chunk_bytes);
+    switch (fail_mode) {
+        1 => api.sortTempFailAfter(doc, fail_after),
+        2 => api.sortAllocFailAfter(doc, fail_after),
+        else => {},
+    }
+    settle(doc, 256 + in.dialect.spins);
+    const cols = api.ls_column_count(doc);
+
+    // The rejection arm, on every iteration: an out-of-range column must be
+    // refused and change nothing. On an EMPTY document (cols == 0) every column
+    // is out of range, which is the only sort call such a document ever sees.
+    _ = api.ls_sort_set(doc, cols, .ascending);
+    _ = api.ls_sort_set(doc, std.math.maxInt(u32), .descending);
+    if (cols == 0) return;
+
+    const col = col_pick % cols;
+
+    // THE POINT OF THIS TARGET: every key encoder, in order, on the same drawn
+    // column and document. The un-overridden (UNKNOWN -> text) pass runs first so
+    // the default path is covered even if every override is refused.
+    sortPass(doc, col, .{ .kind = .text, .semantics = .none }, cols, pause, dir0, false);
+    for (sort_kinds, 0..) |kind, ix| {
+        sortPass(doc, col, kind, cols, pause, dir0, ix == clear_mid_at);
+    }
+
+    // A search under a sort: sorted-coordinate navigation plus the per-cell match
+    // flags over a SORTED window, which is a different row set than the flags
+    // path ever sees unsorted.
+    if (do_search) {
+        var req: api.SearchRequest = .{
+            .kind = in.drive.kind,
+            .op = in.drive.op,
+            .column = if (cols == 0) 0 else in.drive.column % cols,
+            .value_ptr = in.needle.ptr,
+            .value_len = in.needle.len,
+            .case_sensitive = in.drive.case_sensitive,
+        };
+        if (api.ls_search_start(doc, &req)) {
+            api.ls_search_nav(doc, 0, .forward);
+            settleNav(doc, 4096, 4);
+            _ = api.ls_window_set(doc, 0, 64);
+            const flags = api.ls_window_match_flags(doc, 0, @min(cols, 8));
+            std.mem.doNotOptimizeAway(flags.len);
+            if (flags.len != 0) std.mem.doNotOptimizeAway(flags.ptr[flags.len - 1]);
+            api.ls_search_cancel(doc);
+        }
+    }
+
+    // The REBUILD triggers, with a sort still active: each invalidates the
+    // permutation and re-runs the pass, and the view must present the rebuild's
+    // converging prefix rather than falling back.
+    switch (rebuild_mode) {
+        1 => {
+            var freq: api.SearchRequest = .{
+                .kind = .text,
+                .value_ptr = in.needle.ptr,
+                .value_len = in.needle.len,
+            };
+            if (api.ls_filter_set(doc, &freq)) {
+                sortReads(doc, cols);
+                _ = settleSort(doc, 1024);
+                sortReads(doc, cols);
+            }
+            api.ls_filter_clear(doc);
+        },
+        2 => {
+            _ = api.ls_column_null_sentinel_set(doc, col, in.needle.ptr, in.needle.len);
+            sortReads(doc, cols);
+            _ = settleSort(doc, 1024);
+            _ = api.ls_column_null_sentinel_clear(doc, col);
+        },
+        3 => {
+            _ = api.ls_column_override_clear(doc, col);
+            _ = settleSort(doc, 1024);
+        },
+        else => {},
+    }
+    sortReads(doc, cols);
+
+    // A streaming copy of a SORTED rect: the copy cursor walks scattered source
+    // rows here, and past the prefix it must STALL rather than fault.
+    const rect: api.CopyRect = .{
+        .first_row = 0,
+        .row_count = @min(in.drive.copy_rows, 128),
+        .first_col = 0,
+        .col_count = @min(cols, 4),
+    };
+    if (api.ls_copy_open(doc, &rect)) |job| {
+        defer api.ls_copy_close(job);
+        var steps: u32 = 0;
+        while (steps < 64) : (steps += 1) {
+            const p = api.ls_copy_next(job, &copy_buf, copy_buf.len);
+            if (p.step != .more) break;
+        }
+    }
+
+    // Clear after ACTIVE, and then again on an already-idle sort (the no-op arm).
+    api.ls_sort_clear(doc);
+    api.ls_sort_clear(doc);
+    sortReads(doc, cols);
+}
+
+// ---------------------------------------------------------------------------
 // Fuzz tests
 //
 // Each is its own fuzz test, so the fuzzer keeps a SEPARATE corpus per target
@@ -1367,6 +1691,13 @@ test "fuzz gz_trunc: a real deflate stream truncated at a fuzzed offset (task #4
 
 test "fuzz net: the net-source reducer over the injected fake transport" {
     try std.testing.fuzz(try Sandbox.init("net.csv"), oneNet, .{ .corpus = limited(seeds.net) });
+}
+
+test "fuzz sort: every key encoder over a fuzzed CSV, read mid-build and after ACTIVE" {
+    // Shares the committed `seeds.csv` entries — the fuzzer keys its own mutable
+    // corpus on the TEST NAME, so this target evolves independently while
+    // replaying the same documents. No fifth pack to generate or commit.
+    try std.testing.fuzz(try Sandbox.init("sort.csv"), oneSort, .{ .corpus = limited(seeds.csv) });
 }
 
 // ---------------------------------------------------------------------------

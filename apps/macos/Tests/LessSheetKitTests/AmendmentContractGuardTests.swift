@@ -135,7 +135,16 @@ struct AmendmentContractGuardTests {
         // failure return it to its pre-sort file order. PROSE AND COMMENTS ONLY —
         // no signature, enum value, constant, or struct layout changed, and
         // ls_sort_status is still 24 bytes with the same offsets.
-                        baseline: "ef90c08ac7675402713a53847e52eb5c0a7d5e473d04bbd6ee4b2fa561f27295")
+        // Re-bumped once more to reconcile SORTED VIEWS §6/§8 with the shipped
+        // backend, at the reviewer's request (build-sort-by-column-backend, PASS
+        // round 3): an ADVANCING key pass keeps the scan slot, because a jump
+        // under a sort cannot be answered until the pass produces the inverse
+        // mapping — so on a LOCAL document under LS_INDEX_AUTO a jump does not
+        // park the sort and LS_SORT_PARKED is not observable there. It remains
+        // reachable, and tested, where the pass is not being driven (MANUAL
+        // between drives; network documents). PROSE ONLY — the code was accepted
+        // as implemented and nothing about the ABI moved.
+                        baseline: "484bd2f7c86911a042107f954e3b298a81f64b701e9c0f2adbc6247f6f99206c")
     }
 
     // AC23 — the public Swift search/layout contracts are byte-identical:
