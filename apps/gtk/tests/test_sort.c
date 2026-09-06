@@ -257,6 +257,108 @@ test_describe (void)
   g_free (s);
 }
 
+/* --- the header CONTEXT MENU (Amendment 3): three stateful entries, and a
+ *     plain header click is no longer a sort trigger at all --- */
+
+static void
+assert_menu_shape (LsgSortSnapshot snap, guint column, LsgSortMenuEntry *out)
+{
+  guint n = lsg_sort_menu (snap, column, out);
+  g_assert_cmpuint (n, ==, (guint)LSG_SORT_MENU_ENTRIES);
+  g_assert_cmpstr (out[0].title, ==, LSG_SORT_MENU_TITLE_ASC);
+  g_assert_cmpstr (out[1].title, ==, LSG_SORT_MENU_TITLE_DESC);
+  g_assert_cmpstr (out[2].title, ==, LSG_SORT_MENU_TITLE_CLEAR);
+}
+
+static void
+test_menu_entries_and_intents (void)
+{
+  LsgSortMenuEntry e[LSG_SORT_MENU_ENTRIES];
+  const LsgSortSnapshot snaps[2]
+      = { snap (LSG_SORT_PHASE_NONE, 0, LSG_SORT_ASCENDING, 0.0),
+          snap (LSG_SORT_PHASE_ACTIVE, 1, LSG_SORT_ASCENDING, 1.0) };
+  for (int k = 0; k < 2; k++)
+    {
+      assert_menu_shape (snaps[k], 1, e);
+      /* DIRECT intents, not cycle steps — and the SAME LsgSortIntent the cycle
+       * produces, so both trigger paths funnel into one apply step. */
+      assert_set (e[0].intent, 1, LSG_SORT_ASCENDING);
+      assert_set (e[1].intent, 1, LSG_SORT_DESCENDING);
+      g_assert_cmpint (e[2].intent.kind, ==, LSG_SORT_INTENT_CLEAR);
+      /* The two sort entries are always selectable. */
+      g_assert_true (e[0].enabled);
+      g_assert_true (e[1].enabled);
+    }
+}
+
+static void
+test_menu_checks_requested_direction_on_sorted_column_only (void)
+{
+  LsgSortMenuEntry e[LSG_SORT_MENU_ENTRIES];
+  /* No sort: nothing checked anywhere. */
+  assert_menu_shape (snap (LSG_SORT_PHASE_NONE, 0, LSG_SORT_ASCENDING, 0.0), 0,
+                     e);
+  for (int i = 0; i < LSG_SORT_MENU_ENTRIES; i++)
+    g_assert_false (e[i].checked);
+
+  /* The check follows the REQUEST, not the phase — building, parked and failed
+   * all show it, exactly as the indicator does, so the menu and the chevron
+   * can never disagree about which sort was asked for. */
+  const LsgSortPhase phases[4]
+      = { LSG_SORT_PHASE_ACTIVE, LSG_SORT_PHASE_BUILDING,
+          LSG_SORT_PHASE_PARKED, LSG_SORT_PHASE_FAILED };
+  const LsgSortDirection dirs[2] = { LSG_SORT_ASCENDING, LSG_SORT_DESCENDING };
+  for (int p = 0; p < 4; p++)
+    for (int d = 0; d < 2; d++)
+      {
+        LsgSortSnapshot s
+            = (phases[p] == LSG_SORT_PHASE_FAILED)
+                  ? snap_failed (1, dirs[d], LSG_SORT_ERROR_STORAGE)
+                  : snap (phases[p], 1, dirs[d], 0.5);
+        assert_menu_shape (s, 1, e);
+        g_assert_cmpint (e[0].checked, ==, dirs[d] == LSG_SORT_ASCENDING);
+        g_assert_cmpint (e[1].checked, ==, dirs[d] == LSG_SORT_DESCENDING);
+        g_assert_false (e[2].checked); /* Clear Sort is never check-marked */
+        /* A DIFFERENT column's menu shows no check at all. */
+        assert_menu_shape (s, 0, e);
+        for (int i = 0; i < LSG_SORT_MENU_ENTRIES; i++)
+          g_assert_false (e[i].checked);
+      }
+}
+
+static void
+test_menu_clear_is_enabled_per_document (void)
+{
+  LsgSortMenuEntry e[LSG_SORT_MENU_ENTRIES];
+  /* No sort on the document: Clear Sort is not selectable. */
+  assert_menu_shape (snap (LSG_SORT_PHASE_NONE, 0, LSG_SORT_ASCENDING, 0.0), 0,
+                     e);
+  g_assert_false (e[2].enabled);
+
+  /* A sort IS set — on column 1. Clear Sort is selectable from EVERY header,
+   * including column 0's: clearing is a document-level act, and a user who
+   * opens the wrong header's menu should still be able to undo the sort. */
+  LsgSortSnapshot active
+      = snap (LSG_SORT_PHASE_ACTIVE, 1, LSG_SORT_ASCENDING, 1.0);
+  assert_menu_shape (active, 1, e);
+  g_assert_true (e[2].enabled);
+  assert_menu_shape (active, 0, e);
+  g_assert_true (e[2].enabled);
+
+  /* Still true while the pass has not landed, and after it failed: the request
+   * exists, so it can be dropped. */
+  const LsgSortPhase unlanded[2]
+      = { LSG_SORT_PHASE_BUILDING, LSG_SORT_PHASE_PARKED };
+  for (int p = 0; p < 2; p++)
+    {
+      assert_menu_shape (snap (unlanded[p], 1, LSG_SORT_ASCENDING, 0.2), 0, e);
+      g_assert_true (e[2].enabled);
+    }
+  assert_menu_shape (
+      snap_failed (1, LSG_SORT_ASCENDING, LSG_SORT_ERROR_MEMORY), 0, e);
+  g_assert_true (e[2].enabled);
+}
+
 /* ========================================================================= */
 /* THE ONE ACCELERATOR TABLE */
 /* ========================================================================= */
@@ -445,34 +547,65 @@ test_bridge_composes_with_filter (void)
   lsg_document_close (doc);
 }
 
-/* --- the view speaks SORTED coordinates without waiting for the key pass
- *     (Amendment 1: latency beats throughput). The window is read on the very
- *     next statement after the set — no poll, no wait for ACTIVE — and must
- *     already be sorted. An implementation that holds the previous order until
- *     the pass completes fails HERE, which is the point of the amendment. ---
- */
+/* --- from the FIRST servable window the order served is the SORTED one, never
+ *     the pre-sort one (Amendment 1: latency beats throughput).
+ *
+ *     This replaces `test_bridge_serves_sorted_immediately`, which asserted a
+ *     NON-EMPTY window on the statement after the request returned. The frozen
+ *     header promises only `min(K, rows the pass has scanned so far)` servable
+ *     rows — zero before the core's worker commits its first chunk — and that
+ *     the call never blocks, so that assertion was unsatisfiable by any
+ *     implementation here (30 runs, 30 failures). See
+ *     `apps/gtk/.aidev/DECISION-2.md`.
+ *
+ *     What it does NOT prove, stated so nobody assumes it does: that the
+ * bridge did not WAIT. On find.csv that is unobservable — the pass reaches
+ * ACTIVE 0.2-0.4 ms after the request, so every non-empty window on it is
+ * already ACTIVE and a blocking bridge is indistinguishable from a correct
+ * one. The macOS twin covers that half on a fixture it generates; here the
+ * bridge is three lines and the frozen "Never blocks." clause is the guard.
+ * --- */
 
 static void
-test_bridge_serves_sorted_immediately (void)
+test_bridge_serves_sorted_from_first_window (void)
 {
   LsgDocument *doc = open_find_fixture ();
   g_assert_true (lsg_document_sort_set (doc, 0, LSG_SORT_ASCENDING));
 
-  /* find.csv's 8 rows are scanned in one block, so the prefix here is already
-   * the whole order; on a large document it would be the sorted top of the
-   * scanned region instead. Either way it is never the pre-sort order. */
-  GArray *src = view_source_rows (doc, 8);
-  g_assert_cmpuint (src->len, >, 0);
-  g_assert_cmpuint (g_array_index (src, guint64, 0), ==, name_ascending[0]);
-  g_array_free (src, TRUE);
-
-  /* The poll is honest about which phase that was. */
+  /* The REQUEST is visible at once, even before any row is servable: the view
+   * is in sorted coordinates from here on, and the header can already draw its
+   * pending indicator. */
   LsgSortSnapshot s;
   g_assert_true (lsg_document_sort_poll (doc, &s));
   g_assert_cmpuint (s.column, ==, 0);
   g_assert_cmpint (s.direction, ==, LSG_SORT_ASCENDING);
-  g_assert_true (s.phase == LSG_SORT_PHASE_BUILDING
-                 || s.phase == LSG_SORT_PHASE_ACTIVE);
+
+  /* Poll the top window, asserting on EVERY observation — not once at the end.
+   * A "hold the old order until the pass lands" implementation serves the
+   * pre-sort order for a while and the sorted order afterwards; only a
+   * per-observation check catches it. */
+  gboolean served = FALSE;
+  for (int i = 0; i < 5000 && !served; i++)
+    {
+      GArray *src = view_source_rows (doc, 8);
+      g_assert_true (lsg_document_sort_poll (doc, &s));
+      if (src->len > 0)
+        {
+          g_assert_cmpuint (g_array_index (src, guint64, 0), ==,
+                            name_ascending[0]);
+          served = TRUE;
+        }
+      g_array_free (src, TRUE);
+      if (!served)
+        g_usleep (200);
+    }
+  g_assert_true (served);
+
+  /* ... and it converges to the whole order. */
+  g_assert_true (wait_sort_active (doc, NULL));
+  GArray *final_src = view_source_rows (doc, 8);
+  assert_rows (final_src, name_ascending, 8);
+  g_array_free (final_src, TRUE);
   lsg_document_close (doc);
 }
 
@@ -551,6 +684,11 @@ main (int argc, char **argv)
   g_test_add_func ("/sort/cycle-failed-retries",
                    test_cycle_on_failed_pass_retries);
   g_test_add_func ("/sort/indicator-states", test_indicator_states);
+  g_test_add_func ("/sort/menu-entries", test_menu_entries_and_intents);
+  g_test_add_func ("/sort/menu-checked",
+                   test_menu_checks_requested_direction_on_sorted_column_only);
+  g_test_add_func ("/sort/menu-clear-enabled",
+                   test_menu_clear_is_enabled_per_document);
   g_test_add_func ("/sort/describe", test_describe);
 
   /* The one accelerator table. */
@@ -561,8 +699,8 @@ main (int argc, char **argv)
   g_test_add_func ("/sort/bridge-fresh-none", test_bridge_fresh_none);
   g_test_add_func ("/sort/bridge-sorts-and-remaps",
                    test_bridge_sorts_and_remaps);
-  g_test_add_func ("/sort/bridge-serves-immediately",
-                   test_bridge_serves_sorted_immediately);
+  g_test_add_func ("/sort/bridge-serves-sorted-from-first-window",
+                   test_bridge_serves_sorted_from_first_window);
   g_test_add_func ("/sort/bridge-descending",
                    test_bridge_descending_is_reversed);
   g_test_add_func ("/sort/bridge-composes-with-filter",

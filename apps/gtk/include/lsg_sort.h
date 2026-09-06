@@ -7,8 +7,20 @@
  *   1. A PURE, display-free sort VIEW-MODEL — the C analog of the macOS
  *      `SortCycling` / `SortCycle` (Sources/Contracts/SortControl.swift +
  *      Sources/LessSheetKit/SortCycleLogic.swift): the three-state CYCLE
- *      (ascending -> descending -> off) and the header INDICATOR, over plain
- *      value types. It never touches the core.
+ *      (ascending -> descending -> off), the header CONTEXT MENU's three
+ *      stateful entries, and the header INDICATOR, over plain value types. It
+ *      never touches the core.
+ *
+ * AMENDMENT 3 (signed 2026-09-06) — WHAT TRIGGERS A SORT. Exactly two things:
+ * the keyboard shortcut Ctrl+Shift+S, which runs the CYCLE on the keyboard
+ * cursor's column; and the column header's CONTEXT MENU (secondary click), a
+ * GtkPopoverMenu with three EXPLICIT entries — Sort Ascending, Sort
+ * Descending, Clear Sort — reflecting the current state. A menu shows state
+ * and names outcomes; it does not cycle. A PLAIN header press/drag is NOT a
+ * sort trigger and keeps its pre-feature meaning exactly. The press/release
+ * "arming" a header-click cycle needed is therefore retired outright, with no
+ * compatibility path (the v1 rule): delete it rather than leave it
+ * unreachable.
  *
  *   2. The SORT BRIDGE over the real core — the C analog of the macOS
  *      `CoreDocumentSession` sort methods. These `lsg_document_sort_*`
@@ -182,9 +194,12 @@ typedef struct
 } LsgSortIntent;
 
 /*
- * THE CYCLE — the single decision behind a header click, Ctrl+Shift+S on the
- * keyboard cursor's column, and the progress affordance's Cancel. Routing all
- * three through THIS function is what keeps them from drifting apart.
+ * THE CYCLE — the single decision behind Ctrl+Shift+S on the keyboard cursor's
+ * column and the progress affordance's Cancel, which must mean the same "stop"
+ * the cycle means on an unlanded pass. Routing both through THIS function is
+ * what keeps them from drifting apart. Since Amendment 3 a header click is NOT
+ * one of its entry points; the header menu is a separate, simpler surface
+ * (`lsg_sort_menu`) whose entries are DIRECT intents, not cycle steps.
  *
  * Given the current snapshot and the column the user acted on:
  *   - no sort (phase NONE), or a DIFFERENT column than the current one
@@ -205,6 +220,68 @@ typedef struct
  * BY VALUE; a NONE-phase value means "no sort".
  */
 LsgSortIntent lsg_sort_next (LsgSortSnapshot snapshot, guint column);
+
+/* ------------------------------------------------------------------------- */
+/* The header context menu (Amendment 3) */
+/* ------------------------------------------------------------------------- */
+
+/*
+ * The three entry titles, declared ONCE. The GtkPopoverMenu's labels, the
+ * AT-SPI labels the a11y baseline requires for them, and anything else that
+ * ever names these commands read the entries produced by `lsg_sort_menu` —
+ * never a hand-typed second copy. (The KEYBOARD accelerator has its own single
+ * source, the `lsg_a11y_shortcuts` table; these are menu labels, a different
+ * surface.)
+ */
+#define LSG_SORT_MENU_TITLE_ASC "Sort Ascending"
+#define LSG_SORT_MENU_TITLE_DESC "Sort Descending"
+#define LSG_SORT_MENU_TITLE_CLEAR "Clear Sort"
+
+/* The menu ALWAYS has exactly this many entries, in this order:
+ *   [0] Sort Ascending   [1] Sort Descending   [2] Clear Sort */
+#define LSG_SORT_MENU_ENTRIES 3
+
+/*
+ * One entry of the column header's sort context menu.
+ *
+ *   title   — one of the three macros above; static, never NULL.
+ *   intent  — the SAME LsgSortIntent the cycle produces, so both trigger paths
+ *             funnel into one apply step and cannot interpret a request
+ *             differently. DIRECT intents, not cycle steps: choosing the
+ *             direction that is already active re-issues it, which the core
+ *             defines as a no-op.
+ *   checked — draw a check mark: this is the sort currently REQUESTED on THIS
+ *             column. Never set on Clear Sort.
+ *   enabled — selectable. Both sort entries always are; Clear Sort only while
+ * a sort is set on the DOCUMENT.
+ */
+typedef struct
+{
+  const char *title;
+  LsgSortIntent intent;
+  gboolean checked;
+  gboolean enabled;
+} LsgSortMenuEntry;
+
+/*
+ * Fill `out_entries[0 .. LSG_SORT_MENU_ENTRIES)` for `column` and return the
+ * count (always LSG_SORT_MENU_ENTRIES). `out_entries` must not be NULL and
+ * must have room for that many. Pure: no allocation, no core call, no display.
+ *
+ *   `checked` is set on the entry whose direction matches the snapshot's, and
+ *   ONLY when the snapshot's column IS this column. The check follows the
+ *   REQUEST, not the phase — it is set while the pass is building, parked or
+ *   failed too, exactly as `lsg_sort_indicator` shows the chevron in those
+ *   phases, so the menu and the header can never disagree about which sort was
+ *   asked for.
+ *
+ *   `enabled` is TRUE on both sort entries always; on Clear Sort it is TRUE
+ * iff a sort is set on the DOCUMENT (phase != LSG_SORT_PHASE_NONE) — NOT iff
+ * one is set on this column. Clearing is a document-level act, and a user who
+ *   opens the wrong header's menu should still be able to undo the sort.
+ */
+guint lsg_sort_menu (LsgSortSnapshot snapshot, guint column,
+                     LsgSortMenuEntry *out_entries);
 
 /*
  * The header-cell indicator state for `column`.

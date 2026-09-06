@@ -12750,6 +12750,80 @@ test "srt_prefix_oracle: after n scanned rows the view IS the exact sorted top o
     }
 }
 
+test "srt_prefix_window_consistency: ONE window over a LIVE converging prefix is self-consistent and sorted (F3)" {
+    // The AC-s16(a) family reads the prefix at a PAUSED scan point, where nothing
+    // is mutating — which is what makes its oracle comparisons exact, and also
+    // what it cannot see: whether a window materialized while the worker is
+    // COMMITTING CHUNKS is internally coherent. That is the state both frontends
+    // paint on every one of their poll ticks, so it is the state that matters
+    // most, and nothing in the frozen suite looked at it until now.
+    //
+    // The contract this pins is not new. api/lesssheet.h licenses the CONTENT of
+    // the prefix to change BETWEEN calls ("a served prefix row may be DISPLACED
+    // by a smaller value found later"), and says nothing that would license ONE
+    // ls_window_set result to be inconsistent with itself. Two clauses forbid
+    // exactly that: ls_cell is a total function that returns the empty string
+    // only for a row OUTSIDE the materialized window, and the servable region is
+    // "the EXACT sorted top of the scanned region". A window whose rows come
+    // from two prefix generations satisfies neither.
+    //
+    // Measured against the tree at freezing: over ~3000 windows on a 600k-row
+    // document, ~4800 served rows answered ls_source_row but returned an EMPTY
+    // ls_cell, and ~270 adjacent pairs ran the wrong way — always by a jump of
+    // about one checkpoint interval, i.e. one chunk commit landing mid-read.
+    const gpa = std.testing.allocator;
+    const body = try srtBigDoc(gpa, srt_big_rows);
+    defer gpa.free(body);
+    // AUTO on purpose: the worker must be driving the pass while this thread
+    // reads, which is the whole point. Every other prefix test pauses it.
+    var od = try openWith(body, .{ .separator = ',', .header = api.header_off });
+    defer od.deinit();
+    try setSort(od.doc, 0, .descending);
+
+    var windows: u32 = 0;
+    var empty_cells: u32 = 0;
+    var order_breaks: u32 = 0;
+    var mismatches: u32 = 0;
+    var buf: [16]u8 = undefined;
+    const io = std.testing.io;
+    const t0: std.Io.Clock.Timestamp = .now(io, .awake);
+    while (true) {
+        const r = api.ls_window_set(od.doc, 0, 32);
+        const st = api.ls_sort_poll(od.doc);
+        if (r.row_count >= 2) {
+            windows += 1;
+            var prev: u64 = 0;
+            var first = true;
+            var i: u64 = 0;
+            while (i < r.row_count) : (i += 1) {
+                const src = api.ls_source_row(od.doc, i);
+                const cell = api.ls_cell(od.doc, i, 0).slice();
+                // (a) every row the window reports as materialized is servable
+                //     through BOTH accessors ...
+                if (src == api.no_row) mismatches += 1;
+                if (cell.len == 0) empty_cells += 1;
+                // (b) ... and the two agree about WHICH row it is.
+                if (src != api.no_row and cell.len != 0) {
+                    const want = std.fmt.bufPrint(&buf, "{d:0>8}", .{src}) catch unreachable;
+                    if (!std.mem.eql(u8, want, cell)) mismatches += 1;
+                }
+                // (c) and the window is in the requested order, within itself.
+                if (!first and src != api.no_row and !(prev > src)) order_breaks += 1;
+                prev = src;
+                first = false;
+            }
+        }
+        if (st.state == .active) break;
+        if (st.state == .failed) return error.SortFailed;
+        if (elapsedMs(t0) > 30_000) return error.SortTimeout;
+    }
+    // Not vacuous: the loop really did read the view while it was still building.
+    try std.testing.expect(windows > 50);
+    try std.testing.expectEqual(@as(u32, 0), empty_cells);
+    try std.testing.expectEqual(@as(u32, 0), mismatches);
+    try std.testing.expectEqual(@as(u32, 0), order_breaks);
+}
+
 test "srt_prefix_cap: the servable prefix stops at K == LS_WINDOW_MAX_ROWS, however much has been scanned" {
     const gpa = std.testing.allocator;
     const rows: usize = 12_000;

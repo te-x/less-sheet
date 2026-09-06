@@ -10,6 +10,11 @@ build-time memory bound (and AC-s9's restatement) is on the core's ANONYMOUS res
 file-backed, evictable pages of the scratch mappings; measured `ru_maxrss` counts those pages and
 may exceed the figure while the protected property (bounded, row-independent anonymous memory)
 holds. No behavioral change.
+AMENDMENT 3 — SIGNED by the user 2026-09-06: user decision after the macOS cell exposed the gesture
+collision (a plain header click was already whole-column selection): sorting is triggered ONLY by
+the keyboard shortcut and by the column header's context menu; a plain header click is NOT a sort
+trigger and keeps its pre-feature behavior. Amends FR11, AC-s14, AC-s15, and the §5 frontend
+entries; the header sort indicator, shortcut cycle, and everything else stand.
 Changes the frozen `api/lesssheet.h` — root-planner freeze, lock-step edit (no compat layer, per the
 FROZEN-SURFACE AMENDMENT precedent).
 
@@ -24,8 +29,8 @@ data (the smallest value can be on the last row) — the same price search-to-EO
 pay, with the same progress + cancel affordances. Latency beats throughput (Amendment 1): the view
 flips to sorted coordinates IMMEDIATELY and serves a CONVERGING SORTED PREFIX — at every moment the
 exact sorted top of the region scanned so far — so the first sorted-so-far rows appear within tens
-of milliseconds of the click and refine live until the pass completes. Once built, the sorted view
-is served from an on-disk permutation and every position in it is O(1)-addressable.
+of milliseconds of the request and refine live until the pass completes. Once built, the sorted
+view is served from an on-disk permutation and every position in it is O(1)-addressable.
 
 **Non-goals**
 - Multi-column / secondary sort keys.
@@ -39,6 +44,8 @@ is served from an on-disk permutation and every position in it is O(1)-addressab
   here.
 - Converging treatment for find and jump (Amendment 1 scope guard): only the browsing view
   converges; find-in-sorted-view and jump-by-source-row resolve at full coverage (see FR5/FR7).
+- Repurposing the plain header click (Amendment 3): it is not a sort trigger and keeps its
+  pre-feature meaning on each platform.
 
 ## 2. Inputs / Outputs
 
@@ -182,13 +189,20 @@ on all three (it converges as bytes are scanned/fetched); network documents carr
 guarantee, as everywhere.
 
 **FR11 — Frontend behavior (macOS is the template; GTK ports it).**
-- Header click on a column cycles ascending → descending → off, with a platform-conventional sort
-  indicator in that header cell.
-- Keyboard: ⇧⌘S (macOS) / Ctrl+Shift+S (GTK) applies the same three-state cycle to the KEYBOARD
-  CURSOR's column (selection anchor column when a selection exists); on a different column it
-  starts fresh ascending. macOS adds a "Sort by Column" item in a new View menu; GTK registers the
-  accelerator in the single lsg_a11y table (new Sorting group, shown in the shortcuts window, with
-  AT-SPI labels per the a11y baseline).
+- Amendment 3 — sort triggers. Sorting is triggered ONLY by (a) the keyboard shortcut (next
+  bullet) and (b) the column header's CONTEXT MENU (right-click / secondary click): a sort section
+  with three entries — "Sort Ascending", "Sort Descending", "Clear Sort" — reflecting the current
+  state (the active direction on this column is check-marked; "Clear Sort" is enabled only while a
+  sort is set on the document). A PLAIN header click is NOT a sort trigger and keeps its
+  pre-feature behavior on each platform (macOS: whole-column selection, exactly as before this
+  feature). GTK ports the same split: the header gains the equivalent context menu (GtkPopoverMenu)
+  with the same three entries. The platform-conventional sort indicator in the sorted column's
+  header cell stays.
+- Keyboard: ⇧⌘S (macOS) / Ctrl+Shift+S (GTK) applies the three-state cycle
+  (ascending → descending → off) to the KEYBOARD CURSOR's column (selection anchor column when a
+  selection exists); on a different column it starts fresh ascending. macOS adds a "Sort by
+  Column" item in a new View menu; GTK registers the accelerator in the single lsg_a11y table (new
+  Sorting group, shown in the shortcuts window, with AT-SPI labels per the a11y baseline).
 - Amendment 1: on sort, the grid shows the converging prefix immediately and repaints as it
   refines (the repaint-family rule applies); the standard scan progress affordance with cancel is
   visible for the whole build (the >500 ms rule is thereby exceeded, not merely met). Scrolling
@@ -261,14 +275,15 @@ compat layer.
 - search: sorted-block counters (granularity reuses the existing index-block knob) and
   nav-resolves-at-full-coverage semantics.
 
-**apps/macos/.** Header sort indicator + click cycle in the grid header, View menu + ⇧⌘S wired to
-the cursor column, converging-prefix live repaint + sort progress via the existing scan-progress
-affordance, `CoreDocumentSession` grows the sort poll/state plumbing. Repaint rule applies
-(synchronous poke on one-shot mutations).
+**apps/macos/.** Header sort indicator + header context-menu sort entries (plain header click
+unchanged — Amendment 3), View menu + ⇧⌘S wired to the cursor column, converging-prefix live
+repaint + sort progress via the existing scan-progress affordance, `CoreDocumentSession` grows the
+sort poll/state plumbing. Repaint rule applies (synchronous poke on one-shot mutations).
 
-**apps/gtk/.** Ports the settled macOS behavior: header indicator + cycle, Ctrl+Shift+S in the
-lsg_a11y accelerator table (new Sorting group + shortcuts-window entry + AT-SPI labels),
-converging-prefix repaint, progress and error affordances per the existing patterns.
+**apps/gtk/.** Ports the settled macOS behavior: header indicator + header context menu
+(GtkPopoverMenu with the same sort entries — Amendment 3), Ctrl+Shift+S in the lsg_a11y accelerator
+table (new Sorting group + shortcuts-window entry + AT-SPI labels), converging-prefix repaint,
+progress and error affordances per the existing patterns.
 
 **tools/fuzz.** New sort entry point (open corpus file → `ls_sort_set` → poll to terminal → window
 reads in sorted coordinates, including reads while BUILDING).
@@ -287,8 +302,7 @@ files are private, unlinked, and invisible to other processes by content and lif
 
 ## 7. Technology decisions
 
-All approved by the user at sign-off (2026-09-06); Amendment 1 (signed 2026-09-06) adds no new
-technology.
+All approved by the user at sign-off (2026-09-06); Amendments 1–3 add no new technology.
 
 1. **In-house external merge sort in the Zig core (std-only)** — chosen. Alternatives considered:
    an embedded query/sort engine (SQLite, DuckDB-class) — excluded by the single-digit-MB size
@@ -315,10 +329,11 @@ technology.
 
 Approved by the user at sign-off (2026-09-06); AC-s2/s6/s7/s14/s15 as amended and AC-s16 as added
 by Amendment 1, explicitly re-signed 2026-09-06; AC-s9's memory clause clarified by Amendment 2
-(anonymous residency; scratch-mapping pages excluded), signed 2026-09-06. The surfaced consequences
-stand: HTTP sort is a full download on click; descending shows equal values in reverse source
-order; up to 48 B/row scratch disk during the pass; while a build runs the top rows refine live
-under a visible progress affordance.
+(anonymous residency; scratch-mapping pages excluded), signed 2026-09-06; AC-s14/s15's sort
+triggers amended by Amendment 3, signed 2026-09-06. The surfaced consequences stand: HTTP sort is a
+full download on click; descending shows equal values in reverse source order; up to 48 B/row
+scratch disk during the pass; while a build runs the top rows refine live under a visible progress
+affordance.
 
 Backend (contract tests unless marked otherwise):
 
@@ -389,19 +404,27 @@ Backend (contract tests unless marked otherwise):
 Frontends (component tests + headless verification per platform norms; visual checks handed to the
 user):
 
-- **AC-s14 (macOS).** Header click cycles asc→desc→off with a visible indicator; ⇧⌘S applies the
-  cycle to the cursor's column; the View menu item exists; on sort the grid presents the converging
-  prefix immediately and repaints as it refines, with the progress + cancel affordance visible for
-  the whole build; scrolling past the prefix mid-build shows the not-yet-servable presentation;
-  FAILED shows a clean error with the pre-sort view restored; gutter shows source rows; state is
-  gone after close/reopen (session-only); swiftlint/warnings gates stay green.
-- **AC-s15 (GTK).** Same behaviors ported — converging prefix + live repaint + progress included;
+- **AC-s14 (macOS, as amended by Amendment 3).** The column header's context menu carries "Sort
+  Ascending" / "Sort Descending" / "Clear Sort" with the current state reflected (active direction
+  check-marked; "Clear Sort" enabled only while a sort is set); a PLAIN header click does NOT sort
+  and keeps whole-column selection exactly as before this feature; the sorted column shows a
+  visible indicator; ⇧⌘S applies the asc→desc→off cycle to the cursor's column; the View menu item
+  exists; on sort the grid presents the converging prefix immediately and repaints as it refines,
+  with the progress + cancel affordance visible for the whole build; scrolling past the prefix
+  mid-build shows the not-yet-servable presentation; FAILED shows a clean error with the pre-sort
+  view restored; gutter shows source rows; state is gone after close/reopen (session-only);
+  swiftlint/warnings gates stay green.
+- **AC-s15 (GTK, as amended by Amendment 3).** Same behaviors ported — header context menu
+  (GtkPopoverMenu) with the same three sort entries and state reflection, plain header click NOT a
+  sort trigger (pre-feature behavior kept), converging prefix + live repaint + progress included;
   Ctrl+Shift+S registered through the single lsg_a11y table with a Sorting group in the shortcuts
-  window and AT-SPI labels; clang-format/warnings gates stay green.
+  window and AT-SPI labels (the context-menu entries labeled for AT-SPI too); clang-format/warnings
+  gates stay green.
 
 ## 9. Open Questions
 
-None — all interview points were resolved in batches 1–2, the sign-off, and the Amendment 1
-interview and re-sign-off (converging prefix confirmed; K = 4096 via LS_WINDOW_MAX_ROWS; 100 ms
-first-window bound chosen by the user over 500/250/200 ms; find/jump scope guard confirmed).
-Amendment 2 (the §4/AC-s9 anonymous-residency clarification) is SIGNED (2026-09-06).
+None — all interview points were resolved in batches 1–2, the sign-off, the Amendment 1 interview
+and re-sign-off (converging prefix confirmed; K = 4096 via LS_WINDOW_MAX_ROWS; 100 ms first-window
+bound chosen by the user over 500/250/200 ms; find/jump scope guard confirmed), Amendment 2 (the
+§4/AC-s9 anonymous-residency clarification, SIGNED 2026-09-06), and Amendment 3 (sort triggers =
+shortcut + header context menu; plain header click unchanged; SIGNED 2026-09-06).

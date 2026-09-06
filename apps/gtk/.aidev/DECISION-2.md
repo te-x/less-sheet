@@ -1,0 +1,101 @@
+# DECISION-2 — The "serves immediately" bridge test asserted more than the frozen header promises
+
+- Component: `apps/gtk/` (C/GTK4, Meson; gate runs in `less-sheet-gtk-ci:fedora43`)
+- Slice: sort-by-column build cell, round 1
+- Request kind: **contract** (two-key CHANGE-REQUEST; implementer signed, the cell reviewer
+  CO-SIGNED in finding 1 of its round-1 verdict, with one amendment to the requested shape which
+  is adopted below)
+- Ruling: **APPROVED** — amend the frozen test
+- Frozen file amended: `tests/test_sort.c` (ONLY). `include/lsg_sort.h`'s "Never blocks." clause
+  **stands unchanged**.
+- Twin: `apps/macos/.aidev/DECISION-1.md` — same defect, same ruling, adjudicated together.
+
+## Ruling
+
+**APPROVED**, on ground **A (infeasible within the current contract)**. The frozen test is
+amended; no header, signature, type or enum changes anywhere; `api/lesssheet.h` and the backend
+are untouched.
+
+Two keys are present and the second one is real: each cell's reviewer re-derived the premise from
+the sources rather than from the implementer's report — the macOS reviewer from `api/lesssheet.h`
+§4 plus the backend's own AC-s6 test (`backend/tests/all_tests.zig` `srt_converging_presentation`,
+which reads its window only after `waitSortPausedAt`), the GTK reviewer from
+`backend/src/sort.zig` (`startPass` creates the build with an EMPTY prefix and returns; `servableRows`
+returns `@min(prefixRows(d), b.prefix.items.items.len)`, i.e. 0 until the worker's first
+`commitChunk`).
+
+## Why the request is right, stated plainly
+
+The defect is mine. The frozen contract contradicts itself:
+
+- `api/lesssheet.h` §4 THE CONVERGING PREFIX promises the servable region is
+  `min(K, data rows the pass has scanned so far)` — **zero** before the worker commits its first
+  chunk — and says the call **NEVER blocks**;
+- the two frozen bridge tests I wrote asserted a **non-empty** sorted window on the statement
+  after the request returns.
+
+No implementation inside either frontend can satisfy both, and the core is conformant. I asserted
+a property the header explicitly does not promise, in both components, and neither reviewer let it
+through. The measured evidence, run by the orchestrator in the trusted host context:
+
+| probe | result |
+|---|---|
+| macOS M1 — `ls_sort_set` then immediately `ls_window_set(d,0,8)`, 5 trials, `find.csv` | `immediate_rows=0`, `state=1` (BUILDING), `src0=UINT64_MAX` on **5/5** |
+| GTK M1 — 30 runs of `/sort/bridge-serves-immediately` in the pinned container | **pass=0 fail=30** |
+| GTK M2 — poll every 200 µs after the request, 40 iterations | `i=0 rows=0`; `i=1..39 rows=8 src0=6 sorted_top=YES` — **no `NO-PRESORT-LEAK` at any observation** |
+
+That last line matters more than the failure: the amendment's actual promise — *the pre-sort order
+is never served* — holds on every observation. The tests were wrong about the timing, not about
+the behavior.
+
+## What I did NOT approve, and why
+
+**Keeping the test and relaxing "never blocks."** The implementer offered this branch and
+recommended against it; so does the architect ("a hidden wait inside the bridge, however small, is
+the wrong shape"); so do I, for a third reason neither raised. The 5 ms wait is not only a wait:
+it calls `ls_window_set(doc, 0, 1)`, so `setSort` silently resets the core's materialized window
+and invalidates outstanding `ls_str` borrows. Documenting that into the contract would mean a
+poll/control-lane call is also a window-lane call — the one distinction the whole threading
+section rests on — to buy back a single window re-issue that every shipping caller already makes.
+No.
+
+**Making the core publish a first prefix synchronously.** Named by both implementers, correctly,
+as a backend change. It would reopen a closed cell, and it would put an unbounded-in-principle
+amount of scan work inside a call the header promises never blocks, to save 1–3.6 ms on a 4M-row
+file (measurement D). Rejected.
+
+## The amended tests — the same property in both frontends
+
+Both cells now encode one property in two tests, split by the fixture that can actually show each
+half. The GTK reviewer's amendment is adopted in full: the sorted-order check runs on **every**
+observation, not once after the loop, because "hold the old order until ACTIVE" would otherwise
+pass.
+
+**1. From the first servable window, the order served is the SORTED one — never the pre-sort one.**
+On the small shared fixture: issue the sort, assert the snapshot is visible immediately with the
+requested column and direction, then poll the top window in a bounded loop, asserting on every
+iteration that a non-empty window is already the sorted order. Converges within the bound.
+
+**2. The bridge does not wait for the key pass.** On the small fixture this is unobservable —
+measurement D shows `find.csv` reaches ACTIVE in **0.2–0.4 ms**, so every non-empty window on it is
+already ACTIVE and a blocking bridge is indistinguishable from a correct one. So this half runs on
+a fixture GENERATED by the test, large enough that the pass takes hundreds of milliseconds:
+immediately after the request returns the phase must still be **BUILDING** (a bridge that waits for
+the pass cannot produce that), and every observed non-empty window must be in strictly DESCENDING
+source order — which the ascending pre-sort order fails on its first two rows, at any scan depth,
+without the test needing to know how far the scan has got.
+
+### One thing the amended tests do NOT police, said out loud
+
+They catch a bridge that waits for the PASS. They do not catch a *short* bounded
+wait like the 5 ms one: on the large fixture it still returns while BUILDING, and
+no wall-clock threshold small enough to catch it would be safe on a loaded CI
+host. Its removal is therefore ordered directly above and checked by review, not
+by a timing assertion — a flaky gate would be worse than the reviewer's eye.
+
+## What the implementer must do in round 2
+
+- **macOS: delete `awaitFirstPrefix` and its `firstPrefixHandoff` constant**; `setSort` becomes the
+  thin non-blocking mapping of the request's attempt 1. The window-lane side effect goes with it.
+- **GTK: nothing.** `lsg_document_sort_set` is already the thin mapping; the amended test is what
+  changes.

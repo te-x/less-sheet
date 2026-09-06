@@ -21,11 +21,23 @@
 // is back in its pre-sort file order — there is nothing partial left on screen
 // to clean up.
 //
-// WHY A PURE CYCLE TYPE. FR11 gives the feature TWO entry points into the same
-// state machine — a header click and ⇧⌘S on the keyboard cursor's column — plus
-// a third (the progress affordance's Cancel) that must not contradict them.
-// Routing all three through one `SortCycling.next(...)` is what keeps them from
-// drifting; the display layer contributes only "which column was hit".
+// AMENDMENT 3 (signed 2026-09-06) — WHAT TRIGGERS A SORT. Exactly two things:
+//   1. the keyboard shortcut ⇧⌘S, which runs the three-state CYCLE
+//      (ascending → descending → off) on the KEYBOARD CURSOR's column; and
+//   2. the column header's CONTEXT MENU (right-click / secondary click), which
+//      offers three EXPLICIT entries — Sort Ascending, Sort Descending, Clear
+//      Sort — with the current state reflected. A menu shows state and names
+//      outcomes; it does not cycle.
+// A PLAIN header click is NOT a sort trigger. It keeps its pre-feature meaning
+// exactly — whole-column selection — so no existing muscle memory changes.
+//
+// WHY A PURE CYCLE TYPE, STILL. The cycle now has two entry points rather than
+// three (⇧⌘S, and the progress affordance's Cancel, which must mean the same
+// "stop" the cycle means on an unlanded pass). Routing both through one
+// `SortCycling.next(...)` is what keeps them from drifting; the display layer
+// contributes only "which column was hit". The context menu is a separate,
+// simpler surface — `SortCycling.headerMenu(...)` — because its entries are
+// DIRECT intents, not cycle steps.
 //
 // The long-operation chrome is NOT redefined here: a building sort drives the
 // existing `DelayedProgressGating` gate like every other long operation, and a
@@ -162,6 +174,8 @@ public enum SortIntent: Equatable, Sendable {
 ///       has not landed means STOP — which is also exactly what Cancel means, so
 ///       the two affordances cannot drift apart. (`ls_sort_clear` is both verbs,
 ///       and either way the view returns to its pre-sort file order.)
+///   Since Amendment 3 the cycle's only user-facing entry point is ⇧⌘S; the
+///   header menu does not cycle (see `headerMenu(_:for:)`).
 ///     * same column, `.failed`     → `.sort(column, sameDirection)` — a RETRY,
 ///       not an advance. Silently moving to a direction the user never saw
 ///       applied would be the wrong answer to "that didn't work"; the core
@@ -173,9 +187,39 @@ public enum SortIntent: Equatable, Sendable {
 ///   snapshot: `.none` unless `column` is the snapshot's column, else the
 ///   requested direction with `isPending` iff the snapshot `isWorking` and
 ///   `didFail` iff the phase is `.failed`.
+/// - `headerMenu(_:for:)` — the header CONTEXT MENU for `column` (Amendment 3).
+///   ALWAYS exactly three entries, in this order:
+///     [0] `SortCommand.ascendingTitle`  → `.sort(column, .ascending)`
+///     [1] `SortCommand.descendingTitle` → `.sort(column, .descending)`
+///     [2] `SortCommand.clearTitle`      → `.clear`
+///   with:
+///     * `isChecked` on the entry whose direction matches the snapshot's, and
+///       only when the snapshot's column IS this column. Never on Clear Sort,
+///       and never on any entry of a column that is not the sorted one. The
+///       check follows the REQUEST, not the phase — it is set while the pass is
+///       building, parked or failed too, exactly as `indicator(_:for:)` shows
+///       the chevron in those phases, so the menu and the header never disagree
+///       about which sort was asked for.
+///     * `isEnabled` true on both sort entries always; on Clear Sort iff a sort
+///       is set on the DOCUMENT (`snapshot != nil`) — NOT iff it is set on this
+///       column. Clearing is a document-level act, and a user who right-clicks
+///       the wrong header should still be able to undo the sort.
+///   The entries are DIRECT intents, not cycle steps: choosing the direction
+///   that is already active re-issues it, which the core defines as a no-op.
 public protocol SortCycling: Sendable {
     func next(_ snapshot: SortSnapshot?, for column: Int) -> SortIntent
     func indicator(_ snapshot: SortSnapshot?, for column: Int) -> SortIndicator
+    func headerMenu(_ snapshot: SortSnapshot?, for column: Int) -> [SortMenuEntry]
+}
+
+public extension SortCycling {
+    /// DEFAULT (RED seed): no entries, so nothing can be chosen. Declared as a
+    /// PROTOCOL REQUIREMENT above, not only here, so a real conformer's override
+    /// is dispatched through `any SortCycling` — which is what flips the frozen
+    /// menu tests from RED (this empty default) to GREEN. Kept as a default so
+    /// the component still COMPILES before the implementer writes it: the suite
+    /// must be red on behavior, never on the build.
+    func headerMenu(_ snapshot: SortSnapshot?, for column: Int) -> [SortMenuEntry] { [] }
 }
 
 // MARK: - The command declaration (one source for the menu and the shortcut)
@@ -205,8 +249,12 @@ public struct KeyAccelerator: Equatable, Sendable {
 /// command this slice adds.
 ///
 /// The shortcut acts on the KEYBOARD CURSOR's column (the selection anchor's
-/// column when a selection exists) and runs the same `SortCycling.next(_:for:)`
-/// a header click runs, so the two entry points cannot diverge.
+/// column when a selection exists) and runs `SortCycling.next(_:for:)`.
+///
+/// The three CONTEXT-MENU titles live here too, for the same reason: the header
+/// menu, its AT-SPI labels, and anything that ever names these commands read
+/// ONE declaration. A hand-typed second copy is the drift this enum exists to
+/// prevent.
 public enum SortCommand {
     /// The menu this item belongs to. The app's main menu has no View menu today
     /// (an empty SwiftUI one was removed for launch cost); this slice adds it
@@ -215,6 +263,35 @@ public enum SortCommand {
     public static let menuTitle = "Sort by Column"
     /// ⇧⌘S.
     public static let accelerator = KeyAccelerator(key: "s", command: true, shift: true)
+
+    /// The header context menu's three entries (Amendment 3). Titles only —
+    /// the state reflection is `SortCycling.headerMenu(_:for:)`.
+    public static let ascendingTitle = "Sort Ascending"
+    public static let descendingTitle = "Sort Descending"
+    public static let clearTitle = "Clear Sort"
+}
+
+// MARK: - The header context menu (Amendment 3)
+
+/// One entry of the column header's sort context menu. `intent` is the SAME type
+/// the cycle produces, so both trigger paths funnel into one apply step and
+/// cannot interpret a request differently.
+public struct SortMenuEntry: Equatable, Sendable {
+    public let title: String
+    public let intent: SortIntent
+    /// Shown with a check mark: this is the sort currently requested on THIS
+    /// column. Never set on Clear Sort.
+    public let isChecked: Bool
+    /// Selectable. The two sort entries always are; Clear Sort only while a sort
+    /// is set on the DOCUMENT.
+    public let isEnabled: Bool
+
+    public init(title: String, intent: SortIntent, isChecked: Bool, isEnabled: Bool) {
+        self.title = title
+        self.intent = intent
+        self.isChecked = isChecked
+        self.isEnabled = isEnabled
+    }
 }
 
 // MARK: - DocumentSession RED seeds for the sort members

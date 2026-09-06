@@ -1,18 +1,26 @@
 // Frozen behavior tests — sort-by-column slice (planner-owned).
-// ARCH-sort-by-column app criterion AC-s14 (as amended by Amendment 1): the
-// pure three-state CYCLE that both the header click and ⇧⌘S drive, the header
-// indicator, the one declaration of the menu item + accelerator, and the sort
-// bridge against the REAL linked Zig core (apply, sorted coordinates WITHOUT
-// waiting for the pass, descending, composition with a filter, clear restoring
+// ARCH-sort-by-column app criterion AC-s14 (Amendments 1 and 3): the pure
+// three-state CYCLE that ⇧⌘S drives, the header CONTEXT MENU's three stateful
+// entries, the header indicator, the one declaration of the titles +
+// accelerator, and the sort bridge against the REAL linked Zig core (apply,
+// sorted coordinates, descending, composition with a filter, clear restoring
 // the pre-sort order, session-only across a re-open).
+//
+// AMENDMENT 3 — WHAT TRIGGERS A SORT. Only ⇧⌘S (the cycle, on the cursor's
+// column) and the header context menu (three explicit entries). A PLAIN header
+// click is NOT a sort trigger and keeps whole-column selection exactly as
+// before this feature; the frozen selection tests
+// (`SelectCopyTests.wholeColumn`, `NativeGridTests.selectionSecondClickDeselects…`)
+// bind to the model and the controller's semantic seam, not to a gesture form,
+// so they pin that behavior unchanged and needed no edit here.
 // Semantics are normative in Sources/Contracts/SortControl.swift +
 // DocumentSession.swift and api/lesssheet.h SORTED VIEWS.
 //
-// WHY THE CYCLE IS PINNED SO HARD. The feature has three entry points into ONE
-// state machine — a header click, ⇧⌘S on the keyboard cursor's column, and the
-// progress affordance's Cancel. The truth table below is exhaustive over
-// (phase x same/different column x direction) precisely so the three cannot
-// drift apart in the display layer.
+// WHY THE CYCLE IS PINNED SO HARD. Two entry points share ONE state machine —
+// ⇧⌘S on the keyboard cursor's column, and the progress affordance's Cancel,
+// which must mean the same "stop" the cycle means on an unlanded pass. The
+// truth table below is exhaustive over (phase x same/different column x
+// direction) precisely so the two cannot drift apart in the display layer.
 //
 // Determinism: find.csv is far below the core's head budget, so a key pass
 // completes in milliseconds; every bridge test asserts `setSort == true` via
@@ -106,6 +114,93 @@ private func viewSourceRows(_ session: any DocumentSession, _ count: Int) -> [UI
     #expect(SortCommand.menuTitle == "Sort by Column")
     #expect(SortCommand.accelerator == KeyAccelerator(key: "s", command: true, shift: true))
     #expect(SortCommand.accelerator.option == false)
+    // Amendment 3: the header context menu's three titles are declared HERE
+    // too, so the menu, its AT-SPI labels and any future surface naming these
+    // commands all read one place.
+    #expect(SortCommand.ascendingTitle == "Sort Ascending")
+    #expect(SortCommand.descendingTitle == "Sort Descending")
+    #expect(SortCommand.clearTitle == "Clear Sort")
+}
+
+// MARK: - The header context menu (Amendment 3; pure, no core)
+
+/// The menu's three entries, or nil with a recorded issue. Every menu test goes
+/// through this: the RED seed returns an EMPTY array, and indexing it would TRAP
+/// and take the whole `swift test` process down with it, hiding every other
+/// result. A frozen test must fail cleanly on the seed it was written against.
+private func menuEntries(
+    _ cycle: SortCycle, _ snapshot: SortSnapshot?, for column: Int,
+    _ sourceLocation: SourceLocation = #_sourceLocation
+) -> [SortMenuEntry]? {
+    let entries = cycle.headerMenu(snapshot, for: column)
+    guard entries.count == 3 else {
+        Issue.record("the header menu must offer exactly 3 entries; got \(entries.count)",
+                     sourceLocation: sourceLocation)
+        return nil
+    }
+    return entries
+}
+
+@Test func headerMenuAlwaysOffersTheSameThreeEntriesInOrder() {
+    let cycle = SortCycle()
+    for snapshot in [nil, SortSnapshot(phase: .active, column: 1, direction: .ascending)] {
+        guard let menu = menuEntries(cycle, snapshot, for: 1) else { return }
+        #expect(menu[0].title == SortCommand.ascendingTitle)
+        #expect(menu[1].title == SortCommand.descendingTitle)
+        #expect(menu[2].title == SortCommand.clearTitle)
+        // DIRECT intents, not cycle steps — and the same `SortIntent` the cycle
+        // produces, so both trigger paths funnel into one apply step.
+        #expect(menu[0].intent == .sort(column: 1, direction: .ascending))
+        #expect(menu[1].intent == .sort(column: 1, direction: .descending))
+        #expect(menu[2].intent == .clear)
+        // The two sort entries are always selectable.
+        #expect(menu[0].isEnabled)
+        #expect(menu[1].isEnabled)
+    }
+}
+
+@Test func headerMenuChecksTheRequestedDirectionOnlyOnTheSortedColumn() {
+    let cycle = SortCycle()
+    // No sort: nothing checked anywhere.
+    guard let none = menuEntries(cycle, nil, for: 0) else { return }
+    #expect(none.allSatisfy { !$0.isChecked })
+    // The check follows the REQUEST, not the phase — building, parked and failed
+    // all show it, exactly as the header indicator does, so the menu and the
+    // chevron can never disagree about which sort was asked for.
+    for phase: SortPhase in [.active, .building(progress: 0.3), .parked(progress: 0.3), .failed(.storage)] {
+        for dir: SortDirection in [.ascending, .descending] {
+            let snap = SortSnapshot(phase: phase, column: 1, direction: dir)
+            guard let onColumn = menuEntries(cycle, snap, for: 1),
+                  let elsewhere = menuEntries(cycle, snap, for: 0) else { return }
+            #expect(onColumn[0].isChecked == (dir == .ascending))
+            #expect(onColumn[1].isChecked == (dir == .descending))
+            #expect(!onColumn[2].isChecked, "Clear Sort is never check-marked")
+            // A DIFFERENT column's menu shows no check at all.
+            #expect(elsewhere.allSatisfy { !$0.isChecked })
+        }
+    }
+}
+
+@Test func headerMenuEnablesClearSortPerDocumentNotPerColumn() {
+    let cycle = SortCycle()
+    // No sort on the document: Clear Sort is not selectable.
+    guard let idle = menuEntries(cycle, nil, for: 0) else { return }
+    #expect(idle[2].isEnabled == false)
+    // A sort IS set — on column 1. Clear Sort is selectable from EVERY header,
+    // including column 0's: clearing is a document-level act, and a user who
+    // right-clicks the wrong header should still be able to undo the sort.
+    let active = SortSnapshot(phase: .active, column: 1, direction: .ascending)
+    guard let onSorted = menuEntries(cycle, active, for: 1),
+          let onOther = menuEntries(cycle, active, for: 0) else { return }
+    #expect(onSorted[2].isEnabled)
+    #expect(onOther[2].isEnabled)
+    // Still true while the pass has not landed, and after it failed: the request
+    // exists, so it can be dropped.
+    for phase: SortPhase in [.building(progress: 0.1), .parked(progress: 0.1), .failed(.memory)] {
+        guard let m = menuEntries(cycle, SortSnapshot(phase: phase, column: 1, direction: .ascending), for: 0)
+        else { return }
+        #expect(m[2].isEnabled)
+    }
 }
 
 // MARK: - The cycle (pure; no core) — the exhaustive truth table
@@ -244,27 +339,143 @@ private func viewSourceRows(_ session: any DocumentSession, _ count: Int) -> [UI
     #expect(session.filterStatus()?.totalIsFinal == true)
 }
 
-@Test func bridgeServesSortedCoordinatesWithoutWaitingForTheKeyPass() async throws {
-    // AC-s14 / Amendment 1: latency beats throughput. The window is read on the
-    // very next line after `setSort` — NO poll, NO wait for `.active` — and it
-    // must already be in sorted coordinates (the converging prefix). An
-    // implementation that keeps the previous order until the pass completes
-    // fails HERE, which is the whole point of the amendment.
+// MARK: - The converging prefix reaches the frontend (DECISION-1)
+//
+// These two replace `bridgeServesSortedCoordinatesWithoutWaitingForTheKeyPass`,
+// which asserted a NON-EMPTY window on the statement after `setSort` returned.
+// The frozen header promises only `min(K, rows the pass has scanned so far)`
+// servable rows — zero before the core's worker commits its first chunk — and
+// that the call never blocks, so that assertion was unsatisfiable by any
+// implementation here. See `apps/macos/.aidev/DECISION-1.md` for the evidence
+// (5/5 `immediate_rows=0`) and the ruling.
+//
+// The property splits in two, because ONE fixture cannot show both halves:
+//   * WHAT is served — the sorted order, never the pre-sort order, from the
+//     first servable window onward. Shown on the shared 8-row fixture.
+//   * WHEN it is served — the request returns without waiting for the pass.
+//     NOT observable on `find.csv`: measured, it reaches ACTIVE 0.2-0.4 ms after
+//     the request, so every non-empty window on it is already ACTIVE and a
+//     bridge that blocked until the pass landed would be indistinguishable from
+//     a correct one. That half therefore runs on a fixture this test GENERATES,
+//     big enough that the pass takes hundreds of milliseconds.
+
+/// Poll the top window until it serves rows, asserting `check` on EVERY
+/// observation — not once at the end. A "hold the old order until the pass
+/// lands" implementation serves the pre-sort order for a while and the sorted
+/// order afterwards; only a per-observation check catches it.
+@discardableResult
+private func pollTopWindow(
+    _ session: any DocumentSession,
+    rows: Int,
+    within: Duration = .seconds(10),
+    check: (RowWindow, [UInt64?], SortSnapshot?) -> Void
+) throws -> Bool {
+    let clock = ContinuousClock()
+    let start = clock.now
+    var sawRows = false
+    while clock.now - start < within {
+        let win = session.setWindow(firstRow: 0, rowCount: rows)
+        let sources = (0..<win.rows.count).map { session.sourceRow(UInt64($0)) }
+        check(win, sources, session.sortStatus())
+        if !win.rows.isEmpty {
+            sawRows = true
+            break
+        }
+    }
+    return sawRows
+}
+
+@Test func bridgeServesTheSortedOrderFromTheFirstServableWindow() async throws {
     let session = try await openForSort()
     defer { session.close() }
     try #require(session.setSort(column: 0, direction: .ascending), "core rejected the sort")
-    let win = session.setWindow(firstRow: 0, rowCount: 8)
-    #expect(win.rows.isEmpty == false, "a sort must serve its converging prefix immediately")
-    // find.csv's 8 rows are fully scanned in one block, so the prefix here is
-    // the whole (already exact) order; on a large document it would be the
-    // sorted top of the scanned region instead. Either way it is never the
-    // pre-sort order.
-    #expect(session.sourceRow(0) == sortedByNameAscending[0])
-    #expect(win.rows[0][0] == "")
-    // The phase is honest about it: never `.active` until the order is final.
-    let snap = try #require(session.sortStatus())
-    #expect(snap.column == 0)
-    #expect(snap.direction == .ascending)
+
+    // The REQUEST is visible at once, even before any row is servable: the view
+    // is in sorted coordinates from here on, and the header can already draw its
+    // pending indicator.
+    let immediately = try #require(session.sortStatus(), "the sort request must be visible at once")
+    #expect(immediately.column == 0)
+    #expect(immediately.direction == .ascending)
+
+    // Every non-empty window observed, at any point, is the SORTED order — never
+    // the pre-sort order (which would put "Widget", source 0, at the top).
+    let served = try pollTopWindow(session, rows: 8) { win, sources, snap in
+        #expect(snap != nil, "the sort request must not disappear while it builds")
+        guard !win.rows.isEmpty else { return }
+        #expect(sources[0] == sortedByNameAscending[0],
+                "row 0 must already be the sorted top, never the pre-sort order")
+        #expect(win.rows[0][0] == "")
+    }
+    #expect(served, "a sorted window must become servable well within the bound")
+
+    // ... and it converges to the whole order.
+    _ = try await waitSortActive(session)
+    #expect(viewSourceRows(session, 8) == sortedByNameAscending.map { Optional($0) })
+}
+
+/// A generated fixture whose key pass takes long enough to observe. 600k rows of
+/// `"{i:08},{2i:08}"` — column 0 ascends with source order, so sorting it
+/// DESCENDING makes the pre-sort order and the sorted order maximally different
+/// at every scan depth. Returns the path; the caller owns the temp directory.
+private func makeLargeSortFixture() throws -> (url: URL, rows: Int) {
+    let rows = 600_000
+    var text = ""
+    text.reserveCapacity(rows * 18)
+    for i in 0..<rows {
+        text += String(format: "%08d,%08d\n", i, 2 * i)
+    }
+    let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("lesssheet-sorttest-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    let url = dir.appendingPathComponent("big.csv")
+    try text.write(to: url, atomically: true, encoding: .utf8)
+    return (url, rows)
+}
+
+@Test func bridgeDoesNotWaitForTheKeyPass() async throws {
+    let fixture = try makeLargeSortFixture()
+    defer { try? FileManager.default.removeItem(at: fixture.url.deletingLastPathComponent()) }
+    let session = try await CoreSessionOpener().open(
+        path: fixture.url.path(percentEncoded: false), forcing: .sniffAll
+    )
+    defer { session.close() }
+
+    try #require(session.setSort(column: 0, direction: .descending), "core rejected the sort")
+    // THE DISCRIMINATING ASSERTION. On a document this size the pass runs for
+    // hundreds of milliseconds, so a bridge that waited for it — for the whole
+    // pass, or for a first prefix, or for anything — could not possibly be back
+    // here with the phase still BUILDING. On the small fixture this assertion
+    // would be meaningless (it reaches ACTIVE in 0.2-0.4 ms); that is why this
+    // test generates its own.
+    let immediately = try #require(session.sortStatus(), "the sort request must be visible at once")
+    #expect(immediately.column == 0)
+    #expect(immediately.direction == .descending)
+    guard case .building = immediately.phase else {
+        // The one way to be past BUILDING already, on a 600k-row document whose
+        // pass runs for hundreds of milliseconds, is to have waited for it.
+        Issue.record("setSort must return while the key pass is still BUILDING; phase was \(immediately.phase)")
+        return
+    }
+
+    // The prefix becomes servable while the pass is still running — the app has
+    // rows to paint long before the sort lands.
+    //
+    // NOT asserted here, deliberately: that a single mid-build window is
+    // internally in sort order. It is not, on the tree this was written against
+    // — the core materializes over a prefix the worker is concurrently
+    // extending, so one window can carry rows from two generations. That is a
+    // CORE property and a core defect, so its lock lives where it can be fixed:
+    // `srt_prefix_window_consistency` in the backend suite. A frontend cell must
+    // not be red for something it cannot repair, and it must not silently
+    // ratify it either — hence the pointer rather than silence.
+    let served = try pollTopWindow(session, rows: 32) { _, _, snap in
+        #expect(snap != nil, "the sort request must not disappear while it builds")
+    }
+    #expect(served, "the converging prefix must become servable well within the bound")
+
+    // And it converges: the top of a completed descending sort is the last row.
+    _ = try await waitSortActive(session)
+    #expect(viewSourceRows(session, 1) == [Optional(UInt64(fixture.rows - 1))])
 }
 
 @Test func bridgeCancelDuringABuildRestoresThePreSortOrder() async throws {
