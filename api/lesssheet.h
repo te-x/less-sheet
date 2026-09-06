@@ -36,10 +36,12 @@
  * / Numbers. Display (ls_cell) and search are byte-for-byte unaffected — see
  * COPY OUTPUT SAFETY. sort-by-column adds a THIRD view kind on top of the
  * identity and filter views: ls_sort_set / ls_sort_clear / ls_sort_poll order
- * the current view by ONE column, ascending or descending, after one
- * progress-reported, cancellable KEY PASS over the data; while it is active
- * every row-addressing accessor speaks SORTED coordinates, composing with a
- * filter — see SORTED VIEWS. The
+ * the current view by ONE column, ascending or descending, backed by one
+ * progress-reported, cancellable KEY PASS over the data. The view speaks
+ * SORTED coordinates from the instant the sort is requested: while the pass
+ * runs it serves a CONVERGING PREFIX — the exact sorted top of the region
+ * scanned so far — and the whole view once the pass completes, composing with
+ * a filter throughout — see SORTED VIEWS. The
  * walking-skeleton head-window surface is superseded.
  *
  * csv-hardening adds two things to the delimited-text path without changing
@@ -2622,6 +2624,12 @@ ls_copy_job *ls_copy_open(const ls_doc *doc, const ls_copy_rect *rect);
  *     servability model as ls_cell_copy's LS_COPY_PENDING. The job reads the
  *     document's shared frontier; the job itself NEVER scans and never advances
  *     the frontier.
+ *     ONE CARVE-OUT, added by the sort-by-column slice: while a sort is
+ *     LS_SORT_BUILDING the stall is the CONVERGING PREFIX ending, not the
+ *     frontier, and a jump cannot cure it (a jump under a building sort does not
+ *     resolve until LS_SORT_ACTIVE — see SORTED VIEWS JUMP). Poll ls_sort_poll
+ *     and resume at LS_SORT_ACTIVE instead; a caller that copies a large
+ *     selection is better off opening the job after the sort has landed.
  *
  * SINGLE-CONSUMER: do not call ls_copy_next concurrently on one job. See
  * THREADING (ls_copy_close) for cross-job / cross-lane concurrency.
@@ -2660,19 +2668,33 @@ void ls_copy_close(ls_copy_job *job);
  * from this one header, with no external pinned-binary consumer and no compat
  * path. No existing struct, enum, constant, or prototype changes SHAPE; only
  * the meaning of a row INDEX changes, and only while a sort is active.
- * Root-planner freeze; the author's sign-off is recorded 2026-09-06. See
- * docs/architecture/ARCH-sort-by-column.md.)
+ * Root-planner freeze; the author's sign-off is recorded 2026-09-06.
+ * AMENDMENT 1 (converging sorted prefix; author-signed 2026-09-06) rewrote the
+ * serving rule while a pass runs — sections 4, 5, 6, 8 and 11 below — and the
+ * cancel/failure rule. It changed NO signature, enum value, or struct layout:
+ * ls_sort_set / ls_sort_clear / ls_sort_poll and the 24-byte ls_sort_status
+ * stand exactly as first frozen. See docs/architecture/ARCH-sort-by-column.md.)
  *
- * WHY IT IS HONEST ABOUT COST. Nothing sorted can be shown until ONE full pass
- * over the data has extracted every row's key — the smallest value can live on
- * the last row. That pass is the price search-to-EOF and a filter-scan already
- * pay, with the same progress + cancel affordances. Once it completes, the
- * sorted view is served from an on-disk permutation and every position in it is
- * O(1)-addressable. RAM never becomes O(rows).
+ * WHY IT IS HONEST ABOUT COST — AND STILL IMMEDIATE. The FINAL order needs one
+ * full pass over the data: the smallest value can live on the last row. That
+ * pass is the price search-to-EOF and a filter-scan already pay, with the same
+ * progress + cancel affordances. But LATENCY BEATS THROUGHPUT here, so nobody
+ * waits for it to look at the top of the list: the view flips to sorted
+ * coordinates IMMEDIATELY and serves a CONVERGING PREFIX — at every instant the
+ * EXACT sorted top of the region scanned so far — which refines live until the
+ * pass completes. Partial, yes; wrong, never: what is served is always the true
+ * answer for the data seen so far, the progress affordance is visible the whole
+ * time, and the poll never reports ACTIVE until the order is final. Once it
+ * completes, the sorted view is served from an on-disk permutation and every
+ * position in it is O(1)-addressable. RAM never becomes O(rows): the prefix
+ * costs one bounded top-K structure.
  *
  * A SORT IS A VIEW MODE, NOT A JOB. Like a filter, it PERSISTS until cleared or
  * the document is re-opened, across scan-slot contention and across automatic
- * rebuilds. Unlike a filter, a PARTIAL sort is never served (see THE FLIP).
+ * rebuilds. Like a filter, it serves a converging PARTIAL result while its scan
+ * runs — bounded here to the top K rows (see THE CONVERGING PREFIX) — and, like
+ * a filter, it never presents that partial result as final: ls_sort_poll
+ * distinguishes LS_SORT_BUILDING from LS_SORT_ACTIVE at all times.
  *
  * ---- 1. THE REQUEST -------------------------------------------------------
  *   - A document has at most ONE sort: an absolute column ID plus a direction,
@@ -2748,11 +2770,12 @@ void ls_copy_close(ls_copy_job *job);
  * DESCENDING is the ascending permutation READ BACKWARDS. Consequence, stated
  * plainly because it is user-visible: rows that compare equal appear in source
  * order ascending and in REVERSE source order descending; nulls come LAST
- * ascending and FIRST descending. Flipping direction on an ACTIVE sort is O(1)
- * — see THE FLIP.
+ * ascending and FIRST descending. Flipping direction on an ACTIVE sort is O(1),
+ * and a flip WHILE BUILDING costs no re-scan — see THE CONVERGING PREFIX.
  *
  * ---- 3. THE KEY PASS ------------------------------------------------------
- *   - A successful ls_sort_set that is not a no-op (see THE FLIP) starts the
+ *   - A successful ls_sort_set that is not a no-op (see THE CONVERGING PREFIX)
+ *     starts the
  *     KEY PASS: one sequential sweep of the data rows in the document's SINGLE
  *     scan slot which, per row, evaluates the active filter predicate and
  *     extracts the sort key of matching rows. It advances the SHARED frontier
@@ -2776,6 +2799,11 @@ void ls_copy_close(ls_copy_job *job);
  *     size is deliberately NOT an ABI constant: it is a core-internal knob with
  *     one named default and one resolver (see backend/contracts/api.zig
  *     `sort_chunk_default_bytes`), like the window budget.
+ *   - THE PREFIX STRUCTURE. Alongside that chunk the pass maintains ONE
+ *     bounded best-so-far structure holding the top K rows for the requested
+ *     direction — O(K) memory, K == LS_WINDOW_MAX_ROWS — which is what serves
+ *     the converging prefix from the first scanned block onward. It is the
+ *     only RAM the immediacy costs, and it is independent of the row count.
  *   - TEMP STORAGE HYGIENE. Runs, the permutation, and the inverse mapping live
  *     in the platform temp directory under EXACTLY the discipline of the gzip
  *     checkpoint spill and the network spool, through the SAME resolver: mode
@@ -2784,40 +2812,79 @@ void ls_copy_close(ls_copy_job *job);
  *     ls_close / process exit. No new caller-supplied cache-directory knob
  *     exists or will be added.
  *
- * ---- 4. THE FLIP (a building sort never changes what you see) -------------
- *   - While LS_SORT_BUILDING the view keeps its CURRENT order: source order if
- *     nothing was sorted, or the OLD sorted order when a still-valid previous
- *     sort is being replaced by a new column/direction. When the previous
- *     permutation was invalidated because the ROW SET changed (a filter was set
- *     or cleared — see REBUILDS) the view serves the new row set in SOURCE
- *     order while the rebuild runs. A PARTIAL sort is NEVER served.
- *   - The view flips to the new order exactly at LS_SORT_ACTIVE.
- *   - DIRECTION FLIP. ls_sort_set with the SAME column and the OTHER direction
- *     on an LS_SORT_ACTIVE sort completes BEFORE the call returns: the poll
- *     never leaves LS_SORT_ACTIVE, no scan slot is taken, and no pass runs (the
- *     permutation is simply read backwards). It is still a coordinate change,
- *     so it RESETS search and jump (see RESET).
+ * ---- 4. THE CONVERGING PREFIX (what a building sort serves) ---------------
+ *   - THE RULE. ls_sort_set flips the view into SORTED coordinates IMMEDIATELY.
+ *     While LS_SORT_BUILDING the SERVABLE region is the first
+ *         min(K, data rows the pass has scanned so far)
+ *     view rows, and those rows are AT EVERY INSTANT the EXACT sorted top of
+ *     the scanned region for the requested column and direction — under the
+ *     same comparator that will produce the final order, over the same
+ *     (filtered) row set. K is the PREFIX DEPTH and is NOT a new constant: it
+ *     IS LS_WINDOW_MAX_ROWS (4096), read through one resolver, because that is
+ *     exactly how deep a caller can ever address in a single window.
+ *   - DIRECTION IS PART OF "TOP", and this is the one place it bites: a
+ *     DESCENDING prefix is the K GREATEST rows of the scanned region, in
+ *     descending order — it is NOT the ascending prefix reversed. (Reading the
+ *     permutation backwards is correct only for the COMPLETE permutation at
+ *     LS_SORT_ACTIVE, where the two coincide.)
+ *   - BEYOND THE PREFIX. View rows at or past the prefix are NOT YET SERVABLE
+ *     and answer with the existing beyond-frontier values — ls_window_set
+ *     returns a shorter (possibly empty) range, ls_cell the empty string,
+ *     ls_source_row LS_NO_ROW, ls_cell_copy LS_COPY_PENDING, ls_copy_next
+ *     LS_COPY_STEP_STALLED. Nothing new to learn: it is the same convention a
+ *     row past the scan frontier already uses. (One difference worth stating:
+ *     the cure for a stalled sorted copy is to WAIT for LS_SORT_ACTIVE, not to
+ *     ls_jump_start — see JUMP.)
+ *   - REFINEMENT IS VISIBLE, NOT SILENT. A served prefix row may be DISPLACED
+ *     by a smaller value found later, so the top rows re-order as the scan
+ *     advances — the row-count-converges precedent. What is served is never
+ *     wrong for the data seen so far, and ls_sort_poll reports BUILDING with
+ *     monotone progress the whole time, so a partial result is never presented
+ *     as final. Frontends keep the progress + cancel affordance up for the
+ *     whole build (see FRONTEND EXPECTATIONS in ARCH-sort-by-column FR11).
+ *   - AT LS_SORT_ACTIVE the whole view is servable through the permutation and
+ *     the order never changes again for that build.
+ *   - DIRECTION FLIP ON AN ACTIVE SORT. ls_sort_set with the SAME column and
+ *     the OTHER direction on an LS_SORT_ACTIVE sort completes BEFORE the call
+ *     returns: the poll never leaves LS_SORT_ACTIVE, no scan slot is taken, and
+ *     no pass runs (the permutation is simply read backwards). It is still a
+ *     coordinate change, so it RESETS search and jump (see RESET).
+ *   - DIRECTION FLIP WHILE BUILDING. The same call on an LS_SORT_BUILDING sort
+ *     KEEPS THE PASS RUNNING — the run artifacts are direction-agnostic, so
+ *     there is NEVER a source re-scan and progress stays monotone — and the
+ *     prefix re-converges to the new direction's exact top of the region
+ *     scanned so far, from the keys already extracted. The poll stays
+ *     LS_SORT_BUILDING with the new direction. It resets search and jump.
  *   - NO-OP. ls_sort_set with the SAME column AND the SAME direction on an
  *     LS_SORT_ACTIVE sort returns true and does NOTHING AT ALL — no pass, and
- *     NO reset of search or jump. (On a PARKED or FAILED sort the identical
- *     request RE-RUNS the pass; that is how a frontend retries.)
+ *     NO reset of search or jump. (On a BUILDING sort the identical request is
+ *     likewise a no-op: the pass already running is the one that was asked
+ *     for. On a PARKED or FAILED sort the identical request RE-RUNS the pass;
+ *     that is how a frontend retries.)
  *
  * ---- 5. SORTED COORDINATES (what every accessor means) --------------------
- * While a sort is ACTIVE the document presents its rows in SORTED order, and
- * ALL row-addressing accessors reinterpret their row arguments AND results in
- * these SORTED coordinates — composing with a filter, whose row SET they use:
+ * While a sort is PRESENTED — that is, in BOTH LS_SORT_BUILDING and
+ * LS_SORT_ACTIVE, and in LS_SORT_PARKED, which is a frozen build — the document
+ * presents its rows in SORTED order, and ALL row-addressing accessors
+ * reinterpret their row arguments AND results in these SORTED coordinates —
+ * composing with a filter, whose row SET they use. The only difference between
+ * the states is HOW MANY rows are servable (section 4): the converging prefix
+ * while building, the whole view once active.
  *     * ls_window_set / ls_cell / ls_cell_truncated / ls_row_oversized /
  *       ls_cell_copy / ls_window_match_flags / the ls_copy_open rect — address
  *       and serve the rows of the (filtered) row set in sort order. Every cell
  *       rule is unchanged (quoting, truncate/pad, the display cap and its flag,
  *       the copy-output neutralization).
  *     * ls_source_row(doc, i) — the ORIGINAL data-row number of sorted row i
- *       (the gutter value): an O(1) permutation lookup for servable rows,
- *       LS_NO_ROW otherwise. The gutter therefore keeps showing SOURCE numbers,
- *       which is why jump keeps taking them.
+ *       (the gutter value): an O(1) lookup for servable rows — the prefix
+ *       structure while building, the permutation once active — and LS_NO_ROW
+ *       otherwise. The gutter therefore keeps showing SOURCE numbers, which is
+ *       why jump keeps taking them.
  *     * ls_row_count_get — UNCHANGED. A sort does not change the row set, so it
  *       still reports m (the filtered count, or all data rows). After the key
- *       pass it is exact, because the pass reached EOF.
+ *       pass it is exact, because the pass reached EOF. NOTE that while
+ *       building it can exceed the number of SERVABLE rows — exactly as it
+ *       already can while rows lie past the scan frontier.
  *     * ls_jump_* — target_row stays an ORIGINAL data-row number (see JUMP).
  *     * ls_search_* — anchors and found_row are SORTED positions (see FIND).
  *   The effective HEADER record is not a data row and is UNAFFECTED, exactly as
@@ -2838,6 +2905,19 @@ void ls_copy_close(ls_copy_job *job);
  *   then mapped: under a filter the target resolves to the first MATCHING
  *   source row >= target_row, and a target at/past EOF clamps to the last
  *   (matching) source row; 0 for a view with no rows.
+ *
+ *   A JUMP ISSUED WHILE THE SORT IS BUILDING DOES NOT CONVERGE. There is no
+ *   honest partial answer — the sorted position of one arbitrary source row is
+ *   not knowable from a prefix — so the jump reports LS_JUMP_SCANNING with
+ *   pollable progress and completes only when the sort reaches LS_SORT_ACTIVE
+ *   (the deliberate scope guard: only BROWSING converges; jump and find wait).
+ *   If that jump's own scan takes the slot the build PARKS (section 8), and
+ *   then: under LS_INDEX_AUTO the build resumes on its own and BOTH converge;
+ *   under LS_INDEX_MANUAL both stay parked — the jump keeps reporting
+ *   LS_JUMP_SCANNING with frozen progress and the sort LS_SORT_PARKED — until
+ *   an ls_sort_set re-drives the pass. That is MANUAL's documented
+ *   advance-only-while-driven semantics, observable through both polls and
+ *   never a silent stall; interactive frontends run AUTO.
  *
  * ---- 7. FIND UNDER A SORT -------------------------------------------------
  *   ls_search_* operates entirely in SORTED coordinates: ls_search_nav anchors
@@ -2865,14 +2945,15 @@ void ls_copy_close(ls_copy_job *job);
  *       mode kept — and the key pass will complete those counts anyway), and
  *       any active search is RESET (see RESET).
  *     * An ls_jump_start / ls_search_start / ls_search_nav that must SCAN takes
- *       the slot from a building key pass: the sort goes LS_SORT_PARKED, its
- *       progress frozen, the REQUEST kept, and the view still unsorted (or
- *       still in the old order). LS_SORT_PARKED is the sort analog of
- *       LS_FILTER_CANCELLED and is likewise NOT a user cancellation — but note
- *       the difference: a cancelled FILTER still serves its (partial) view,
- *       whereas a parked SORT serves no sorted view at all. It is named PARKED
- *       rather than CANCELLED for exactly that reason (the signed design's
- *       "cancelled" state).
+ *       the slot from a building key pass: the sort goes LS_SORT_PARKED with
+ *       its progress frozen, its REQUEST kept, and its CONVERGING PREFIX frozen
+ *       at the content it had converged to — still served, still exact for the
+ *       region scanned so far, simply no longer refining. LS_SORT_PARKED is the
+ *       sort analog of LS_FILTER_CANCELLED and is likewise NOT a user
+ *       cancellation (ls_sort_clear yields LS_SORT_IDLE, not this): it is a
+ *       partial result, and a frontend keeps showing it under the progress
+ *       affordance. It is named PARKED rather than CANCELLED so no one reads it
+ *       as the user's doing (it is the signed design's "cancelled" state).
  *     * Under LS_INDEX_AUTO on a LOCAL document the key pass is a background
  *       view-completion job: from LS_SORT_PARKED it RESUMES on its own and
  *       converges to LS_SORT_ACTIVE without further caller input, whatever
@@ -2890,11 +2971,14 @@ void ls_copy_close(ls_copy_job *job);
  *   These calls INVALIDATE a built or building permutation, and the sort
  *   request PERSISTS and re-runs the pass automatically (progress + cancel; on
  *   a network document that is another full fetch):
- *     * ls_filter_set and ls_filter_clear (the row SET changed — while the
- *       rebuild runs the view serves the NEW row set in SOURCE order);
+ *     * ls_filter_set and ls_filter_clear (the row SET changed);
  *     * ls_column_override_set / ls_column_override_clear on the SORT COLUMN;
  *     * ls_column_null_sentinel_set / ls_column_null_sentinel_clear on the SORT
  *       COLUMN.
+ *   A rebuild PRESENTS LIKE ANY BUILD (section 4): the poll re-enters
+ *   LS_SORT_BUILDING and the view immediately serves the REBUILD's converging
+ *   prefix over the new row set / new key — it does not fall back to file
+ *   order for the duration.
  *   Nothing else does. In particular a background INFERENCE publication or an
  *   accepted proposal does NOT re-order a built sort: the effective type and
  *   null policy are captured at ls_sort_set, so the order a user is looking at
@@ -2915,10 +2999,21 @@ void ls_copy_close(ls_copy_job *job);
  *   A key pass that cannot finish because ephemeral temp storage failed (disk
  *   full, create/write/read error) or because an allocation failed ends
  *   LS_SORT_FAILED at a consistent point, with ls_sort_status.error saying
- *   which. The view is UNCHANGED (the previous order is still served), the
- *   request is retained so the frontend can render it and retry with an
- *   identical ls_sort_set, no temp file or thread is leaked, and NO partially
- *   sorted view is ever served. There is no partial-success state.
+ *   which. The view then RETURNS TO ITS PRE-SORT ORDER — file order within the
+ *   current view (the filtered row set if a filter is active) — and is FULLY
+ *   SERVABLE again: no stale converging prefix is left on screen, and nothing
+ *   partial is ever presented as an order. The request is RETAINED so the
+ *   frontend can render it and retry with an identical ls_sort_set, and no temp
+ *   file or thread is leaked. There is no partial-success state.
+ *
+ *   WHY FILE ORDER AND NOT "THE PREVIOUS SORT": by section 4 a new ls_sort_set
+ *   ABANDONS the old order the instant it starts (the view is already showing
+ *   the new request's converging prefix), so at failure time there is no
+ *   previous sorted order still being served. Retaining one would mean keeping
+ *   a second permutation on temp disk for the whole build, doubling the
+ *   retained-bytes-per-row bound for a case that is already an error path.
+ *   ls_sort_clear (cancel) restores the same file order, and additionally
+ *   drops the request (LS_SORT_IDLE).
  *
  * ---- 12. LAZINESS ---------------------------------------------------------
  *   The sort machinery costs NOTHING until the first ls_sort_set on a document:
@@ -2950,22 +3045,26 @@ typedef enum ls_sort_state {
     /* No sort: the document's rows are in file order (within the current view).
      * The whole snapshot is zero. */
     LS_SORT_IDLE = 0,
-    /* A sort is requested and its key pass is advancing. The view is NOT yet
-     * sorted (see THE FLIP). */
+    /* A sort is requested and its key pass is advancing. The view ALREADY
+     * speaks sorted coordinates and serves the CONVERGING PREFIX — the exact
+     * sorted top of the region scanned so far, refining live (see THE
+     * CONVERGING PREFIX). Rows past the prefix are not yet servable. */
     LS_SORT_BUILDING = 1,
     /* A sort is active: the view IS sorted, progress is exactly 1.0, and every
      * row accessor speaks sorted coordinates. */
     LS_SORT_ACTIVE = 2,
     /* A sort is requested but its key pass stopped before EOF because a
      * jump/find took the single scan slot. Progress is frozen, the request is
-     * kept, and the view is UNSORTED (or still in the previous order) — no
-     * partial sort is ever served. NOT a user cancellation (ls_sort_clear
-     * yields LS_SORT_IDLE, not this): the analog of LS_FILTER_CANCELLED. Under
-     * LS_INDEX_AUTO on a local document it resumes and converges to
-     * LS_SORT_ACTIVE on its own; otherwise another ls_sort_set re-drives it. */
+     * kept, and the CONVERGING PREFIX is frozen at the content it had reached —
+     * still served, still exact for the region scanned so far, simply no longer
+     * refining. NOT a user cancellation (ls_sort_clear yields LS_SORT_IDLE, not
+     * this): the analog of LS_FILTER_CANCELLED. Under LS_INDEX_AUTO on a local
+     * document it resumes and converges to LS_SORT_ACTIVE on its own;
+     * otherwise another ls_sort_set re-drives it. */
     LS_SORT_PARKED = 3,
-    /* The key pass failed (see `error`). The view is unchanged, the request is
-     * retained, nothing leaked. An identical ls_sort_set retries. */
+    /* The key pass failed (see `error`). The view is RESTORED to its pre-sort
+     * file order and fully servable, the request is retained, nothing leaked.
+     * An identical ls_sort_set retries. */
     LS_SORT_FAILED = 4,
 } ls_sort_state;
 
@@ -3012,19 +3111,25 @@ typedef struct ls_sort_status {
  *   current view / search / jump / filter all untouched) — when
  *   `column >= ls_column_count(doc)` or `direction` is outside its enum domain.
  *
- *   returns true — one of three things happened:
- *     - NO-OP: the sort was already LS_SORT_ACTIVE on this exact column AND
- *       direction. Nothing at all changed (search and jump are NOT reset).
+ *   returns true — one of four things happened:
+ *     - NO-OP: the sort was already LS_SORT_ACTIVE or LS_SORT_BUILDING on this
+ *       exact column AND direction. Nothing at all changed (search and jump are
+ *       NOT reset), and a running pass keeps running.
  *     - INSTANT FLIP: the sort was LS_SORT_ACTIVE on this column in the OTHER
  *       direction. The view is already re-ordered when this call returns, the
  *       poll never left LS_SORT_ACTIVE, and no scan ran. Search and jump ARE
  *       reset (the coordinate space changed).
+ *     - BUILDING FLIP: the sort was LS_SORT_BUILDING on this column in the
+ *       OTHER direction. The pass KEEPS RUNNING (no source re-scan, progress
+ *       still monotone) and the converging prefix re-converges to the new
+ *       direction. Search and jump ARE reset.
  *     - BUILD: otherwise the KEY PASS starts, taking the single scan slot
  *       (cancelling a scanning jump, yielding a running filter-scan, resetting
  *       any search). The call NEVER blocks; observe it with ls_sort_poll
  *       (LS_SORT_BUILDING, or already LS_SORT_ACTIVE for a document with
- *       nothing to scan). The view keeps its CURRENT order until the pass
- *       completes.
+ *       nothing to scan). The view flips into SORTED coordinates IMMEDIATELY
+ *       and serves the converging prefix from the first scanned block onward
+ *       (see THE CONVERGING PREFIX) — it does NOT keep its previous order.
  *
  * ON A NETWORK DOCUMENT this call is an explicit demand to fetch the whole
  * resource (amendment (d) above): the pass drives the transfer to EOF with
@@ -3037,11 +3142,12 @@ typedef struct ls_sort_status {
 bool ls_sort_set(ls_doc *doc, uint32_t column, ls_sort_direction direction);
 
 /*
- * Remove the sort, restoring FILE ORDER within the current view (no-op when
- * ls_sort_poll already reports LS_SORT_IDLE). This is ALSO the cancel verb: a
- * running key pass is stopped and its request dropped, with all frontier gains
- * KEPT, and the view is left exactly as it was (a building sort was never
- * serving anything new, and an active one reverts to file order). Afterwards
+ * Remove the sort, restoring FILE ORDER within the current view — the filtered
+ * row set if a filter is active (no-op when ls_sort_poll already reports
+ * LS_SORT_IDLE). This is ALSO the cancel verb: a running key pass is stopped
+ * and its request dropped, with all frontier gains KEPT. Either way the view
+ * RETURNS TO ITS PRE-SORT ORDER and is fully servable again — a cancelled
+ * build's converging prefix is gone, not frozen on screen. Afterwards
  * ls_sort_poll reports LS_SORT_IDLE.
  *
  * Clearing RESETS any active search to LS_SEARCH_IDLE and returns the jump slot

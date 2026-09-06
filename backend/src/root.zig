@@ -417,6 +417,22 @@ pub fn sortResidentReset(doc: *api.Doc) void {
     sort.residentReset(d);
 }
 
+/// See contracts/api.zig `sortPrefixRows` (THE resolver for the prefix depth).
+pub fn sortPrefixRows(doc: *const api.Doc) u64 {
+    return sort.prefixRows(asDoc(doc));
+}
+
+/// See contracts/api.zig `sortScannedRows`.
+pub fn sortScannedRows(doc: *const api.Doc) u64 {
+    return sort.scannedRows(asDoc(doc));
+}
+
+/// See contracts/api.zig `sortPauseAfterRows`.
+pub fn sortPauseAfterRows(doc: *api.Doc, rows: u64) void {
+    const d: *Document = @ptrCast(@alignCast(doc));
+    sort.pauseAfterRows(d, rows);
+}
+
 /// See contracts/api.zig `tempSpillDirSetForTest` -- the process-wide override
 /// of THE ONE ephemeral-temp resolver (src/tempdir.zig).
 pub fn tempSpillDirSetForTest(dir: ?[]const u8) void {

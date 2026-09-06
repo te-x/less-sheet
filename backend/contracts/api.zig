@@ -1659,9 +1659,14 @@ comptime {
 // Planner-owned; amended only together with the C header.
 //
 // The full normative model is in api/lesssheet.h (the comparator's total order,
-// the key pass, the flip-only-at-ACTIVE rule, sorted coordinates, jump/find
-// under a sort, the four-way scan slot, rebuild triggers, RESET, failure, and
-// laziness). Implementation obligations this contract adds on top:
+// the key pass, THE CONVERGING PREFIX, sorted coordinates, jump/find under a
+// sort, the four-way scan slot, rebuild triggers, RESET, failure, and
+// laziness). AMENDMENT 1 (converging sorted prefix; author-signed 2026-09-06)
+// replaced the original flip-at-ACTIVE serving rule: the view speaks sorted
+// coordinates from the instant `ls_sort_set` returns and serves the exact
+// sorted top of the scanned region while the pass runs. No type, signature, or
+// layout below changed for it. Implementation obligations this contract adds
+// on top:
 //   - `ls_sort_set` is the ONLY new call that may allocate, and what it may
 //     allocate is bounded by the CHUNK KNOB below, never by the row count.
 //     `ls_sort_clear` / `ls_sort_poll` perform ZERO allocator calls and never
@@ -1671,7 +1676,11 @@ comptime {
 //     allocator (`openWithAllocator`), so the frozen tests can count it and
 //     detect leaks; every temp file it creates is deleted by `ls_close`.
 //   - The permutation and the inverse mapping live on EPHEMERAL TEMP STORAGE,
-//     never in an O(rows) in-process array.
+//     never in an O(rows) in-process array. The converging prefix is served
+//     from ONE bounded top-K structure (K == `window_max_rows`), the only RAM
+//     the immediacy costs and independent of the row count.
+//   - Cancel (`ls_sort_clear`) and `.failed` both return the view to its
+//     PRE-SORT file order, fully servable — never a frozen partial prefix.
 // ===========================================================================
 
 /// Mirrors `ls_sort_direction`. Descending is the ascending permutation read
@@ -1682,11 +1691,14 @@ pub const SortDirection = enum(c_int) {
 };
 
 /// Mirrors `ls_sort_state`. `idle` == no sort (the whole snapshot is zero);
-/// `building` == the key pass is advancing and the view is NOT yet re-ordered;
-/// `active` == the view IS sorted; `parked` == the pass yielded the single scan
-/// slot (request kept, progress frozen, NO partial sort served — the analog of
-/// `FilterState.cancelled`, and never a user cancellation); `failed` == the
-/// pass could not finish (see `SortError`), view unchanged.
+/// `building` == the key pass is advancing and the view ALREADY serves the
+/// CONVERGING PREFIX (the exact sorted top of the region scanned so far,
+/// refining live; rows past it are not yet servable); `active` == the whole
+/// view is sorted and stable; `parked` == the pass yielded the single scan slot
+/// (request kept, progress frozen, prefix frozen at its converged content and
+/// still served — the analog of `FilterState.cancelled`, and never a user
+/// cancellation); `failed` == the pass could not finish (see `SortError`) and
+/// the view is RESTORED to its pre-sort file order.
 pub const SortState = enum(c_int) {
     idle = 0,
     building = 1,
@@ -1792,10 +1804,39 @@ pub const sortTempFailAfter = core.sortTempFailAfter;
 /// the default). The pass must end `.failed` with `.memory`, not abort.
 pub const sortAllocFailAfter = core.sortAllocFailAfter;
 
+// --- The ONE prefix-depth resolver (ARCH-sort-by-column Amendment 1) --------
+// K is NOT a new constant: it IS `window_max_rows` (LS_WINDOW_MAX_ROWS, 4096),
+// because that is exactly how deep a caller can address in one window. This
+// resolver is the single place that says so; every consumer (the prefix
+// structure's capacity, the servable-range clamp, the frozen tests below) reads
+// THIS, never a literal 4096. A second hard-coded copy is a review finding —
+// the `srt_prefix_cap` test reads the resolver rather than a literal precisely
+// so the gate follows the resolver wherever it goes.
+
+/// THE RESOLVER: how many view rows a BUILDING sort can serve at most.
+pub const sortPrefixRows = core.sortPrefixRows;
+
+/// TEST-ONLY (Zig; NOT the C ABI): data rows the CURRENT key pass has scanned so
+/// far (0 when no pass has run on this document). Paired with
+/// `sortPauseAfterRows`, this is what makes the AC-s16(a) prefix-oracle family
+/// DETERMINISTIC rather than a race: a test parks the pass at a known n and
+/// compares the served prefix against an oracle's sorted top of exactly those n
+/// rows.
+pub const sortScannedRows = core.sortScannedRows;
+
+/// TEST-ONLY (Zig; NOT the C ABI): make the key pass stop advancing once it has
+/// scanned `rows` data rows, and WAIT there (state stays `.building`, progress
+/// frozen) until the limit is raised again. `std.math.maxInt(u64)` (the default)
+/// means no limit. Modelled on the network fixture's `withhold` gate: the test
+/// owns when the scan advances, so "the prefix after n rows" is an exact,
+/// reproducible statement instead of a timing accident.
+pub const sortPauseAfterRows = core.sortPauseAfterRows;
+
 /// AC-s9: PEAK sort-owned RESIDENT bytes since the last `sortResidentReset` —
 /// the key chunk plus the merge read-buffers plus the pass's own state. The
-/// bound is `2 * sortChunkBytes(doc)`, and it must be INDEPENDENT of the row
-/// count (that independence, not the absolute number, is the O(rows) lock).
+/// bound is `2 * sortChunkBytes(doc)` plus the O(K) prefix structure, and it
+/// must be INDEPENDENT of the row count (that independence, not the absolute
+/// number, is the O(rows) lock).
 /// Deliberately a core-owned counter rather than process RSS: RSS is not
 /// deterministic enough to gate on, and the allocator's own arenas are not the
 /// thing under test.
@@ -1857,6 +1898,12 @@ comptime {
         @compileError("signature drift: sortResidentBytes");
     if (@TypeOf(core.sortResidentReset) != fn (*Doc) void)
         @compileError("signature drift: sortResidentReset");
+    if (@TypeOf(core.sortPrefixRows) != fn (*const Doc) u64)
+        @compileError("signature drift: sortPrefixRows");
+    if (@TypeOf(core.sortScannedRows) != fn (*const Doc) u64)
+        @compileError("signature drift: sortScannedRows");
+    if (@TypeOf(core.sortPauseAfterRows) != fn (*Doc, u64) void)
+        @compileError("signature drift: sortPauseAfterRows");
     if (@TypeOf(core.tempSpillDirSetForTest) != fn (?[]const u8) void)
         @compileError("signature drift: tempSpillDirSetForTest");
 }

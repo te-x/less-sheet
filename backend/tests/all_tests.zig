@@ -12044,11 +12044,12 @@ test "eofcap_controls: the honesty assertions are SATISFIABLE and the fixtures a
 //                                       srt_numeric_order, srt_numeric_oracle,
 //                                       srt_temporal_boolean_order,
 //                                       srt_groups_and_nulls               [RED]
-//   AC-s2  descending ................. srt_descending_is_reversed         [RED]
+//   AC-s2  descending + flips ......... srt_descending_is_reversed,
+//                                       srt_flip_while_building            [RED]
 //   AC-s3  sorted coordinates ......... srt_coordinates                    [RED]
 //   AC-s4  filter composition ......... srt_filter_composition             [RED]
 //   AC-s5  find in a sorted view ...... srt_find_sorted                    [RED]
-//   AC-s6  flip only at DONE / rebuild  srt_flip_only_at_done,
+//   AC-s6  converging presentation .... srt_converging_presentation,
 //                                       srt_rebuild_triggers,
 //                                       srt_noop_and_reset                 [RED]
 //   AC-s7  failure + cancel ........... srt_failure_modes, srt_clear_cancels [RED]
@@ -12062,14 +12063,30 @@ test "eofcap_controls: the honesty assertions are SATISFIABLE and the fixtures a
 //   AC-s13 fuzz / hostile input ....... srt_corpus_hostile_sweep           [RED]
 //                                       (+ the out-of-gate tools/fuzz entry,
 //                                        srt_measurement_obligations)
+//   AC-s16 converging prefix .......... srt_prefix_oracle, srt_prefix_cap   [RED]
+//          (b) 100 ms first window .... srt_measurement_obligations         [RM]
 //   validation / ABI shape ............ srt_reject, srt_abi              [GUARD]
+//
+// AMENDMENT 1 (converging sorted prefix; author-signed 2026-09-06). The view
+// speaks SORTED coordinates from the instant ls_sort_set returns and serves the
+// exact sorted top of the region scanned so far, refining live; cancel and
+// failure return it to its PRE-SORT file order. The tests that encoded the
+// superseded flip-at-ACTIVE rule were re-authored, not layered over: what was
+// `srt_flip_only_at_done` (which asserted the view stays UNSORTED while
+// building) is now `srt_converging_presentation`, which asserts the opposite.
+//
+// DETERMINISM FOR THE PREFIX FAMILY. "The prefix after n scanned rows" is only
+// a testable statement if the test owns n. `sortPauseAfterRows` parks the pass
+// at a known row count and `sortScannedRows` says when it has arrived (the
+// network fixture's `withhold` gate, applied to the sort), so the AC-s16(a)
+// oracle comparisons are exact and reproducible rather than timing accidents.
 //
 // RED SEED (src/sort.zig): request validation and the poll snapshot are real,
 // so every rejection/laziness/ABI GUARD is green from the start — but a valid
 // ls_sort_set starts NO key pass and the poll stays LS_SORT_IDLE, so
 // `waitSortActive` returns error.SortNotStarted (mirroring waitFilterDone over
 // the column-config seed) and every ordering, coordinate, composition, slot,
-// bound, and failure assertion FAILS instead of hanging.
+// bound, prefix, and failure assertion FAILS instead of hanging.
 //
 // WHY AN ORACLE AND NOT ONLY GOLDEN ARRAYS. ARCH AC-s1 asks for "the reference
 // order computed by an independent oracle". Two of the tests below generate a
@@ -12138,6 +12155,41 @@ fn sortOverrideDatetime(doc: *api.Doc, col: u32, semantics: api.ColumnDatetimeSe
     t.kind = .datetime;
     t.datetime_semantics = semantics;
     try std.testing.expectEqual(api.ColumnResult.ok, api.ls_column_override_set(doc, col, &t));
+}
+
+/// Poll until the pass has scanned exactly `rows` data rows AND is parked there
+/// by `sortPauseAfterRows` (state still BUILDING). Errors on IDLE for the same
+/// fail-fast reason as `waitSortActive`, and on a pass that ran past the limit.
+fn waitSortPausedAt(doc: *api.Doc, rows: u64) !void {
+    const io = std.testing.io;
+    const t0: std.Io.Clock.Timestamp = .now(io, .awake);
+    while (true) {
+        const s = api.ls_sort_poll(doc);
+        if (s.state == .idle) return error.SortNotStarted;
+        if (s.state == .failed) return error.SortFailed;
+        const n = api.sortScannedRows(doc);
+        if (n > rows) return error.SortRanPastThePause;
+        if (n == rows and s.state == .building) return;
+        if (s.state == .active) return error.SortFinishedBeforeThePause;
+        if (elapsedMs(t0) > 15_000) return error.SortTimeout;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+}
+
+/// The view's source-row sequence for the first `n` rows, plus the servable
+/// count: `out[0..count]` are the gutter values and `count` is where
+/// `ls_source_row` starts answering LS_NO_ROW. This is how the converging
+/// prefix is read — the servable region is a PREFIX, so its length is itself an
+/// assertion.
+fn viewPrefix(doc: *api.Doc, buf: []u64) usize {
+    _ = api.ls_window_set(doc, 0, @intCast(@min(buf.len, api.window_max_rows)));
+    var count: usize = 0;
+    while (count < buf.len) : (count += 1) {
+        const sr = api.ls_source_row(doc, @intCast(count));
+        if (sr == api.no_row) break;
+        buf[count] = sr;
+    }
+    return count;
 }
 
 /// Sort by `col` in `dir`, wait for ACTIVE, and assert the view's source-row
@@ -12566,32 +12618,209 @@ fn srtBigDoc(gpa: std.mem.Allocator, rows: usize) ![]u8 {
 /// gap between the two calls), rather than a race the gate would flake on.
 const srt_big_rows: usize = 300_000;
 
-test "srt_flip_only_at_done: a building sort serves the OLD order, never a partial one" {
+test "srt_converging_presentation: the view is sorted IMMEDIATELY and serves the exact top of what has been scanned" {
     const gpa = std.testing.allocator;
     const body = try srtBigDoc(gpa, srt_big_rows);
     defer gpa.free(body);
     var od = try openWith(body, .{ .separator = ',', .header = api.header_off, .index_mode = api.index_manual });
     defer od.deinit();
-    // Column 0 ascends with source order, so sort it DESCENDING: any partial
-    // publication would be instantly visible as a non-source, non-reversed order.
+    // Column 0 ascends with source order, so DESCENDING makes every claim below
+    // discriminating: the old flip-at-ACTIVE behavior serves source row 0 at the
+    // top while building, the converging prefix serves the LARGEST scanned row.
+    const paused: u64 = 5_000;
+    api.sortPauseAfterRows(od.doc, paused);
     try setSort(od.doc, 0, .descending);
-    var saw_building = false;
-    while (true) {
-        const s = api.ls_sort_poll(od.doc);
-        if (s.state == .active) break;
-        if (s.state == .idle) return error.SortNotStarted;
-        saw_building = true;
-        // While BUILDING the view is still the identity view, exactly.
-        _ = api.ls_window_set(od.doc, 0, 4);
-        try std.testing.expectEqual(@as(u64, 0), api.ls_source_row(od.doc, 0));
-        try std.testing.expectEqual(@as(u64, 1), api.ls_source_row(od.doc, 1));
-        try std.testing.expect(s.progress >= 0.0 and s.progress <= 1.0);
-    }
-    try std.testing.expectEqual(true, saw_building);
-    // At ACTIVE — and only then — the order flips.
+    try waitSortPausedAt(od.doc, paused);
+
+    const s = api.ls_sort_poll(od.doc);
+    try std.testing.expectEqual(api.SortState.building, s.state);
+    try std.testing.expect(s.progress >= 0.0 and s.progress < 1.0); // not final yet
+    // SORTED COORDINATES ALREADY: the top of the view is the greatest key among
+    // the 5000 rows scanned so far, not source row 0.
+    _ = api.ls_window_set(od.doc, 0, 4);
+    try std.testing.expectEqual(@as(u64, paused - 1), api.ls_source_row(od.doc, 0));
+    try std.testing.expectEqual(@as(u64, paused - 2), api.ls_source_row(od.doc, 1));
+    // ... and the servable region stops at the prefix depth K, even though 5000
+    // rows have been scanned and the row count reports far more.
+    const k = api.sortPrefixRows(od.doc);
+    try std.testing.expectEqual(api.window_max_rows, k); // K IS the window max
+    try std.testing.expectEqual(@as(u64, 0), api.ls_window_set(od.doc, k, 16).row_count);
+    try std.testing.expect(api.ls_row_count_get(od.doc).count > k);
+    // Releasing the pause lets the SAME pass run on to the full, stable order
+    // (raising the limit resumes it — no re-request is needed, and an identical
+    // ls_sort_set on a building sort is a no-op by contract).
+    api.sortPauseAfterRows(od.doc, std.math.maxInt(u64));
+    _ = try waitSortActive(od.doc);
     _ = api.ls_window_set(od.doc, 0, 4);
     try std.testing.expectEqual(@as(u64, srt_big_rows - 1), api.ls_source_row(od.doc, 0));
     try std.testing.expectEqual(@as(f64, 1.0), api.ls_sort_poll(od.doc).progress);
+}
+
+// --- AC-s16(a) the converging prefix is EXACT, against an in-test oracle ----
+
+/// n rows of "{key:0>6},{tag}\n" where key = (i * 7919) % 1_000_000 — a
+/// bijection for i < 1_000_000, so every key is distinct and the sorted order is
+/// a genuine scramble of source order (source row i is NOT near sorted position
+/// i, which is what makes a prefix claim discriminating). `tag` is "y" on every
+/// third row, so a filter can halve the row set without touching the key column.
+fn genScrambledRows(gpa: std.mem.Allocator, n: usize) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(gpa);
+    var line: [32]u8 = undefined;
+    for (0..n) |i| {
+        const key = (i * 7919) % 1_000_000;
+        const tag: []const u8 = if (i % 3 == 0) "y" else "n";
+        const t = try std.fmt.bufPrint(&line, "{d:0>6},{s}\n", .{ key, tag });
+        try buf.appendSlice(gpa, t);
+    }
+    return buf.toOwnedSlice(gpa);
+}
+
+fn scrambledKey(i: usize) usize {
+    return (i * 7919) % 1_000_000;
+}
+
+const PrefixRow = struct { key: usize, source: u64 };
+
+fn prefixAsc(_: void, x: PrefixRow, y: PrefixRow) bool {
+    if (x.key != y.key) return x.key < y.key;
+    return x.source < y.source;
+}
+
+/// The descending prefix is the K GREATEST rows of the scanned region — NOT the
+/// K smallest reversed. Equivalently (and this is the form the header pins):
+/// sort the whole scanned region ascending, read it backwards, take K. That
+/// makes the tie rule REVERSE source order, matching "descending is the
+/// ascending permutation read backwards". The keys in this fixture are
+/// distinct, so no tie is exercised here — AC-s2 covers ties — but the helper
+/// states the contract's rule rather than a convenient one.
+fn prefixDesc(_: void, x: PrefixRow, y: PrefixRow) bool {
+    if (x.key != y.key) return x.key > y.key;
+    return x.source > y.source;
+}
+
+/// The oracle: the sorted top of the FIRST `n` source rows (optionally only the
+/// filter-matching ones), truncated to `k`. Caller frees.
+fn oraclePrefix(gpa: std.mem.Allocator, n: usize, k: usize, desc: bool, only_tagged: bool) ![]u64 {
+    var rows: std.ArrayList(PrefixRow) = .empty;
+    defer rows.deinit(gpa);
+    for (0..n) |i| {
+        if (only_tagged and i % 3 != 0) continue;
+        try rows.append(gpa, .{ .key = scrambledKey(i), .source = @intCast(i) });
+    }
+    if (desc) std.mem.sort(PrefixRow, rows.items, {}, prefixDesc) else std.mem.sort(PrefixRow, rows.items, {}, prefixAsc);
+    const take = @min(k, rows.items.len);
+    const out = try gpa.alloc(u64, take);
+    for (0..take) |i| out[i] = rows.items[i].source;
+    return out;
+}
+
+test "srt_prefix_oracle: after n scanned rows the view IS the exact sorted top of those n rows" {
+    const gpa = std.testing.allocator;
+    const rows: usize = 20_000;
+    const body = try genScrambledRows(gpa, rows);
+    defer gpa.free(body);
+
+    // Four pause points across two directions and both view kinds. Each arm is a
+    // fresh document so the pass starts from row 0 with nothing carried over.
+    inline for (.{ false, true }) |filtered| {
+        inline for (.{ api.SortDirection.ascending, api.SortDirection.descending }) |dir| {
+            for ([_]u64{ 1, 9, 500, 7_000 }) |n| {
+                var od = try openWith(body, .{ .separator = ',', .header = api.header_off, .index_mode = api.index_manual });
+                defer od.deinit();
+                if (filtered) try setFilter(od.doc, predReqCase(1, .eq, "y", false));
+                api.sortPauseAfterRows(od.doc, n);
+                try setSort(od.doc, 0, dir);
+                try waitSortPausedAt(od.doc, n);
+
+                const k: usize = @intCast(api.sortPrefixRows(od.doc));
+                const want = try oraclePrefix(gpa, @intCast(n), k, dir == .descending, filtered);
+                defer gpa.free(want);
+
+                var buf: [4200]u64 = undefined;
+                const got = viewPrefix(od.doc, buf[0..@min(buf.len, want.len + 8)]);
+                // EXACTLY min(K, matching rows among those n) rows are servable,
+                // and they are the oracle's sorted top of exactly those n rows.
+                try std.testing.expectEqual(want.len, got);
+                try std.testing.expectEqualSlices(u64, want, buf[0..got]);
+                // The first row past the prefix is not yet servable.
+                try std.testing.expectEqual(api.no_row, api.ls_source_row(od.doc, @intCast(got)));
+            }
+        }
+    }
+}
+
+test "srt_prefix_cap: the servable prefix stops at K == LS_WINDOW_MAX_ROWS, however much has been scanned" {
+    const gpa = std.testing.allocator;
+    const rows: usize = 12_000;
+    const body = try genScrambledRows(gpa, rows);
+    defer gpa.free(body);
+    var od = try openWith(body, .{ .separator = ',', .header = api.header_off, .index_mode = api.index_manual });
+    defer od.deinit();
+    // THE ONE RESOLVER: K is not a second constant, it IS the window maximum.
+    const k = api.sortPrefixRows(od.doc);
+    try std.testing.expectEqual(api.window_max_rows, k);
+
+    api.sortPauseAfterRows(od.doc, 10_000); // far more scanned than K
+    try setSort(od.doc, 0, .ascending);
+    try waitSortPausedAt(od.doc, 10_000);
+    // A window that straddles the cap is truncated AT the cap -- the
+    // discriminating shape: an uncapped implementation would serve 4096 rows
+    // here, a capped one exactly the 96 that remain below K.
+    const straddle = api.ls_window_set(od.doc, k - 96, api.window_max_rows);
+    try std.testing.expectEqual(@as(u64, 96), straddle.row_count);
+    try std.testing.expect(api.ls_source_row(od.doc, k - 1) != api.no_row);
+    try std.testing.expectEqual(@as(u64, 0), api.ls_window_set(od.doc, k, 8).row_count);
+    // Once ACTIVE the cap is gone: the whole view is addressable.
+    api.sortPauseAfterRows(od.doc, std.math.maxInt(u64));
+    _ = try waitSortActive(od.doc);
+    try std.testing.expectEqual(@as(u64, 8), api.ls_window_set(od.doc, rows - 8, 64).row_count);
+}
+
+test "srt_flip_while_building: a direction flip mid-pass re-converges the prefix without re-scanning" {
+    const gpa = std.testing.allocator;
+    const rows: usize = 20_000;
+    const body = try genScrambledRows(gpa, rows);
+    defer gpa.free(body);
+    var od = try openWith(body, .{ .separator = ',', .header = api.header_off, .index_mode = api.index_manual });
+    defer od.deinit();
+    const n: u64 = 1_000;
+    api.sortPauseAfterRows(od.doc, n);
+    try setSort(od.doc, 0, .ascending);
+    try waitSortPausedAt(od.doc, n);
+    const before = api.ls_sort_poll(od.doc).progress;
+
+    const k: usize = @intCast(api.sortPrefixRows(od.doc));
+    var buf: [4200]u64 = undefined;
+    const asc = try oraclePrefix(gpa, @intCast(n), k, false, false);
+    defer gpa.free(asc);
+    try std.testing.expectEqual(asc.len, viewPrefix(od.doc, buf[0 .. asc.len + 8]));
+    try std.testing.expectEqualSlices(u64, asc, buf[0..asc.len]);
+
+    // FLIP mid-pass. The run artifacts are direction-agnostic, so the pass keeps
+    // running: no re-scan (the scanned count does not reset), progress does not
+    // regress, and the poll stays BUILDING with the new direction.
+    try setSort(od.doc, 0, .descending);
+    const after = api.ls_sort_poll(od.doc);
+    try std.testing.expectEqual(api.SortState.building, after.state);
+    try std.testing.expectEqual(api.SortDirection.descending, after.direction);
+    try std.testing.expect(after.progress >= before);
+    try std.testing.expectEqual(n, api.sortScannedRows(od.doc));
+
+    const desc = try oraclePrefix(gpa, @intCast(n), k, true, false);
+    defer gpa.free(desc);
+    try std.testing.expectEqual(desc.len, viewPrefix(od.doc, buf[0 .. desc.len + 8]));
+    try std.testing.expectEqualSlices(u64, desc, buf[0..desc.len]);
+
+    // And the SAME pass still converges to the full descending order.
+    api.sortPauseAfterRows(od.doc, std.math.maxInt(u64));
+    _ = try waitSortActive(od.doc);
+    _ = api.ls_window_set(od.doc, 0, 4);
+    var top: usize = 0;
+    for (0..rows) |i| {
+        if (scrambledKey(i) > scrambledKey(top)) top = i;
+    }
+    try std.testing.expectEqual(@as(u64, @intCast(top)), api.ls_source_row(od.doc, 0));
 }
 
 test "srt_rebuild_triggers: a filter change and a sort-column override change each re-run the pass" {
@@ -12649,7 +12878,7 @@ test "srt_noop_and_reset: an identical re-request changes NOTHING; every real ch
 
 // --- AC-s7 graceful failure and cancel -------------------------------------
 
-test "srt_failure_modes: injected storage and allocation failure each FAIL cleanly, view unchanged" {
+test "srt_failure_modes: injected storage and allocation failure each FAIL cleanly, view restored to file order" {
     inline for (.{
         .{ api.SortError.storage, true },
         .{ api.SortError.memory, false },
@@ -12665,10 +12894,15 @@ test "srt_failure_modes: injected storage and allocation failure each FAIL clean
         try std.testing.expectEqual(arm[0], s.err);
         // The REQUEST is retained so the frontend can render and retry it ...
         try std.testing.expectEqual(@as(u32, 1), s.column);
-        // ... and the view is UNCHANGED: still the previous (name) order, still
-        // fully servable, with no partial sort anywhere.
-        try expectSourceRows(od.doc, &.{ 1, 3, 2, 0, 4 });
-        try expectCell(od.doc, 0, 0, "alpha");
+        // ... and the view is RESTORED to its PRE-SORT order — file order within
+        // the current view — and fully servable. Amendment 1: the previous sort's
+        // order is NOT what comes back, because ls_sort_set abandoned it the
+        // instant this pass started (the view was already showing the new
+        // request's converging prefix); leaving that stale prefix on screen, or
+        // keeping a second permutation alive to fall back to, are both worse than
+        // simply un-sorting. Nothing partial is ever left presented as an order.
+        try expectSourceRows(od.doc, &.{ 0, 1, 2, 3, 4 });
+        try expectCell(od.doc, 0, 0, "delta"); // source row 0
         // Nothing leaked: no temp file survives the failed pass.
         try std.testing.expectEqual(false, api.sortTempStore(od.doc).present);
         // An identical re-request RETRIES (a failed sort is not a no-op) and,
@@ -12681,21 +12915,30 @@ test "srt_failure_modes: injected storage and allocation failure each FAIL clean
     }
 }
 
-test "srt_clear_cancels: clearing mid-pass stops it, polls IDLE, and leaves the view untouched" {
+test "srt_clear_cancels: clearing mid-pass stops it, polls IDLE, and restores the pre-sort order" {
     const gpa = std.testing.allocator;
     const body = try srtBigDoc(gpa, srt_big_rows);
     defer gpa.free(body);
     var od = try openWith(body, .{ .separator = ',', .header = api.header_off, .index_mode = api.index_manual });
     defer od.deinit();
+    const paused: u64 = 5_000;
+    api.sortPauseAfterRows(od.doc, paused);
     try setSort(od.doc, 0, .descending);
-    try std.testing.expect(api.ls_sort_poll(od.doc).state != .idle); // it really started
+    try waitSortPausedAt(od.doc, paused);
+    // The converging prefix really was live and really was sorted (otherwise
+    // "restores the pre-sort order" would be vacuous).
+    _ = api.ls_window_set(od.doc, 0, 4);
+    try std.testing.expectEqual(@as(u64, paused - 1), api.ls_source_row(od.doc, 0));
+
     api.ls_sort_clear(od.doc);
     const s = api.ls_sort_poll(od.doc);
     try std.testing.expectEqual(api.SortState.idle, s.state);
     try std.testing.expectEqual(@as(f64, 0.0), s.progress);
-    // The view never changed, and no sort temp file survives the cancel.
+    // The view RETURNS to its pre-sort file order — the prefix is gone, not
+    // frozen on screen — and no sort temp file survives the cancel.
     _ = api.ls_window_set(od.doc, 0, 4);
     try std.testing.expectEqual(@as(u64, 0), api.ls_source_row(od.doc, 0));
+    try std.testing.expectEqual(@as(u64, 1), api.ls_source_row(od.doc, 1));
     try std.testing.expectEqual(false, api.sortTempStore(od.doc).present);
     // Clearing again is a no-op, and a document is closable mid-pass.
     api.ls_sort_clear(od.doc);
@@ -12848,6 +13091,7 @@ test "srt_memory_bound: build residency stays within 2x the chunk knob and does 
     const gpa = std.testing.allocator;
     const chunk: u64 = 64 * 1024;
     var peaks: [2]u64 = undefined;
+    var allowance: u64 = 0;
     inline for (.{ 2_000, 40_000 }, 0..) |rows, i| {
         const body = try srtBigDoc(gpa, rows);
         defer gpa.free(body);
@@ -12859,11 +13103,14 @@ test "srt_memory_bound: build residency stays within 2x the chunk knob and does 
         _ = try waitSortActive(od.doc);
         peaks[i] = api.sortResidentBytes(od.doc);
         try std.testing.expect(peaks[i] > 0); // RED seed: 0
-        try std.testing.expect(peaks[i] <= 2 * chunk);
+        // Amendment 1 adds ONE bounded top-K prefix structure to the build's
+        // footprint; 64 bytes per prefix row is a generous per-entry allowance.
+        allowance = 2 * chunk + 64 * api.sortPrefixRows(od.doc);
+        try std.testing.expect(peaks[i] <= allowance);
     }
-    // 20x the rows must not move the peak: the bound is the KNOB, never O(rows).
-    // (The merge read-buffers are derived from the same knob — one resolver.)
-    try std.testing.expect(peaks[1] <= 2 * chunk);
+    // 20x the rows must not move the peak: the bound is the two KNOBS (the chunk
+    // and K), never O(rows) — each read through its own single resolver.
+    try std.testing.expect(peaks[1] <= allowance);
 }
 
 // --- AC-s11 sources: gzip and network --------------------------------------
@@ -12935,6 +13182,22 @@ test "srt_network: no sort work without a demand; a sort IS the demand, and canc
         _ = api.ls_window_set(doc, 0, 4);
         try std.testing.expectEqual(@as(u64, rows - 1), api.ls_source_row(doc, 0));
     }
+    // (b2) THE PREFIX CONVERGES AS BYTES ARE FETCHED: parked at a known scan
+    //      depth, the top of a network document's sorted view is the exact top
+    //      of what has been fetched so far — the same rule as local, with no
+    //      wall-clock promise attached.
+    {
+        const doc = try openFakeToDone(&fx);
+        defer api.ls_close(doc);
+        const n: u64 = 2_000;
+        api.sortPauseAfterRows(doc, n);
+        try setSort(doc, 1, .descending);
+        try waitSortPausedAt(doc, n);
+        _ = api.ls_window_set(doc, 0, 4);
+        // Column 1 is 2*i, so the greatest scanned key is source row n-1.
+        try std.testing.expectEqual(n - 1, api.ls_source_row(doc, 0));
+        try std.testing.expectEqual(n - 2, api.ls_source_row(doc, 1));
+    }
     // (c) CANCEL mid-fetch leaves an unsorted, still-usable document.
     {
         const doc = try openFakeToDone(&fx);
@@ -12949,41 +13212,66 @@ test "srt_network: no sort work without a demand; a sort IS the demand, and canc
 
 // --- AC-s12 the single scan slot -------------------------------------------
 
-test "srt_slot_rules: sort takes the slot; a jump parks it; AUTO converges, MANUAL waits" {
+test "srt_slot_rules: sort takes the slot; a jump parks the build (prefix frozen); AUTO converges, MANUAL waits" {
     const gpa = std.testing.allocator;
     const body = try srtBigDoc(gpa, srt_big_rows);
     defer gpa.free(body);
 
-    // (a) MANUAL: a jump that must scan takes the slot -> PARKED, and it STAYS
-    //     parked until another ls_sort_set re-drives it.
+    // (a) MANUAL: a jump that must scan takes the slot -> the build PARKS with
+    //     its prefix FROZEN (still served, still exact for what was scanned),
+    //     and the jump itself does NOT resolve — a jump under a sort needs the
+    //     inverse mapping, which only exists at ACTIVE, and there is no honest
+    //     partial answer for it (the Amendment 1 scope guard: only BROWSING
+    //     converges). Under MANUAL neither moves until the caller re-drives —
+    //     the documented advance-only-while-driven semantics, observable through
+    //     BOTH polls rather than a silent stall.
     {
         var od = try openWith(body, .{ .separator = ',', .header = api.header_off, .index_mode = api.index_manual });
         defer od.deinit();
+        const paused: u64 = 5_000;
+        api.sortPauseAfterRows(od.doc, paused);
         try setSort(od.doc, 0, .descending);
+        try waitSortPausedAt(od.doc, paused);
+        api.sortPauseAfterRows(od.doc, std.math.maxInt(u64));
         api.ls_jump_start(od.doc, srt_big_rows - 1_000); // must scan: takes the slot
-        _ = try waitJumpDone(od.doc);
+        try std.testing.io.sleep(.fromMilliseconds(50), .awake);
+
         const parked = api.ls_sort_poll(od.doc);
         try std.testing.expectEqual(api.SortState.parked, parked.state);
         try std.testing.expectEqual(@as(u32, 0), parked.column); // request KEPT
         try std.testing.expectEqual(api.SortDirection.descending, parked.direction);
-        // Still parked after a wait: MANUAL never resumes on its own.
+        // The frozen prefix is STILL SERVED, in sorted coordinates.
+        _ = api.ls_window_set(od.doc, 0, 2);
+        try std.testing.expectEqual(@as(u64, paused - 1), api.ls_source_row(od.doc, 0));
+        // The jump has not landed and will not until the sort does.
+        try std.testing.expectEqual(api.JumpState.scanning, api.ls_jump_poll(od.doc).state);
+        // Still parked after another wait: MANUAL never resumes on its own.
         try std.testing.io.sleep(.fromMilliseconds(50), .awake);
         try std.testing.expectEqual(api.SortState.parked, api.ls_sort_poll(od.doc).state);
-        // Re-driving it converges.
+
+        // Re-driving the sort converges it — and, being a sort state change,
+        // returns the jump slot to idle (the RESET rule), so the caller re-issues
+        // the jump and it now lands in O(1) through the inverse mapping.
         try setSort(od.doc, 0, .descending);
         _ = try waitSortActive(od.doc);
+        try std.testing.expectEqual(api.JumpState.idle, api.ls_jump_poll(od.doc).state);
         _ = api.ls_window_set(od.doc, 0, 2);
         try std.testing.expectEqual(@as(u64, srt_big_rows - 1), api.ls_source_row(od.doc, 0));
+        api.ls_jump_start(od.doc, srt_big_rows - 1_000);
+        const landed = try waitJumpDone(od.doc);
+        try std.testing.expectEqual(@as(u64, 999), landed.landed_row); // descending
     }
-    // (b) AUTO: the same contention resolves on its own — the pass resumes and
-    //     converges to ACTIVE with no further caller input.
+    // (b) AUTO: the same contention resolves on its own — the pass resumes,
+    //     converges to ACTIVE, and the pending jump lands with no further caller
+    //     input. This is the shipped mode; MANUAL's park is a testing artifact.
     {
         var od = try openWith(body, .{ .separator = ',', .header = api.header_off });
         defer od.deinit();
         try setSort(od.doc, 0, .descending);
         api.ls_jump_start(od.doc, srt_big_rows - 1_000);
-        _ = try waitJumpDone(od.doc);
         _ = try waitSortActive(od.doc);
+        const landed = try waitJumpDone(od.doc);
+        try std.testing.expectEqual(@as(u64, 999), landed.landed_row);
         _ = api.ls_window_set(od.doc, 0, 2);
         try std.testing.expectEqual(@as(u64, srt_big_rows - 1), api.ls_source_row(od.doc, 0));
     }
@@ -13025,6 +13313,14 @@ test "srt_corpus_hostile_sweep: every corpus case sorts on every column without 
         var col: u32 = 0;
         while (col < cols) : (col += 1) {
             inline for (.{ api.SortDirection.ascending, api.SortDirection.descending }) |dir| {
+                // Read the view MID-BUILD too (Amendment 1 adds a whole servable
+                // window while the pass runs — hostile bytes now reach the
+                // window path through the prefix structure, not only through the
+                // finished permutation).
+                api.sortPauseAfterRows(doc, 1);
+                try std.testing.expectEqual(true, api.ls_sort_set(doc, col, dir));
+                try sampleServableBounded(doc);
+                api.sortPauseAfterRows(doc, std.math.maxInt(u64));
                 try std.testing.expectEqual(true, api.ls_sort_set(doc, col, dir));
                 const s = try waitSortTerminal(doc);
                 // Whatever the outcome, the snapshot is WELL-DEFINED and the
@@ -13141,6 +13437,12 @@ test "srt_measurement_obligations: the sort criteria this gate CANNOT prove (RM 
     // Recorded here so they appear in the test list and cannot be forgotten.
     // The reviewer must see NUMBERS for each, measured in ONE build session,
     // before-and-after, on the target host:
+    //   AC-s16b  FIRST SORTED WINDOW within 100 ms of ls_sort_set on the local
+    //            10-col / 10 GB mmap reference — a viewport-sized top window in
+    //            sorted coordinates, exact for the region scanned by then.
+    //            This is Amendment 1's headline promise and the number the
+    //            human picked over 500 / 250 / 200 ms; report it next to the
+    //            AC-s10 table. Network documents are exempt.
     //   AC-s10a  key-pass wall time on the 10-col / 10 GB local reference is
     //            <= 3x the SAME-SESSION full-file search scan.
     //   AC-s10b  gzip sorted-scroll latency, COLD and WARM, on the reference

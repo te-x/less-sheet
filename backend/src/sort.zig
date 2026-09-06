@@ -123,6 +123,31 @@ pub fn residentReset(d: *Document) void {
     d.sort_resident_peak = 0;
 }
 
+// --- The ONE prefix-depth resolver (contracts/api.zig `sortPrefixRows`) -----
+// K is NOT a new constant: it IS api.window_max_rows (LS_WINDOW_MAX_ROWS), the
+// deepest a caller can address in one window. Every consumer -- the top-K
+// structure's capacity, the servable-range clamp while BUILDING -- reads THIS,
+// never a literal 4096.
+
+/// THE RESOLVER: how many view rows a BUILDING sort can serve at most.
+pub fn prefixRows(d: *const Document) u64 {
+    _ = d;
+    return api.window_max_rows;
+}
+
+/// AC-s16(a) determinism seam: data rows the current key pass has scanned.
+pub fn scannedRows(d: *const Document) u64 {
+    return d.sort_scanned_rows;
+}
+
+/// AC-s16(a) determinism seam: stop the pass after `rows` scanned data rows and
+/// wait there (maxInt restores "no limit").
+pub fn pauseAfterRows(d: *Document, rows: u64) void {
+    d.lock();
+    defer d.unlock();
+    d.sort_pause_after_rows = rows;
+}
+
 /// Where this document's sort scratch goes — always THE resolver, never a
 /// locally built "/tmp/..." literal (src/tempdir.zig says why).
 pub fn tempDir() []const u8 {

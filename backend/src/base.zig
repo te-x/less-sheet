@@ -569,6 +569,14 @@ pub const Document = struct {
     sort_temp_unlinked: bool = false,
     /// AC-s9 peak sort-owned resident bytes since the last reset.
     sort_resident_peak: u64 = 0,
+    /// AC-s16(a) determinism seam: data rows the CURRENT key pass has scanned
+    /// (reset at the start of each pass), and the row count at which the pass
+    /// must stop and WAIT (maxInt == no limit). Together they let a frozen test
+    /// park the pass at a known n and assert the converging prefix is exactly
+    /// the sorted top of those n rows -- the network fixture's `withhold` gate,
+    /// applied to the sort. Read/written only through the Zig-only seams.
+    sort_scanned_rows: u64 = 0,
+    sort_pause_after_rows: u64 = std.math.maxInt(u64),
 
     // --- window-budget instrumentation state --------------------------------
     // DEFAULTED (like copy_cursor_* / gz_* above) so openWithAllocator's literal

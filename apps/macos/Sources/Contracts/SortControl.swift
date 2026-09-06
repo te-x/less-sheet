@@ -3,11 +3,23 @@
 // click and ⇧⌘S drive, and the header indicator the grid draws.
 //
 // The core model — a sort is a THIRD VIEW KIND that re-orders the current view
-// by ONE column after a progress-reported, cancellable KEY PASS, after which
-// every row accessor, jump, find, and copy speaks SORTED coordinates — is
+// by ONE column, backed by a progress-reported, cancellable KEY PASS, with
+// every row accessor, jump, find, and copy speaking SORTED coordinates — is
 // normative in api/lesssheet.h SORTED VIEWS and mirrored on `DocumentSession`
 // (setSort / clearSort / sortStatus). The doc comments here restate exactly
 // what the frozen tests pin, and nothing more.
+//
+// LATENCY BEATS THROUGHPUT (ARCH-sort-by-column Amendment 1). The grid does NOT
+// wait for the pass: the view speaks sorted coordinates from the instant
+// `setSort` returns and serves the CONVERGING PREFIX — the exact sorted top of
+// the region scanned so far, up to 4096 rows — which REFINES LIVE as the scan
+// advances. So the app must repaint the top of the grid as the snapshot
+// changes (the repaint-family rule: a one-shot mutation with no scroll needs a
+// synchronous poke), keep the progress + cancel affordance up for the WHOLE
+// build rather than only past the ~500 ms threshold, and show the ordinary
+// not-yet-servable presentation for rows past the prefix. On `.failed` the view
+// is back in its pre-sort file order — there is nothing partial left on screen
+// to clean up.
 //
 // WHY A PURE CYCLE TYPE. FR11 gives the feature TWO entry points into the same
 // state machine — a header click and ⇧⌘S on the keyboard cursor's column — plus
@@ -36,12 +48,15 @@ public enum SortFailure: Equatable, Sendable {
 /// The sort's phase (mirrors `ls_sort_state` minus IDLE, which the bridge maps
 /// to a nil snapshot — no sort, the rows are in file order).
 ///
+/// `building` already SERVES: the view is in sorted coordinates and the top
+/// rows are the exact sorted top of what has been scanned, refining live.
 /// `progress` is in [0, 1] and monotone within one build. `parked` is the core's
 /// `LS_SORT_PARKED`: the key pass yielded the single scan slot to a jump or a
-/// find. It is NOT a user cancellation and — unlike a cancelled FILTER, which
-/// still serves its partial view — a parked sort serves NO sorted view at all;
-/// under the app's LS_INDEX_AUTO documents it resumes and converges on its own,
-/// so the UI treats it exactly like `building`.
+/// find, so its prefix is FROZEN at the content it had reached — still served,
+/// still exact for what was scanned, simply no longer refining. It is NOT a user
+/// cancellation; on the app's LS_INDEX_AUTO documents it resumes and converges
+/// on its own, so the UI treats it exactly like `building`. `failed` means the
+/// view is back in its pre-sort file order and fully servable.
 public enum SortPhase: Equatable, Sendable {
     case building(progress: Double)
     case active
@@ -74,7 +89,10 @@ public struct SortSnapshot: Equatable, Sendable {
     }
 
     /// True while a key pass is outstanding (`building` or `parked`) — the
-    /// condition the delayed-progress gate and the Cancel affordance key on.
+    /// condition the progress + Cancel affordance keys on. Amendment 1 makes it
+    /// the LIVE-REPAINT condition too: while this is true the served top rows
+    /// can change on any poll, so the grid re-reads its window instead of
+    /// assuming a settled order.
     public var isWorking: Bool {
         switch phase {
         case .building, .parked: return true
@@ -100,10 +118,12 @@ public struct SortSnapshot: Equatable, Sendable {
 public struct SortIndicator: Equatable, Sendable {
     /// nil = this column is not sorted (draw nothing).
     public let direction: SortDirection?
-    /// True while the pass for THIS column is still outstanding: the indicator
-    /// is shown but the grid is NOT yet re-ordered (api/lesssheet.h "THE FLIP" —
-    /// the view flips only at ACTIVE), so the header renders it in its pending
-    /// styling rather than claiming an order the rows do not have.
+    /// True while the pass for THIS column is still outstanding. The grid IS
+    /// already re-ordered — it shows the exact sorted top of what has been
+    /// scanned (api/lesssheet.h THE CONVERGING PREFIX) — but that top is still
+    /// REFINING and rows past the prefix are not yet servable, so the header
+    /// renders the indicator in its pending styling rather than claiming a
+    /// settled order.
     public let isPending: Bool
     /// True when the pass for THIS column FAILED: the indicator is shown in its
     /// error styling and a click retries (see `SortCycling`).
@@ -140,7 +160,8 @@ public enum SortIntent: Equatable, Sendable {
 ///     * same column, `.active` descending  → `.clear` (the third state, "off");
 ///     * same column, `.building` / `.parked` → `.clear`. Acting on a pass that
 ///       has not landed means STOP — which is also exactly what Cancel means, so
-///       the two affordances cannot drift apart. (`ls_sort_clear` is both verbs.)
+///       the two affordances cannot drift apart. (`ls_sort_clear` is both verbs,
+///       and either way the view returns to its pre-sort file order.)
 ///     * same column, `.failed`     → `.sort(column, sameDirection)` — a RETRY,
 ///       not an advance. Silently moving to a direction the user never saw
 ///       applied would be the wrong answer to "that didn't work"; the core

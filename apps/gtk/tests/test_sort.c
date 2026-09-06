@@ -17,10 +17,12 @@
  *
  *   SORT BRIDGE — the real Zig core through lsg_document_sort_* over the
  *   find.csv fixture: set a sort (the view re-orders and the gutter still
- * shows ORIGINAL numbers via the frozen slice-1 lsg_window_source_row),
- * descending as the reversed order, composition over an active filter, clear
- * (file order restored), out-of-range rejection leaving the view untouched,
- * and the session-only fresh state on a re-open.
+ * shows ORIGINAL numbers via the frozen slice-1 lsg_window_source_row), sorted
+ * coordinates served WITHOUT waiting for the key pass (Amendment 1's
+ * converging prefix), descending as the reversed order, composition over an
+ * active filter, clear restoring the PRE-SORT file order, out-of-range
+ * rejection leaving the view untouched, and the session-only fresh state on a
+ * re-open.
  *
  * RED against the seeded src/lsg_sort.c (CLEAR-always cycle, no-op bridge) and
  * GREEN as the module is implemented. Determinism: the fixture is tiny (8 data
@@ -180,7 +182,10 @@ test_cycle_on_failed_pass_retries (void)
 }
 
 /* --- the header indicator: only the sort column; PENDING while the pass has
- *     not landed (the grid is not re-ordered yet) --- */
+ *     not landed. PENDING does NOT mean "unsorted": Amendment 1 has the grid
+ *     already showing the exact sorted top of what was scanned; it means that
+ *     top is still refining, so the header must not claim a settled order.
+ *     --- */
 
 static void
 test_indicator_states (void)
@@ -440,7 +445,40 @@ test_bridge_composes_with_filter (void)
   lsg_document_close (doc);
 }
 
-/* --- clearing restores file order (and is also the cancel verb) --- */
+/* --- the view speaks SORTED coordinates without waiting for the key pass
+ *     (Amendment 1: latency beats throughput). The window is read on the very
+ *     next statement after the set — no poll, no wait for ACTIVE — and must
+ *     already be sorted. An implementation that holds the previous order until
+ *     the pass completes fails HERE, which is the point of the amendment. ---
+ */
+
+static void
+test_bridge_serves_sorted_immediately (void)
+{
+  LsgDocument *doc = open_find_fixture ();
+  g_assert_true (lsg_document_sort_set (doc, 0, LSG_SORT_ASCENDING));
+
+  /* find.csv's 8 rows are scanned in one block, so the prefix here is already
+   * the whole order; on a large document it would be the sorted top of the
+   * scanned region instead. Either way it is never the pre-sort order. */
+  GArray *src = view_source_rows (doc, 8);
+  g_assert_cmpuint (src->len, >, 0);
+  g_assert_cmpuint (g_array_index (src, guint64, 0), ==, name_ascending[0]);
+  g_array_free (src, TRUE);
+
+  /* The poll is honest about which phase that was. */
+  LsgSortSnapshot s;
+  g_assert_true (lsg_document_sort_poll (doc, &s));
+  g_assert_cmpuint (s.column, ==, 0);
+  g_assert_cmpint (s.direction, ==, LSG_SORT_ASCENDING);
+  g_assert_true (s.phase == LSG_SORT_PHASE_BUILDING
+                 || s.phase == LSG_SORT_PHASE_ACTIVE);
+  lsg_document_close (doc);
+}
+
+/* --- clearing restores the PRE-SORT file order (and is also the cancel verb:
+ *     a cancelled build's converging prefix is gone, not frozen on screen)
+ *     --- */
 
 static void
 test_bridge_clear_restores_file_order (void)
@@ -523,6 +561,8 @@ main (int argc, char **argv)
   g_test_add_func ("/sort/bridge-fresh-none", test_bridge_fresh_none);
   g_test_add_func ("/sort/bridge-sorts-and-remaps",
                    test_bridge_sorts_and_remaps);
+  g_test_add_func ("/sort/bridge-serves-immediately",
+                   test_bridge_serves_sorted_immediately);
   g_test_add_func ("/sort/bridge-descending",
                    test_bridge_descending_is_reversed);
   g_test_add_func ("/sort/bridge-composes-with-filter",

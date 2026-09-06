@@ -1,9 +1,10 @@
 // Frozen behavior tests — sort-by-column slice (planner-owned).
-// ARCH-sort-by-column app criterion AC-s14: the pure three-state CYCLE that
-// both the header click and ⇧⌘S drive, the header indicator, the one
-// declaration of the menu item + accelerator, and the sort bridge against the
-// REAL linked Zig core (apply, sorted coordinates, descending, composition with
-// a filter, clear, session-only across a re-open, and clean failure).
+// ARCH-sort-by-column app criterion AC-s14 (as amended by Amendment 1): the
+// pure three-state CYCLE that both the header click and ⇧⌘S drive, the header
+// indicator, the one declaration of the menu item + accelerator, and the sort
+// bridge against the REAL linked Zig core (apply, sorted coordinates WITHOUT
+// waiting for the pass, descending, composition with a filter, clear restoring
+// the pre-sort order, session-only across a re-open).
 // Semantics are normative in Sources/Contracts/SortControl.swift +
 // DocumentSession.swift and api/lesssheet.h SORTED VIEWS.
 //
@@ -164,8 +165,9 @@ private func viewSourceRows(_ session: any DocumentSession, _ count: Int) -> [UI
     #expect(c.indicator(active, for: 1)
             == SortIndicator(direction: .descending, isPending: false, didFail: false))
     // While the pass is outstanding the indicator SHOWS but is marked pending:
-    // the grid is not re-ordered yet (the view flips only at ACTIVE), so the
-    // header must not claim an order the rows do not have.
+    // the grid IS already re-ordered (it shows the exact sorted top of what has
+    // been scanned) but that top is still REFINING and rows past the prefix are
+    // not yet servable, so the header must not claim a settled order.
     for phase: SortPhase in [.building(progress: 0.2), .parked(progress: 0.2)] {
         #expect(c.indicator(SortSnapshot(phase: phase, column: 1, direction: .ascending), for: 1)
                 == SortIndicator(direction: .ascending, isPending: true, didFail: false))
@@ -240,6 +242,41 @@ private func viewSourceRows(_ session: any DocumentSession, _ count: Int) -> [UI
     #expect(viewSourceRows(session, 5) == [6, 4, 1, 2, 0].map { Optional($0) })
     // The key pass ran the filter to completion on its way through.
     #expect(session.filterStatus()?.totalIsFinal == true)
+}
+
+@Test func bridgeServesSortedCoordinatesWithoutWaitingForTheKeyPass() async throws {
+    // AC-s14 / Amendment 1: latency beats throughput. The window is read on the
+    // very next line after `setSort` — NO poll, NO wait for `.active` — and it
+    // must already be in sorted coordinates (the converging prefix). An
+    // implementation that keeps the previous order until the pass completes
+    // fails HERE, which is the whole point of the amendment.
+    let session = try await openForSort()
+    defer { session.close() }
+    try #require(session.setSort(column: 0, direction: .ascending), "core rejected the sort")
+    let win = session.setWindow(firstRow: 0, rowCount: 8)
+    #expect(win.rows.isEmpty == false, "a sort must serve its converging prefix immediately")
+    // find.csv's 8 rows are fully scanned in one block, so the prefix here is
+    // the whole (already exact) order; on a large document it would be the
+    // sorted top of the scanned region instead. Either way it is never the
+    // pre-sort order.
+    #expect(session.sourceRow(0) == sortedByNameAscending[0])
+    #expect(win.rows[0][0] == "")
+    // The phase is honest about it: never `.active` until the order is final.
+    let snap = try #require(session.sortStatus())
+    #expect(snap.column == 0)
+    #expect(snap.direction == .ascending)
+}
+
+@Test func bridgeCancelDuringABuildRestoresThePreSortOrder() async throws {
+    // AC-s7 / Amendment 1: `clearSort` is also the cancel verb, and the view
+    // comes back in FILE order — the converging prefix is gone, not frozen.
+    let session = try await openForSort()
+    defer { session.close() }
+    try #require(session.setSort(column: 0, direction: .descending), "core rejected the sort")
+    session.clearSort()
+    #expect(session.sortStatus() == nil)
+    #expect(viewSourceRows(session, 8) == (0..<8).map { Optional(UInt64($0)) })
+    #expect(session.setWindow(firstRow: 0, rowCount: 8).rows[0][0] == "Widget")
 }
 
 @Test func bridgeClearRestoresFileOrder() async throws {

@@ -26,11 +26,21 @@
  * sorted row's original number; this slice adds NO new source-row accessor and
  * NO new drawing path beyond the header indicator.
  *
- * THE ONE THING A USER MUST BE TOLD, and the one thing this header exists to
- * make impossible to forget: a building sort does NOT re-order the grid. The
- * view flips only at LS_SORT_ACTIVE, so between the click and the landing the
- * indicator must render as PENDING (see LsgSortIndicator.pending) rather than
- * claiming an order the rows do not have.
+ * LATENCY BEATS THROUGHPUT (ARCH-sort-by-column Amendment 1), and this is the
+ * one thing this header exists to make impossible to forget: the grid does NOT
+ * wait for the pass. The view speaks sorted coordinates from the instant
+ * lsg_document_sort_set returns and serves the CONVERGING PREFIX — the exact
+ * sorted top of the region scanned so far, up to 4096 rows — which REFINES
+ * LIVE as the scan advances. So the widget must (1) repaint the top of the
+ * grid as the poll changes rather than painting once and waiting, (2) keep the
+ * progress
+ * + cancel affordance up for the WHOLE build rather than only past the ~500 ms
+ * delayed-progress threshold, and (3) render the ordinary not-yet-servable
+ * presentation for rows past the prefix. The indicator stays PENDING (see
+ * LsgSortIndicator.pending) for the whole build: the rows ARE sorted, but the
+ * top is still refining, so the header must not claim a settled order. On
+ * FAILED, and on cancel, the view is back in its pre-sort file order — there
+ * is nothing partial left on screen to clean up.
  *
  * COMPOSITION WITH THE EARLIER SLICES (verified, NO frozen change to them):
  *   - FILTER (slice 4). A sort composes OVER the filter: the sorted row set is
@@ -100,12 +110,19 @@ typedef enum
  * LSG_SORT_PHASE_NONE is the "no sort" case the bridge reports for
  * LS_SORT_IDLE; the rows are in file order.
  *
+ * LSG_SORT_PHASE_BUILDING already SERVES: the view is in sorted coordinates
+ * and its top rows are the exact sorted top of what has been scanned, refining
+ * live.
+ *
  * LSG_SORT_PHASE_PARKED is the core's LS_SORT_PARKED: the key pass yielded the
- * single scan slot to a jump or a find. It is NOT a user cancellation and —
- * unlike a cancelled FILTER, which still serves its partial view — a parked
- * sort serves NO sorted view at all. On the local documents this frontend
- * opens with LS_INDEX_AUTO it resumes and converges on its own, so the UI
- * treats it exactly like BUILDING. */
+ * single scan slot to a jump or a find, so its prefix is FROZEN at the content
+ * it had reached — still served, still exact for what was scanned, simply no
+ * longer refining. It is NOT a user cancellation. On the local documents this
+ * frontend opens with LS_INDEX_AUTO it resumes and converges on its own, so
+ * the UI treats it exactly like BUILDING.
+ *
+ * LSG_SORT_PHASE_FAILED means the view is back in its pre-sort file order and
+ * fully servable. */
 typedef enum
 {
   LSG_SORT_PHASE_NONE = 0,
@@ -196,10 +213,14 @@ LsgSortIntent lsg_sort_next (LsgSortSnapshot snapshot, guint column);
  *   sorted    — this column is the sort column (draw the chevron); FALSE for
  *               every other column, and then the other fields are zero.
  *   pending   — the pass for THIS column is still outstanding (BUILDING or
- *               PARKED): the indicator SHOWS, but the grid is NOT re-ordered
- *               yet, so the header renders it in its pending styling instead
- * of claiming an order the rows do not have. failed    — the pass for THIS
- * column FAILED: error styling, and a click retries (see lsg_sort_next).
+ *               PARKED): the indicator SHOWS and the grid IS already
+ *               re-ordered (it shows the exact sorted top of what has been
+ *               scanned), but that top is still REFINING and rows past the
+ *               prefix are not yet servable, so the header renders it in its
+ *               pending styling instead of claiming a settled order.
+ *   failed    — the pass for THIS column FAILED: error styling, and a click
+ *               retries (see lsg_sort_next). The view is back in its pre-sort
+ *               file order.
  */
 typedef struct
 {
@@ -242,9 +263,12 @@ gboolean lsg_document_sort_set (LsgDocument *doc, guint column,
 
 /*
  * Clear the sort (ls_sort_clear) — also the CANCEL verb for a running key
- * pass. No-op when no sort is active. The view is left exactly as it was; any
- * active find is reset and the jump slot returns to idle, so the widget
- * invalidates its find view-model exactly as it does on a filter change.
+ * pass. No-op when no sort is active. Either way the view RETURNS TO ITS
+ * PRE-SORT file order (the filtered row set if a filter is active) and is
+ * fully servable again — a cancelled build's converging prefix is gone, not
+ * frozen on screen. Any active find is reset and the jump slot returns to
+ * idle, so the widget invalidates its find view-model exactly as it does on a
+ * filter change.
  */
 void lsg_document_sort_clear (LsgDocument *doc);
 

@@ -127,7 +127,15 @@ struct AmendmentContractGuardTests {
         // or prototype changes shape; a v1 frozen-surface edit under lock-step rebuild
         // (no external ABI consumer). Updated through the change-authority process,
         // exactly as this guard provides for an approved header amendment.
-                        baseline: "fe9183577543060db97e1f69a4192a8822d691f18b2cfeacc946f01008d43817")
+        // Re-bumped again for ARCH-sort-by-column AMENDMENT 1 (converging sorted
+        // prefix; author-signed 2026-09-06 after the first freeze). SORTED VIEWS
+        // sections 4/5/6/8/9/11 and the ls_sort_state comments were rewritten: the
+        // view speaks sorted coordinates from the instant ls_sort_set returns and
+        // serves the exact sorted top of the region scanned so far, and cancel /
+        // failure return it to its pre-sort file order. PROSE AND COMMENTS ONLY —
+        // no signature, enum value, constant, or struct layout changed, and
+        // ls_sort_status is still 24 bytes with the same offsets.
+                        baseline: "ef90c08ac7675402713a53847e52eb5c0a7d5e473d04bbd6ee4b2fa561f27295")
     }
 
     // AC23 — the public Swift search/layout contracts are byte-identical:
