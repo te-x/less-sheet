@@ -64,6 +64,11 @@
   </screenshots>
 
   <releases>
+    <release version="0.1.3" date="2026-09-07">
+      <description>
+        <p>Bug fixes.</p>
+      </description>
+    </release>
     <release version="0.1.2" date="2026-09-05">
       <description>
         <p>Faster launch: the window opens in about a third of the time, and memory at rest is lower.</p>
