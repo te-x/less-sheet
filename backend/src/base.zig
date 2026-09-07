@@ -420,7 +420,15 @@ pub const Document = struct {
     // SORTED coordinates must not be extended after the sort changed (or went
     // away), and a converging prefix that refined under it must re-materialize.
     win_request_sorted: bool = false,
+    // The PREFIX generation this window was materialized from: an identical
+    // request may extend it only while that generation still stands, so one
+    // ls_window_set result never spans two of them.
     win_request_sort_gen: u64 = 0,
+    // The SORT generation (column / direction / build identity) it was
+    // materialized under. Equal means the buffer is a coherent snapshot of the
+    // current sort and the accessors serve it directly; different means the
+    // same rows in a NEW order, and they re-map through the live mapping.
+    win_sort_build_gen: u64 = 0,
     win_cursor_valid: bool = false,
     win_cursor_pos: Pos = .{ .logical = 0, .physical = 0 },
     win_cursor_row: u64 = 0,

@@ -117,30 +117,41 @@ fn windowSetInner(d: *Document, first_row: u64, row_count: u32) api.RowRange {
     // A PRESENTED sort (building, parked, or active) makes the row arguments
     // SORTED coordinates — composing with a filter, whose row SET it uses.
     const sorted = sort.presented(d);
-    const sort_gen = d.sort_view_gen;
     d.unlock();
+
+    // THE SORTED PATH DECIDES ITS OWN IDENTITY, under the SAME hold of the
+    // mutex that materializes (see windowSetSorted). Sampling the prefix
+    // generation here, releasing the mutex, and re-taking it there is what let
+    // one window mix TWO prefix generations: the worker commits a chunk in that
+    // gap, the retained rows stay from the older prefix and the newly added
+    // ones come from the newer, so the result is out of order with itself and
+    // rows the caller was told are materialized cannot be found (F3).
+    if (sorted) {
+        if (d.column_count == 0 or clamped == 0) {
+            clearWindow(d, first_row);
+            d.win_request_valid = false;
+            return .{ .first_row = first_row, .row_count = 0 };
+        }
+        return windowSetSorted(d, first_row, clamped, filtered, filter_gen);
+    }
 
     const identical = d.win_request_valid and
         d.win_first == first_row and
         d.win_request_count == clamped and
         d.win_request_filtered == filtered and
         d.win_request_filter_gen == filter_gen and
-        d.win_request_sorted == sorted and
-        d.win_request_sort_gen == sort_gen;
+        !d.win_request_sorted;
     if (!identical) {
         clearWindow(d, first_row);
         d.win_request_valid = true;
         d.win_request_count = clamped;
         d.win_request_filtered = filtered;
         d.win_request_filter_gen = filter_gen;
-        d.win_request_sorted = sorted;
-        d.win_request_sort_gen = sort_gen;
+        d.win_request_sorted = false;
     }
 
     if (d.column_count == 0 or clamped == 0)
         return .{ .first_row = first_row, .row_count = 0 };
-
-    if (sorted) return windowSetSorted(d, first_row, clamped);
 
     // While filtered, first_row/row_count are FILTERED coordinates and rows
     // are served by counting into the filter's per-block counters + a bounded
@@ -289,9 +300,36 @@ fn locateSourceRow(d: *Document, src: u64, unbounded: bool) ?Pos {
 /// the servable region (the prefix depth while building, the row count once
 /// active) are simply not served. Holds the mutex for the whole call, like
 /// windowSetFiltered.
-fn windowSetSorted(d: *Document, first_row: u64, clamped: u64) api.RowRange {
+fn windowSetSorted(d: *Document, first_row: u64, clamped: u64, filtered: bool, filter_gen: u64) api.RowRange {
     d.lock();
     defer d.unlock();
+    // ONE prefix generation per window. Read here, under the hold that
+    // materializes, and compared against the one this window was built from:
+    // an identical request may only EXTEND a window while the order it was
+    // built from still stands. Once the prefix refines (or the sort itself
+    // changes) the window is rebuilt from scratch rather than grown across the
+    // seam — the caller asked for a view of the top of the file, and half of
+    // one generation followed by half of the next is a view of neither.
+    const view_gen = d.sort_view_gen;
+    const build_gen = d.sort_gen;
+    const identical = d.win_request_valid and
+        d.win_first == first_row and
+        d.win_request_count == clamped and
+        d.win_request_filtered == filtered and
+        d.win_request_filter_gen == filter_gen and
+        d.win_request_sorted and
+        d.win_request_sort_gen == view_gen and
+        d.win_sort_build_gen == build_gen;
+    if (!identical) {
+        clearWindow(d, first_row);
+        d.win_request_valid = true;
+        d.win_request_count = clamped;
+        d.win_request_filtered = filtered;
+        d.win_request_filter_gen = filter_gen;
+        d.win_request_sorted = true;
+        d.win_request_sort_gen = view_gen;
+        d.win_sort_build_gen = build_gen;
+    }
     if (d.win_rows >= clamped) return .{ .first_row = first_row, .row_count = d.win_rows };
     const servable = sort.servableRows(d);
     const avail_end = if (d.complete) d.total_rows else d.frontier_rows;
@@ -484,6 +522,27 @@ fn windowSlot(d: *Document, row: u64) ?usize {
     }
     d.lock();
     defer d.unlock();
+    if (!sort.presented(d)) return null;
+
+    // THE MATERIALIZED WINDOW IS A SNAPSHOT, and inside it a row index means
+    // what it meant when the window was built. The prefix a BUILDING sort
+    // serves refines continuously — the header licenses that BETWEEN calls —
+    // so resolving these rows through the LIVE mapping would answer for a
+    // different top-K than the one whose bytes are in the buffer: a row the
+    // caller was just told is materialized would come back empty, and two rows
+    // of one window could come from two generations. The gutter reads the same
+    // snapshot (see sourceRow), so the cell and the source row can never
+    // disagree about which row this is.
+    //
+    // A change of the SORT ITSELF — a different column, a flip, a rebuild — is
+    // the other case, and it is not a refinement: the row SET is unchanged, so
+    // the rows in the buffer are still the right rows, only in a new order.
+    // There the live mapping IS the answer, and a row it maps outside this
+    // window is simply not served.
+    if (d.sort_gen == d.win_sort_build_gen) {
+        if (row < d.win_first or row >= d.win_first + d.win_rows) return null;
+        return @intCast(row - d.win_first);
+    }
     const src = sort.sourceRowAt(d, row) orelse return null;
     // ZERO ALLOCATOR CALLS on this path: the by-source index was built by the
     // ls_window_set that materialized this window (a call the contract lets
@@ -572,12 +631,13 @@ pub fn matchFlags(d: *Document, first_col: u32, col_count: u32) api.Str {
     defer d.unlock();
 
     if (d.search_state == .idle) return empty_str;
-    // Under a sort the flags are computed per MATERIALIZED row, while the cell
-    // path maps each view row through the CURRENT order. If the order moved
-    // since this window was built (a converging prefix refining, a rebuild),
-    // the two would disagree — so serve no flags at all rather than flags that
-    // label the wrong rows. The caller's next ls_window_set restores them.
-    if (d.win_request_sorted and d.win_request_sort_gen != d.sort_view_gen) return empty_str;
+    // Under a sort the flags are computed per MATERIALIZED row — the same
+    // snapshot the cells are now served from, so a refining prefix can no
+    // longer put the two out of step. A change of the SORT ITSELF does: there
+    // the cell path re-maps through the new order while these flags still
+    // describe the old one, so serve none rather than flags that label the
+    // wrong rows. The caller's next ls_window_set restores them.
+    if (d.win_request_sorted and d.win_sort_build_gen != d.sort_gen) return empty_str;
     const search_gen = d.search_gen;
 
     const total: usize = @intCast(d.win_rows * @as(u64, col_count));
@@ -660,6 +720,18 @@ pub fn sourceRow(d: *Document, row: u64) u64 {
     d.lock();
     if (sort.presented(d)) {
         defer d.unlock();
+        // Inside the materialized window the gutter comes from the SAME
+        // snapshot the cells do (see windowSlot), so one ls_window_set result
+        // stays coherent with itself however far the live prefix has moved on
+        // since. Outside it — the servable prefix a caller may address without
+        // materializing — the live mapping answers, which is what keeps
+        // ls_source_row an O(1) gutter lookup over the whole servable region.
+        if (d.win_request_sorted and d.sort_gen == d.win_sort_build_gen and
+            row >= d.win_first and row < d.win_first + d.win_rows)
+        {
+            const idx: usize = @intCast(row - d.win_first);
+            if (idx < d.win_source.items.len) return d.win_source.items[idx];
+        }
         return sort.sourceRowAt(d, row) orelse api.no_row;
     }
     d.unlock();
