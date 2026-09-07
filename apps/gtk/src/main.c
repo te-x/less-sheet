@@ -31,6 +31,7 @@
 #include <lsg_grid_geometry.h>
 #include <lsg_jump.h>
 #include <lsg_net_open.h>
+#include <lsg_sort.h>
 #include <lsg_window_poll.h>
 
 #include <string.h>
@@ -49,6 +50,10 @@
 #define LSG_ICON_RESOURCE_PATH "/com/lesssheet/LessSheet/icons"
 /* Row buffer beyond the viewport (the scroll buffer), each side. */
 #define GRID_OVERSCAN 4
+/* The header sort indicator's footprint, as a fraction of the text line
+ * height — the ONE place its size is decided; every call site reads the one
+ * `ind_size` computed from it. */
+#define LSG_SORT_INDICATOR_SCALE 0.55
 /* Poll cadence for the frontier / network drive. */
 #define POLL_INTERVAL_MS 100
 /* Auto-dismiss delay for the in-app AdwToast notices (single source of truth —
@@ -282,6 +287,34 @@ typedef struct
   GtkToggleButton *filter_toggle;
   gboolean filter_ui_guard; /* re-entrancy guard for programmatic toggle */
 
+  /* Sort-by-column: the last polled snapshot (phase NONE == no sort) is the
+   * ONE piece of sort state this frontend keeps — the cycle, the header
+   * indicator, the progress affordance and the announcements all read it, and
+   * every tick refreshes it from the core. Session-only, like the filter.
+   *
+   * A sort is triggered by exactly two things (Amendment 3): Ctrl+Shift+S on
+   * the cursor's column, and the column header's CONTEXT MENU. A plain header
+   * press/drag keeps its pre-feature meaning (whole-column selection).
+   *
+   * `sort_menu` is the live header popover (rebuilt on every open, so its
+   * check marks and its Clear-Sort sensitivity are the current snapshot's) and
+   * `sort_menu_intents` the entries it was built from — the widget hands those
+   * intents straight back to the one apply funnel, so a menu entry and the
+   * keyboard cycle cannot mean different things.
+   *
+   * `sort_pending` holds the request a network document's confirmation dialog
+   * is asking about (sorting an HTTP source downloads it — the frozen bridge
+   * requires the widget to say so before issuing the call). */
+  LsgSortSnapshot sort;
+  guint sort_settle_id; /* one-shot first-prefix repaint (0 == none) */
+  GtkWidget *sort_menu; /* the header GtkPopoverMenu (owned) */
+  GSimpleActionGroup *sort_actions; /* its three actions, prefix "sortmenu" */
+  const char *sort_hp_label; /* the label the shared bar currently shows */
+  guint sort_settle_ticks;   /* settle ticks chained by THIS request */
+  LsgSortIntent sort_menu_intents[LSG_SORT_MENU_ENTRIES];
+  LsgSortIntent sort_pending; /* awaiting the network confirmation */
+  gint64 sort_redrive_us;     /* last parked-pass re-drive (monotonic) */
+
   /* Network doc (http_range): the core is DEMAND-DRIVEN — a bare ls_window_set
    * fetches nothing, so every viewport landing beyond the fetched frontier
    * (filter-apply, filter/deep scroll) must be driven through ls_jump_start.
@@ -309,6 +342,9 @@ typedef struct
    * cancel, shared by every long operation. */
   GtkWidget *hp_box;
   GtkProgressBar *hp_bar;
+  /* Which long operation the shared bar currently belongs to — the ONE place
+   * that answers "what does the inline ✕ cancel?". */
+  int hp_owner; /* LSG_HP_* */
 
   /* Settings + dialect override. */
   char *doc_path; /* current LOCAL path (OWNED); NULL for a network doc */
@@ -401,6 +437,18 @@ enum
   SEL_CELLS,
   SEL_ROWS,
   SEL_COLS
+};
+
+/* Owners of the ONE header-bar progress widget. At most one is live at a time:
+ * a URL open stops any copy before it goes in flight, a copy refuses to start
+ * while an open is in flight, and a key pass claims the bar only when it is
+ * free (re-claiming it on the next poll tick once the other owner is done). */
+enum
+{
+  LSG_HP_NONE = 0,
+  LSG_HP_COPY,
+  LSG_HP_NET,
+  LSG_HP_SORT
 };
 
 /* ------------------------------------------------------------------------- */
@@ -509,9 +557,34 @@ static void grid_update_a11y_description (App *app);
 
 /* Reusable header-bar progress (defined in the copy section); the network open
  * also drives it (unified long-op status). */
-static void header_progress_show (App *app, const char *label);
+static void header_progress_show (App *app, int owner, const char *label);
 static void header_progress_set (App *app, gdouble fraction);
 static void header_progress_hide (App *app);
+
+/* Sort-by-column: fold one sort poll (progress, landing, failure) — returns
+ * TRUE when the grid needs re-materializing, because a BUILDING pass refines
+ * its converging prefix under the current window. Run the three-state cycle on
+ * `column` (a header click, Ctrl+Shift+S, or the cancel affordance). Keep the
+ * shared progress bar in step with the pass. All defined with the sort helpers
+ * below. */
+static gboolean sort_poll_fold (App *app);
+static void sort_state_reset (App *app);
+static void do_sort_cycle (App *app, guint column);
+static void sort_request (App *app, LsgSortIntent intent);
+static void sort_note_inputs_changed (App *app);
+static void sort_menu_build (App *app);
+/* Re-arm the one-shot first-prefix repaint; resume a key pass parked on a
+ * network document when nothing on screen would be lost. Both defined with the
+ * sort helpers below. */
+static void sort_settle_arm (App *app);
+static void sort_redrive_parked (App *app);
+/* Hit-test a pointer to a view row + physical column, and the region it fell
+ * in (0 = cell body, 1 = gutter, 2 = header, 3 = corner). Defined with the
+ * selection helpers below; the header context menu uses it too. */
+static int hit_test (App *app, double x, double y, guint64 *out_row,
+                     guint *out_col);
+static void sort_progress_sync (App *app);
+static gboolean sort_pass_running (App *app);
 
 /* Drop an in-flight network open. Defined with the network helpers; every path
  * that opens a different document calls it first. */
@@ -637,6 +710,18 @@ app_reset_document (App *app)
 
   /* The old document's filter died with its core handle: back to identity. */
   app->filter = lsg_filter_initial ();
+
+  /* Sort state is SESSION-ONLY and died with the core handle too: back to
+   * "not sorted", with the pending first-prefix repaint dropped. */
+  if (app->sort_settle_id != 0)
+    {
+      g_source_remove (app->sort_settle_id);
+      app->sort_settle_id = 0;
+    }
+  app->sort_redrive_us = 0;
+  app->sort_hp_label = NULL;
+  app->sort_settle_ticks = 0;
+  sort_state_reset (app);
 
   app->is_network = FALSE;
   app->net_drive_active = FALSE;
@@ -1039,6 +1124,15 @@ grid_poll_tick (gpointer data)
         keep = TRUE;
     }
 
+  /* Keep ticking while a key pass runs: the sorted view's converging prefix
+   * refines under the CURRENT window, so it needs re-materializing (the tick
+   * coalesces that into the one materialize below), and the progress + cancel
+   * affordance stays live for the whole build. */
+  repaint |= sort_poll_fold (app);
+  sort_redrive_parked (app); /* a pass parked over the network, when free */
+  if (sort_pass_running (app))
+    keep = TRUE;
+
   /* Keep ticking while a network fetch-drive is in flight (net-park). */
   if (app->net_drive_active)
     {
@@ -1061,6 +1155,63 @@ grid_poll_tick (gpointer data)
 /* ------------------------------------------------------------------------- */
 /* Drawing */
 /* ------------------------------------------------------------------------- */
+
+/*
+ * The sort indicator in a column header cell, at (cx, cy) with a `size`-wide
+ * footprint. Follows the GTK column-view convention exactly: a triangle
+ * pointing UP for ascending and DOWN for descending — the pan-up / pan-down
+ * symbolic pair Adwaita gives `columnview header sort-indicator`.
+ *
+ *   settled — filled, in the theme foreground;
+ *   pending — outlined: the rows ARE already re-ordered (the exact sorted top
+ *             of the region scanned so far), but that top is still refining,
+ *             so the header must not claim a settled order;
+ *   failed  — outlined and struck through: the view is back in its pre-sort
+ *             file order, and clicking the header retries the pass.
+ *
+ * Colors come from the passed theme foreground only; the source color is
+ * restored to it on the way out.
+ */
+static void
+draw_sort_indicator (cairo_t *cr, const GdkRGBA *fg, LsgSortIndicator ind,
+                     double cx, double cy, double size)
+{
+  const double half = size * 0.5;
+  const double h = size * 0.6;
+  const gboolean outlined = ind.pending || ind.failed;
+
+  GdkRGBA c = *fg;
+  if (outlined)
+    c.alpha *= 0.55;
+  gdk_cairo_set_source_rgba (cr, &c);
+  cairo_set_line_width (cr, 1.0);
+
+  if (ind.direction == LSG_SORT_ASCENDING)
+    {
+      cairo_move_to (cr, cx, cy - h * 0.5);
+      cairo_line_to (cr, cx + half, cy + h * 0.5);
+      cairo_line_to (cr, cx - half, cy + h * 0.5);
+    }
+  else
+    {
+      cairo_move_to (cr, cx, cy + h * 0.5);
+      cairo_line_to (cr, cx + half, cy - h * 0.5);
+      cairo_line_to (cr, cx - half, cy - h * 0.5);
+    }
+  cairo_close_path (cr);
+  if (outlined)
+    cairo_stroke (cr);
+  else
+    cairo_fill (cr);
+
+  if (ind.failed)
+    {
+      cairo_move_to (cr, cx - half, cy);
+      cairo_line_to (cr, cx + half, cy);
+      cairo_stroke (cr);
+    }
+  gdk_cairo_set_source_rgba (cr, fg);
+}
 
 /* Set `layout`'s text and ellipsize width, then paint it left-aligned and
  * vertically centered in the row at (x, y). */
@@ -1325,8 +1476,17 @@ grid_draw (GtkDrawingArea *area, cairo_t *cr, int width, int height,
           double colw
               = (app->col_widths[col] > 0.0) ? app->col_widths[col] : 0.0;
           const char *label = (ci < app->hdr_count) ? app->hdr_labels[ci] : "";
-          draw_text (cr, layout, label, x + pad, 0.0, colw - 2.0 * pad,
+          /* The sort indicator sits at the right edge of its header cell and
+           * takes its room out of the label's ellipsize width, so a long
+           * header never paints over it. */
+          LsgSortIndicator ind = lsg_sort_indicator (app->sort, col);
+          const double ind_size = line_h * LSG_SORT_INDICATOR_SCALE;
+          double ind_w = ind.sorted ? (ind_size + pad) : 0.0;
+          draw_text (cr, layout, label, x + pad, 0.0, colw - 2.0 * pad - ind_w,
                      header_h, line_h);
+          if (ind.sorted && colw > 2.0 * pad + ind_w)
+            draw_sort_indicator (cr, &fg, ind, x + colw - pad - ind_size * 0.5,
+                                 header_h * 0.5, ind_size);
           x += colw;
         }
       pango_layout_set_font_description (layout,
@@ -1886,7 +2046,7 @@ on_url_response (AdwAlertDialog *dialog, const char *response, gpointer data)
 
   /* Unified header-bar progress (pulse until a byte-fraction is known); the ✕
    * cancels the open (routed in on_hp_cancel_clicked). */
-  header_progress_show (app, "Connecting…");
+  header_progress_show (app, LSG_HP_NET, "Connecting…");
   header_progress_set (app, -1.0);
   if (app->net_poll_id == 0)
     app->net_poll_id = g_timeout_add (POLL_INTERVAL_MS, net_poll_tick, app);
@@ -2123,6 +2283,19 @@ grid_update_a11y_description (App *app)
 
   char *desc = lsg_a11y_grid_description (name, app->n_cols, rows, estimated,
                                           first, last, app->filter.active);
+  /* The sort is part of what the grid IS right now, so it rides on the same
+   * description — from the one describe builder the header indicator and the
+   * announcements use, so the three can never disagree. */
+  if (app->sort.phase != LSG_SORT_PHASE_NONE)
+    {
+      char *label = a11y_column_name (app, app->sort.column);
+      char *sorted = lsg_sort_describe (app->sort, label);
+      char *joined = g_strdup_printf ("%s, %s", desc, sorted);
+      g_free (desc);
+      g_free (sorted);
+      g_free (label);
+      desc = joined;
+    }
   gtk_accessible_update_property (GTK_ACCESSIBLE (app->area),
                                   GTK_ACCESSIBLE_PROPERTY_DESCRIPTION, desc,
                                   -1);
@@ -2266,6 +2439,19 @@ on_key_pressed (GtkEventControllerKey *ctrl, guint keyval, guint keycode,
 
   gboolean ctrl_held = (state & GDK_CONTROL_MASK) != 0;
   gboolean shift_held = (state & GDK_SHIFT_MASK) != 0;
+
+  /* Ctrl+Shift+S cycles the sort on the KEYBOARD CURSOR's column (the
+   * selection's anchor column when a selection exists, else the leftmost
+   * visible one) — the same cycle a header click runs. GRID scope, like Ctrl+C
+   * and Ctrl+A below: declared once in the lsg_a11y table, never registered as
+   * an app accelerator, so a focused GtkText keeps its own Ctrl+Shift+S. */
+  if (ctrl_held && shift_held && (keyval == GDK_KEY_s || keyval == GDK_KEY_S))
+    {
+      guint col = (app->sel_mode != SEL_NONE) ? app->sel_a_col
+                                              : app->cur_colwin.first;
+      do_sort_cycle (app, col);
+      return GDK_EVENT_STOP;
+    }
 
   /* Ctrl+C and Ctrl+A stay on the GRID's key controller, never registered as
    * global accelerators, so a focused text entry keeps its own copy and
@@ -3958,11 +4144,12 @@ capture_top_source_row (App *app)
   return sr;
 }
 
-/* Reflect a filtered/identity row-count change into the grid geometry and land
- * the viewport on `first_row` (filtered row 0 on apply, the captured source
- * row on clear). */
+/* Reflect a view change (filter applied/cleared, a sort set/cleared) into the
+ * grid geometry and land the viewport on `first_row` — filtered row 0 on a
+ * filter apply, the captured source row on a clear, sorted row 0 when a sort
+ * takes over the coordinates. */
 static void
-filter_rebuild_grid (App *app, guint64 first_row)
+view_rebuild_grid (App *app, guint64 first_row)
 {
   LsgRowCount rc = lsg_document_row_count (app->doc);
   app->row_estimate = (rc.count > 0) ? rc.count : 1;
@@ -4029,7 +4216,11 @@ do_apply_filter (App *app)
    */
   find_update_labels (app);
 
-  filter_rebuild_grid (app, 0); /* land on filtered row 0 */
+  /* An active sort re-runs over the new row set (its request persists) and
+   * serves the rebuild's prefix; reflect that at once. */
+  sort_note_inputs_changed (app);
+
+  view_rebuild_grid (app, 0); /* land on filtered row 0 */
   /* ls_filter_set parks the filter scan immediately, at count 0, and on a
    * network document the filtered frontier advances ONLY through a jump. Drive
    * it to original row 0 or the filtered view paints empty. Inert locally. */
@@ -4059,7 +4250,14 @@ do_clear_filter (App *app)
    * -> identity) — stop any in-flight copy first (same rule as apply). */
   copy_stop_and_join (app);
 
-  guint64 restore = capture_top_source_row (app); /* BEFORE clearing */
+  /* Re-anchor on the row that was on screen — but only where a SOURCE row
+   * names a view row. With a sort live the view is in sorted coordinates and
+   * the sort request survives this clear, so a source number would scroll to
+   * an unrelated sorted position (on a real document, far past the converging
+   * prefix). Land at the top there instead. */
+  guint64 restore = (app->sort.phase != LSG_SORT_PHASE_NONE)
+                        ? 0
+                        : capture_top_source_row (app); /* BEFORE clearing */
   lsg_document_filter_clear (app->doc);
   app->filter = lsg_filter_cleared (app->filter);
 
@@ -4070,7 +4268,8 @@ do_clear_filter (App *app)
   find_update_labels (app); /* the label, not just the state */
 
   filter_set_toggle (app, FALSE); /* the (x) path also un-presses the toggle */
-  filter_rebuild_grid (app, restore); /* identity view, re-anchored */
+  sort_note_inputs_changed (app); /* an active sort re-runs over the new set */
+  view_rebuild_grid (app, restore); /* identity view, re-anchored */
   update_title_subtitle (app);
   a11y_announce_subtitle (
       app); /* filter clear -> the row-count line (MEDIUM) */
@@ -4114,6 +4313,610 @@ on_filter_toggled (GtkToggleButton *toggle, gpointer data)
     do_apply_filter (app);
   else
     do_clear_filter (app);
+}
+
+/* ------------------------------------------------------------------------- */
+/* Sort by column: the cycle, the converging prefix, progress + cancel */
+/* ------------------------------------------------------------------------- */
+
+/* One extra materialize this soon after a sort request. The core publishes the
+ * FIRST converging prefix from its own scan thread, a moment after
+ * ls_sort_set returns (the call never blocks), so the window materialized
+ * inside the request itself is still empty. One frame later it is not — and
+ * waiting for the ordinary 100 ms poll tick to discover that would be a
+ * visible stall on the one transition the whole feature is judged by. */
+#define LSG_SORT_SETTLE_MS 16
+/* How many settle ticks one request may chain before the ordinary 100 ms poll
+ * takes over — the bound that keeps this from becoming a 16 ms repaint loop
+ * for the whole build when the top of the view stays empty (a network pass, or
+ * a rebuild whose prefix does not reach the current viewport). Past ~100 ms
+ * the ordinary tick is at least as fast. */
+#define LSG_SORT_SETTLE_MAX_TICKS 6
+/* Minimum spacing between re-drives of a key pass parked on a network document
+ * (see sort_redrive_parked) — the one bound that keeps a pass which re-parks
+ * immediately from spinning the poll loop. */
+#define LSG_SORT_REDRIVE_MIN_MS 1000
+
+/* Back to "not sorted" — the same all-zero snapshot a fresh document polls. */
+static void
+sort_state_reset (App *app)
+{
+  LsgSortSnapshot none = { LSG_SORT_PHASE_NONE, LSG_SORT_ERROR_NONE, 0,
+                           LSG_SORT_ASCENDING, 0.0 };
+  app->sort = none;
+}
+
+static gboolean
+sort_pass_running (App *app)
+{
+  /* PARKED is not a user cancellation: the pass yielded the single scan slot
+   * and its prefix is frozen, not gone. On the local documents this frontend
+   * opens with LS_INDEX_AUTO it resumes on its own, so the UI treats it
+   * exactly like BUILDING — the affordance stays up and honest. */
+  return app->sort.phase == LSG_SORT_PHASE_BUILDING
+         || app->sort.phase == LSG_SORT_PHASE_PARKED;
+}
+
+/* A pass that is PARKED on a NETWORK document is not advancing and will not
+ * resume by itself: the core wants the scan slot back for a parked pass only
+ * when the document is local and AUTO-indexed (backend `wantsSlot`). Locally
+ * this is never true, which is why PARKED counts as running everywhere else.
+ */
+static gboolean
+sort_paused_on_network (App *app)
+{
+  return app->is_network && app->sort.phase == LSG_SORT_PHASE_PARKED;
+}
+
+/* What the shared progress bar should SAY about the key pass right now — the
+ * one place the wording is decided, and named after the thing that is actually
+ * happening. A paused pass says WHY it is paused and therefore what the user
+ * can do about it: end the search (or let the jump land) and it resumes by
+ * itself; the header menu re-picks it deliberately; the ✕ drops it. Returns a
+ * static string, so callers may compare the pointers. */
+static const char *
+sort_progress_label (App *app)
+{
+  if (!sort_paused_on_network (app))
+    return "Sorting…";
+  if (app->find.display.active)
+    return "Sorting paused — a search is using the scan";
+  if (app->jump.kind == LSG_JUMP_FLOW_SCANNING || app->net_drive_active)
+    return "Sorting paused — a jump is using the scan";
+  /* Parked with nothing else holding the scan: sort_redrive_parked picks it up
+   * within LSG_SORT_REDRIVE_MIN_MS. */
+  return "Sorting paused — resuming";
+}
+
+/* The sort's share of the ONE header-bar progress widget. Unlike a copy there
+ * is NO delayed-progress gate: FR11 asks for the affordance over the WHOLE
+ * build, because the grid is already showing a still-refining order. The label
+ * says which of the two things is true — advancing, or stopped with its
+ * progress frozen — because claiming "Sorting…" over a pass that is not
+ * running would be the silent stall the standing rule forbids. */
+static void
+sort_progress_sync (App *app)
+{
+  if (!sort_pass_running (app))
+    {
+      if (app->hp_owner == LSG_HP_SORT)
+        header_progress_hide (app);
+      return;
+    }
+
+  const char *label = sort_progress_label (app);
+  if (app->hp_owner != LSG_HP_SORT)
+    {
+      if (app->hp_owner != LSG_HP_NONE)
+        return; /* a copy / URL open has it; re-claimed when it hides */
+      header_progress_show (app, LSG_HP_SORT, label);
+      app->sort_hp_label = label;
+    }
+  else if (label != app->sort_hp_label)
+    {
+      header_progress_show (app, LSG_HP_SORT, label);
+      app->sort_hp_label = label;
+    }
+  header_progress_set (app, app->sort.progress);
+}
+
+/* Announce the current sort state (MEDIUM) from the one description builder,
+ * on the DISCRETE events only — never per poll tick. */
+static void
+sort_announce (App *app)
+{
+  char *label = a11y_column_name (app, app->sort.column);
+  a11y_announce (app, lsg_sort_describe (app->sort, label),
+                 GTK_ACCESSIBLE_ANNOUNCEMENT_PRIORITY_MEDIUM);
+  g_free (label);
+}
+
+static const char *
+sort_failure_text (LsgSortError error)
+{
+  switch (error)
+    {
+    case LSG_SORT_ERROR_STORAGE:
+      return "Sorting failed — there was not enough temporary disk space";
+    case LSG_SORT_ERROR_MEMORY:
+      return "Sorting failed — there was not enough memory";
+    default:
+      return "Sorting failed";
+    }
+}
+
+/* Every sort change the user can make resets the core's search and returns the
+ * jump slot to idle (the coordinate space changed) — the filter-apply rule,
+ * verbatim. The find DRAFT is retained, so re-running is one Enter. */
+static void
+sort_reset_find_and_jump (App *app)
+{
+  app->find = lsg_find_invalidated (app->find);
+  app->find_sticky_notice = LSG_FIND_NOTICE_NONE;
+  app->find_wrap_issued = FALSE;
+  find_clear_mask (app);
+  app->jump = lsg_jump_initial ();
+  find_update_labels (app); /* the label, not just the state */
+}
+
+static gboolean sort_settle_tick (gpointer data);
+
+static void
+sort_settle_schedule (App *app)
+{
+  if (app->sort_settle_id != 0)
+    g_source_remove (app->sort_settle_id);
+  app->sort_settle_id
+      = g_timeout_add (LSG_SORT_SETTLE_MS, sort_settle_tick, app);
+}
+
+static gboolean
+sort_settle_tick (gpointer data)
+{
+  App *app = data;
+  app->sort_settle_id = 0;
+  if (app->doc == NULL)
+    return G_SOURCE_REMOVE;
+  sort_poll_fold (app);
+  grid_repaint (app);
+  /* Measured, not assumed: the core's first chunk commit lands 1.0-3.6 ms
+   * after the request on a 4M-row / 126 MB file, so one shot is normally
+   * enough and this chain does not continue. Where it is not, look again at
+   * this cadence while the pass runs and the materialized window is still
+   * EMPTY — but only up to LSG_SORT_SETTLE_MAX_TICKS, because past ~100 ms the
+   * ordinary poll tick is at least as fast, and two cases keep a window empty
+   * for the WHOLE build: a network pass (no prefix until the first chunk is
+   * fetched) and a rebuild whose prefix does not reach the current viewport.
+   * Neither of those is the fast first-paint this exists for. */
+  app->sort_settle_ticks++;
+  if (sort_pass_running (app) && app->win != NULL
+      && lsg_window_row_count (app->win) == 0
+      && app->sort_settle_ticks < LSG_SORT_SETTLE_MAX_TICKS)
+    sort_settle_schedule (app);
+  return G_SOURCE_REMOVE;
+}
+
+/* Start a fresh settle chain for a new request (the counter is per request).
+ */
+static void
+sort_settle_arm (App *app)
+{
+  app->sort_settle_ticks = 0;
+  sort_settle_schedule (app);
+}
+
+/* Issue the request and hand the grid its new coordinates. PRIVATE to the
+ * funnel below: every trigger goes through `sort_request`, which owns the
+ * no-op guard and the network-download confirmation. */
+static void
+sort_apply (App *app, guint column, LsgSortDirection direction)
+{
+  if (app->doc == NULL || column >= app->n_cols)
+    return;
+
+  /* A sort changes the copy job's coordinate space, which the frozen copy
+   * contract says invalidates an open job — stop any in-flight copy BEFORE the
+   * view changes, exactly as a filter apply does. */
+  copy_stop_and_join (app);
+
+  if (!lsg_document_sort_set (app->doc, column, direction))
+    {
+      settings_toast (app, "That column cannot be sorted");
+      return;
+    }
+
+  sort_reset_find_and_jump (app);
+
+  /* The guaranteed non-idle post-set poll: the indicator and the progress
+   * affordance are correct before this call returns. */
+  lsg_document_sort_poll (app->doc, &app->sort);
+  sort_progress_sync (app);
+
+  /* The view speaks SORTED coordinates from here — land on sorted row 0, which
+   * is exactly where the converging prefix is. */
+  view_rebuild_grid (app, 0);
+  update_title_subtitle (app);
+  sort_announce (app);
+  ensure_poll (app);
+  sort_settle_arm (app);
+}
+
+/* Remove the sort, restoring the pre-sort order of the current view. This is
+ * also the CANCEL verb for a running key pass — one core call, one code path,
+ * so the header click and the progress ✕ can never drift apart. */
+static void
+sort_do_clear (App *app)
+{
+  if (app->doc == NULL)
+    return;
+  copy_stop_and_join (app);
+
+  /* Re-anchor near the row that was on screen where that is meaningful: in the
+   * identity view the top row's ORIGINAL number IS its file-order index. Under
+   * a filter the pre-sort view is in FILTERED coordinates, which a source row
+   * does not name, so land at the top rather than guess a wrong row. */
+  guint64 restore = app->filter.active ? 0 : capture_top_source_row (app);
+
+  lsg_document_sort_clear (app->doc);
+  sort_reset_find_and_jump (app);
+
+  lsg_document_sort_poll (app->doc, &app->sort); /* now IDLE / all-zero */
+  sort_progress_sync (app);                      /* hides the bar */
+  view_rebuild_grid (app, restore);
+  update_title_subtitle (app);
+  sort_announce (app); /* "not sorted" */
+}
+
+static void
+on_sort_net_response (AdwAlertDialog *dialog, const char *response,
+                      gpointer data)
+{
+  (void)dialog;
+  App *app = data;
+  if (g_strcmp0 (response, "sort") != 0)
+    return;
+  sort_apply (app, app->sort_pending.column, app->sort_pending.direction);
+}
+
+/*
+ * THE ONE APPLY FUNNEL. Every sort trigger — the header menu's three entries,
+ * Ctrl+Shift+S, and the progress ✕ — resolves to an LsgSortIntent and hands it
+ * here, so the two policies below are decided in exactly one place however
+ * many affordances there are:
+ *
+ *   1. A NO-OP re-request (the same column AND direction on a live pass, which
+ *      the menu makes reachable by choosing the direction already checked)
+ *      changes nothing in the core — not even the search. So it must change
+ *      nothing here either: re-anchoring the viewport or dropping the find
+ *      would be a side effect the core did not have.
+ *   2. On a NETWORK document a pass that must SCAN is an explicit demand to
+ *      fetch the whole resource, so it is CONFIRMED first — the obligation the
+ *      frozen bridge puts on the widget. A direction flip on an already-ACTIVE
+ *      sort re-reads the same permutation backwards and fetches nothing, so it
+ *      is not gated.
+ */
+static void
+sort_request (App *app, LsgSortIntent intent)
+{
+  if (app->doc == NULL || app->n_cols == 0)
+    return;
+
+  if (intent.kind == LSG_SORT_INTENT_CLEAR)
+    {
+      sort_do_clear (app);
+      return;
+    }
+  if (intent.column >= app->n_cols)
+    return;
+
+  gboolean live = (app->sort.phase == LSG_SORT_PHASE_ACTIVE
+                   || app->sort.phase == LSG_SORT_PHASE_BUILDING);
+  if (live && app->sort.column == intent.column
+      && app->sort.direction == intent.direction)
+    return; /* no-op: the core would do nothing, so neither do we */
+
+  gboolean instant_flip = (app->sort.phase == LSG_SORT_PHASE_ACTIVE
+                           && app->sort.column == intent.column);
+  if (app->is_network && !instant_flip)
+    {
+      app->sort_pending = intent;
+
+      AdwDialog *dialog = adw_alert_dialog_new ("Sort this document?", NULL);
+      adw_alert_dialog_set_body (
+          ADW_ALERT_DIALOG (dialog),
+          "Sorting a document opened over the network downloads all of it. "
+          "Progress is shown, and you can cancel while it runs.");
+      adw_alert_dialog_add_response (ADW_ALERT_DIALOG (dialog), "cancel",
+                                     "Cancel");
+      adw_alert_dialog_add_response (ADW_ALERT_DIALOG (dialog), "sort",
+                                     "Sort");
+      adw_alert_dialog_set_response_appearance (
+          ADW_ALERT_DIALOG (dialog), "sort", ADW_RESPONSE_SUGGESTED);
+      adw_alert_dialog_set_default_response (ADW_ALERT_DIALOG (dialog),
+                                             "sort");
+      adw_alert_dialog_set_close_response (ADW_ALERT_DIALOG (dialog),
+                                           "cancel");
+      g_signal_connect (dialog, "response", G_CALLBACK (on_sort_net_response),
+                        app);
+      adw_dialog_present (dialog, GTK_WIDGET (app->window));
+      return;
+    }
+
+  sort_apply (app, intent.column, intent.direction);
+}
+
+/*
+ * The three-state CYCLE on `column` — since Amendment 3 the keyboard's
+ * decision (Ctrl+Shift+S) and the progress ✕'s "stop", which must mean the
+ * same thing on an unlanded pass. The header menu is a separate, simpler
+ * surface: its entries are DIRECT intents, and both paths end in
+ * `sort_request`.
+ */
+static void
+do_sort_cycle (App *app, guint column)
+{
+  if (app->doc == NULL || app->n_cols == 0)
+    return;
+  if (column >= app->n_cols)
+    column = app->n_cols - 1; /* clamping is the caller's job */
+  sort_request (app, lsg_sort_next (app->sort, column));
+}
+
+/* --- the column header's sort context menu (Amendment 3) ----------------- */
+
+/* Hand entry `index` of the menu the widget last built back to the one apply
+ * funnel. The entry's intent is the contract's own LsgSortIntent, captured
+ * when the menu was built, so a menu entry and the keyboard cycle cannot mean
+ * different things. */
+static void
+sort_menu_activate (App *app, guint index)
+{
+  if (index >= (guint)LSG_SORT_MENU_ENTRIES)
+    return;
+  if (app->sort_menu != NULL)
+    gtk_popover_popdown (GTK_POPOVER (app->sort_menu));
+  sort_request (app, app->sort_menu_intents[index]);
+}
+
+static void
+on_sort_menu_ascending (GSimpleAction *action, GVariant *param, gpointer data)
+{
+  (void)action;
+  (void)param;
+  sort_menu_activate ((App *)data, 0);
+}
+
+static void
+on_sort_menu_descending (GSimpleAction *action, GVariant *param, gpointer data)
+{
+  (void)action;
+  (void)param;
+  sort_menu_activate ((App *)data, 1);
+}
+
+static void
+on_sort_menu_clear (GSimpleAction *action, GVariant *param, gpointer data)
+{
+  (void)action;
+  (void)param;
+  sort_menu_activate ((App *)data, 2);
+}
+
+/* The action names the three entries are bound to, in the contract's order.
+ * `lsg_sort_menu` owns the TITLES; this owns only the wiring. */
+static const char *const SORT_MENU_ACTIONS[LSG_SORT_MENU_ENTRIES]
+    = { "ascending", "descending", "clear" };
+
+/* Build the popover + its action group once, parented on the grid. The MODEL
+ * is rebuilt per open (sort_menu_present), because the check marks and the
+ * Clear-Sort sensitivity are a function of the live snapshot. */
+static void
+sort_menu_build (App *app)
+{
+  static const GActionEntry entries[] = {
+    { "ascending", on_sort_menu_ascending, NULL, "false", NULL, { 0 } },
+    { "descending", on_sort_menu_descending, NULL, "false", NULL, { 0 } },
+    { "clear", on_sort_menu_clear, NULL, NULL, NULL, { 0 } },
+  };
+
+  app->sort_actions = g_simple_action_group_new ();
+  g_action_map_add_action_entries (G_ACTION_MAP (app->sort_actions), entries,
+                                   G_N_ELEMENTS (entries), app);
+  gtk_widget_insert_action_group (GTK_WIDGET (app->area), "sortmenu",
+                                  G_ACTION_GROUP (app->sort_actions));
+
+  app->sort_menu = gtk_popover_menu_new_from_model (NULL);
+  gtk_popover_set_has_arrow (GTK_POPOVER (app->sort_menu), FALSE);
+  gtk_widget_set_halign (app->sort_menu, GTK_ALIGN_START);
+  gtk_widget_set_parent (app->sort_menu, GTK_WIDGET (app->area));
+  /* The popover is a menu ABOUT the column header it was opened on; its items
+   * take their accessible names from the model titles. */
+  gtk_accessible_update_property (GTK_ACCESSIBLE (app->sort_menu),
+                                  GTK_ACCESSIBLE_PROPERTY_LABEL,
+                                  "Sort by column", -1);
+}
+
+/* Present the menu for `column` at (x, y) in grid coordinates. */
+static void
+sort_menu_present (App *app, guint column, double x, double y)
+{
+  if (app->sort_menu == NULL || app->sort_actions == NULL)
+    return;
+
+  LsgSortMenuEntry entries[LSG_SORT_MENU_ENTRIES];
+  guint n = lsg_sort_menu (app->sort, column, entries);
+
+  GMenu *model = g_menu_new ();
+  for (guint i = 0; i < n; i++)
+    {
+      app->sort_menu_intents[i] = entries[i].intent;
+
+      char *detailed = g_strconcat ("sortmenu.", SORT_MENU_ACTIONS[i], NULL);
+      GMenuItem *item = g_menu_item_new (entries[i].title, detailed);
+      g_menu_append_item (model, item);
+      g_object_unref (item);
+      g_free (detailed);
+
+      GAction *action = g_action_map_lookup_action (
+          G_ACTION_MAP (app->sort_actions), SORT_MENU_ACTIONS[i]);
+      if (action == NULL)
+        continue;
+      g_simple_action_set_enabled (G_SIMPLE_ACTION (action),
+                                   entries[i].enabled);
+      /* A boolean-stateful action draws the native check mark; Clear Sort has
+       * no state and is never check-marked. */
+      if (g_action_get_state_type (action) != NULL)
+        g_simple_action_set_state (G_SIMPLE_ACTION (action),
+                                   g_variant_new_boolean (entries[i].checked));
+    }
+
+  gtk_popover_menu_set_menu_model (GTK_POPOVER_MENU (app->sort_menu),
+                                   G_MENU_MODEL (model));
+  g_object_unref (model);
+
+  GdkRectangle at = { (int)x, (int)y, 1, 1 };
+  gtk_popover_set_pointing_to (GTK_POPOVER (app->sort_menu), &at);
+  gtk_popover_popup (GTK_POPOVER (app->sort_menu));
+}
+
+/* Secondary click on a column HEADER opens that column's sort menu. A primary
+ * press/drag is untouched — it still selects whole columns (GtkGestureDrag is
+ * bound to the primary button), which is the pre-feature meaning Amendment 3
+ * requires a plain header press to keep. */
+static void
+on_sort_context_pressed (GtkGestureClick *gesture, int n_press, double x,
+                         double y, gpointer data)
+{
+  (void)n_press;
+  App *app = data;
+  if (app->doc == NULL || app->n_cols == 0)
+    return;
+
+  guint64 row;
+  guint col;
+  if (hit_test (app, x, y, &row, &col) != 2) /* 2 == the header strip */
+    return;
+
+  gtk_gesture_set_state (GTK_GESTURE (gesture), GTK_EVENT_SEQUENCE_CLAIMED);
+  sort_menu_present (app, col, x, y);
+}
+
+/*
+ * Resume a key pass that PARKED on a network document.
+ *
+ * A parked pass wants the scan slot back only on a local AUTO-indexed document
+ * (backend `wantsSlot`), so over the network a find or a jump that took the
+ * slot leaves the pass stopped until another request re-drives it — and
+ * re-issuing the request is, per the frozen ABI, also a RESET of the search
+ * and the jump slot.
+ *
+ * So it is re-driven only when that reset costs the user nothing they can see:
+ * no active find, no jump in flight, no network fetch-drive running. Under a
+ * live find the pass stays parked and the affordance says "Sorting paused"
+ * (sort_progress_sync) rather than lying about progress; choosing the same
+ * entry in the header menu resumes it deliberately. The alternatives were
+ * worse: gating find/jump during a build takes away the search on exactly the
+ * documents where the wait is longest, and an unconditional re-drive would
+ * silently delete the match count the user is reading.
+ *
+ * Bounded by LSG_SORT_REDRIVE_MIN_MS so a pass that re-parks at once cannot
+ * spin the main loop.
+ */
+static void
+sort_redrive_parked (App *app)
+{
+  if (!sort_paused_on_network (app))
+    return;
+  if (app->find.display.active || app->jump.kind == LSG_JUMP_FLOW_SCANNING
+      || app->net_drive_active)
+    return;
+
+  gint64 now = g_get_monotonic_time ();
+  if (app->sort_redrive_us != 0
+      && now - app->sort_redrive_us < LSG_SORT_REDRIVE_MIN_MS * 1000)
+    return;
+  app->sort_redrive_us = now;
+
+  /* The request is unchanged and already confirmed, so this is a RESUME, not a
+   * new demand: no dialog, no re-anchor, and the search/jump the core resets
+   * are idle by the guard above. A LANDED jump flow keeps its local result
+   * across the core's reset; that is inert, because jump_poll_fold reads the
+   * core's slot only while the flow is SCANNING, which the guard excludes. */
+  if (!lsg_document_sort_set (app->doc, app->sort.column, app->sort.direction))
+    return;
+  lsg_document_sort_poll (app->doc, &app->sort);
+  sort_progress_sync (app);
+  sort_settle_arm (app);
+}
+
+/* Fold one sort poll: the progress affordance, the landing / failure notices,
+ * and whether the grid needs re-materializing. Called from the poll tick,
+ * which coalesces the repaint into at most one window fetch per tick. */
+static gboolean
+sort_poll_fold (App *app)
+{
+  if (app->doc == NULL)
+    return FALSE;
+
+  LsgSortSnapshot was = app->sort;
+  lsg_document_sort_poll (app->doc,
+                          &app->sort); /* zeroed when there is none */
+  sort_progress_sync (app);
+
+  gboolean changed
+      = (app->sort.phase != was.phase || app->sort.column != was.column
+         || app->sort.direction != was.direction);
+  if (changed)
+    {
+      if (app->sort.phase == LSG_SORT_PHASE_FAILED)
+        {
+          /* Graceful failure: a clean notice, and the view is already back in
+           * its pre-sort order with the request kept, so the header shows the
+           * failed indicator and a click retries it. */
+          settings_toast (app, sort_failure_text (app->sort.error));
+          sort_announce (app);
+        }
+      else if (app->sort.phase == LSG_SORT_PHASE_ACTIVE
+               && (was.phase == LSG_SORT_PHASE_BUILDING
+                   || was.phase == LSG_SORT_PHASE_PARKED))
+        {
+          sort_announce (app); /* the order has settled */
+        }
+    }
+
+  /* A running pass REFINES its converging prefix under the current window, so
+   * the window has to be re-issued every tick to show it; a phase change is
+   * worth one more repaint (the full view at ACTIVE, the restored file order
+   * on FAILED). A pass PARKED on a network document is the exception: its
+   * prefix is frozen until something re-drives it, so re-materializing the
+   * same window ten times a second would buy nothing. The tick itself keeps
+   * running (grid_poll_tick reads sort_pass_running), so the re-drive still
+   * gets its chance. */
+  return (sort_pass_running (app) && !sort_paused_on_network (app)) || changed;
+}
+
+/*
+ * An input the key pass captured has changed (a filter set/cleared, a type
+ * override, a null sentinel): the core re-runs the pass by itself and the view
+ * serves the REBUILD's converging prefix. Pick the new phase up at once and
+ * keep ticking, so the progress affordance and the pending indicator are back
+ * on screen without waiting for the next tick.
+ */
+static void
+sort_note_inputs_changed (App *app)
+{
+  if (app->doc == NULL || app->sort.phase == LSG_SORT_PHASE_NONE)
+    return;
+  /* A rebuild resets the core's search and the jump slot exactly as an
+   * explicit sort change does, and whether one is triggered is the CORE's
+   * decision, not something to re-derive here — so the find view-model is
+   * invalidated whenever a sort is live and a captured input moved. The cost
+   * of being wrong this way is one re-pressed Enter; the cost of the other way
+   * is a match count on screen that the core has already thrown away. */
+  sort_reset_find_and_jump (app);
+  sort_poll_fold (app);
+  ensure_poll (app);
+  sort_settle_arm (app);
 }
 
 /* Toggling "Match case" re-issues whatever the flag governs so the new
@@ -4167,15 +4970,28 @@ on_hp_cancel_clicked (GtkButton *button, gpointer data)
 {
   (void)button;
   App *app = data;
-  /* The progress widget is shared, but by construction only one owner is ever
-   * live — a URL open stops any copy before it goes in flight, and a copy
-   * refuses to start while one is in flight — so at most one of copy_op / net
-   * is non-NULL here. */
-  if (app->copy_op != NULL)
-    g_atomic_int_set (&app->copy_op->cancel,
-                      1); /* the worker stops promptly */
-  else if (app->net != NULL)
-    lsg_net_open_cancel (app->net); /* the poll folds to CANCELLED */
+  /* The widget is shared, so the ✕ cancels whatever CLAIMED it — one owner at
+   * a time, named at show time, never re-derived here. */
+  switch (app->hp_owner)
+    {
+    case LSG_HP_COPY:
+      if (app->copy_op != NULL)
+        g_atomic_int_set (&app->copy_op->cancel,
+                          1); /* the worker stops promptly */
+      break;
+    case LSG_HP_NET:
+      if (app->net != NULL)
+        lsg_net_open_cancel (app->net); /* the poll folds to CANCELLED */
+      break;
+    case LSG_HP_SORT:
+      /* ls_sort_clear IS the cancel verb: the pass stops and the view returns
+       * to its pre-sort order. Exactly what a header click on a building sort
+       * does, through the same one cycle. */
+      do_sort_cycle (app, app->sort.column);
+      break;
+    default:
+      break;
+    }
 }
 
 static void
@@ -4197,10 +5013,11 @@ build_header_progress (App *app)
 }
 
 static void
-header_progress_show (App *app, const char *label)
+header_progress_show (App *app, int owner, const char *label)
 {
   if (app->hp_box == NULL)
     return;
+  app->hp_owner = owner;
   gtk_progress_bar_set_fraction (app->hp_bar, 0.0);
   if (label != NULL)
     {
@@ -4227,6 +5044,12 @@ header_progress_hide (App *app)
 {
   if (app->hp_box != NULL)
     gtk_widget_set_visible (app->hp_box, FALSE);
+  app->hp_owner = LSG_HP_NONE;
+  /* A key pass outlives a copy or a URL open, and its affordance must be up
+   * for the WHOLE build — so the freed bar goes straight back to it instead of
+   * blinking off until the next poll tick. */
+  if (sort_pass_running (app))
+    sort_progress_sync (app);
 }
 
 /* --- selection algebra (view rows + physical columns) --- */
@@ -4488,7 +5311,7 @@ copy_tick (gpointer data)
       && g_get_monotonic_time () - op->started_us
              >= (gint64)LSG_PROGRESS_DELAY_MS * 1000)
     {
-      header_progress_show (app, "Copying…");
+      header_progress_show (app, LSG_HP_COPY, "Copying…");
       op->progress_shown = TRUE;
     }
   if (op->progress_shown)
@@ -4734,6 +5557,18 @@ build_grid_page (App *app)
   g_signal_connect (keys, "key-pressed", G_CALLBACK (on_key_pressed), app);
   gtk_widget_add_controller (GTK_WIDGET (app->area), keys);
 
+  /* Secondary click on a column header: that column's sort menu (Amendment 3).
+   * Added BEFORE the drag gesture so the two are visibly separate affordances;
+   * they never contend, because GtkGestureDrag is bound to the primary button
+   * and this one to the secondary. */
+  GtkGesture *ctx = gtk_gesture_click_new ();
+  gtk_gesture_single_set_button (GTK_GESTURE_SINGLE (ctx),
+                                 GDK_BUTTON_SECONDARY);
+  g_signal_connect (ctx, "pressed", G_CALLBACK (on_sort_context_pressed), app);
+  gtk_widget_add_controller (GTK_WIDGET (app->area),
+                             GTK_EVENT_CONTROLLER (ctx));
+  sort_menu_build (app);
+
   /* Drag-to-select a cell rectangle (or whole rows via the gutter / whole
    * columns via the header). */
   GtkGesture *drag = gtk_gesture_drag_new ();
@@ -4802,6 +5637,12 @@ on_window_destroy (GtkWidget *widget, gpointer data)
       g_source_remove (app->prefs_infer_poll_id);
       app->prefs_infer_poll_id = 0;
     }
+  /* The sort's one-shot first-prefix repaint (see LSG_SORT_SETTLE_MS). */
+  if (app->sort_settle_id != 0)
+    {
+      g_source_remove (app->sort_settle_id);
+      app->sort_settle_id = 0;
+    }
   /* The capture settle machine's frame-clock tick, removed while app->area is
    * still a live widget. Always 0 in an unarmed run. */
   if (app->capture.tick_id != 0 && app->area != NULL)
@@ -4810,6 +5651,15 @@ on_window_destroy (GtkWidget *widget, gpointer data)
                                        app->capture.tick_id);
       app->capture.tick_id = 0;
     }
+  /* The header sort menu is parented on the grid by hand, so it has to be
+   * unparented by hand — before its parent goes. */
+  if (app->sort_menu != NULL)
+    {
+      gtk_widget_unparent (app->sort_menu);
+      app->sort_menu = NULL;
+    }
+  g_clear_object (&app->sort_actions);
+
   /* Every widget pointer goes NULL together: they all die with the window, and
    * each one is NULL-guarded at its use sites, so whatever still runs after
    * this (the copy join below, main()'s teardown) is a no-op instead of a
@@ -5050,7 +5900,7 @@ dialect_reopen (App *app, ls_open_options options)
                       "The open job could not be started.");
           return;
         }
-      header_progress_show (app, "Connecting…");
+      header_progress_show (app, LSG_HP_NET, "Connecting…");
       header_progress_set (app,
                            -1.0); /* pulse until a byte fraction is known */
       if (app->net_poll_id == 0)
@@ -5589,6 +6439,7 @@ action_shortcuts (GSimpleAction *a, GVariant *p, gpointer data)
     [LSG_A11Y_GROUP_FIND] = "Find",
     [LSG_A11Y_GROUP_NAVIGATION] = "Navigation",
     [LSG_A11Y_GROUP_SELECTION] = "Selection",
+    [LSG_A11Y_GROUP_SORTING] = "Sorting",
   };
 
   guint n = 0;
@@ -5978,6 +6829,8 @@ column_apply_type (App *app, guint32 col)
   else
     lsg_document_column_override_clear (app->doc, col);
   column_cache_effective (app, col);
+  /* The key pass captured this column's type: an active sort on it re-runs. */
+  sort_note_inputs_changed (app);
 }
 
 /* A one-line summary of column `col`'s CURRENT settings, for the collapsed
@@ -6234,6 +7087,7 @@ on_col_null_enabled (GObject *row, GParamSpec *pspec, gpointer data)
       lsg_document_column_null_sentinel_clear (app->doc, col);
     }
   column_cache_effective (app, col);
+  sort_note_inputs_changed (app); /* the pass captured the null policy */
   grid_repaint (app);
 }
 
@@ -6255,6 +7109,7 @@ on_col_null_value_apply (GtkWidget *entry, gpointer data)
   lsg_document_column_null_sentinel_set (app->doc, col,
                                          len ? s->null_sentinel : NULL, len);
   column_cache_effective (app, col);
+  sort_note_inputs_changed (app); /* the pass captured the null policy */
   grid_repaint (app);
 }
 
@@ -6288,6 +7143,7 @@ on_col_reset (GtkButton *btn, gpointer data)
   lsg_document_column_override_clear (app->doc, col);
   lsg_document_column_null_sentinel_clear (app->doc, col);
   column_cache_effective (app, col);
+  sort_note_inputs_changed (app); /* type + null policy both went back */
   /* Reset cleared has_manual_width — re-sample the auto width so a previously
    * widened column shrinks back. */
   sample_one_column_width (app, col);
