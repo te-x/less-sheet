@@ -89,7 +89,8 @@ extension DocumentModel {
         jumpFlow: JumpFlow,
         jumpFieldActive: Bool = false,
         findSession: FindSession = FindControl().initial(),
-        findFieldActive: Bool = false
+        findFieldActive: Bool = false,
+        sortSnapshot: SortSnapshot? = nil
     ) -> DocumentModel {
         let snapshot = DocumentModel(opener: live.opener)
         snapshot.path = live.path
@@ -109,6 +110,7 @@ extension DocumentModel {
         snapshot.jumpFieldActive = jumpFieldActive
         snapshot.findSession = findSession
         snapshot.findFieldActive = findFieldActive
+        snapshot.sortSnapshot = sortSnapshot
         return snapshot
     }
 
@@ -135,6 +137,7 @@ extension DocumentModel {
         // two poll loops never fold snapshots concurrently. The join happens off
         // the main actor and costs at most one poll interval.
         let previous = pollTask
+        let generation = viewGeneration
         pollTask = Task.detached(priority: .utility) { [weak self, session] in
             previous?.cancel()
             _ = await previous?.value
@@ -144,12 +147,13 @@ extension DocumentModel {
                 let jump = session.jumpStatus()
                 let search = session.searchStatus()
                 let filter = session.filterStatus()
+                let sort = session.sortStatus()
                 let columns = (session as? CoreDocumentSession)?.columnInferenceState()
                 let columnProgress = (session as? CoreDocumentSession)?.columnInferenceProgress()
                 let keepGoing = await self?.applyPoll(PollSnapshot(
-                    session: session,
+                    session: session, generation: generation,
                     rowCount: rowCount, progress: progress, jump: jump, search: search,
-                    filter: filter, columns: columns, columnProgress: columnProgress)) ?? false
+                    filter: filter, sort: sort, columns: columns, columnProgress: columnProgress)) ?? false
                 if !keepGoing { break }
                 try? await Task.sleep(for: .milliseconds(100))
             }
@@ -163,11 +167,15 @@ extension DocumentModel {
         /// on a session the model has already replaced; folding its snapshot
         /// would show the previous document's row count and progress.
         let session: any DocumentSession
+        /// The view generation the reads below were taken under (see
+        /// `DocumentModel.viewGeneration`).
+        let generation: Int
         let rowCount: RowCountInfo
         let progress: ScanProgress
         let jump: JumpStatus
         let search: SearchSnapshot?
         let filter: FilterSnapshot?
+        let sort: SortSnapshot?
         let columns: (active: Bool, generation: UInt64)?
         let columnProgress: Double?
     }
@@ -177,33 +185,17 @@ extension DocumentModel {
     /// running, so an idle document costs nothing.
     private func applyPoll(_ snapshot: PollSnapshot) -> Bool {
         guard let live = session, live === snapshot.session else { return false }
+        // A tick read before a filter/sort change would fold the PREVIOUS view's
+        // snapshots over the new one; the transition started its own poll task.
+        guard snapshot.generation == viewGeneration else { return false }
         rowCountInfo = snapshot.rowCount
         indexProgress = snapshot.progress
         filterSnapshot = snapshot.filter
+        let sortNeedsRepaint = foldSort(snapshot.sort)
         columnInferenceProgress = snapshot.columnProgress
         foldJump(snapshot.jump)
         foldSearch(snapshot.search)
-        if let columns = snapshot.columns, columns.generation != columnMetadataGeneration,
-           let core = session as? CoreDocumentSession {
-            columnMetadataGeneration = columns.generation
-            var changedColumns = Set<Int>()
-            for metadata in core.columnMetadata(coordinatedInferenceIDs()) {
-                if gridInferenceIDs.contains(UInt32(metadata.column)) {
-                    if windowColumnMetadata[metadata.column] != metadata {
-                        changedColumns.insert(metadata.column)
-                    }
-                    windowColumnMetadata[metadata.column] = metadata
-                }
-                if panelInferenceIDs.contains(UInt32(metadata.column))
-                    || panelSelectedColumn == UInt32(metadata.column) {
-                    if panelMetadata[metadata.column] != metadata {
-                        changedColumns.insert(metadata.column)
-                    }
-                    panelMetadata[metadata.column] = metadata
-                }
-            }
-            requestColumnConfigurationRedraw(changedColumns)
-        }
+        foldColumnMetadata(snapshot.columns)
 
         let filterOngoing = snapshot.filter.map { !$0.totalIsFinal } ?? false
         let jumpScanning: Bool = { if case .scanning = jumpFlow { return true } else { return false } }()
@@ -214,11 +206,44 @@ extension DocumentModel {
             searchActive: Self.searchActive(snapshot.search),
             filterOngoing: filterOngoing
         ))
-        if decision.reissueWindow {
+        // A building sort REFINES the rows it already serves, under an unchanged
+        // window geometry, so the window is re-issued once per tick (never per
+        // frame — the wide-document case converges over hundreds of re-issues)
+        // and the repaint is poked explicitly: a mutation that changes no
+        // observable geometry would otherwise wait for the next event (the
+        // repaint-family rule).
+        if decision.reissueWindow || sortIsWorking {
             materialize(start: desiredStart, count: desiredCount)
         }
+        if sortNeedsRepaint { NativeGridController.live?.apply() }
 
-        return decision.continuePolling || (snapshot.columns?.active ?? false)
+        return decision.continuePolling || sortIsWorking || (snapshot.columns?.active ?? false)
+    }
+
+    /// Folds a published column-metadata generation: pulls the coordinated id
+    /// set's snapshots and asks for a TARGETED redraw of only the columns whose
+    /// metadata actually changed. Split out of `applyPoll`, which folds the rest.
+    private func foldColumnMetadata(_ columns: (active: Bool, generation: UInt64)?) {
+        guard let columns, columns.generation != columnMetadataGeneration,
+              let core = session as? CoreDocumentSession else { return }
+        columnMetadataGeneration = columns.generation
+        var changedColumns = Set<Int>()
+        for metadata in core.columnMetadata(coordinatedInferenceIDs()) {
+            if gridInferenceIDs.contains(UInt32(metadata.column)) {
+                if windowColumnMetadata[metadata.column] != metadata {
+                    changedColumns.insert(metadata.column)
+                }
+                windowColumnMetadata[metadata.column] = metadata
+            }
+            if panelInferenceIDs.contains(UInt32(metadata.column))
+                || panelSelectedColumn == UInt32(metadata.column) {
+                if panelMetadata[metadata.column] != metadata {
+                    changedColumns.insert(metadata.column)
+                }
+                panelMetadata[metadata.column] = metadata
+            }
+        }
+        requestColumnConfigurationRedraw(changedColumns)
     }
 
     /// A search still needs polling while its match-scan runs or a navigation

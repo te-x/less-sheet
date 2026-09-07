@@ -194,6 +194,13 @@ extension DocumentModel {
             requestCoordinatedInference(core)
         }
         if remeasure { remeasureConfiguredColumn(column) }
+        // A type override or null sentinel on the SORT column makes the core
+        // rebuild the pass (§9); re-read it so the chrome says so at once, and
+        // bump the view generation so a tick already in flight cannot fold the
+        // pre-rebuild snapshot back over it (the filter/sort transitions do the
+        // same).
+        viewGeneration += 1
+        refreshSortAfterInputsChanged()
         requestColumnConfigurationRedraw([column])
         startPolling()
         NativeGridController.live?.apply()

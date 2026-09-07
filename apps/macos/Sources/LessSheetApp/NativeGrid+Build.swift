@@ -130,7 +130,7 @@ extension NativeGridController {
         if let path = FrameDump.liveGridInitialDumpPath {
             DispatchQueue.main.async { [weak self] in
                 guard self != nil else { return }
-                _ = FrameDump.captureLiveGrid(to: path)
+                FrameDump.captureInitialLiveGrid(to: path)
                 FrameDump.terminateIfRequested()
             }
         }

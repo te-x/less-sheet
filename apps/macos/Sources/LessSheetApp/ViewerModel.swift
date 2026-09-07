@@ -126,6 +126,28 @@ final class DocumentModel {
     // and a dialect re-open, so re-running is one Enter.
     var findSession: FindSession = FindControl().initial()
 
+    // The active sort's poll snapshot, or nil for file order (ARCH-sort-by-column).
+    // Session-only like every other per-document option: a re-open starts unsorted.
+    var sortSnapshot: SortSnapshot?
+    /// Counts REAL window fetches (`ls_window_set` + its label/metadata reads),
+    /// for the probe that shows the converge loop is not busy-waiting. Diagnostic
+    /// only, like `matchFlagsFetchCount`.
+    @ObservationIgnored var windowFetches = 0
+    /// Counts re-drives of a PARKED key pass, for the probe that shows a network
+    /// sort resuming (the `matchFlagsFetchCount` precedent — diagnostic, not
+    /// presentation state).
+    @ObservationIgnored var sortRedrives = 0
+    /// True while a converge loop is re-issuing a short sorted window in slices
+    /// (`scheduleSortConverge`), so only one ever runs. Pure control state.
+    @ObservationIgnored var sortConvergeRunning = false
+    /// How long the last row-window materialize took. Drives the "this window is
+    /// slow" decision below; a derived measurement, not presentation state.
+    @ObservationIgnored var lastWindowFetch: Duration = .zero
+    /// A materialize known to be slow is running (or about to): the viewer shows
+    /// a loading state rather than freezing silently. Only ever true in sorted
+    /// mode, where a window can cost seconds on a gzip source.
+    var windowLoading = false
+
     // The active filter's poll snapshot, or nil for the identity view.
     // `filterDocumentRows` captures the base document row count at the moment
     // filtering began and holds it fixed, since the session's own `rowCount()`
@@ -174,6 +196,8 @@ final class DocumentModel {
     let composer = DialectComposer()
     let findControl = FindControl()
     let filterControl = FilterControl()
+    /// The ONE sort state machine behind the header click, ⇧⌘S and Cancel.
+    let sortCycle = SortCycle()
     let windowPoll = WindowPoll()
     let selectionModel = SelectionModel()
     let columnSizer = ColumnSizer()
@@ -190,6 +214,14 @@ final class DocumentModel {
     /// fold would immediately clobber "Stopped". Cleared by the next fresh
     /// search or navigation, and by any find-session reset.
     @ObservationIgnored var userStopped = false
+
+    /// Bumped by every VIEW-MODE change that swaps the row coordinate space
+    /// (setting or clearing a filter or a sort). A poll tick carries the
+    /// generation its reads were taken under, so a tick that was already in
+    /// flight when the mode changed is DROPPED instead of folding the previous
+    /// view's snapshots over the new one — which otherwise showed up as a
+    /// just-applied sort or filter briefly reading as "none".
+    @ObservationIgnored var viewGeneration = 0
 
     var session: (any DocumentSession)?
     /// Claimed by every `open` / `openURL` call before it suspends on the

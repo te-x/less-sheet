@@ -192,6 +192,8 @@ struct ContentView: View {
                 RepaintAuditProbe.run(model: model)
             } else if MatchFlagsFetchProbe.active {
                 MatchFlagsFetchProbe.run(model: model)
+            } else if SortProbe.active {
+                SortProbe.run(model: model)
             } else if FrameDump.liveGridInitialDumpPath == nil {
                 // Overlay, find and settings scenes render off the SwiftUI mirror
                 // here; the plain grid scene self-captures the LIVE table instead.

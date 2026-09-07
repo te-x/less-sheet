@@ -140,12 +140,49 @@ extension DocumentModel {
     /// together, so the fetch is O(visible columns) rather than O(columnCount).
     /// `window.firstColumn` then carries that range, and every consumer indexes
     /// column-RELATIVE: absolute column `c` sits at slot `c - firstColumn`.
+    /// Synchronous, except for the sorted-and-measured-slow case below.
     func materialize(start: UInt64, count: Int) {
-        guard let session else { return }
         desiredStart = start
         desiredCount = count
+        // A sorted window can be genuinely slow: sorted order means scattered
+        // reads, and on a gzip source one window costs of the order of a second
+        // (the signed ship-and-measure decision). Paying that synchronously with
+        // no affordance is the silent freeze the >500 ms rule forbids — so when
+        // the LAST fetch on this document proved that slow, show the loading
+        // state and let it PAINT (one runloop turn) before paying for the next
+        // one. Everything else — every local document, and every unsorted
+        // window — takes the direct path exactly as before.
+        // A deferred fetch is already pending: it reads the CURRENT desired
+        // geometry when it runs, so the newest request is what lands.
+        guard !windowLoading else { return }
+        guard isSorted, lastWindowFetch > SortWindowTuning.slowWindow else {
+            fetchWindow()
+            return
+        }
+        // Bound the REQUEST as well as announcing the wait: at the measured
+        // per-row cost of a sorted gzip window the 1200-row scroll buffer IS the
+        // freeze, and the user can only see a viewport's worth anyway. The
+        // buffer comes back as soon as a fetch is fast again.
+        desiredCount = min(desiredCount, lastVisibleCount + SortWindowTuning.slowWindowMargin)
+        windowLoading = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.windowLoading else { return }
+            self.fetchWindow()
+            self.windowLoading = false
+            NativeGridController.live?.apply()
+        }
+    }
+
+    /// The materialize itself: the row window AND the current horizontal column
+    /// window in one fetch, at the CURRENT desired geometry (the deferred path
+    /// above may have had a newer request land while it waited).
+    private func fetchWindow() {
+        guard let session else { return }
+        windowFetches += 1
+        let started = progressClock.now
         let columns = columnFetchRange()
-        window = session.setWindow(firstRow: start, rowCount: count, columns: columns)
+        window = session.setWindow(firstRow: desiredStart, rowCount: desiredCount, columns: columns)
+        lastWindowFetch = progressClock.now - started
         // The visible bytes just changed, even when the geometry happens to match
         // the previous window, so the highlight mask must refetch.
         invalidateMatchFlags()

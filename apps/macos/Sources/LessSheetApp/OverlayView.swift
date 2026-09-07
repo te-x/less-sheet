@@ -85,6 +85,12 @@ struct OverlayView: View {
 
             GlassEffectContainer(spacing: 8) {
                 HStack(alignment: .bottom, spacing: 8) {
+                    if model.windowLoading {
+                        WindowLoadingCapsule(model: model)
+                    }
+                    if model.sortSnapshot != nil {
+                        SortBannerView(model: model)
+                    }
                     if model.filterBanner != nil {
                         FilterBannerView(model: model)
                     }

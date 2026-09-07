@@ -109,6 +109,9 @@ extension NativeGridController {
     /// extends. `offsetX` is ABSOLUTE — the same `columnFirstX`-rooted space the
     /// cell path uses, NOT the header's own descrolled local space, which the
     /// header re-bases before calling here.
+    /// A plain header click toggles the whole-column selection and a shift-click
+    /// extends to it — exactly as before the sort feature (Amendment 3: a header
+    /// click is NOT a sort trigger; sorting is ⇧⌘S and the header context menu).
     func headerMouseDown(atX offsetX: CGFloat, shift: Bool) {
         guard let index = windowColumnIndex(atX: offsetX), index < absoluteColumns.count else { return }
         container.window?.makeFirstResponder(table)
@@ -119,6 +122,13 @@ extension NativeGridController {
             model.toggleWholeColumn(column)
         }
         refreshSelectionDisplay()
+    }
+
+    /// The ABSOLUTE column under an x in the controller's space — the resolution
+    /// the header's context menu needs before it can offer per-column entries.
+    func headerColumn(atX offsetX: CGFloat) -> Int? {
+        guard let index = windowColumnIndex(atX: offsetX), index < absoluteColumns.count else { return nil }
+        return absoluteColumns[index]
     }
 
     /// The header context menu, deep-linked to the clicked column.

@@ -1,4 +1,5 @@
 import AppKit
+import Contracts
 import Foundation
 
 // The main menu, assembled in code.
@@ -21,6 +22,7 @@ extension AppDelegate {
         main.addItem(container(appMenu(name)))
         main.addItem(container(fileMenu()))
         main.addItem(container(editMenu()))
+        main.addItem(container(viewMenu()))
         main.addItem(container(goMenu()))
         main.addItem(container(findMenu()))
         let windows = windowMenu()
@@ -81,6 +83,27 @@ extension AppDelegate {
         return menu
     }
 
+    /// The View menu, back for exactly one item: the sort command. Its title and
+    /// accelerator come from the SINGLE `SortCommand` declaration the grid's
+    /// header click and key routing read, so the shortcut shown here is always
+    /// the one that fires.
+    private func viewMenu() -> NSMenu {
+        let menu = NSMenu(title: SortCommand.menuSection)
+        menu.addItem(item(SortCommand.menuTitle, #selector(menuSortByColumn(_:)),
+                          SortCommand.accelerator.key,
+                          modifiers: Self.modifiers(SortCommand.accelerator), target: self))
+        return menu
+    }
+
+    /// The one place a `KeyAccelerator` becomes AppKit modifier flags.
+    private static func modifiers(_ accelerator: KeyAccelerator) -> NSEvent.ModifierFlags {
+        var flags: NSEvent.ModifierFlags = []
+        if accelerator.command { flags.insert(.command) }
+        if accelerator.shift { flags.insert(.shift) }
+        if accelerator.option { flags.insert(.option) }
+        return flags
+    }
+
     private func goMenu() -> NSMenu {
         let menu = NSMenu(title: "Go")
         menu.addItem(item("Jump to Row…", #selector(menuJumpToRow(_:)), "j", target: self))
@@ -132,6 +155,7 @@ extension AppDelegate {
 
     @objc fileprivate func menuOpenFile(_ sender: Any?) { AppDelegate.openViaPanel() }
     @objc fileprivate func menuOpenURL(_ sender: Any?) { AppDelegate.openURLViaSheet() }
+    @objc fileprivate func menuSortByColumn(_ sender: Any?) { DocumentModel.shared.cycleSortAtCursor() }
     @objc fileprivate func menuJumpToRow(_ sender: Any?) { DocumentModel.shared.requestJumpFocus() }
     @objc fileprivate func menuFind(_ sender: Any?) { DocumentModel.shared.requestFindFocus() }
     @objc fileprivate func menuFindNext(_ sender: Any?) { DocumentModel.shared.stepFind(.forward) }

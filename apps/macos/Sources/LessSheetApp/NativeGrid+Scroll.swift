@@ -149,6 +149,12 @@ extension NativeGridController {
     /// separately, as the root of its own capture, and drawn at its live
     /// position.
     func compositeCapture(into rep: NSBitmapImageRep) {
+        // Force the FIXED strips to draw NOW. `cacheDisplay` reuses a
+        // layer-backed view's existing backing store, so a state change made
+        // between the last draw cycle and this capture — a sort's header
+        // indicator and its ORIGINAL row numbers, say — would otherwise be
+        // captured one draw behind. `display()` is synchronous and unconditional.
+        gutter.display()
         container.cacheDisplay(in: container.bounds, to: rep)
 
         guard let ctx = NSGraphicsContext(bitmapImageRep: rep) else { return }
@@ -196,7 +202,7 @@ extension NativeGridController {
         NSRect(x: 0, y: containerBounds.height - NativeGrid.bandHeight,
                width: containerBounds.width, height: NativeGrid.hairline).fill()
         header.capturesBackground = true
-        header.needsDisplay = true
+        header.display()
         if let sub = header.bitmapImageRepForCachingDisplay(in: header.bounds) {
             header.cacheDisplay(in: header.bounds, to: sub)
             sub.draw(in: header.convert(header.bounds, to: container))

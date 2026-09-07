@@ -90,10 +90,13 @@ extension DocumentModel {
             // The CORE clamps; rejecting is an app-layer reading of that clamp. A
             // scan that ended short of the target means the target was past the
             // last row, so restore the pre-jump viewport instead of landing on the
-            // clamped last row. Identity view only: under a filter `row` is a
-            // filtered index and `target` an original row number, and a filtered
-            // jump clamps to the last match by design.
-            if !isFiltered, case let .scanning(target, preJumpFirstRow, _) = previous, row < target {
+            // clamped last row. Identity view only: under a filter or a sort `row`
+            // is a view index and `target` an original row number, and such a jump
+            // lands at the target's position in that view by design.
+            // Under a SORT the landing is the target's SORTED position, which is
+            // unrelated to the target's own number — exactly the domain mismatch
+            // the filtered case has, so it is excluded the same way.
+            if !isFiltered, !isSorted, case let .scanning(target, preJumpFirstRow, _) = previous, row < target {
                 rejectJump(restoreTo: preJumpFirstRow, scanned: true)
                 return
             }

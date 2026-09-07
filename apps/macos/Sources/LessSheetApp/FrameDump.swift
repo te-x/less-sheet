@@ -10,7 +10,8 @@ import SwiftUI
 //
 // `LESSSHEET_DUMP_SCENE` selects which presentation state to capture:
 //   grid (default) · overlay · titlebar · overscroll · separator · quote ·
-//   jump · progress · settings   (error uses its own entry; `launch` is the
+//   jump · progress · settings · sorted · sorting · sortloading · sortfailed
+//   (error uses its own entry; `launch` is the
 // no-document state and needs no file). "pills" stays as
 // an alias of "separator". Every scene renders EAGERLY (no ScrollView/LazyVStack, which
 // ImageRenderer cannot capture off-screen) and bounded to the loaded window, so
@@ -132,6 +133,14 @@ enum FrameDump {
         case "progress":
             let flow = JumpFlow.scanning(target: model.rowCountInfo.count, preJumpFirstRow: 0, progress: 0.42)
             render(overlayScene(model, expandedPill: nil, jumpFlow: flow), size: gridSize, to: path)
+        case "sorting":
+            // The build in flight: the converging prefix on screen, the header
+            // indicator pending, and the progress + Cancel affordance up.
+            render(sortScene(model, phase: .building(progress: 0.37)), size: gridSize, to: path)
+        case "sortloading":
+            render(sortLoadingScene(model), size: gridSize, to: path)
+        case "sortfailed":
+            render(sortScene(model, phase: .failed(.storage)), size: gridSize, to: path)
         case "configure", "settings":
             // The live Settings window uses a native Form (NSView-backed), which
             // ImageRenderer cannot snapshot; render a plain-view mirror of the
@@ -153,10 +162,29 @@ enum FrameDump {
         guard let path = dumpPath else { return nil }
         let env = ProcessInfo.processInfo.environment
         let scene = env[sceneKey]
-        guard scene == nil || scene == "grid" else { return nil }
+        // `sorted` joins the live-grid path because the header's sort indicator
+        // and the gutter's ORIGINAL row numbers only exist in the REAL grid; the
+        // eager mirror draws neither.
+        guard scene == nil || scene == "grid" || scene == "sorted" else { return nil }
         guard env["LESSSHEET_JUMP"] == nil, env["LESSSHEET_FIND"] == nil,
               env["LESSSHEET_LANDING_STALL"] == nil else { return nil }
         return path
+    }
+
+    /// The initial live-grid capture, from the grid's own build hook (after
+    /// layout, so the container has a size). For the `sorted` scene it first
+    /// applies the shipping sort cycle to column 0 and lets the pass converge, so
+    /// the PNG carries the re-ordered rows, the header indicator and the ORIGINAL
+    /// row numbers in the gutter — all the shipping render.
+    @MainActor
+    static func captureInitialLiveGrid(to path: String) {
+        if ProcessInfo.processInfo.environment[sceneKey] == "sorted",
+           let model = NativeGridController.live?.model {
+            model.cycleSort(column: 0)
+            pumpUntil(deadline: Date().addingTimeInterval(3)) { !model.sortIsWorking }
+            NativeGridController.live?.apply()
+        }
+        _ = captureLiveGrid(to: path)
     }
 
     /// Renders the LIVE grid container (real NSTableView rows, gutter, header,
@@ -227,6 +255,15 @@ enum FrameDump {
     static func dumpError(error: DocumentOpenError, path filePath: String) {
         guard let path = dumpPath else { return }
         render(ErrorPanel(error: error, path: filePath), size: gridSize, to: path)
+    }
+
+    /// Runs the main runloop until `settled` holds or `deadline` passes.
+    /// Verification-only, and never on a shipping path.
+    @MainActor
+    private static func pumpUntil(deadline: Date, settled: () -> Bool) {
+        while !settled(), Date() < deadline {
+            RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.02))
+        }
     }
 
     /// Renders the grid at the currently materialized window — used by the

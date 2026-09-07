@@ -28,14 +28,19 @@ extension NativeGridController {
         columnAlignments = model.windowColumnAlignments()
         absoluteColumns = model.windowAbsoluteColumns()
         columnFirstX = CGFloat(model.columnWindow.firstX)
-        let truncatedColumns = zip(absoluteColumns, headerTruncated).compactMap { column, truncated in
+        var notes = zip(absoluteColumns, headerTruncated).compactMap { column, truncated in
             truncated ? "column \(column + 1) label truncated" : nil
+        }
+        // The sort indicator is drawn, so it must be spoken too.
+        if let snapshot = model.sortSnapshot,
+           let reading = SortCopy.indicatorLabel(model.sortIndicator(for: snapshot.column)) {
+            notes.append("\(model.columnLabel(snapshot.column)) \(reading)")
         }
         header.setAccessibilityElement(true)
         header.setAccessibilityRole(.group)
-        header.setAccessibilityLabel(truncatedColumns.isEmpty
+        header.setAccessibilityLabel(notes.isEmpty
             ? "Column headers"
-            : "Column headers, \(truncatedColumns.joined(separator: ", "))")
+            : "Column headers, \(notes.joined(separator: ", "))")
         // The header's resize hit-zones sit at fixed offsets from this same
         // geometry, and AppKit re-derives cursor rects only on a frame change or
         // an explicit invalidate — never on a content-offset change.
@@ -56,6 +61,7 @@ extension NativeGridController {
         applyPresentationChanges()
         applyStructuralColumnChanges()
         applyFilterToggle()
+        applySortChange()
 
         syncRowCountEstimate()
         refreshVisibleRows()
@@ -75,6 +81,7 @@ extension NativeGridController {
         let preToggleTop = headerShift != nil ? currentTopDataRow() : 0
 
         lastOpenGeneration = model.openGeneration
+        lastSortSnapshot = model.sortSnapshot
         // The previous document's fit identity is meaningless here: a matching
         // row/x/width must not suppress the new document's first fit.
         lastFitViewport = nil
@@ -135,6 +142,7 @@ extension NativeGridController {
             && model.columnPresentationRevision == lastColumnPresentationRevision
             && model.visibleColumns == lastVisibleColumns
             && model.isFiltered == lastIsFiltered
+            && model.sortSnapshot == lastSortSnapshot
             && numberOfRows(in: table) == lastRowCount
             && model.pendingScrollRow == nil
     }
@@ -179,6 +187,21 @@ extension NativeGridController {
     private func applyFilterToggle() {
         guard model.isFiltered != lastIsFiltered else { return }
         lastIsFiltered = model.isFiltered
+        refreshLayoutMetrics()
+        layoutContainer()
+    }
+
+    /// A sort change repaints the header indicator, and entering or leaving
+    /// sorted mode switches the gutter between identity and ORIGINAL row numbers
+    /// — which can change its width, so the metrics are refreshed now rather
+    /// than at the next scroll (the filter-toggle precedent).
+    private func applySortChange() {
+        guard model.sortSnapshot != lastSortSnapshot else { return }
+        let wasSorted = lastSortSnapshot != nil
+        lastSortSnapshot = model.sortSnapshot
+        header.needsDisplay = true
+        gutter.needsDisplay = true
+        guard wasSorted != (model.sortSnapshot != nil) else { return }
         refreshLayoutMetrics()
         layoutContainer()
     }

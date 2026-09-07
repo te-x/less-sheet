@@ -69,6 +69,7 @@ extension DocumentModel {
                 return
             }
             filterDocumentRows = capturedDocumentRows
+            viewGeneration += 1
             // A content swap that can keep an identical window geometry.
             invalidateMatchFlags()
             cancelWrapNav()
@@ -79,6 +80,7 @@ extension DocumentModel {
             selection = nil   // the row coordinate space just changed
             filterSnapshot = session.filterStatus()
             filterScanStartedAt = progressClock.now
+            refreshSortAfterInputsChanged()   // the row set changed: the sort rebuilds (§9)
             rowCountInfo = session.rowCount()
             landViewport(on: 0)
             startPolling()
@@ -100,10 +102,12 @@ extension DocumentModel {
         _ = session.setWindow(firstRow: UInt64(firstVisibleRow), rowCount: 1)
         let anchor = session.sourceRow(UInt64(firstVisibleRow)) ?? 0
         session.clearFilter()
+        viewGeneration += 1
         invalidateMatchFlags()
         filterSnapshot = nil
         filterDocumentRows = nil
         filterScanStartedAt = nil
+        refreshSortAfterInputsChanged()   // likewise on the way back to the identity view
         rowCountInfo = session.rowCount()
         cancelWrapNav()
         userStopped = false
@@ -111,7 +115,10 @@ extension DocumentModel {
         searchNavDirection = .forward
         setJumpFlow(.idle)
         selection = nil   // the row coordinate space just changed
-        landViewport(on: anchor)
+        // `anchor` is an ORIGINAL row number. It is a view index only in the
+        // IDENTITY view — with a sort still active the restored view is the
+        // SORTED one — so the re-anchor goes through the domain-correct path.
+        reanchor(onSourceRow: anchor)
         startPolling()
         // The re-anchor may land the same visible row, in which case the landing
         // carries no repaint (see `applyFindAsFilter`).

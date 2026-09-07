@@ -62,6 +62,7 @@ struct GridView: View {
         _ = model.findSession.display.current?.row
         _ = model.findSession.display.current?.column
         _ = model.isFiltered
+        _ = model.sortSnapshot
         _ = model.visibleColumns
         _ = model.columnWidths
         _ = model.columnPresentationRevision
@@ -158,6 +159,9 @@ final class NativeGridController: NSObject, NSTableViewDataSource, NSTableViewDe
     /// Increments each time `apply()` runs its repaint body past the built guard.
     var applyTick = 0
     var lastIsFiltered = false
+    /// The sort state the header and gutter were last drawn for, so a phase or
+    /// direction change repaints the indicator without waiting for a scroll.
+    var lastSortSnapshot: SortSnapshot?
     var built = false
     var landingApplyScheduled = false
     var pendingCellToggle: GridCell?

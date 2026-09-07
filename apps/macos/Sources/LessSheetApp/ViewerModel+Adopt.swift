@@ -278,6 +278,9 @@ extension DocumentModel {
         self.filterSnapshot = nil
         self.filterDocumentRows = nil
         self.filterScanStartedAt = nil
+        // Sort state is session-only and dies with the old handle, like the rest.
+        self.sortSnapshot = nil
+        self.windowLoading = false
         self.pendingScrollRow = nil
         // Row/column indices from the previous document are meaningless here.
         // The copy itself was already cancelled at the top of the open, before

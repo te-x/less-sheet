@@ -15,10 +15,11 @@ extension DocumentModel {
     /// the measurement exact.
     func rowNumberColumnWidth() -> CGFloat {
         let maxVisible: Int
-        if isFiltered {
-            // Original row numbers are non-contiguous under a filter, so size for
-            // the largest POSSIBLE one. Re-deriving it from each visible row's
-            // source mapping would make the gutter width change as you scroll.
+        if isFiltered || isSorted {
+            // Original row numbers are non-contiguous under a filter — and in any
+            // order at all under a sort — so size for the largest POSSIBLE one.
+            // Re-deriving it from each visible row's source mapping would make the
+            // gutter width change as you scroll.
             let documentRows = filterDocumentRows?.count ?? rowCountInfo.count
             maxVisible = Int(min(documentRows, UInt64(Int.max)))
         } else {
@@ -30,12 +31,13 @@ extension DocumentModel {
     }
 
     /// The gutter's value for a row: its ORIGINAL data-row number while a filter
-    /// is active, forwarded verbatim from the core and never recomputed, else its
-    /// own index. `nil` when filtered and the row is not currently servable — the
-    /// gutter leaves it blank until a re-window catches up, exactly like its
-    /// cells.
+    /// or a SORT is active, forwarded verbatim from the core and never
+    /// recomputed, else its own index. `nil` when the row is not currently
+    /// servable — past a filter's counted region, or past a building sort's
+    /// converging prefix — and the gutter leaves it blank until a re-window
+    /// catches up, exactly like its cells.
     func gutterRow(forRow row: Int) -> UInt64? {
-        guard isFiltered else { return UInt64(row) }
+        guard isFiltered || isSorted else { return UInt64(row) }
         return session?.sourceRow(UInt64(row))
     }
 

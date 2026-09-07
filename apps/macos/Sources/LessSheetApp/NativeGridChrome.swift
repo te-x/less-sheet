@@ -1,6 +1,7 @@
 // Data table (event routing), sticky column header, and row-number gutter.
 import AppKit
 import Contracts
+import Foundation
 import SwiftUI
 
 // MARK: - Data table
@@ -103,18 +104,74 @@ final class GridHeaderView: NSView {
     override func menu(for event: NSEvent) -> NSMenu? {
         let point = convert(event.locationInWindow, from: nil)
         guard let controller else { return nil }
+        let menu = columnMenu(forColumn: controller.headerColumn(atX: point.x + contentOffsetX),
+                              offsetX: point.x + contentOffsetX)
+        controller.container.window?.makeFirstResponder(self)
+        return menu
+    }
+
+    /// The header's context menu, built for `column` (nil when the click missed
+    /// every column). Factored out of `menu(for:)` so the headless probe can
+    /// build and validate the REAL menu — enablement included — without a
+    /// synthetic event.
+    func columnMenu(forColumn column: Int?, offsetX: CGFloat) -> NSMenu {
         let menu = NSMenu(title: "Column")
+        // WE decide enablement, not AppKit. With autoenabling left on, its
+        // `update()` pass re-enables any item whose target responds to the
+        // action — which would silently override "Clear Sort is disabled while
+        // nothing is sorted" and leave a selectable item that does nothing.
+        menu.autoenablesItems = false
         let item = NSMenuItem(title: "Configure Column…", action: #selector(configureColumn(_:)), keyEquivalent: "")
         item.target = self
-        item.representedObject = point.x + contentOffsetX
+        item.representedObject = offsetX
         menu.addItem(item)
-        controller.container.window?.makeFirstResponder(self)
+        // Amendment 3: sorting is triggered from HERE (and from ⇧⌘S) — never
+        // from a plain header click, which keeps its whole-column selection.
+        // Titles, order and state all come from `SortCycling.headerMenu`, so the
+        // menu cannot disagree with the chevron the header draws.
+        if let column {
+            menu.addItem(.separator())
+            for sortItem in sortMenuItems(forColumn: column) { menu.addItem(sortItem) }
+        }
         return menu
     }
 
     @objc private func configureColumn(_ sender: NSMenuItem) {
         guard let offsetX = sender.representedObject as? CGFloat else { return }
         controller?.configureColumnFromHeader(atX: offsetX)
+    }
+
+    /// The sort entries for `column`, built from `SortCycling.headerMenu` — the
+    /// frozen decision about titles, order, check marks and enablement. Factored
+    /// out of `menu(for:)` so the headless probe can drive the SAME construction
+    /// without a synthetic event.
+    func sortMenuItems(forColumn column: Int) -> [NSMenuItem] {
+        guard let model = controller?.model else { return [] }
+        return model.sortMenu(for: column).enumerated().map { index, entry in
+            let item = NSMenuItem(title: entry.title, action: #selector(applySortEntry(_:)), keyEquivalent: "")
+            item.target = self
+            // The entry's identity, resolved back through the SAME menu on
+            // activation — so the action can never carry a stale intent.
+            item.representedObject = [column, index]
+            item.state = entry.isChecked ? .on : .off
+            item.isEnabled = entry.isEnabled
+            return item
+        }
+    }
+
+    /// Re-reads the menu for the clicked column and applies the chosen entry's
+    /// intent. Re-reading rather than capturing the intent keeps the model's
+    /// current state authoritative even if the sort moved on while the menu was
+    /// open (`isEnabled` is re-checked too — AppKit can still deliver an item
+    /// that has just become invalid).
+    @objc private func applySortEntry(_ sender: NSMenuItem) {
+        guard let identity = sender.representedObject as? [Int], identity.count == 2,
+              let model = controller?.model else { return }
+        let entries = model.sortMenu(for: identity[0])
+        guard identity[1] < entries.count else { return }
+        let entry = entries[identity[1]]
+        guard entry.isEnabled else { return }
+        model.applySortIntent(entry.intent)
     }
 
     /// The resize-vs-select dispatch, factored out so a probe can drive it with a
@@ -152,6 +209,29 @@ final class GridHeaderView: NSView {
         resizingIndex = nil
     }
 
+    /// The sort glyph at the trailing edge of the sorted column's header cell —
+    /// the chevron macOS uses for a sorted column, up for ascending and down for
+    /// descending. A PENDING pass draws it in the tertiary colour: the rows ARE
+    /// already re-ordered, but only the converging prefix is final, so the header
+    /// must not claim a settled order. A FAILED pass draws it in the system's red
+    /// and a click on the header retries.
+    private func drawSortIndicator(_ indicator: SortIndicator, in cell: NSRect) {
+        guard let direction = indicator.direction else { return }
+        let color: NSColor = indicator.didFail
+            ? .systemRed
+            : (indicator.isPending ? .tertiaryLabelColor : .labelColor)
+        let config = NSImage.SymbolConfiguration(pointSize: 9, weight: .semibold)
+            .applying(.init(paletteColors: [color]))
+        guard let base = NSImage(systemSymbolName: direction == .ascending ? "chevron.up" : "chevron.down",
+                                 accessibilityDescription: nil),
+              let image = base.withSymbolConfiguration(config) else { return }
+        let size = image.size
+        let rect = NSRect(x: cell.maxX - size.width - GridMetrics.cellHPadding,
+                          y: cell.midY - size.height / 2, width: size.width, height: size.height)
+        guard rect.minX > cell.minX else { return }   // no room in a very narrow column
+        image.draw(in: rect, from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+    }
+
     override func draw(_ dirtyRect: NSRect) {
         guard let controller else { return }
         let height = bounds.height
@@ -175,6 +255,10 @@ final class GridHeaderView: NSView {
             }
             if columnIndex < controller.headerTruncated.count, controller.headerTruncated[columnIndex] {
                 SheetRowView.drawTruncationMarker(in: cell)
+            }
+            if columnIndex < controller.absoluteColumns.count {
+                drawSortIndicator(controller.model.sortIndicator(for: controller.absoluteColumns[columnIndex]),
+                                  in: cell)
             }
             grid.setFill()
             NSRect(x: cursorX + width - NativeGrid.hairline, y: 0,
