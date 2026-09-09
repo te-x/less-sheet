@@ -64,6 +64,11 @@
   </screenshots>
 
   <releases>
+    <release version="0.1.4" date="2026-09-09">
+      <description>
+        <p>Drop a file into the window to open it. Repeated searches and filters reuse previous scan progress, including navigation in sorted views.</p>
+      </description>
+    </release>
     <release version="0.1.3" date="2026-09-07">
       <description>
         <p>Sort by any column, ascending or descending, from the column header's menu or with a keyboard shortcut. The first sorted rows appear at once and refine while the file is scanned; memory stays flat, with the sort's working data kept in temporary files.</p>

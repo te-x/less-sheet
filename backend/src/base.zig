@@ -275,7 +275,7 @@ pub const Document = struct {
     search_pos: Pos,
     search_rows: u64,
     search_to_eof: bool, // scan goal: full sweep to EOF (vs nav-limited resume)
-    // Generation: bumped by every ls_search_start so an in-flight worker chunk
+    // Generation: bumped when ls_search_start changes the request so a worker chunk
     // of a replaced search is discarded on commit (no stale counts / no UAF of
     // the request buffers the worker snapshots lock-free).
     search_gen: u64,
@@ -294,6 +294,9 @@ pub const Document = struct {
     // Per-index-block match counters (owned): block b == rows
     // [b*checkpoint_interval, (b+1)*checkpoint_interval); O(checkpoints) always.
     block_counts: std.ArrayList(u64),
+    match_cache: @import("match_cache.zig").Cache = .{},
+    search_oversized_stage: std.ArrayList(OversizedMatch) = .empty,
+    search_oversized_matches: std.ArrayList(OversizedMatch) = .empty,
     // Worker match-scan scratch + request snapshot (worker-only; lock-free
     // during a chunk). Refreshed under the lock when search_gen changes.
     search_scratch: std.ArrayList(u8),
@@ -354,8 +357,7 @@ pub const Document = struct {
     // windowSetFiltered / nav.nthMatchInBlock) honor the background filter-
     // scan's FULL-cell match decision for a giant row without re-scanning it.
     // `filter_oversized_stage` is lock-free staging exclusive to the ONE
-    // filter-scan chunk currently executing (mirrors `oversized_stage`, but
-    // filter-only: no other scan tests the filter predicate). At commit time
+    // filter or filtered-search chunk currently executing. At commit time
     // (filter.commitFilter) it drains into `filter_oversized_matches`, the
     // persistent, FILTER-GENERATION-scoped list (reset in setFilter alongside
     // filter_block_counts) -- UNCONDITIONALLY, since the filter's own counted
@@ -854,6 +856,9 @@ pub fn freeDoc(doc: *Document) void {
     doc.mf_flags.deinit(doc.gpa);
     doc.win_src_index.deinit(doc.gpa);
     doc.block_counts.deinit(doc.gpa);
+    doc.match_cache.deinit(doc.gpa);
+    doc.search_oversized_stage.deinit(doc.gpa);
+    doc.search_oversized_matches.deinit(doc.gpa);
     doc.search_scratch.deinit(doc.gpa);
     doc.search_refs.deinit(doc.gpa);
     doc.w_query.deinit(doc.gpa);

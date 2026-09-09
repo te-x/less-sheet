@@ -44,7 +44,7 @@ struct LaunchStateView: View {
                 .frame(width: Self.logoSize, height: Self.logoSize)
                 .accessibilityHidden(true) // the title below carries the meaning
                 .padding(.bottom, 8)
-            Text("Open a spreadsheet to view it")
+            Text("Drop a file here or open a spreadsheet")
                 .font(.title3)
                 .foregroundStyle(.secondary)
             VStack(alignment: .leading, spacing: 6) {

@@ -586,6 +586,47 @@ const NavIndex = struct {
     }
 };
 
+/// Bounded snapshot of Find's sorted counters. Source-order match counts alone
+/// cannot restore sorted navigation: that would make the next arrow rescan the
+/// document. The permutation generation and prefix coverage must also match.
+pub const NavCache = struct {
+    generation: ?u64 = null,
+    counts: std.ArrayList(u64) = .empty,
+    rows: u64 = 0,
+    filter_cum: u64 = 0,
+
+    pub fn deinit(self: *NavCache, gpa: std.mem.Allocator) void {
+        self.counts.deinit(gpa);
+    }
+
+    pub fn capture(self: *NavCache, d: *Document) !void {
+        const b = d.sort_build orelse return;
+        if (d.sort_state != .active or b.nav.search_gen != d.search_gen or !b.nav.ready) return;
+        if (!d.search_total_exact and b.nav.tallied_rows != d.search_rows) return;
+        try self.counts.appendSlice(d.gpa, b.nav.counts.items);
+        self.generation = d.sort_gen;
+        self.rows = d.search_rows;
+        self.filter_cum = d.search_filter_cum;
+    }
+
+    pub fn compatible(self: *const NavCache, d: *Document) bool {
+        return d.sort_state == .active and self.generation != null and self.generation.? == d.sort_gen;
+    }
+
+    pub fn restore(self: *const NavCache, d: *Document) bool {
+        if (!self.compatible(d)) return false;
+        const b = d.sort_build orelse return false;
+        b.nav.counts.ensureTotalCapacity(d.gpa, self.counts.items.len) catch return false;
+        b.nav.reset(d.search_gen);
+        b.nav.counts.appendSliceAssumeCapacity(self.counts.items);
+        b.nav.ready = true;
+        b.nav.tallied_rows = self.rows;
+        d.search_filter_cum = self.filter_cum;
+        d.sort_nav_tally = true;
+        return true;
+    }
+};
+
 // ===========================================================================
 // Ephemeral temp storage — the SAME discipline (and the SAME resolver) as the
 // gzip checkpoint spill and the network spool: mode 0600, unlinked at creation,

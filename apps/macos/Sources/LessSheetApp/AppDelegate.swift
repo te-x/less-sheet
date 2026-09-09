@@ -127,7 +127,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         CaptureProbe.configure(window: window)   // inert without LESSSHEET_CAPTURE_*
         LaunchTiming.phase("before_hosting_view")
-        window.contentView = NSHostingView(rootView: ContentView(model: .shared))
+        let content = FileDropHostingView(rootView: ContentView(model: .shared))
+        content.registerForDraggedTypes([.fileURL])
+        window.contentView = content
         LaunchTiming.phase("after_hosting_view")
         for type in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
             window.standardWindowButton(type)?.alphaValue = 1

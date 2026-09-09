@@ -109,6 +109,8 @@ pub fn searchScanChunk(doc: *Document, start_pos: Pos, start_row: u64, filtered:
     const scan = doc.beginMatchScan(.search, generation, start_pos);
     const target = ((start_row / checkpoint_interval) + 1) * checkpoint_interval;
     base.beginOversizedChunk(doc);
+    doc.search_oversized_stage.clearRetainingCapacity();
+    doc.filter_oversized_stage.clearRetainingCapacity();
     doc.search_match_stage.clearRetainingCapacity();
     // FRONTIER COMMIT GUARD (source.Source.commitBound), hoisted out of the row
     // loop: a LOCAL document pays one register test per row, no call.
@@ -171,6 +173,10 @@ pub fn searchScanChunk(doc: *Document, start_pos: Pos, start_row: u64, filtered:
             }
         }
         base.stageOversized(doc, row, pos, res.next);
+        if (doc.reader.bytesConsumed(doc.source, res.next) - doc.reader.bytesConsumed(doc.source, pos) > api.window_row_scan_max_bytes) {
+            doc.search_oversized_stage.append(doc.gpa, .{ .row = row, .matched = res.matched_col != null }) catch {};
+            if (filtered) doc.filter_oversized_stage.append(doc.gpa, .{ .row = row, .matched = res.filter_matched }) catch {};
+        }
         pos = res.next;
         row += 1;
         if (doc.source == .gzip) doc.gz_match_resident_bytes = @max(doc.gz_match_resident_bytes, 2 * @sizeOf(matcher.StreamCell));
@@ -230,6 +236,7 @@ pub fn commitSearch(doc: *Document, res: SearchChunk, filtered: bool) void {
     };
 
     doc.block_counts.appendAssumeCapacity(res.matches);
+    doc.search_oversized_matches.appendSlice(doc.gpa, doc.search_oversized_stage.items) catch {};
     // ARCH FR7: fold this chunk's matches into the per-SORTED-block counters
     // (O(index blocks) memory, never a match list). Done here, inside the scan
     // that was already visiting these rows, so no navigation ever has to pay a
@@ -277,6 +284,7 @@ fn maybeAdvanceFilterFromSearch(doc: *Document, block: u64, res: SearchChunk) vo
     if (block != doc.filter_block_counts.items.len) return;
     doc.filter_block_counts.ensureUnusedCapacity(doc.gpa, 1) catch return;
     doc.filter_block_counts.appendAssumeCapacity(res.filter_matches);
+    doc.filter_oversized_matches.appendSlice(doc.gpa, doc.filter_oversized_stage.items) catch {};
     doc.filter_rows = res.end_row;
     doc.filter_pos = res.end_pos;
     doc.filter_total +%= res.filter_matches;
@@ -1123,15 +1131,36 @@ pub fn startSearch(d: *Document, request: *const api.SearchRequest) bool {
     }
 
     d.lock();
-    // Replace any previous search ENTIRELY.
-    if (d.scope_mask.len > 0) d.gpa.free(d.scope_mask);
-    d.search_query.deinit(d.gpa);
-    d.search_query = query;
-    d.scope_mask = mask;
-    d.search_kind = req.kind;
-    d.search_op = req.op;
-    d.search_column = req.column;
-    d.search_gen +%= 1;
+    const target: MatchCtx = .{ .kind = req.kind, .op = req.op, .column = req.column, .q = &query, .scope_mask = mask, .column_count = d.column_count };
+    const reuse = d.search_state != .idle and base.sourceFaultCount(d) == 0 and
+        @import("match_cache.zig").resumable(d.search_rows, d.search_total_exact, d.block_counts.items.len) and
+        @import("match_cache.zig").same(docCtx(d), target);
+    if (reuse) {
+        // The request AND view are unchanged (view changes reset search to
+        // IDLE). Keep the current cursor, worker snapshot and sorted tally.
+        // A chunk still in flight belongs to this same scan and may commit.
+        query.deinit(d.gpa);
+        if (mask.len > 0) d.gpa.free(mask);
+    } else {
+        d.match_cache.remember(d, target, false);
+        if (d.scope_mask.len > 0) d.gpa.free(d.scope_mask);
+        d.search_query.deinit(d.gpa);
+        d.search_query = query;
+        d.scope_mask = mask;
+        d.search_kind = req.kind;
+        d.search_op = req.op;
+        d.search_column = req.column;
+        d.search_gen +%= 1;
+        d.block_counts.clearRetainingCapacity();
+        d.search_oversized_matches.clearRetainingCapacity();
+        d.search_total = 0;
+        d.search_total_exact = false;
+        d.search_rows = 0;
+        d.search_pos = d.data_start;
+        d.search_progress = 0.0;
+        sort.navResetLocked(d, d.search_gen);
+        _ = d.match_cache.restore(d, docCtx(d), false);
+    }
 
     // Take the scan slot: cancel a scanning jump (DONE persists; gains kept).
     if (d.jump_state == .scanning) {
@@ -1139,22 +1168,20 @@ pub fn startSearch(d: *Document, request: *const api.SearchRequest) bool {
         d.jump_progress = 0.0;
     }
 
-    // Reset counts / navigation / cursor; the match-scan starts from row 0.
-    d.block_counts.clearRetainingCapacity();
-    d.search_total = 0;
-    d.search_total_exact = false;
-    d.search_rows = 0;
-    d.search_pos = d.data_start;
-    d.search_progress = 0.0;
+    // Every submission resets navigation, including a cached result. A
+    // pending off-main navigation must not publish its previous landing.
+    d.nav_gen +%= 1;
     d.search_found_row = 0;
     d.search_found_col = 0;
     d.search_position = 0;
     d.search_nav = .none;
     d.nav_pending = false;
     d.search_to_eof = true;
-    // FIND UNDER A SORT (ARCH FR7): point the per-sorted-block counters at this
-    // search, so its own match-scan tallies them as it goes.
-    sort.navResetLocked(d, d.search_gen);
+    if (d.search_total_exact) {
+        d.search_state = .done;
+        d.unlock();
+        return true;
+    }
 
     if (d.reader.atEnd(d.source, d.data_start) or d.column_count == 0) {
         // Nothing to scan: already DONE with total 0.
@@ -1165,7 +1192,7 @@ pub fn startSearch(d: *Document, request: *const api.SearchRequest) bool {
         return true;
     }
     // A NETWORK search launches NO to-EOF match-scan. It parks immediately
-    // (CANCELLED, nothing scanned, to_eof false); each ls_search_nav then
+    // (CANCELLED, retained prefix only, to_eof false); each ls_search_nav then
     // resumes it only as far as the next match via the existing
     // CANCELLED-resume machinery, so the full match total M is never computed
     // over the wire (total = the scanned-prefix count; total_exact only if a

@@ -368,6 +368,31 @@ pub fn setFilter(d: *Document, request: *const api.SearchRequest) bool {
 
     d.lock();
     // Replace any previous filter ENTIRELY.
+    const target: MatchCtx = .{ .kind = req.kind, .op = req.op, .column = req.column, .q = &query, .scope_mask = mask, .column_count = d.column_count };
+    if (d.filter_state != .idle and d.filter_total_exact and d.sort_state == .active and
+        base.sourceFaultCount(d) == 0 and @import("match_cache.zig").same(filterCtx(d), target))
+    {
+        // The row set and completed sort are unchanged. Reset the requested
+        // navigation state, but keep the sort's permutation and filter counts.
+        query.deinit(d.gpa);
+        if (mask.len > 0) d.gpa.free(mask);
+        d.jump_state = .idle;
+        d.jump_progress = 0.0;
+        d.jump_landed = 0;
+        d.search_state = .idle;
+        d.search_nav = .none;
+        d.search_progress = 0.0;
+        d.search_found_row = 0;
+        d.search_found_col = 0;
+        d.search_position = 0;
+        d.search_total = 0;
+        d.search_total_exact = false;
+        d.nav_pending = false;
+        d.nav_gen +%= 1;
+        d.unlock();
+        return true;
+    }
+    d.match_cache.remember(d, target, true);
     if (d.filter_scope_mask.len > 0) d.gpa.free(d.filter_scope_mask);
     d.filter_query.deinit(d.gpa);
     d.filter_query = query;
@@ -395,7 +420,7 @@ pub fn setFilter(d: *Document, request: *const api.SearchRequest) bool {
     d.search_total_exact = false;
     d.nav_pending = false;
 
-    // Reset the counted region / counters; the filter-scan restarts from row 0.
+    // Initialize a fresh counted region, then restore compatible session work.
     d.filter_block_counts.clearRetainingCapacity();
     d.filter_oversized_matches.clearRetainingCapacity(); // ARCH-huge-row-filtered
     d.filter_total = 0;
@@ -403,6 +428,13 @@ pub fn setFilter(d: *Document, request: *const api.SearchRequest) bool {
     d.filter_rows = 0;
     d.filter_pos = d.data_start;
     d.filter_progress = 0.0;
+
+    if (d.match_cache.restore(d, filterCtx(d), true) and d.filter_total_exact) {
+        d.filter_state = .done;
+        sort.rebuildForInputChange(d, null);
+        d.unlock();
+        return true;
+    }
 
     if (d.reader.atEnd(d.source, d.data_start) or d.column_count == 0) {
         // Nothing to scan: already DONE with total 0.
@@ -462,6 +494,8 @@ pub fn clearFilter(d: *Document) void {
     d.lock();
     defer d.unlock();
     if (d.filter_state == .idle) return; // no-op
+
+    d.match_cache.takeFilter(d);
 
     d.filter_state = .idle;
     d.filter_progress = 0.0;

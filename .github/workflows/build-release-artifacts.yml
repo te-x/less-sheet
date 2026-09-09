@@ -1,0 +1,70 @@
+name: Build release artifacts
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to package
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Zig 0.16.0
+        run: |
+          curl -fsSLO https://ziglang.org/download/0.16.0/zig-aarch64-macos-0.16.0.tar.xz
+          tar -xf zig-aarch64-macos-0.16.0.tar.xz
+          echo "$PWD/zig-aarch64-macos-0.16.0" >> "$GITHUB_PATH"
+      - name: Build and run macOS artifacts
+        run: >-
+          python3 tools/release/make_release
+          --platform mac
+          --version "${{ inputs.version }}"
+          --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-macos-arm64
+          path: |
+            dist/less-sheet-${{ inputs.version }}-macos-arm64.*
+            dist/manifest.json
+          if-no-files-found: error
+
+  linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            zig_arch: x86_64
+            artifact_arch: x86_64
+          - runner: ubuntu-24.04-arm
+            zig_arch: aarch64
+            artifact_arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Zig 0.16.0
+        run: |
+          curl -fsSLO https://ziglang.org/download/0.16.0/zig-${{ matrix.zig_arch }}-linux-0.16.0.tar.xz
+          tar -xf zig-${{ matrix.zig_arch }}-linux-0.16.0.tar.xz
+          echo "$PWD/zig-${{ matrix.zig_arch }}-linux-0.16.0" >> "$GITHUB_PATH"
+      - name: Build and run Linux artifact
+        run: >-
+          python3 tools/release/make_release
+          --platform linux
+          --arch "${{ matrix.artifact_arch }}"
+          --version "${{ inputs.version }}"
+          --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-linux-${{ matrix.artifact_arch }}
+          path: |
+            dist/less-sheet-${{ inputs.version }}-linux-${{ matrix.artifact_arch }}.tar.gz
+            dist/manifest.json
+          if-no-files-found: error

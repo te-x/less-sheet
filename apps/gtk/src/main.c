@@ -1791,7 +1791,8 @@ prefetch_discard (App *app)
 }
 
 /* Open one local GFile into the grid, or an error page. Does NOT take
- * ownership of `file`. Shared by the file dialog and the command-line open. */
+ * ownership of `file`. Shared by the file dialog, file drops and command line.
+ */
 static void
 open_file (App *app, GFile *file)
 {
@@ -1856,6 +1857,53 @@ on_file_opened (GObject *source, GAsyncResult *res, gpointer data)
     }
   open_file (app, file);
   g_object_unref (file);
+}
+
+/* Like a file-manager launch, a drop opens the first file in this single
+ * document window. COPY means opening a reference, never moving the source.
+ * Keep this on the window so launch, grid, empty and error pages all work. */
+static GdkDragAction
+on_file_drop_motion (GtkDropTarget *target, double x, double y, gpointer data)
+{
+  (void)target;
+  (void)x;
+  (void)y;
+  (void)data;
+  /* Wayland can initially report MOVE as the selected action even when the
+   * source supports COPY too. Explicitly prefer COPY during negotiation. */
+  return GDK_ACTION_COPY;
+}
+
+static gboolean
+on_file_drop (GtkDropTarget *target, const GValue *value, double x, double y,
+              gpointer data)
+{
+  (void)x;
+  (void)y;
+  /* Some file managers offer only MOVE, even when dropping onto a viewer.
+   * Accept that gesture, but never acknowledge a move: a successful MOVE can
+   * tell the source to delete its file. COPY can finish normally; a move-only
+   * drag ends without transferring ownership. Clear its selected action too:
+   * some X11 sources inspect that even after an unsuccessful completion.
+   */
+  GdkDrop *drop = gtk_drop_target_get_current_drop (target);
+  gboolean copied
+      = drop == NULL || (gdk_drop_get_actions (drop) & GDK_ACTION_COPY) != 0;
+  if (drop != NULL && !copied)
+    gdk_drop_status (drop, GDK_ACTION_NONE, GDK_ACTION_NONE);
+  if (!G_VALUE_HOLDS (value, GDK_TYPE_FILE_LIST))
+    return FALSE;
+  GdkFileList *list = g_value_get_boxed (value);
+  GSList *files = list != NULL ? gdk_file_list_get_files (list) : NULL;
+  if (files == NULL || !G_IS_FILE (files->data))
+    return FALSE;
+  GFile *file = G_FILE (files->data);
+  if (!g_file_is_native (file)
+      || g_file_query_file_type (file, G_FILE_QUERY_INFO_NONE, NULL)
+             == G_FILE_TYPE_DIRECTORY)
+    return FALSE;
+  open_file ((App *)data, file);
+  return copied;
 }
 
 static void
@@ -2790,6 +2838,9 @@ find_run_query (App *app)
       app->find_nav_direction = LSG_SEARCH_FORWARD;
       app->find_wrap_issued = FALSE;
       lsg_document_search_nav (app->doc, lsg_search_nav_from_top ());
+      /* A retained query may already be complete. Fold that result before
+       * painting, rather than flashing a fresh 0% scan until the next tick. */
+      find_poll_fold (app);
       ensure_poll (app);
     }
   else
@@ -5492,7 +5543,7 @@ build_launch_page (App *app)
   adw_status_page_set_title (ADW_STATUS_PAGE (status), "less-sheet");
   adw_status_page_set_description (
       ADW_STATUS_PAGE (status),
-      "Open a delimited file, or a CSV over the network.");
+      "Drop a file here, open a delimited file, or a CSV over the network.");
 
   GtkWidget *box = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 12);
   gtk_widget_set_halign (box, GTK_ALIGN_CENTER);
@@ -7773,6 +7824,13 @@ ensure_window (App *app, GtkApplication *gtk_app)
 
   GtkWidget *win = adw_application_window_new (gtk_app);
   app->window = GTK_WINDOW (win);
+  GtkDropTarget *file_drop = gtk_drop_target_new (
+      GDK_TYPE_FILE_LIST, GDK_ACTION_COPY | GDK_ACTION_MOVE);
+  g_signal_connect (file_drop, "enter", G_CALLBACK (on_file_drop_motion), app);
+  g_signal_connect (file_drop, "motion", G_CALLBACK (on_file_drop_motion),
+                    app);
+  g_signal_connect (file_drop, "drop", G_CALLBACK (on_file_drop), app);
+  gtk_widget_add_controller (win, GTK_EVENT_CONTROLLER (file_drop));
   g_signal_connect (win, "map", G_CALLBACK (on_window_map), app);
   g_signal_connect (win, "destroy", G_CALLBACK (on_window_destroy), app);
 
