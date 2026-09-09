@@ -255,6 +255,8 @@
         streamed from a URL — with more formats coming.</p>
       <p class="lede">It never loads the whole file into memory, only the
         minimum needed to fill the window.</p>
+      <p class="lede">Open from the file picker, the command line, a URL, or
+        simply drop a file onto the window.</p>
 
       <div class="ledger">
         <div class="only-mac">
@@ -385,9 +387,12 @@
   <div class="col">
     <div class="prose">
       <div class="rn">04</div>
-      <h2>Search &amp; filter.</h2>
+      <h2>Search, filter &amp; sort.</h2>
       <p>Quickly find content across the entire file, or filter down to just
-        the rows you need.</p>
+        the rows you need. Sort any column directly from its header.</p>
+      <p>Completed searches are remembered while you move between Find, Where
+        and filtering, so returning to the same query does not scan the file
+        again.</p>
       <p>Copying returns the original bytes, regardless of any formatting you
         applied in the viewer.</p>
     </div>
@@ -491,7 +496,7 @@
       <div class="dl">
         <div>
           <h3>macOS</h3>
-          <p style="margin:0"><a class="btn" href="https://github.com/te-x/less-sheet/releases/download/v0.1.3/less-sheet-0.1.3-macos-arm64.dmg">Download 0.1.3 · .dmg</a></p>
+          <p style="margin:0"><a class="btn" href="https://github.com/te-x/less-sheet/releases/download/v0.1.4/less-sheet-0.1.4-macos-arm64.dmg">Download 0.1.4 · .dmg</a></p>
           <p class="reqs">macOS 26.0+ · Apple silicon · 3&nbsp;MB</p>
 
           <div class="dl-way">Homebrew</div>
@@ -502,7 +507,7 @@ brew install --cask less-sheet</code></pre>
             so. The middle line trusts this one cask, not the whole tap.</p>
 
           <div class="dl-way">curl</div>
-          <pre class="cmd"><code>curl -fsSL https://github.com/te-x/less-sheet/releases/download/v0.1.3/less-sheet-0.1.3-macos-arm64.tar.gz | tar -xz -C /Applications</code></pre>
+          <pre class="cmd"><code>curl -fsSL https://github.com/te-x/less-sheet/releases/download/v0.1.4/less-sheet-0.1.4-macos-arm64.tar.gz | tar -xz -C /Applications</code></pre>
 
           <div class="fn"><b>First launch needs one extra step.</b>
             less-sheet is not notarized by Apple, so the .dmg and the Homebrew
@@ -514,19 +519,19 @@ brew install --cask less-sheet</code></pre>
         </div>
         <div>
           <h3>Linux</h3>
-          <p style="margin:0"><a class="btn" href="https://github.com/te-x/less-sheet/releases/download/v0.1.3/less-sheet-0.1.3-x86_64.flatpak">Download 0.1.3 · Flatpak</a></p>
+          <p style="margin:0"><a class="btn" href="https://github.com/te-x/less-sheet/releases/download/v0.1.4/less-sheet-0.1.4-x86_64.flatpak">Download 0.1.4 · Flatpak</a></p>
           <p class="reqs">x86_64 · runs on any distribution</p>
 
           <div class="dl-way">Flatpak</div>
           <pre class="cmd"><code>flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
-flatpak install ./less-sheet-0.1.3-x86_64.flatpak
+flatpak install ./less-sheet-0.1.4-x86_64.flatpak
 flatpak run com.lesssheet.LessSheet</code></pre>
           <p class="reqs">Uses the GNOME 49 runtime, which Flatpak fetches from
             Flathub if you don’t already have it. The first line only adds Flathub
             as a source; on most desktops it is already there.</p>
 
           <div class="dl-way">tarball</div>
-          <pre class="cmd"><code>curl -fsSL https://github.com/te-x/less-sheet/releases/download/v0.1.3/less-sheet-0.1.3-linux-x86_64.tar.gz | tar -xz
+          <pre class="cmd"><code>curl -fsSL https://github.com/te-x/less-sheet/releases/download/v0.1.4/less-sheet-0.1.4-linux-x86_64.tar.gz | tar -xz
 ./less-sheet/install.sh</code></pre>
           <p class="reqs">x86_64 and aarch64 · 0.8&nbsp;MB · installs to
             ~/.local/bin, no root<br>

@@ -80,13 +80,13 @@ modules:
       - type: extra-data
         only-arches: [x86_64]
         filename: less-sheet.tar.gz
-        url: https://github.com/te-x/less-sheet/releases/download/v0.1.3/less-sheet-0.1.3-linux-x86_64.tar.gz
-        sha256: e1ca6c446c86bd6c4409926dc7e934f9f3bb992658794fdd5ae0e644b1b66b39
-        size: 888645
+        url: https://github.com/te-x/less-sheet/releases/download/v0.1.4/less-sheet-0.1.4-linux-x86_64.tar.gz
+        sha256: 0a3304efe21bfa56f95c1cd8a85aae811ee7875d18c0683e2dd7fa8ace4d1dbb
+        size: 894165
 
       - type: extra-data
         only-arches: [aarch64]
         filename: less-sheet.tar.gz
-        url: https://github.com/te-x/less-sheet/releases/download/v0.1.3/less-sheet-0.1.3-linux-aarch64.tar.gz
-        sha256: a74d4be8a8dbad04252e2b4aad286912ff6383c20224f432748f30a111d91ba1
-        size: 765240
+        url: https://github.com/te-x/less-sheet/releases/download/v0.1.4/less-sheet-0.1.4-linux-aarch64.tar.gz
+        sha256: 24d69a9c0a703c6561092c184eaefbf0749f2ffbe24cb4793328c73535dc0a0e
+        size: 769738
