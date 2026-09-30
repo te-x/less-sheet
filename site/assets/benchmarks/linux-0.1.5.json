@@ -1,0 +1,176 @@
+{
+  "version": "0.1.5",
+  "date": "2026-09-30",
+  "artifact": "less-sheet-0.1.5-linux-x86_64.tar.gz",
+  "artifact_sha256": "eeab655443d1f47e6daf56bdd0d018f9ecce63b6795827f1f85d7bc1b5481892",
+  "system": {
+    "os": "Arch Linux",
+    "cpu": "Intel Core i7-12700",
+    "storage": "Samsung 980 PRO",
+    "gpu": "NVIDIA GeForce RTX 3080",
+    "driver": "610.57.04",
+    "renderer": "OpenGL",
+    "gtk": "4.22.4",
+    "libadwaita": "1.9.3",
+    "display_scale": 1.5
+  },
+  "method": {
+    "launch": "Process entry to first painted data rows. One warm-up per fixture, then ten interleaved fresh process launches. Filesystem and driver caches were not flushed.",
+    "memory": "Pss_Anon from /proc/pid/smaps_rollup. Three samples per fixture, 8 seconds after opening small files, 45 seconds for 10 GB files. Windows were moved to an inactive workspace after first paint. Toolkit/driver allocations vary with window placement. File-backed mappings and GPU memory are excluded.",
+    "display": "Medians rounded to nearest 5 ms; highest memory in each fixture group rounded up to 5 MiB."
+  },
+  "fixtures": {
+    "c10-10KB.csv": {
+      "launch_ms": [
+        160.2,
+        157.2,
+        151.9,
+        165.3,
+        153.4,
+        151.1,
+        159.5,
+        173.2,
+        188.2,
+        173.8
+      ],
+      "memory_mib": [
+        44.97265625,
+        37.8515625,
+        37.83203125
+      ]
+    },
+    "c10-10MB.csv": {
+      "launch_ms": [
+        161.0,
+        158.4,
+        154.6,
+        158.2,
+        154.0,
+        164.0,
+        154.3,
+        192.7,
+        172.0,
+        176.7
+      ],
+      "memory_mib": [
+        97.265625,
+        39.76953125,
+        96.765625
+      ]
+    },
+    "c10-10GB.csv": {
+      "launch_ms": [
+        158.5,
+        165.4,
+        155.8,
+        165.2,
+        149.6,
+        156.3,
+        153.5,
+        175.9,
+        171.6,
+        170.0
+      ],
+      "memory_mib": [
+        38.1953125,
+        40.296875,
+        38.2734375
+      ]
+    },
+    "c2000-10MB.csv": {
+      "launch_ms": [
+        160.0,
+        159.4,
+        166.5,
+        155.2,
+        151.8,
+        158.5,
+        156.6,
+        181.9,
+        184.5,
+        203.1
+      ],
+      "memory_mib": [
+        131.62109375,
+        45.16015625,
+        43.35546875
+      ]
+    },
+    "c2000-10GB.csv": {
+      "launch_ms": [
+        150.3,
+        155.8,
+        160.9,
+        158.9,
+        154.4,
+        159.4,
+        156.1,
+        191.0,
+        188.2,
+        178.8
+      ],
+      "memory_mib": [
+        6.98046875,
+        44.21484375,
+        72.34765625
+      ]
+    },
+    "c10-10KB.csv.gz": {
+      "launch_ms": [
+        145.6,
+        151.3,
+        152.0,
+        151.8,
+        148.7,
+        151.1,
+        159.6,
+        176.3,
+        180.5,
+        177.8
+      ],
+      "memory_mib": [
+        76.62890625,
+        104.70703125,
+        103.53515625
+      ]
+    },
+    "c10-10MB.csv.gz": {
+      "launch_ms": [
+        195.9,
+        188.6,
+        181.5,
+        180.8,
+        180.5,
+        180.6,
+        187.8,
+        207.1,
+        210.4,
+        204.2
+      ],
+      "memory_mib": [
+        44.75390625,
+        73.13671875,
+        75.33203125
+      ]
+    },
+    "c10-10GB.csv.gz": {
+      "launch_ms": [
+        196.7,
+        184.3,
+        187.3,
+        195.4,
+        183.1,
+        197.4,
+        180.1,
+        204.7,
+        216.1,
+        204.9
+      ],
+      "memory_mib": [
+        47.84765625,
+        73.2109375,
+        47.94140625
+      ]
+    }
+  }
+}

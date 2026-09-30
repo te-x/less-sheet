@@ -64,6 +64,12 @@
   </screenshots>
 
   <releases>
+    <release version="0.1.5" date="2026-09-30">
+      <description>
+        <p>Refreshed native GTK layout with compact controls, clearer tables,
+        and smoother animations using OpenGL rendering.</p>
+      </description>
+    </release>
     <release version="0.1.4" date="2026-09-09">
       <description>
         <p>Drop a file into the window to open it. Repeated searches and filters reuse previous scan progress, including navigation in sorted views.</p>

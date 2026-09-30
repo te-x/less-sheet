@@ -1,0 +1,148 @@
+#!/usr/bin/env python3
+"""Capture real, mapped GTK windows with the macOS frontpage framing.
+
+Run after a release GTK build in a Hyprland desktop session. The helper uses
+the production source and its existing capture state machine, then photographs
+the mapped window and native popovers with grim. No desktop theme or persistent
+window rules are changed. PNG originals stay in --out; only WebP files ship.
+"""
+
+import argparse
+import json
+import os
+from pathlib import Path
+import runpy
+import shlex
+import subprocess
+import tempfile
+import time
+
+REPO = Path(__file__).resolve().parents[2]
+MAC_CAPTURE = runpy.run_path(str(REPO / "tools/shots/capture_shots"))
+SHOTS = ("hero", "jump", "dialect", "search", "filter")
+WINDOW = (1560, 982)
+
+
+def command(*args):
+    return subprocess.check_output(args, text=True).strip()
+
+
+def build_helper(path):
+    build = REPO / "apps/gtk/build"
+    flags = shlex.split(command("pkg-config", "--cflags", "--libs", "gtk4", "libadwaita-1"))
+    subprocess.run([
+        "cc", "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror",
+        '-DLSG_VERSION="%s"' % (REPO / "VERSION").read_text().strip(),
+        str(REPO / "tools/shots/gtk_capture.c"),
+        str(build / "lesssheet-resources.c"),
+        "-I" + str(REPO / "apps/gtk/include"), str(build / "liblsgkit.a"),
+        str(REPO / "apps/gtk/.core-linux/lib/liblesssheet.a"),
+        *flags, "-o", str(path),
+    ], check=True)
+
+
+def capture(helper, fixture, shot, theme, out):
+    stem = out / ("shot-%s-linux-%s" % (shot, theme))
+    png = stem.with_suffix(".png")
+    png.unlink(missing_ok=True)
+    env = dict(os.environ)
+    env.pop("GSK_RENDERER", None)
+    env.update({
+        "ADW_DEBUG_COLOR_SCHEME": "prefer-" + theme,
+        "LESSSHEET_GTK_CAPTURE": shot,
+        "LESSSHEET_GTK_CAPTURE_QUERY": "Lisbon",
+        "LESSSHEET_GTK_CAPTURE_ROW": "1500",
+        "LESSSHEET_GTK_CAPTURE_WHERE": "city=Lisbon",
+        "LESSSHEET_GTK_CAPTURE_SIZE": "%dx%d" % WINDOW,
+    })
+    with stem.with_suffix(".log").open("w+") as log:
+        proc = subprocess.Popen([str(helper), str(fixture)], env=env,
+                                stdout=log, stderr=log)
+        try:
+            deadline = time.monotonic() + 20
+            window = None
+            while time.monotonic() < deadline:
+                if proc.poll() is not None:
+                    raise RuntimeError("capture app exited early")
+                clients = json.loads(command("hyprctl", "-j", "clients"))
+                window = next((w for w in clients if w["pid"] == proc.pid), None)
+                if window:
+                    break
+                time.sleep(0.05)
+            if window is None:
+                raise RuntimeError("capture window did not map")
+            # Hyprland 0.55+ uses Lua dispatchers. Restrict every operation to
+            # this helper's PID, so a focus change cannot resize another app.
+            command("hyprctl", "eval",
+                    'local w = hl.get_window("address:%s"); '
+                    'assert(w); '
+                    'hl.dispatch(hl.dsp.window.float({action = "set", window = w})); '
+                    'hl.dispatch(hl.dsp.window.resize({x = %d, y = %d, relative = false, window = w})); '
+                    'hl.dispatch(hl.dsp.window.center({window = w})); '
+                    'for _,p in ipairs({"opacity", "opacity_inactive", "opacity_fullscreen", '
+                    '"opacity_override", "opacity_inactive_override", "opacity_fullscreen_override"}) do '
+                    'hl.dispatch(hl.dsp.window.set_prop({prop=p,value="1",window=w})) end'
+                    % (window["address"], *WINDOW))
+            while time.monotonic() < deadline:
+                log.seek(0)
+                body = log.read()
+                if "capture_failed=" in body or "capture_timeout=" in body:
+                    raise RuntimeError(body)
+                if "capture_ready=" + shot in body:
+                    break
+                time.sleep(0.05)
+            else:
+                raise RuntimeError("capture state never settled")
+            # The feature marker gates the content; allow the compositor's
+            # separate floating/resize transition to finish before exporting.
+            time.sleep(0.6)
+            clients = json.loads(command("hyprctl", "-j", "clients"))
+            window = next(w for w in clients if w["pid"] == proc.pid)
+            if tuple(window["size"]) != WINDOW:
+                raise RuntimeError("compositor capture dimensions: %s" % window["size"])
+            x, y = window["at"]
+            subprocess.run(["grim", "-s", "1.5", "-g",
+                            "%d,%d %dx%d" % (x, y, *WINDOW), str(png)], check=True)
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+
+    # Same 1500x989 canvas and window bounds as the macOS set. Keep the GTK
+    # window's native appearance and proportions; never stretch the pixels.
+    webp = stem.with_suffix(".webp")
+    subprocess.run([
+        "magick", "-size", "1500x989", "xc:none", "(", str(png),
+        "-resize", "1376x866", ")", "-geometry", "+62+41",
+        "-compose", "over", "-composite", "-quality", "86", str(webp),
+    ], check=True)
+    geometry = command("magick", "identify", "-format", "%wx%h", str(webp))
+    if geometry != "1500x989" or webp.stat().st_size > 150 * 1024:
+        raise RuntimeError("screenshot dimensions or transfer budget failed: " + str(webp))
+    print("%s: %s, %.0f KiB" % (webp.name, geometry, webp.stat().st_size / 1024), flush=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--shots", default=",".join(SHOTS))
+    args = parser.parse_args()
+    wanted = args.shots.split(",")
+    if not set(wanted) <= set(SHOTS):
+        parser.error("unknown screenshot state")
+    out = args.out.resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    fixture = Path(MAC_CAPTURE["write_fixture"](str(out / "fixture-2000.csv")))
+    with tempfile.TemporaryDirectory(prefix="less-sheet-capture-") as work:
+        helper = Path(work) / "gtk-capture"
+        build_helper(helper)
+        for shot in wanted:
+            for theme in ("light", "dark"):
+                capture(helper, fixture, shot, theme, out)
+
+
+if __name__ == "__main__":
+    main()

@@ -48,7 +48,7 @@ time_open() {
     [ -n "$ms" ] && printf '%.0f\n' "$ms" || echo timeout
 }
 
-pss_anon_mib() { awk '/^Pss_Anon:/{printf "%.1f", $2/1024; exit}' "/proc/$1/smaps_rollup" 2>/dev/null || echo "?"; }
+pss_anon_mib() { awk '/^Pss_Anon:/{printf "%.1f", $2/1024; found=1; exit} END{if(!found)exit 1}' "/proc/$1/smaps_rollup"; }
 settle_seconds() { case "$1" in *10GB*) echo 45 ;; *) echo 8 ;; esac; }
 
 app_mib() {
@@ -57,7 +57,11 @@ app_mib() {
         "$app" "$f" > /dev/null 2>&1 &
         pid=$!
         sleep "$(settle_seconds "$f")"
-        v="$(pss_anon_mib "$pid")"
+        if ! v="$(pss_anon_mib "$pid")"; then
+            stop "$pid"
+            echo "app memory sample failed: $f (pid $pid)" >&2
+            return 1
+        fi
         stop "$pid"
         best="$(awk -v a="$best" -v b="$v" 'BEGIN{print (b>a)?b:a}')"
     done
@@ -71,8 +75,17 @@ core_mib() {
         "$coremem" "$f" > "$out" 2>&1 &
         pid=$!
         for _ in $(seq 1 1200); do grep -q '^READY' "$out" && break; sleep 0.1; done
+        if ! grep -q '^READY' "$out"; then
+            stop "$pid"
+            echo "core index did not finish: $f" >&2
+            return 1
+        fi
         sleep 1
-        v="$(pss_anon_mib "$pid")"
+        if ! v="$(pss_anon_mib "$pid")"; then
+            stop "$pid"
+            echo "core memory sample failed: $f (pid $pid)" >&2
+            return 1
+        fi
         stop "$pid"
         best="$(awk -v a="$best" -v b="$v" 'BEGIN{print (b>a)?b:a}')"
     done
@@ -95,8 +108,10 @@ done
 printf '\n%-18s %8s %14s   %8s %8s %8s\n' fixture open_ms "min-max" core_MiB app_MiB ui_MiB
 for f in "${fixtures[@]}"; do
     vals="$(grep -E '^[0-9]+$' "$work/samples.$f")"
+    [ "$(wc -l <<<"$vals")" -eq "$runs" ] || { echo "incomplete launch samples for $f" >&2; exit 1; }
     med="$(median <<<"$vals")"; mn="$(sort -n <<<"$vals" | head -1)"; mx="$(sort -n <<<"$vals" | tail -1)"
-    core="$(core_mib "$dir/$f")"; total="$(app_mib "$dir/$f")"
+    core="$(core_mib "$dir/$f")" || exit 1
+    total="$(app_mib "$dir/$f")" || exit 1
     ui="$(awk -v t="$total" -v c="$core" 'BEGIN{printf "%.1f", t-c}')"
     printf '%-18s %8s %14s   %8s %8s %8s\n' "$f" "$med" "$mn-$mx" "$core" "$total" "$ui"
     echo "    samples:$(tr '\n' ' ' <<<"$vals")" >&2
