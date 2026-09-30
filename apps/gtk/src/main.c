@@ -72,7 +72,8 @@
  * pixel pad. Every width the grid computes — the open sample, the "Reset to
  * Auto" re-sample, and the auto-fit-on-scroll ceiling — resolves through the
  * four accessors below, so a width rule is changed in exactly one place. */
-#define WIDTH_PAD_PX 12.0
+#define GRID_CELL_PAD_PX 10.0
+#define WIDTH_PAD_PX (2.0 * GRID_CELL_PAD_PX)
 #define WIDTH_DEFAULT_CHARS 12.0
 #define WIDTH_MIN_CHARS 3.0
 #define WIDTH_MAX_CHARS 60.0
@@ -86,20 +87,10 @@
 /* GObject data key carrying a dialect button's kind, so the ONE create-popup
  * callback can serve both the separator and the quote dropdown. */
 #define DIALECT_KIND_KEY "lsg-kind"
-/* GSK renderer this app asks for when the environment does not name one — the
- * ONE place the default lives. The grid is painted with Cairo and Pango
- * whatever GSK does afterwards, so a GPU renderer only uploads and composites
- * an already-CPU-drawn frame: it buys nothing at steady state here, and its
- * context creation costs the whole launch budget.
- *
- * No version gate is needed for fractional scaling: Wayland fractional scale
- * landed in GTK 4.11.1 working with the CAIRO renderer (GL and Vulkan were the
- * experimental ones then, behind GDK_DEBUG=gl-fractional), and this app's
- * floor is GTK 4.20 — the meson minimum and what the GNOME 49 Flatpak runtime
- * ships. Verified on a 1.5x display: GTK still commits a viewport-scaled
- * buffer under this default. */
-#define LSG_DEFAULT_GSK_RENDERER "cairo"
-
+/* Prefer accelerated OpenGL: it starts faster than Vulkan in the native
+ * renderer benchmark while keeping Adwaita animations smooth. GTK retains
+ * its renderer fallback chain if OpenGL cannot be realized. */
+#define LSG_DEFAULT_GSK_RENDERER "gl"
 /* ------------------------------------------------------------------------- */
 /* Screenshot capture (LESSSHEET_GTK_CAPTURE) — the state types. The contract
  * is documented at the capture section near the bottom of this file; the types
@@ -1045,7 +1036,8 @@ update_title_subtitle (App *app)
     {
       LsgRowCount rc = lsg_document_row_count (app->doc);
       if (rc.exact)
-        sub = g_strdup_printf ("%" G_GUINT64_FORMAT " rows", rc.count);
+        sub = g_strdup_printf ("%" G_GUINT64_FORMAT " rows · %u columns",
+                               rc.count, app->n_cols);
       else
         {
           LsgScanProgress prog = lsg_document_index_progress (app->doc);
@@ -1264,7 +1256,7 @@ grid_draw (GtkDrawingArea *area, cairo_t *cr, int width, int height,
   const double header_h = app->header_h;
   const double row_h = app->row_h;
   const double line_h = app->line_h;
-  const double pad = 6.0;
+  const double pad = GRID_CELL_PAD_PX;
   const double hval = gtk_adjustment_get_value (app->hadj);
 
   PangoLayout *layout = pango_cairo_create_layout (cr);
@@ -1281,9 +1273,9 @@ grid_draw (GtkDrawingArea *area, cairo_t *cr, int width, int height,
 
   /* Subtle header / gutter tints and hairlines derived from the fg color. */
   GdkRGBA tint = fg;
-  tint.alpha = 0.05;
+  tint.alpha = 0.04;
   GdkRGBA line = fg;
-  line.alpha = 0.15;
+  line.alpha = 0.08;
 
   /* The live system accent (Adwaita), never a hardcoded color: find highlights
    * (subtle in scope, strong on the current match) and the keyboard cursor's
@@ -1323,6 +1315,18 @@ grid_draw (GtkDrawingArea *area, cairo_t *cr, int width, int height,
       if (y + row_h < header_h || y > (double)height)
         continue;
 
+      /* A very light band makes wide rows easier to follow without adding
+       * widgets or doing work outside the materialized viewport. */
+      if (view_row % 2 != 0)
+        {
+          GdkRGBA stripe = fg;
+          stripe.alpha = 0.025;
+          gdk_cairo_set_source_rgba (cr, &stripe);
+          cairo_rectangle (cr, gutter, y, (double)width - gutter, row_h);
+          cairo_fill (cr);
+          gdk_cairo_set_source_rgba (cr, &fg);
+        }
+
       double x = gutter + (cw.first_x - hval);
       for (guint32 ci = 0; ci < got_cols; ci++)
         {
@@ -1341,13 +1345,12 @@ grid_draw (GtkDrawingArea *area, cairo_t *cr, int width, int height,
               cur_w = colw;
             }
 
-          /* The selection marquee is a MUTED fill derived from the theme
-           * foreground, so it reads in light and dark and stays visually
-           * behind the accent find highlight. */
+          /* Selection uses a quiet system-accent fill, behind the stronger
+           * find highlights and the active cell's focus outline. */
           if (selection_contains (app, view_row, col))
             {
-              GdkRGBA sel = fg;
-              sel.alpha = 0.20;
+              GdkRGBA sel = have_accent ? accent : fg;
+              sel.alpha = 0.12;
               gdk_cairo_set_source_rgba (cr, &sel);
               cairo_rectangle (cr, x, y, colw, row_h);
               cairo_fill (cr);
@@ -1430,9 +1433,12 @@ grid_draw (GtkDrawingArea *area, cairo_t *cr, int width, int height,
   gdk_cairo_set_source_rgba (cr, &tint);
   cairo_rectangle (cr, 0.0, header_h, gutter, (double)height - header_h);
   cairo_fill (cr);
-  gdk_cairo_set_source_rgba (cr, &fg);
+  GdkRGBA muted = fg;
+  muted.alpha *= 0.55;
+  gdk_cairo_set_source_rgba (cr, &muted);
   pango_layout_set_font_description (
       layout, app->gutter_font_desc); /* sans row numbers */
+  pango_layout_set_alignment (layout, PANGO_ALIGN_RIGHT);
   for (guint32 ri = 0; ri < got_rows; ri++)
     {
       guint64 view_row = span.first_row + ri;
@@ -1453,6 +1459,7 @@ grid_draw (GtkDrawingArea *area, cairo_t *cr, int width, int height,
     }
   pango_layout_set_font_description (layout,
                                      app->font_desc); /* back to data cells */
+  pango_layout_set_alignment (layout, PANGO_ALIGN_LEFT);
   cairo_restore (cr);
 
   /* --- column header (sticky top; scrolls horizontally only) --- */
@@ -1487,6 +1494,12 @@ grid_draw (GtkDrawingArea *area, cairo_t *cr, int width, int height,
           if (ind.sorted && colw > 2.0 * pad + ind_w)
             draw_sort_indicator (cr, &fg, ind, x + colw - pad - ind_size * 0.5,
                                  header_h * 0.5, ind_size);
+          /* Header dividers also advertise the existing resize handles. */
+          gdk_cairo_set_source_rgba (cr, &line);
+          cairo_move_to (cr, x + colw + 0.5, 8.0);
+          cairo_line_to (cr, x + colw + 0.5, header_h - 8.0);
+          cairo_stroke (cr);
+          gdk_cairo_set_source_rgba (cr, &fg);
           x += colw;
         }
       pango_layout_set_font_description (layout,
@@ -1534,8 +1547,8 @@ measure_font (App *app)
   app->line_h = (double)(ascent + descent) / PANGO_SCALE;
   if (app->line_h < 1.0)
     app->line_h = 16.0;
-  app->row_h = app->line_h + 10.0;
-  app->header_h = app->line_h + 12.0;
+  app->row_h = app->line_h + 14.0;
+  app->header_h = app->line_h + 20.0;
 }
 
 static void
@@ -3956,10 +3969,10 @@ jump_popover_create (GtkMenuButton *button, gpointer data)
   jump_popover_ensure (data);
 }
 
-/* The app's one CSS provider: the rejection shake, and the dialect dropdown's
- * flat list. */
+/* The app's one CSS provider. Surfaces use theme colors; controls retain
+ * native Adwaita styling and focus states. */
 static void
-install_jump_css (void)
+install_app_css (void)
 {
   GtkCssProvider *css = gtk_css_provider_new ();
   /* Shake with `transform: translate`, NEVER margins: a transform is a
@@ -3981,7 +3994,9 @@ install_jump_css (void)
             * so the standard popover background shows through — matching the
             * Find/Jump popovers. Row hover-highlight is unaffected (it comes
             * from the activatable rows, not this background). */
-           ".lsg-flat-list { background: none; }");
+           ".lsg-flat-list { background: none; }"
+           ".lsg-grid { background: @view_bg_color; }"
+           ".lsg-welcome-actions button { padding: 14px 20px; }");
   GdkDisplay *display = gdk_display_get_default ();
   if (display != NULL)
     gtk_style_context_add_provider_for_display (
@@ -4112,23 +4127,46 @@ header_glyph_draw (GtkDrawingArea *area, cairo_t *cr, int width, int height,
     }
 }
 
-/*
- * A 2-line header-bar menu-button child: a small, dimmed CATEGORY word ("Sep"
- * / "Quote") stacked over the current CHARACTER glyph (kept up to date by
- * dialect_sync_quick_controls via `*out_glyph`). Using set_child (not
- * set_label) also drops the GtkMenuButton dropdown arrow.
- */
-static GtkWidget *
-build_dialect_button_child (const char *category, GtkLabel **out_glyph)
+/* Native breakpoints hide captions, preserving icons, values and accessible
+ * names on narrow windows. The window owns the breakpoint and its setters. */
+static void
+compact_hide (AdwBreakpoint *compact, GtkWidget *widget)
 {
-  GtkWidget *box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
+  GValue hidden = G_VALUE_INIT;
+  g_value_init (&hidden, G_TYPE_BOOLEAN);
+  g_value_set_boolean (&hidden, FALSE);
+  adw_breakpoint_add_setter (compact, G_OBJECT (widget), "visible", &hidden);
+  g_value_unset (&hidden);
+}
+
+static GtkWidget *
+build_tool_content (GtkWidget *icon, const char *text, AdwBreakpoint *compact)
+{
+  GtkWidget *box = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 6);
+  gtk_widget_set_valign (box, GTK_ALIGN_CENTER);
+  gtk_box_append (GTK_BOX (box), icon);
+  GtkWidget *label = gtk_label_new (text);
+  gtk_box_append (GTK_BOX (box), label);
+  if (compact != NULL)
+    compact_hide (compact, label);
+  return box;
+}
+
+/* Single-line parsing controls retain the effective character when compact. */
+static GtkWidget *
+build_dialect_button_child (const char *category, GtkLabel **out_glyph,
+                            AdwBreakpoint *compact)
+{
+  GtkWidget *box = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 6);
   gtk_widget_set_valign (box, GTK_ALIGN_CENTER);
   GtkWidget *cat = gtk_label_new (category);
-  gtk_widget_add_css_class (cat, "caption");   /* small */
   gtk_widget_add_css_class (cat, "dim-label"); /* muted */
   GtkWidget *glyph = gtk_label_new ("");
   gtk_box_append (GTK_BOX (box), cat);
   gtk_box_append (GTK_BOX (box), glyph);
+  gtk_box_append (GTK_BOX (box),
+                  gtk_image_new_from_icon_name ("pan-down-symbolic"));
+  compact_hide (compact, cat);
   *out_glyph = GTK_LABEL (glyph);
   return box;
 }
@@ -5541,26 +5579,57 @@ build_launch_page (App *app)
    * its own identity. */
   adw_status_page_set_icon_name (ADW_STATUS_PAGE (status), LSG_APP_ID);
   adw_status_page_set_title (ADW_STATUS_PAGE (status), "less-sheet");
-  adw_status_page_set_description (
-      ADW_STATUS_PAGE (status),
-      "Drop a file here, open a delimited file, or a CSV over the network.");
+  adw_status_page_set_description (ADW_STATUS_PAGE (status),
+                                   "Your data, at a glance.\nOpen large "
+                                   "tables instantly, wherever they live.");
 
-  GtkWidget *box = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 12);
+  GtkWidget *box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 12);
   gtk_widget_set_halign (box, GTK_ALIGN_CENTER);
+  gtk_widget_set_size_request (box, 300, -1);
+  gtk_widget_add_css_class (box, "lsg-welcome-actions");
 
-  GtkWidget *open = gtk_button_new_with_label ("Open File…");
+  GtkWidget *open = gtk_button_new ();
+  gtk_button_set_child (GTK_BUTTON (open),
+                        build_tool_content (gtk_image_new_from_icon_name (
+                                                "document-open-symbolic"),
+                                            "Open File…", NULL));
   gtk_widget_add_css_class (open, "pill");
   gtk_widget_add_css_class (open, "suggested-action");
   gtk_widget_set_tooltip_text (open, "Open File (Ctrl+O)");
+  GtkWidget *open_shortcut = gtk_shortcut_label_new ("<Control>o");
+  gtk_widget_set_hexpand (open_shortcut, TRUE);
+  gtk_widget_set_halign (open_shortcut, GTK_ALIGN_END);
+  gtk_box_append (GTK_BOX (gtk_button_get_child (GTK_BUTTON (open))),
+                  open_shortcut);
+  a11y_name (open, LSG_A11Y_CONTROL_OPEN_FILE);
   g_signal_connect (open, "clicked", G_CALLBACK (action_open), app);
 
-  GtkWidget *open_url = gtk_button_new_with_label ("Open URL…");
+  GtkWidget *open_url = gtk_button_new ();
+  gtk_button_set_child (GTK_BUTTON (open_url),
+                        build_tool_content (gtk_image_new_from_icon_name (
+                                                "insert-link-symbolic"),
+                                            "Open URL…", NULL));
   gtk_widget_add_css_class (open_url, "pill");
   gtk_widget_set_tooltip_text (open_url, "Open URL (Ctrl+Shift+O)");
+  GtkWidget *url_shortcut = gtk_shortcut_label_new ("<Control><Shift>o");
+  gtk_widget_set_hexpand (url_shortcut, TRUE);
+  gtk_widget_set_halign (url_shortcut, GTK_ALIGN_END);
+  gtk_box_append (GTK_BOX (gtk_button_get_child (GTK_BUTTON (open_url))),
+                  url_shortcut);
+  a11y_name (open_url, LSG_A11Y_CONTROL_OPEN_URL);
   g_signal_connect (open_url, "clicked", G_CALLBACK (action_open_url), app);
 
   gtk_box_append (GTK_BOX (box), open);
   gtk_box_append (GTK_BOX (box), open_url);
+  GtkWidget *hint = gtk_label_new ("Or drop a file anywhere in this window");
+  gtk_widget_add_css_class (hint, "dim-label");
+  gtk_widget_add_css_class (hint, "caption");
+  gtk_widget_set_margin_top (hint, 6);
+  gtk_box_append (GTK_BOX (box), hint);
+  GtkWidget *formats = gtk_label_new ("CSV · TSV · CSV.gz");
+  gtk_widget_add_css_class (formats, "dim-label");
+  gtk_widget_add_css_class (formats, "caption");
+  gtk_box_append (GTK_BOX (box), formats);
   adw_status_page_set_child (ADW_STATUS_PAGE (status), box);
   return status;
 }
@@ -5569,6 +5638,7 @@ static GtkWidget *
 build_grid_page (App *app)
 {
   GtkWidget *grid = gtk_grid_new ();
+  gtk_widget_add_css_class (grid, "lsg-grid");
 
   app->vadj = g_object_ref_sink (gtk_adjustment_new (0, 0, 1, 1, 1, 1));
   app->hadj = g_object_ref_sink (gtk_adjustment_new (0, 0, 1, 1, 1, 1));
@@ -6707,6 +6777,7 @@ static GtkWidget *
 build_parsing_page (App *app)
 {
   GtkWidget *page = adw_preferences_page_new ();
+  adw_preferences_page_set_name (ADW_PREFERENCES_PAGE (page), "parsing");
   adw_preferences_page_set_title (ADW_PREFERENCES_PAGE (page), "Parsing");
   adw_preferences_page_set_icon_name (ADW_PREFERENCES_PAGE (page),
                                       "document-properties-symbolic");
@@ -7722,6 +7793,7 @@ static GtkWidget *
 build_columns_page (App *app)
 {
   GtkWidget *page = adw_preferences_page_new ();
+  adw_preferences_page_set_name (ADW_PREFERENCES_PAGE (page), "columns");
   adw_preferences_page_set_title (ADW_PREFERENCES_PAGE (page), "Columns");
   adw_preferences_page_set_icon_name (ADW_PREFERENCES_PAGE (page),
                                       "view-grid-symbolic");
@@ -7812,6 +7884,17 @@ launch_page_show (App *app)
   gtk_stack_set_visible_child_name (app->stack, "launch");
 }
 
+static void
+on_columns_clicked (GtkButton *button, gpointer data)
+{
+  (void)button;
+  App *app = data;
+  settings_present (app);
+  if (app->prefs != NULL)
+    adw_preferences_dialog_set_visible_page_name (
+        ADW_PREFERENCES_DIALOG (app->prefs), "columns");
+}
+
 /* Build the single window once (idempotent). Shared by "activate" (no file)
  * and "open" (a file passed on the command line / by the file manager). */
 static void
@@ -7820,10 +7903,16 @@ ensure_window (App *app, GtkApplication *gtk_app)
   if (app->window != NULL)
     return;
   app->app = ADW_APPLICATION (gtk_app);
-  install_jump_css ();
+  install_app_css ();
 
   GtkWidget *win = adw_application_window_new (gtk_app);
   app->window = GTK_WINDOW (win);
+  /* Narrow windows keep the parsing values while dropping their captions. */
+  gtk_widget_set_size_request (win, 360, 360);
+  AdwBreakpoint *compact = adw_breakpoint_new (
+      adw_breakpoint_condition_parse ("max-width: 700sp"));
+  adw_application_window_add_breakpoint (ADW_APPLICATION_WINDOW (win),
+                                         compact);
   GtkDropTarget *file_drop = gtk_drop_target_new (
       GDK_TYPE_FILE_LIST, GDK_ACTION_COPY | GDK_ACTION_MOVE);
   g_signal_connect (file_drop, "enter", G_CALLBACK (on_file_drop_motion), app);
@@ -7924,6 +8013,7 @@ ensure_window (App *app, GtkApplication *gtk_app)
   GtkWidget *find_btn = gtk_menu_button_new ();
   gtk_menu_button_set_icon_name (GTK_MENU_BUTTON (find_btn),
                                  "edit-find-symbolic");
+  gtk_menu_button_set_has_frame (GTK_MENU_BUTTON (find_btn), FALSE);
   gtk_widget_set_tooltip_text (find_btn, "Find (Ctrl+F)");
   a11y_name (find_btn, LSG_A11Y_CONTROL_FIND);
   app->find_button = GTK_MENU_BUTTON (find_btn);
@@ -7974,13 +8064,15 @@ ensure_window (App *app, GtkApplication *gtk_app)
   gtk_drawing_area_set_draw_func (GTK_DRAWING_AREA (app->header_glyph),
                                   header_glyph_draw, app, NULL);
   gtk_button_set_child (GTK_BUTTON (hdr_toggle), app->header_glyph);
+  gtk_widget_add_css_class (hdr_toggle, "flat");
   g_signal_connect (hdr_toggle, "toggled",
                     G_CALLBACK (on_header_toggle_toggled), app);
 
   GtkWidget *sep_btn = gtk_menu_button_new ();
   gtk_menu_button_set_child (
       GTK_MENU_BUTTON (sep_btn),
-      build_dialect_button_child ("Sep", &app->sep_glyph_label));
+      build_dialect_button_child ("Sep", &app->sep_glyph_label, compact));
+  gtk_menu_button_set_has_frame (GTK_MENU_BUTTON (sep_btn), FALSE);
   gtk_widget_set_tooltip_text (sep_btn, "Field separator");
   a11y_name (sep_btn, LSG_A11Y_CONTROL_SEPARATOR);
   app->sep_button = GTK_MENU_BUTTON (sep_btn);
@@ -7992,7 +8084,8 @@ ensure_window (App *app, GtkApplication *gtk_app)
   GtkWidget *quote_btn = gtk_menu_button_new ();
   gtk_menu_button_set_child (
       GTK_MENU_BUTTON (quote_btn),
-      build_dialect_button_child ("Quote", &app->quote_glyph_label));
+      build_dialect_button_child ("Quote", &app->quote_glyph_label, compact));
+  gtk_menu_button_set_has_frame (GTK_MENU_BUTTON (quote_btn), FALSE);
   gtk_widget_set_tooltip_text (quote_btn, "Quote character");
   a11y_name (quote_btn, LSG_A11Y_CONTROL_QUOTE);
   app->quote_button = GTK_MENU_BUTTON (quote_btn);
@@ -8014,11 +8107,16 @@ ensure_window (App *app, GtkApplication *gtk_app)
   /* Hidden until a copy or a network open drives it. */
   build_header_progress (app);
 
-  /* pack_end is right-anchored — the first packed ends up rightmost — so this
-   * is the REVERSE of the left-to-right order
-   * [Find][Jump][Header][Separator][Quote][Settings], with the progress box
-   * leftmost of the group, next to the title. */
+  GtkWidget *columns = gtk_button_new_from_icon_name ("view-grid-symbolic");
+  gtk_widget_set_tooltip_text (columns, "Column visibility and formatting");
+  gtk_accessible_update_property (GTK_ACCESSIBLE (columns),
+                                  GTK_ACCESSIBLE_PROPERTY_LABEL,
+                                  "Column settings", -1);
+  g_signal_connect (columns, "clicked", G_CALLBACK (on_columns_clicked), app);
+  /* pack_end is right-anchored: this is the reverse of the visual order.
+   * All controls occupy one compact, native header row. */
   adw_header_bar_pack_end (ADW_HEADER_BAR (header), settings_btn);
+  adw_header_bar_pack_end (ADW_HEADER_BAR (header), columns);
   adw_header_bar_pack_end (ADW_HEADER_BAR (header), quote_btn);
   adw_header_bar_pack_end (ADW_HEADER_BAR (header), sep_btn);
   adw_header_bar_pack_end (ADW_HEADER_BAR (header), hdr_toggle);
@@ -8033,6 +8131,9 @@ ensure_window (App *app, GtkApplication *gtk_app)
   app->stack = GTK_STACK (gtk_stack_new ());
   gtk_widget_set_vexpand (GTK_WIDGET (app->stack), TRUE);
   gtk_stack_add_named (app->stack, build_grid_page (app), "grid");
+  g_signal_connect_object (
+      adw_style_manager_get_default (), "notify::accent-color",
+      G_CALLBACK (gtk_widget_queue_draw), app->area, G_CONNECT_SWAPPED);
 
   /* Toast overlay for the transient notices. The passive filter status lives
    * in the header-bar subtitle, so the stack is the overlay's sole child. */
@@ -8790,8 +8891,7 @@ main (int argc, char *argv[])
 {
   App app = { 0 };
   app.t_start = g_get_monotonic_time (); /* capture entry ASAP */
-  /* Renderer default, set BEFORE any GTK/GDK call so GSK reads it: overwrite
-   * FALSE, so an explicit GSK_RENDERER in the environment always wins. */
+  /* Before GTK initialization; an explicit renderer choice always wins. */
   g_setenv ("GSK_RENDERER", LSG_DEFAULT_GSK_RENDERER, FALSE);
   app.timing = (g_getenv ("LESSSHEET_GTK_TIMING") != NULL);
   /* ONE env read, and deliberately nothing else: the value is not even PARSED
