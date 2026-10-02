@@ -28,6 +28,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var routedLaunchOpen = false
     private var mainWindow: NSWindow?
     private var settingsWindow: NSWindow?
+    private var updateChecker: UpdateChecker?
 
     override init() {
         super.init()
@@ -79,6 +80,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+
+    func checkForUpdates() {
+        if updateChecker == nil { updateChecker = UpdateChecker() }
+        updateChecker?.check(for: mainWindow)
+    }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         if !flag { showMainWindow(); mainWindow?.makeKeyAndOrderFront(nil) }

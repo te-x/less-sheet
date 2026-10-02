@@ -23,7 +23,7 @@ adw_dep  = dependency('libadwaita-1', version : '>= 1.8',  include_type : 'syste
 glib_dep = dependency('glib-2.0',                          include_type : 'system')
 
 # The Zig core, cross-built to this container's arch (glibc target) and placed
-# under .core-linux/lib/ by the gate (see .aidev/profile.sh) BEFORE meson runs.
+# under .core-linux/lib/ before Meson runs (see tools/check).
 # Linked here as a prebuilt static archive.
 core_dir = meson.current_source_dir() / '.core-linux' / 'lib'
 core_dep = cc.find_library('lesssheet', dirs : [core_dir], static : true)

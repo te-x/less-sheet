@@ -1,4 +1,4 @@
-// Frozen behavior tests — settings-panel-redesign GUI end-to-end (planner-owned).
+// Frozen behavior tests — settings-panel-redesign GUI end-to-end (shared).
 // ARCH-column-config amendment criteria 11 (embedded Settings stays O(viewport)
 // at 100k), 20 (one coherent Settings surface — no "Configure Columns…" entry,
 // no document-window sheet/second panel, Parsing full-width above a side-by-side
@@ -11,9 +11,9 @@
 // the empty-diff of the frozen C ABI + ColumnPanel.swift by
 // AmendmentContractGuardTests.
 //
-// PROBE CONTRACT (implementer-owned, to be wired in the build — the same
+// PROBE CONTRACT (internal, to be wired in the build — the same
 // division of labor as NativeGridTests: this file pins the env hooks, line
-// prefixes, and required values; the probes live in implementer-owned Sources
+// prefixes, and required values; the probes live in internal Sources
 // and stay INERT in production). All are RED at freeze because the current app
 // has the OLD separate-sheet panel and emits none of these lines; each probe
 // self-terminates after its ONE terminal line under LESSSHEET_DUMP_EXIT.
@@ -60,7 +60,7 @@
 // VoiceOver navigation and Increase-Contrast / Reduce-Motion behavior (AC16/AC20);
 // the 100 ms interactive TARGET for open/raise/select/scroll and the release-mode
 // timing on the real corpus (AC11/AC5 non-functional) — this gate pins only the
-// 500 ms HARD bound in debug. State these to the orchestrator; do not weaken them.
+// 500 ms HARD bound in debug. State these to the maintainer; do not weaken them.
 import Foundation
 import Testing
 

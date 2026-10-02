@@ -17,8 +17,8 @@
 //! crash for the four crash-oriented targets in `harness.zig` to catch. A wrong
 //! lane index is worse still: it reports a structural byte where there is none,
 //! and every position this scan yields is one a caller may publish as a row
-//! start (see review/REVIEW-row-count-drift.md — "a terminator is consumed
-//! whole, or not at all" rests on the offset being exact).
+//! start ("a terminator is consumed whole, or not at all" rests on the offset
+//! being exact).
 //!
 //! The property is total equivalence, not merely "finds something":
 //!

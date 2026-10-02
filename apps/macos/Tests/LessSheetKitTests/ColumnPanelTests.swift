@@ -1,5 +1,5 @@
 // Frozen behavior tests — column-config PANEL geometry + label search
-// (planner-owned). ARCH-column-config criterion 11 (the 100k-column panel is
+// (shared). ARCH-column-config criterion 11 (the 100k-column panel is
 // O(viewport)) + criterion 12 (bounded, batched label search). Pure, no GUI:
 // the AppKit NSTableView reuse and off-main search scheduling live in the app;
 // these pin the deterministic decisions (which rows to instantiate; which

@@ -41,6 +41,7 @@ extension AppDelegate {
     private func appMenu(_ name: String) -> NSMenu {
         let menu = NSMenu(title: name)
         menu.addItem(item("About \(name)", #selector(NSApplication.orderFrontStandardAboutPanel(_:)), ""))
+        menu.addItem(item("Check for Updates…", #selector(menuCheckForUpdates(_:)), "", target: self))
         menu.addItem(.separator())
         let services = NSMenu(title: "Services")
         let servicesItem = NSMenuItem(title: "Services", action: nil, keyEquivalent: "")
@@ -153,6 +154,7 @@ extension AppDelegate {
 
     // MARK: - Actions
 
+    @objc fileprivate func menuCheckForUpdates(_ sender: Any?) { checkForUpdates() }
     @objc fileprivate func menuOpenFile(_ sender: Any?) { AppDelegate.openViaPanel() }
     @objc fileprivate func menuOpenURL(_ sender: Any?) { AppDelegate.openURLViaSheet() }
     @objc fileprivate func menuSortByColumn(_ sender: Any?) { DocumentModel.shared.cycleSortAtCursor() }

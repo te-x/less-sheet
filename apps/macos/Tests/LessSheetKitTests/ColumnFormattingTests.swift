@@ -1,4 +1,4 @@
-// Frozen behavior tests — column-config DISPLAY formatting (planner-owned).
+// Frozen behavior tests — column-config DISPLAY formatting (shared).
 // ARCH-column-config criteria 14 (exact decimal, never lies) + 15 (strict ISO
 // boundaries). Pure, no GUI, no core: `ColumnDisplayFormatting` maps a raw cell
 // + effective type + format options + locale to a display string OR a raw

@@ -1,4 +1,4 @@
-// Frozen behavior tests — select-copy slice (planner-owned), the PURE half.
+// Frozen behavior tests — select-copy slice (shared), the PURE half.
 //
 // ARCH-select-copy turns the pure viewer into a tool: rectangular cell selection
 // (unbounded index space) and column resize / auto-fit — every operation bounded
@@ -24,13 +24,13 @@
 //   AC5 columnSizing* ....................... manual override sticks + overrides
 //     auto-grow; auto-fit computes the visible-window fit; clearing reverts.
 //
-// RED SEED (planner freeze) — RED on BEHAVIOR, never compile/import: the
+// RED SEED (maintainer freeze) — RED on BEHAVIOR, never compile/import: the
 // LessSheetKit seed impls return trivial results — SelectionModel produces nil /
 // unchanged selections, ColumnSizer ignores the manual map and returns the floor
 // from autoFit. So every AC test below fails on behavior while the tree compiles
 // (the conformances hold).
 //
-// RED → GREEN (implementer): implement the seeds per the Contracts doc-comments
+// RED → GREEN (developer): implement the seeds per the Contracts doc-comments
 // (SelectCopyLogic.swift) and route the App's selection state and column widths
 // through them. No frozen path changes.
 import Foundation

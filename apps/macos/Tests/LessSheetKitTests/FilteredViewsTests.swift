@@ -1,4 +1,4 @@
-// Frozen behavior tests — filtered-views slice (planner-owned).
+// Frozen behavior tests — filtered-views slice (shared).
 // ARCH-filtered-views app criteria 16–18: the filtered banner view-model's
 // pinned semantics, and the filter bridge against the REAL linked Zig core —
 // applying a filter (in-place remap into filtered coordinates), the source-row
@@ -182,7 +182,7 @@ private func waitJump(_ session: any DocumentSession) async throws -> UInt64 {
     // `caseSensitive` exactly like find. Default (insensitive) "Needle" folds
     // to the 6 needle rows; Match case ON is byte-exact — only source row 3
     // ("Needle point"). (The ON assertions are RED until the bridge marshals
-    // the flag; re-issuing on toggle is the implementer's UI glue.)
+    // the flag; re-issuing on toggle is the developer's UI glue.)
     let session = try await openFiltered()
     defer { session.close() }
     // Insensitive (default): an uppercase query folds -> 6 rows.

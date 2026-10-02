@@ -1,5 +1,5 @@
 // Frozen behavior tests — column-config, the type MODEL + automatic alignment
-// (planner-owned). ARCH-column-config criterion 16 (alignment) + the Swift/ABI
+// (shared). ARCH-column-config criterion 16 (alignment) + the Swift/ABI
 // value-type mapping. Pure, no GUI, no core: `ColumnAligning` is a value
 // transform (like `WindowPolling`), and the enum raw values are pinned to the C
 // ABI so the `CoreDocumentSession` bridge is a direct `rawValue` map.

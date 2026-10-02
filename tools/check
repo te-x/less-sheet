@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# Build, format and test the core and native frontends.
+set -euo pipefail
+
+check_root="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$check_root"
+
+die() { printf 'error: %s\n' "$1" >&2; exit 1; }
+need() { command -v "$1" >/dev/null || die "$1 is required"; }
+need_zig() {
+    need zig
+    [ "$(zig version)" = 0.16.0 ] || die "Zig 0.16.0 is required"
+}
+
+case "$(uname -m)" in
+    arm64|aarch64) check_arch=aarch64; check_platform=linux/arm64 ;;
+    x86_64|amd64) check_arch=x86_64; check_platform=linux/amd64 ;;
+    *) die "unsupported host architecture" ;;
+esac
+
+container_tool() {
+    command -v docker || command -v podman || die "Docker or Podman is required"
+}
+
+check_backend() (
+    need_zig
+    cd backend
+    zig fmt --check src contracts tests build.zig
+    zig build -Dtarget=aarch64-linux-musl -Doptimize=ReleaseSafe
+    zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe
+    zig build -Doptimize=ReleaseSafe
+    zig build test -Doptimize=ReleaseSafe
+    if [ "$(uname -s)" != Linux ]; then
+        check_container="$(container_tool)"
+        check_target="$check_arch-linux-musl"
+        zig build test -Dtarget="$check_target" -Doptimize=ReleaseSafe
+        check_binary="./zig-out/bin/behavior-tests-$check_target"
+        [ -x "$check_binary" ] || die "Linux test binary is missing"
+        check_result="$("$check_container" run --rm --platform "$check_platform" \
+            --user 1000:1000 --ulimit core=0 --security-opt label=disable \
+            -v "$check_root":/repo \
+            --tmpfs /repo/backend/.zig-cache/tmp:rw,mode=1777 \
+            -w /repo/backend registry.fedoraproject.org/fedora:43 "$check_binary" 2>&1)"
+        printf '%s\n' "$check_result" | tail -3
+        [[ "$check_result" =~ All\ [0-9]+\ tests\ passed ]] \
+            || die "Linux test binary did not report a passing run"
+    fi
+)
+
+check_macos() (
+    [ "$(uname -s)" = Darwin ] || die "macOS checks require macOS"
+    need_zig; need swift; need swiftlint
+    (cd backend && zig build -Doptimize=ReleaseSafe)
+    python3 tools/csvgen/gen.py --case unicode_emoji --case eol_crlf \
+        --case wide_100k_cols --case enc_utf16le --case happy_numeric \
+        --seed 1337 --out apps/macos/.build/corpus-cache
+    cd apps/macos
+    # SwiftPM does not track the separately built static archive.
+    rm -f .build/*/debug/LessSheet .build/*/release/LessSheet
+    swift build -Xswiftc -warnings-as-errors
+    swiftlint lint --strict Sources
+    python3 ../../tools/tests/check_update_release_swift
+    swift test --no-parallel
+)
+
+check_gtk() (
+    need_zig; need clang-format
+    (cd backend && zig build -Dtarget="$check_arch-linux-gnu" \
+        -Doptimize=ReleaseSafe -p "$check_root/apps/gtk/.core-linux")
+    cd apps/gtk
+    clang-format --dry-run -Werror src/*.c include/lsg_*.h
+    check_commands='set -e
+        if [ -f build-checks/build.ninja ]; then
+            meson setup --reconfigure build-checks
+        else
+            meson setup build-checks
+        fi
+        meson compile -C build-checks
+        meson test -C build-checks --print-errorlogs
+        cc -std=c11 -Wall -Wextra -Werror ../../tools/tests/gtk_update_release.c \
+            $(pkg-config --cflags --libs glib-2.0) -o build-checks/update-release-tests
+        ./build-checks/update-release-tests'
+    if [ "$(uname -s)" = Linux ] && command -v meson >/dev/null \
+        && pkg-config --atleast-version=4.20 gtk4 \
+        && pkg-config --atleast-version=1.8 libadwaita-1; then
+        sh -c "$check_commands"
+    else
+        check_container="$(container_tool)"
+        check_image=less-sheet-gtk-ci:fedora43
+        "$check_container" image inspect "$check_image" >/dev/null 2>&1 \
+            || "$check_container" build --platform "$check_platform" \
+                -t "$check_image" -f .ci/Dockerfile .ci
+        "$check_container" run --rm --platform "$check_platform" \
+            --security-opt label=disable -v "$check_root":/src \
+            -w /src/apps/gtk "$check_image" sh -c "$check_commands"
+    fi
+)
+
+need python3
+case "${1:-all}" in
+    backend) check_backend ;;
+    macos) check_macos ;;
+    gtk) check_gtk ;;
+    all)
+        check_backend
+        if [ "$(uname -s)" = Darwin ]; then check_macos; fi
+        check_gtk
+        ;;
+    *) die "usage: tools/check [all|backend|macos|gtk]" ;;
+esac

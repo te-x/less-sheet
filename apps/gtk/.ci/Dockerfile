@@ -1,8 +1,7 @@
 # less-sheet GTK frontend — pinned CI/gate image.
 #
-# aidev decision 6 + the 2026-07-17 ARCH amendment: the WHOLE gate (compile-level
-# conformance AND behavior) runs inside a Linux GNOME container, because the dev
-# Mac has no GTK/Meson toolchain. This image is that container.
+# Build and behavior checks run in a Linux GNOME container so macOS
+# development does not require a local GTK/Meson toolchain.
 #
 # fedora:43 ships GTK 4.20 / libadwaita 1.8 / meson 1.8 / gcc 15 (GNOME 49) —
 # the ARCH-gtk-a11y decision-7 floor (GTK 4.20 / libadwaita 1.8), required by

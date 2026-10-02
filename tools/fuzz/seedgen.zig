@@ -260,7 +260,7 @@ pub fn main(init: std.process.Init) !void {
     try adversarialCsv(gpa, &adv);
     for (adv.items) |d| try csv.addSpread(d, 2);
 
-    // ---- gz_raw: the csvgen catalog's .csv.gz twins ------------------------
+    // ---- gz_raw: the csvgen catalog's.csv.gz twins ------------------------
     for (gz_files.items) |path| {
         const data = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(gz_doc_max)) catch |e| switch (e) {
             error.StreamTooLong => try headOf(gpa, io, path, gz_doc_max),
@@ -279,8 +279,7 @@ pub fn main(init: std.process.Init) !void {
         const out = try gpa.alloc(u8, 4 * 1024 * 1024);
         defer gpa.free(out);
 
-        // THE TWO REGRESSION SEEDS the reviewer asked to carry over
-        // (review/REVIEW-flate-feed-guard.md): fixture A cut 50 and fixture B cut
+        // THE TWO REGRESSION SEEDS: fixture A cut 50 and fixture B cut
         // 16891 — mid-DEFLATE-symbol truncations that produced a garbage decode
         // (a complete, exact, WRONG document) before the wave-(b) fix. `tail_cut`
         // counts bytes removed from the END, so a "keep N" cut is raw.len - N.

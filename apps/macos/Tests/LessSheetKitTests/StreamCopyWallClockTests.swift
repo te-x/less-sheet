@@ -1,4 +1,4 @@
-// Frozen behavior test — thin-frontend-shared-core Phase 2 (planner-owned), the
+// Frozen behavior test — thin-frontend-shared-core Phase 2 (shared), the
 // END-TO-END STREAMING-COPY WALL-CLOCK probe (GATING). The real-core half: it
 // opens a real ~100k-row document and copies its WHOLE selection through the
 // STREAMING path — DocumentSession.openCopy -> ls_copy_open / ls_copy_next /

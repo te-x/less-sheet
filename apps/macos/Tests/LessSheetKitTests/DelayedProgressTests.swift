@@ -1,4 +1,4 @@
-// Frozen behavior tests — stream-copy slice (planner-owned), the PROGRESS half
+// Frozen behavior tests — stream-copy slice (shared), the PROGRESS half
 // (ARCH-stream-copy win #2 / AC8 + AC9): the reusable "subtle progress after
 // ~500 ms" gate `DelayedProgressGating` (implemented in LessSheetKit as
 // `DelayedProgressGate`). Same pattern as SelectCopyTests: the pure, no-GUI,
@@ -31,9 +31,9 @@
 //   AC9 jumpSurfacesProgressPastThreshold / filterSurfacesProgressPastThreshold
 //        the existing long ops surface through the SAME gate within ~500 ms
 //        ("just wiring"); the AC9 AUDIT NOTE (index/jump/filter/open status) is
-//        the implementer's doc deliverable, not a test.
+//        the developer's doc deliverable, not a test.
 //
-// RED SEED (planner freeze) — RED on BEHAVIOR, never compile/import: the Kit
+// RED SEED (maintainer freeze) — RED on BEHAVIOR, never compile/import: the Kit
 // seed `DelayedProgressGate.indication(for:)` returns `.hidden` for every state,
 // so every "appears / surfaces / offers cancel" assertion fails (expects a
 // visible indicator, gets hidden) while the tree compiles (the conformance
@@ -41,7 +41,7 @@
 // construction (the no-regression half). The seed `threshold` is a real ~500 ms,
 // so the band pin holds from the seed.
 //
-// RED → GREEN (implementer): implement `indication(for:)` per the protocol
+// RED → GREEN (developer): implement `indication(for:)` per the protocol
 // doc-comment and wire copy (with its cancel) + index/jump/filter through the
 // one gate; record the AC9 audit note. No frozen path changes.
 import Testing

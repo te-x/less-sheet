@@ -6,7 +6,7 @@ pub fn build(b: *std.Build) void {
     // ARCH-security-hardening + PROJECT.md "Build & gate"): the distributed core
     // runs with runtime safety checks ON, so a bug on untrusted CSV/gzip/network
     // input faults cleanly instead of becoming undefined behavior. `@setRuntimeSafety(false)`
-    // carve-outs are added ONLY on bench-proven-over-budget loops (src/, implementer).
+    // carve-outs are added ONLY on bench-proven-over-budget loops (src/, developer).
     //
     // We resolve `-Doptimize` MANUALLY (mirroring standardOptimizeOption's own
     // `-Doptimize` branch) rather than via `standardOptimizeOption(.{})` so that
@@ -23,7 +23,7 @@ pub fn build(b: *std.Build) void {
         "Prioritize performance, safety, or binary size",
     ) orelse .ReleaseSafe;
 
-    // Implementation module (implementer-owned, src/).
+    // Implementation module (internal, src/).
     // Links libc: the core opens/stats files and mmaps their head via the
     // POSIX/libc syscall layer (on macOS syscalls must go through libSystem).
     const core_mod = b.createModule(.{
@@ -33,7 +33,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
 
-    // Frozen contract module (planner-owned, contracts/). It imports the
+    // Frozen contract module (shared, contracts/). It imports the
     // implementation to run the comptime signature pins, and the
     // implementation imports it for the shared ABI types.
     const api_mod = b.createModule(.{
@@ -170,7 +170,7 @@ pub fn build(b: *std.Build) void {
     corpus_opts.addOptionPath("dir", corpus_dir);
     const corpus_mod = corpus_opts.createModule();
 
-    // Behavior tests (planner-owned, tests/) import only the contract module
+    // Behavior tests (shared, tests/) import only the contract module
     // (`api`) and the injected corpus locator (`corpus`).
     const behavior_tests = b.addTest(.{
         .root_module = b.createModule(.{

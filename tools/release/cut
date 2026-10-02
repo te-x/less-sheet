@@ -4,7 +4,7 @@
 # across the release surface, commits and tags. Publishes NOTHING.
 #
 #   tools/release/cut 0.1.1
-#   tools/release/cut 0.1.1 --skip-gate      # only when the gate just passed
+#   tools/release/cut 0.1.1 --skip-checks    # only when checks just passed
 #
 # WHY THIS IS TWO SCRIPTS AND NOT ONE. The Mac builds (it is the only machine
 # with the Swift toolchain, and it runs the Linux build in podman) and never
@@ -23,11 +23,11 @@ die()  { printf 'error: %s\n' "$1" >&2; exit 1; }
 cd "$(git rev-parse --show-toplevel)"
 
 WANT="${1:-}"
-SKIP_GATE=0
+SKIP_CHECKS=0
 shift || true
 for a in "$@"; do
     case "$a" in
-        --skip-gate) SKIP_GATE=1 ;;
+        --skip-checks) SKIP_CHECKS=1 ;;
         *) die "unknown option '$a'" ;;
     esac
 done
@@ -54,13 +54,13 @@ echo "less-sheet — cutting $HAVE -> $WANT"
 echo "  release repo   $RELEASE_REPO"
 echo "  download base  $BASE"
 
-# ---------------------------------------------------------------------- gate --
+# -------------------------------------------------------------------- checks --
 # Before touching anything, so a red gate costs nothing to recover from.
-if [ "$SKIP_GATE" = 1 ]; then
-    printf '\n  WARNING: --skip-gate. Shipping code whose gate has not run.\n' >&2
+if [ "$SKIP_CHECKS" = 1 ]; then
+    printf '\n  WARNING: --skip-checks. Build and test checks were skipped.\n' >&2
 else
-    say "gate (api integrity + backend + macOS + GTK)"
-    bash .aidev/gate.sh || die "the gate failed — nothing was changed"
+    say "build and test checks (backend + macOS + GTK)"
+    bash tools/check || die "checks failed — nothing was changed"
 fi
 
 # --------------------------------------------------------------------- bump --

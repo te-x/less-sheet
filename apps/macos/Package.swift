@@ -1,12 +1,7 @@
 // swift-tools-version: 6.1
-// FROZEN by the planner (viewer-ui contract): target/dependency/platform
-// changes go through the change-request process. Implementer-owned code lives
-// in Sources/LessSheetKit and Sources/LessSheetApp; Sources/Contracts and
-// Tests are planner-owned.
 import PackageDescription
 
-// The Zig core is built by the component gate BEFORE swift build (see
-// .aidev/profile.sh CONFORMANCE_CMD) and linked statically from
+// Build the Zig core before Swift (see tools/check). It is linked statically from
 // ../../backend/zig-out/lib. Absolute -L via Context keeps the link
 // independent of the linker's working directory. The C header is
 // single-sourced from ../../api/lesssheet.h through a checked-in relative
@@ -24,10 +19,10 @@ let package = Package(
     targets: [
         // C shim vendoring the workspace-frozen core header (no Swift code).
         .target(name: "CLessSheet"),
-        // Planner-owned contract surface: protocols + types the UI consumes.
+        // shared contract surface: protocols + types the UI consumes.
         .target(name: "Contracts"),
         // Swift wrapper over the core C ABI + view-model logic
-        // (implementer-owned; conformances pinned by frozen tests).
+        // (internal; conformances pinned by frozen tests).
         .target(
             name: "LessSheetKit",
             dependencies: ["Contracts", "CLessSheet"],
@@ -36,7 +31,7 @@ let package = Package(
                 .unsafeFlags(["-L\(backendLibDir)"]),
             ]
         ),
-        // Thin SwiftUI shell (implementer-owned).
+        // Thin SwiftUI shell (internal).
         .executableTarget(
             name: "LessSheetApp",
             dependencies: ["LessSheetKit", "Contracts"]

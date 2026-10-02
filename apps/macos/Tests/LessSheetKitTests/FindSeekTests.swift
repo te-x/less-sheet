@@ -1,4 +1,4 @@
-// Frozen behavior tests — find-seek slice (planner-owned).
+// Frozen behavior tests — find-seek slice (shared).
 // ARCH-find-seek app criteria 7–8: the find view-model's pinned semantics
 // (composing + validation, count state machine, wrap, Esc/reopen clearing)
 // and the search bridge against the REAL linked Zig core — including the

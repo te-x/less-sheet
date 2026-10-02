@@ -1,9 +1,9 @@
 //! Frozen Zig-side contract for the less-sheet core (viewer-ui + find-seek +
 //! csv-hardening + filtered-views slices).
 //!
-//! This file is planner-owned. It mirrors the workspace-frozen C header
+//! This file is shared. It mirrors the workspace-frozen C header
 //! `api/lesssheet.h` EXACTLY — names, types, values, and semantics; the two
-//! files are amended only together, by the planner. The comptime block below
+//! files are amended only together, by the maintainer. The comptime block below
 //! pins every public signature: any drift in `src/` fails `zig build`.
 //!
 //! Tests (backend/tests/) import ONLY this module (`@import("api")`).
@@ -60,7 +60,7 @@
 //!     reported through the EXISTING terminal vocabulary (correct-rows-so-far,
 //!     complete, exact -- the damaged-gz shape) and, at open, the existing
 //!     `.io` status: there is NO new C-ABI error code and api/lesssheet.h stays
-//!     byte-identical. The recovery MECHANISM is implementer-owned. Frozen by
+//!     byte-identical. The recovery MECHANISM is internal. Frozen by
 //!     the sigbus_* tests, whose banner records the measured platform split
 //!     (macOS does not fault on truncate; Linux does).
 
@@ -337,11 +337,11 @@ pub const CopyResult = enum(c_int) {
 
 // ---------------------------------------------------------------------------
 // csv-gz internal Source/Reader SEAM value types (ARCH-csv-gz "Internal
-// Source/Reader contract"). Planner-owned + FROZEN: the OBSERVABLE vocabulary
+// Source/Reader contract"). shared + FROZEN: the OBSERVABLE vocabulary
 // the repaired, bounded-streaming Source/Reader seam speaks + the result shapes
 // the Zig-only test seams below hand back. The seam's OWN types (source.Source,
 // reader.Reader, reader.Pos, source.Cursor) and the checkpoint/cache/lexer/
-// matcher MECHANISM stay implementer-owned in src/ (the af83db9 reader-
+// matcher MECHANISM stay internal in src/ (the af83db9 reader-
 // interface ownership boundary is preserved -- Decision 1-C); the comptime
 // block at the bottom pins that `core` PROVIDES the enumerated capabilities in
 // THIS vocabulary. NONE of these cross the C ABI -- api/lesssheet.h is unchanged.
@@ -486,7 +486,7 @@ pub const copyAdvancesReset = core.copyAdvancesReset;
 // api/lesssheet.h stays BYTE-IDENTICAL: csv-gz adds transparent, checkpointed
 // gzip BEHIND the unchanged ABI, and these let the frozen tests prove the
 // bounded/streaming/recovery/replay properties the C ABI cannot express
-// directly. Each reads implementer-owned base.Document state that is DEFAULTED
+// directly. Each reads internal base.Document state that is DEFAULTED
 // to zero, so a plain-CSV document reports zeros and the mmap fast path is
 // unaffected (AC20); the SEED leaves them zero, which is what makes every
 // csv-gz quantitative AC RED until the gzip Source is built + wired.
@@ -577,7 +577,7 @@ pub const gzTouchReplayLane = core.gzTouchReplayLane;
 // the EXISTING short ls_row_range (a shorter contiguous prefix; suffix pending) --
 // never a new flag, and ls_row_oversized keeps its narrower per-row (>1 MiB)
 // meaning. These seams let the frozen tests prove the byte/work model the C ABI
-// cannot express. Each reads implementer-owned base.Document state DEFAULTED to
+// cannot express. Each reads internal base.Document state DEFAULTED to
 // zero, so the SEED reports zero -> every quantitative window-budget/#6 AC
 // (">0 and <=bound", plus the #6 deferred-nav behavioral flip) is RED until the
 // aggregate meter + the bounded/off-main nav are built + wired (mirroring
@@ -689,7 +689,7 @@ comptime {
     // against `core.*` -- the frozen SourceEnd/DualLimit vocabulary via @TypeOf,
     // the rest via @hasDecl existence (their BEHAVIOR is pinned by the 22-AC
     // suite + the instrumentation seams below, and the seam TYPE INTERNALS stay
-    // implementer-owned). "No operation may require a total logical length or a
+    // internal). "No operation may require a total logical length or a
     // slice from logical byte zero" is honored by the unknown-end query +
     // dual-limit cursor REPLACING len()/slice(0,len()).
     // (1) Source construction from a mapping + a selected mmap|gzip kind.
@@ -765,7 +765,7 @@ comptime {
     // installed Zig-0.16 std gzip decoder. A future std layout change that would
     // break the value-copy inflate-checkpoint adapter fails the build HERE,
     // loudly (ARCH req6 "compile-proven snapshot adapter"). Frozen in the
-    // contract so the implementer cannot silently drop the guard. The fields
+    // contract so the developer cannot silently drop the guard. The fields
     // below are exactly the checkpoint state (input pointer repaired on restore;
     // consumed_bits sub-byte alignment; reader = the <=64 KiB history window;
     // container_metadata = member CRC/ISIZE; state = DEFLATE block/pending) --
@@ -788,7 +788,7 @@ comptime {
 // the authoritative LAYOUT (size/align/offset) + SIGNATURE pins. api/lesssheet.h
 // is byte-identical above its appended extension block (AC1); the C
 // LS_COLUMN_STATIC_ASSERTs and these Zig pins together freeze the layout on
-// every supported target. Planner-owned; amended only with the C header.
+// every supported target. shared; amended only with the C header.
 //
 // Enum-valued snapshot fields are `enum(u32)` (layout-identical to the C
 // `uint32_t` the header stores); the RESULT enum is `enum(c_int)` (the C enum
@@ -1091,9 +1091,9 @@ comptime {
 // job-status snapshot struct, and the four ls_open_url_* / ls_net_open_*
 // export fns. api/lesssheet.h is byte-identical ABOVE its appended block (AC2);
 // this section + the comptime pins at the bottom freeze the additive surface.
-// Planner-owned; amended only with the C header.
+// shared; amended only with the C header.
 //
-// TEST VEHICLE (planner decision, ARCH-sanctioned). The ARCH delegated the
+// TEST VEHICLE (maintainer decision, ARCH-sanctioned). The ARCH delegated the
 // choice of "fixture HTTP server OR injectable transport seam, whichever fits
 // std.http.Client testability best." We freeze an INJECTABLE TRANSPORT seam:
 // std.http.Client in Zig 0.16 is Io-coupled and awkward to point at an
@@ -1115,10 +1115,10 @@ comptime {
 // exactly as openWithAllocator twins ls_open); instrumentation seams
 // (netRangeMode / netFetchCount / netResidentBytes / netSpoolStore /
 // netForceCacheBytes on a DONE doc; netJobProbe on the job) read
-// implementer-owned base.Document / job state DEFAULTED to zero, so the SEED
+// internal base.Document / job state DEFAULTED to zero, so the SEED
 // reports zero/unwired and every transport-dependent AC is RED until the
 // http_range Source + real transport are built + wired. The http_range Source
-// TYPE INTERNALS stay implementer-owned in src/ (the af83db9 reader-interface
+// TYPE INTERNALS stay internal in src/ (the af83db9 reader-interface
 // ownership boundary / csv-gz Decision 1-C): tests bind only to this frozen
 // vocabulary + the C ABI, never to a SourceKind variant or transport vtable.
 // ===========================================================================
@@ -1290,7 +1290,7 @@ pub const NetFixture = struct {
     /// sent -> wait): a short body is a retryable FAULT whose un-fetched bytes are
     /// NEVER zero-filled or marked present. A short HEAD at open fails
     /// LS_NET_ERROR_SHORT_BODY; a post-open short range simply does not advance the
-    /// frontier (root-planner boundary: no new post-open error state). `null` (the
+    /// frontier (root-maintainer boundary: no new post-open error state). `null` (the
     /// default) delivers the whole body. Random-fill (range) fixtures. Zig-only.
     short_body_at: ?u64 = null,
     /// FRONTIER COMMIT GUARD lock (cell `net_peek_mutex`, reviewer-filed): a
@@ -1336,7 +1336,7 @@ pub const NetJobProbe = struct {
 
 /// `decideProbe` result (never-full-download-streaming AC17): the pure
 /// fill-strategy / length classification from a successful (2xx) probe's raw
-/// signals. Planner-owned Zig-only value type (like OpenBudget / NetSpoolStore
+/// signals. shared Zig-only value type (like OpenBudget / NetSpoolStore
 /// -- never the C ABI). Replaces the old net_source-private `Probe` verdict at
 /// the seam: `range = !is_gz` is DROPPED (gzip composes over the spool, TD4)
 /// and `length_known` is ADDED (splits Content-Length: 0 from an absent
@@ -1445,7 +1445,7 @@ comptime {
 // ADDITIVE: the batched per-window match-flags companion call. Mirrors the
 // appended api/lesssheet.h "MATCH-FLAGS EXTENSION" block EXACTLY (ONE read-only
 // C-ABI entry point; NO new type/enum/struct/constant, so every layout above is
-// byte-identical). Planner-owned; amended only with the C header. The observable
+// byte-identical). shared; amended only with the C header. The observable
 // verdict is pinned by the `mf*` behavior tests (backend) + the macOS golden
 // bridge test; the impl lives in src/ (window.zig, reading win_buf).
 // ===========================================================================
@@ -1473,7 +1473,7 @@ comptime {
 // ADDITIVE: the core-framed streaming TSV COPY JOB family. Mirrors the appended
 // api/lesssheet.h "STREAMING COPY EXTENSION" block EXACTLY (ONE constant, THREE
 // types, ONE opaque handle, THREE C-ABI entry points). Everything above --
-// including the Phase 1 MATCH-FLAGS EXTENSION -- is byte-identical. Planner-owned;
+// including the Phase 1 MATCH-FLAGS EXTENSION -- is byte-identical. shared;
 // amended only with the C header. The observable framing (byte-identical to the
 // deleted TSVCopyBuilder) is pinned by the `cp*` behavior tests (backend) + the
 // macOS golden bridge test; the impl lives in src/ (root.zig + the sweep reusing
@@ -1581,7 +1581,7 @@ comptime {
 // terminates if and only if each call ADVANCES, or reports `capped`, or lands on
 // `atEnd`. Driving that op ONE CALL AT A TIME under a step budget turns the hang
 // into a failing assertion. This block spells the seam pieces a frozen test needs
-// for that; the DEFINITIONS all stay implementer-owned in src/ (csv-gz Decision
+// for that; the DEFINITIONS all stay internal in src/ (csv-gz Decision
 // 1-C), and the capabilities themselves are already pinned above.
 // ===========================================================================
 
@@ -1597,7 +1597,7 @@ pub const ReaderSeam = @typeInfo(@TypeOf(core.readerMatchRow)).@"fn".params[0].t
 /// The CSV Reader seam value for a RESOLVED dialect -- separator, optional quote
 /// (null == quoting off), and a resolved `encoding_*` -- i.e. exactly what `open`
 /// hands every scan after sniffing + encoding resolution. This is the ONE place
-/// outside src/ that constructs one, so implementer-side field drift fails HERE,
+/// outside src/ that constructs one, so developer-side field drift fails HERE,
 /// as a contract compile error, instead of silently rewriting a frozen test.
 pub fn csvReaderSeam(sep: u8, quote: ?u8, encoding: u8) ReaderSeam {
     return .{ .csv = .{ .sep = sep, .quote = quote, .encoding = encoding } };
@@ -1656,7 +1656,7 @@ comptime {
 // kind. Mirrors api/lesssheet.h "SORTED VIEWS" EXACTLY: the direction / state /
 // error enums, the `ls_sort_status` snapshot, and the three `ls_sort_*` export
 // fns; the comptime block at the bottom pins the LAYOUT and the SIGNATURES.
-// Planner-owned; amended only together with the C header.
+// shared; amended only together with the C header.
 //
 // The full normative model is in api/lesssheet.h (the comparator's total order,
 // the key pass, THE CONVERGING PREFIX, sorted coordinates, jump/find under a
@@ -1746,7 +1746,7 @@ pub const ls_sort_poll = core.ls_sort_poll;
 /// therefore the single number that bounds the build's process memory. Merge
 /// read-buffers are DERIVED from the resolver below, never independently sized:
 /// changing the sort's memory footprint must be one edit in one place.
-/// 32 MiB (ARCH-sort-by-column §4, planner-tunable).
+/// 32 MiB (ARCH-sort-by-column §4, maintainer-tunable).
 pub const sort_chunk_default_bytes: u64 = 32 * 1024 * 1024;
 
 /// THE RESOLVER: the chunk size in force for THIS document — `sort_chunk_default_bytes`
@@ -1767,7 +1767,7 @@ pub const sortChunkBytesSetForTest = core.sortChunkBytesSetForTest;
 // --- Test-only instrumentation seams (ARCH-sort-by-column) ------------------
 // Zig-level seams (NOT C ABI — like `openWithAllocator` / `copyAdvances` /
 // `gz*` / `net*`), so api/lesssheet.h carries no test-only surface. Each reads
-// implementer-owned state DEFAULTED to zero, so the SEED reports zeros and
+// internal state DEFAULTED to zero, so the SEED reports zeros and
 // every quantitative sort AC is RED until the key pass, the external merge, and
 // the permutation are built and wired.
 

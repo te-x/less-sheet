@@ -5,7 +5,7 @@
 //! It is shared rather than duplicated for one specific reason: two of the seeds
 //! AC-c2 requires the corpus to carry are the `flate_b1` regression cuts — the
 //! mid-DEFLATE-symbol truncations that produced a garbage decode before the
-//! wave-(b) fix (`review/REVIEW-flate-feed-guard.md`: fixture A cut 50, fixture
+//! wave-(b) fix (fixture A cut 50, fixture
 //! B cut 16891). A cut offset only means anything against ONE exact deflate
 //! stream, so the generator and the harness must emit the same bytes for the same
 //! payload. This mirrors the frozen suite's own `deflateRaw` / `gzMember` helpers

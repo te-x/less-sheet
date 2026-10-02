@@ -1,4 +1,4 @@
-//! Frozen behavior tests — viewer-ui + find-seek slices (planner-owned).
+//! Frozen behavior tests — viewer-ui + find-seek slices (shared).
 //! Every core acceptance criterion of ARCH-viewer-ui (1–8) maps to at least
 //! one test below, and the walking-skeleton dialect/error coverage is carried
 //! over onto the windowed surface. Tests exercise the PUBLIC C ABI through
@@ -1951,7 +1951,7 @@ test "abi: the exported C symbols are callable through extern linkage" {
 }
 
 // ===========================================================================
-// find-seek slice (ARCH-find-seek core criteria 1–6). Frozen; planner-owned.
+// find-seek slice (ARCH-find-seek core criteria 1–6). Frozen; shared.
 // Naming: f<criterion>. Semantics under test are pinned in api/lesssheet.h
 // (SEARCH section + ls_search_* contracts) and mirrored in contracts/api.zig.
 // Determinism: generated needle fixtures force header OFF so record i is data
@@ -2898,7 +2898,7 @@ test "abi: the search C symbols are callable through extern linkage; enum values
 
 // ===========================================================================
 // csv-hardening slice (ARCH-csv-hardening core criteria 1-17; app criteria
-// 18-20 live in apps/macos). Frozen; planner-owned. Naming: h<criterion>.
+// 18-20 live in apps/macos). Frozen; shared. Naming: h<criterion>.
 // Semantics are pinned in api/lesssheet.h (TEXT AND ENCODING: detection
 // pipeline, transcode-to-UTF-8 guarantee vs UTF-8 pass-through, the
 // LS_CELL_MAX_BYTES display cap, search-over-the-full-cell; DELIMITED-TEXT:
@@ -3413,7 +3413,7 @@ test "abi: csv-hardening constants are pinned and truncation symbols link" {
 
 // ===========================================================================
 // filtered-views slice (ARCH-filtered-views core criteria 1-15; app criteria
-// 16-18 live in apps/macos). Frozen; planner-owned. Naming: fv<criterion>.
+// 16-18 live in apps/macos). Frozen; shared. Naming: fv<criterion>.
 // Semantics are pinned in api/lesssheet.h FILTERED VIEWS (the filter view mode,
 // the counters-not-lists memory bound, the shared scan slot, filtered
 // coordinates for the row accessors / jump / find, source-row mapping, reset)
@@ -3866,7 +3866,7 @@ test "fv15: setting/clearing a filter resets an active find; a re-open clears th
 // defers off-main with LS_SEARCH_NAV_SEARCHING — is the separate, still-frozen
 // wb_ac11 / wb_ac12 proof and is NOT relaxed here (see ARCH-window-budget
 // criterion 12: off-main only when "synchronous resolution is not provably
-// bounded"). The implementer honors both by dispatching off-main ONLY when the
+// bounded"). The developer honors both by dispatching off-main ONLY when the
 // re-lex would exceed the budget, and inline (resolveNavLockedFiltered on the
 // calling thread) otherwise — not blanket off-main under any filter.
 // ---------------------------------------------------------------------------
@@ -3954,7 +3954,7 @@ test "abi: the filter C symbols are callable through extern linkage; enum values
 }
 
 // ===========================================================================
-// huge-row-budget slice (ARCH-huge-row-budget). Frozen; planner-owned. Bounds
+// huge-row-budget slice (ARCH-huge-row-budget). Frozen; shared. Bounds
 // the SYNCHRONOUS window scan (ls_window_set) to LS_WINDOW_ROW_SCAN_MAX_BYTES
 // per row so a huge row/cell can never block the caller (UI) thread: such a row
 // is served as a bounded PREFIX and flagged by the NEW per-row ls_row_oversized
@@ -4134,7 +4134,7 @@ test "abi: LS_WINDOW_ROW_SCAN_MAX_BYTES is pinned and ls_row_oversized links" {
 }
 
 // ===========================================================================
-// huge-row-FILTERED slice (ARCH-huge-row-filtered). Frozen; planner-owned.
+// huge-row-FILTERED slice (ARCH-huge-row-filtered). Frozen; shared.
 // Extends the huge-row-budget WINDOW bound to the FILTERED view path: a filtered
 // view materialize landing on / crossing a giant row (source extent >
 // LS_WINDOW_ROW_SCAN_MAX_BYTES) must be O(budget), NOT O(giant-row bytes) --
@@ -4301,7 +4301,7 @@ test "hrf3-nav: filter count / source mapping / jump-under-filter / find-within-
 }
 
 // ===========================================================================
-// csv-corpus slice (ARCH-csv-corpus, AC2-AC4). Frozen; planner-owned.
+// csv-corpus slice (ARCH-csv-corpus, AC2-AC4). Frozen; shared.
 //
 // This sweep binds OUR parser to the clean-room generator's parser-agnostic
 // oracle: it iterates the GENERATED manifest.json and, for every non-heavy
@@ -4316,7 +4316,7 @@ test "hrf3-nav: filter count / source mapping / jump-under-filter / find-within-
 // deliberately NOT wired, so corpus.dir has no manifest.json and both tests
 // fail at loadCorpus with error.CorpusNotGenerated -- a crisp behavior RED
 // ("the corpus generate step is not wired"), never a compile/import failure.
-// The implementer makes it GREEN by adding, in build.zig, a b.addSystemCommand
+// The developer makes it GREEN by adding, in build.zig, a b.addSystemCommand
 // that runs `python3 tools/csvgen/gen.py --all --seed 1337 --out <cache>`,
 // making the behavior-test run depend on it, and injecting <cache> as
 // corpus.dir (Options.addOptionPath) -- plus the AC7 selftest.py oracle guard.
@@ -4347,7 +4347,7 @@ test "hrf3-nav: filter count / source mapping / jump-under-filter / find-within-
 // change), so that dimension is robustness-only (exact + >= manifest). The
 // only such light case is blank_lines_interspersed (its manifest notes say so:
 // "5 non-empty data rows"); a rename or a NEW interior-blank case falls into
-// the strict-== branch and fails LOUD, prompting a planner review -- never a
+// the strict-== branch and fails LOUD, prompting a maintainer review -- never a
 // silent pass. See recordModelDiverges.
 // ===========================================================================
 
@@ -4601,7 +4601,7 @@ test "corpus: cold-open + first window is < 500 ms for every non-heavy case (ARC
 // ===========================================================================
 // select-copy slice (ARCH-select-copy) — the SHARED api/ + BACKEND piece: the
 // bounded, window-INDEPENDENT LOSSLESS full-cell read ls_cell_copy. Frozen;
-// planner-owned. Maps ARCH acceptance criterion 3 (Copy is lossless + correct),
+// shared. Maps ARCH acceptance criterion 3 (Copy is lossless + correct),
 // BACKEND portion: a cell past the 4 KiB display cap is read COMPLETE up to the
 // caller's byte cap; the truncated flag + the exact-cap, code-point-boundary
 // cut; a small cell reads byte-identical to ls_cell; the NO-BORROW (copy)
@@ -4842,7 +4842,7 @@ test "abi: the select-copy symbol links through extern linkage; ls_copy_result v
 
 // ===========================================================================
 // stream-copy slice (ARCH-stream-copy) — the BACKEND COPY CURSOR. Frozen;
-// planner-owned. ls_cell_copy is accelerated by an internal, forward, view-
+// shared. ls_cell_copy is accelerated by an internal, forward, view-
 // scoped COPY CURSOR behind the UNCHANGED ABI (api/lesssheet.h + the
 // ls_cell_copy signature stay byte-identical): a row-major sweep advances O(1)
 // per row instead of re-locating each cell from a sparse checkpoint. Maps:
@@ -4877,7 +4877,7 @@ test "abi: the select-copy symbol links through extern linkage; ls_copy_result v
 // interval-scaled. `count ~= N`  vs  `baseline >= 100*N` together prove the
 // cursor path is O(rows), NOT O(rows x interval). The linear CEILING (e.g.
 // `<= N+64`) independently rules out any interval factor (an O(N x interval)
-// count would be ~1000x larger). (Planner-decided seam shape — see hand-off.)
+// count would be ~1000x larger). (maintainer-decided seam shape — see hand-off.)
 //
 // RED SEED: the cursor is unbuilt, so cellCopy locates from scratch in BOTH
 // toggle states — the AC1/AC2 equivalence sweeps hold trivially (like the
@@ -5143,7 +5143,7 @@ test "sc5: backwards / re-anchor access stays correct and never slower than from
 
 // ===========================================================================
 // csv-gz slice (ARCH-csv-gz) — transparent, checkpointed `.csv.gz`. Frozen;
-// planner-owned. Tests exercise the PUBLIC C ABI through @import("api") only,
+// shared. Tests exercise the PUBLIC C ABI through @import("api") only,
 // PLUS the Zig-only instrumentation seams (gz* / snapshot probe — NOT the C
 // ABI, like copyAdvances), so api/lesssheet.h is BYTE-IDENTICAL (AC1). gzip
 // fixtures are generated DETERMINISTICALLY IN-TEST via the pinned Zig-0.16 std
@@ -5183,7 +5183,7 @@ test "sc5: backwards / re-anchor access stays correct and never slower than from
 // state == 0/false -> every QUANTITATIVE AC's "did real work" clause (`> 0 and
 // <= bound`) fails at 0 (RED) — exactly stream-copy's `copyAdvances == 0` seed.
 // The four GUARD ACs (AC1/20/21/22) are invariants: GREEN by construction and
-// must STAY green. GREEN needs the implementer to build+wire the bounded,
+// must STAY green. GREEN needs the developer to build+wire the bounded,
 // checkpointed gzip Source + streaming matcher and set the counters.
 // ===========================================================================
 
@@ -5697,7 +5697,7 @@ test "gz_ac9: recovery matrix — empty/invalid/truncated/footer-mismatch/struct
 test "gz_ac10: a salvaged prefix has a deterministic immutable end (exact count, terminal poll, stable)" {
     const gpa = std.testing.allocator;
     // `header_off` is deliberate, not incidental (adjudicated CHANGE-REQUEST, see
-    // review/REVIEW-flate-feed-guard.md): this test's SUBJECT is that a salvaged
+    // the flate feed-guard investigation): this test's SUBJECT is that a salvaged
     // prefix has a deterministic immutable end, and it must not also depend on
     // header SNIFFING. `buildShape` decides `has_header` from record 1's
     // numeric-ness alone, before any index exists and without consulting the row
@@ -6000,7 +6000,7 @@ test "gz_ac22: uses ONLY the pinned Zig-0.16 std gzip decoder — no runtime dep
 }
 
 // ===========================================================================
-// REGRESSION (csv-gz tail near EOF) — planner-frozen. A `.csv.gz` whose INFLATED
+// REGRESSION (csv-gz tail near EOF) — maintainer-frozen. A `.csv.gz` whose INFLATED
 // size exceeds the O(head) open budget (LS_OPEN_HEAD_MAX_BYTES == 4 MiB) rendered
 // its FINAL ~chunk_bytes (256 KiB) of rows as EMPTY cells while the row COUNT
 // stayed EXACT. Field repro: eagleData_berlinTile.csv.gz — 37,317,552 rows,
@@ -6031,7 +6031,7 @@ test "gz_ac22: uses ONLY the pinned Zig-0.16 std gzip decoder — no runtime dep
 //
 // RED NOW: the gzip tail cells are empty and diverge from the non-empty oracle.
 // GREEN once the Source serves inflated output all the way to true logical EOF.
-// FIX SCOPE: src/source.zig only (implementer) — do NOT relax these assertions.
+// FIX SCOPE: src/source.zig only (developer) — do NOT relax these assertions.
 // ===========================================================================
 
 /// Differential tail check: a distinct-per-row CSV that inflates PAST the 4 MiB
@@ -6136,7 +6136,7 @@ test "gz_tail_eof: behind-frontier REPLAY tail past a durable 32 MiB checkpoint 
 
 // ===========================================================================
 // gz_net_tail — NETWORK-path regression for the gz Source tail materialization
-// (frozen; planner-owned). Pins the ROUND-2 fix in src/source.zig (commit
+// (frozen; shared). Pins the ROUND-2 fix in src/source.zig (commit
 // 26abe2e): the byteAtLane forward-lane guards. A budget-stalled forward lane
 // must NOT leave a stale, CLOBBERED op buffer that a later fwd_buffered read
 // (the round-1 fast path) then trusts.
@@ -6251,7 +6251,7 @@ test "gz_net_tail: a budget-stalled forward lane never serves a clobbered op buf
 }
 
 // ===========================================================================
-// window-budget slice (ARCH-window-budget). Frozen; planner-owned. Bounds the
+// window-budget slice (ARCH-window-budget). Frozen; shared. Bounds the
 // SYNCHRONOUS work of ls_window_set to a fixed 8 MiB (8,388,608-byte) aggregate
 // charged-work ceiling and repairs the filtered ls_search_nav lane (backlog #6),
 // BOTH behind a BYTE-IDENTICAL api/lesssheet.h (AC1): a budget-truncated window
@@ -6276,7 +6276,7 @@ test "gz_net_tail: a budget-stalled forward lane never serves a clobbered op buf
 //   AC12 #6 pass/fix branch ...... wb_ac12 (frozen OFF-MAIN branch: SEARCHING + worker resolves; replace/cancel/concurrent) [RED]
 //   AC13 no dependency/storage ... wb_ac13 (retries leak nothing; source read-only; deps frozen by the freeze) [GUARD]
 //
-// #6 FROZEN BRANCH (ARCH criterion 12 / Decision 5). The planner has DETERMINED
+// #6 FROZEN BRANCH (ARCH criterion 12 / Decision 5). The maintainer has DETERMINED
 // the synchronous filtered-nav lane is NOT provably bounded: nav.relexBlock /
 // countInBlockUpTo re-lex a whole checkpoint block (up to checkpoint_interval ==
 // 2048 rows) of possibly-giant rows synchronously under the document lock with an
@@ -6286,7 +6286,7 @@ test "gz_net_tail: a budget-stalled forward lane never serves a clobbered op buf
 // returns PROMPTLY with LS_SEARCH_NAV_SEARCHING (bounded synchronous work) and the
 // existing search worker resolves the exact FOUND/EXHAUSTED off-main, outside the
 // short commit lock (FR11: a background giant-row parse never makes a concurrent
-// ls_window_set / poll wait). Should the implementer instead PROVE a finite
+// ls_window_set / poll wait). Should the developer instead PROVE a finite
 // synchronous bound, relaxing this contract is a two-key CHANGE-REQUEST, not a
 // free change.
 //
@@ -6842,7 +6842,7 @@ test "wb_ac13: window retries add no leak and never touch the source file (ARCH 
 
 // ===========================================================================
 // gz-filter-stream slice — REGRESSION test for a diagnosed csv-gz defect
-// (frozen; planner-owned). A background FILTER or SEARCH scan that TRAILS the
+// (frozen; shared). A background FILTER or SEARCH scan that TRAILS the
 // index frontier — the document already inflated once by the AUTO indexer, so
 // every row the scan wants is at or behind the forward inflater — must reuse
 // ONE live inflater and STREAM forward (ARCH-csv-gz req6: "Sequential forward
@@ -6980,7 +6980,7 @@ test "gzfs_search: a gzip FIND-scan trailing the frontier streams forward, does 
 }
 
 // ===========================================================================
-// gz-filter-stream — GENERAL multi-block regression (planner-owned, frozen).
+// gz-filter-stream — GENERAL multi-block regression (shared, frozen).
 // gzfs_filter/gzfs_search above use a 48-row, single-block, no-contention
 // fixture; the shipped fix passed them yet an earlier round still re-inflated a
 // ~32 MiB checkpoint interval PER 2048-row block when a behind-frontier replay
@@ -7132,7 +7132,7 @@ test "gzfs_search_multiblock: a gzip FIND-scan trailing the frontier across many
 
 // ===========================================================================
 // column-config slice (ARCH-column-config) — the SHARED api/ + BACKEND piece.
-// Frozen; planner-owned. Drives the additive column-metadata C ABI (see
+// Frozen; shared. Drives the additive column-metadata C ABI (see
 // api/lesssheet.h "COLUMN METADATA EXTENSION") through @import("api"). The
 // display half (formatting/alignment/panel/search) lives in the macOS suite;
 // inference, publication, conflict/proposal, precedence, the sparse type model,
@@ -7822,7 +7822,7 @@ test "cc_ac19_reopen_is_fresh: a new handle begins at generation 0 with no state
 
 // ===========================================================================
 // network-source slice (ARCH-network-source) — frozen behavior tests
-// (planner-owned). Each of the ARCH's 17 acceptance criteria maps to >=1 test;
+// (shared). Each of the ARCH's 17 acceptance criteria maps to >=1 test;
 // the backend covers AC1-AC9, AC11-AC16 (AC10 "no cold-start marker" and AC17
 // "frontend entry point" are macOS-side; AC9's visible-affordance UI half is
 // macOS, its poll-surface half is here). Hermetic + deterministic: NO live
@@ -8231,7 +8231,7 @@ test "net_ac16: dependencies & size — Zig std only (std.http.Client / std.cryp
 
 // ===========================================================================
 // never-full-download-streaming slice (ARCH-never-full-download-streaming) —
-// frozen behavior tests (planner-owned). Each of the ARCH's 24 acceptance
+// frozen behavior tests (shared). Each of the ARCH's 24 acceptance
 // criteria maps to a `nfd_acN` test below. A network document must be STRICTLY
 // lazy: it fetches only what open / scroll / search / a deep jump needs, with
 // NO background network scan (the shipped slice's `buildDownloadAll` +
@@ -8900,22 +8900,22 @@ test "nfd_ac25: network filter parks CANCELLED and advances only on a filtered d
 }
 
 // ---------------------------------------------------------------------------
-// Real-network CORE-path bug regressions (planner-frozen, RED-first). A
+// Real-network CORE-path bug regressions (maintainer-frozen, RED-first). A
 // diagnosis root-caused three bugs in the http_range (real-transport) path that
 // the instant fake-transport gate never caught (the fake fetchInto returns
 // immediately, so it hides both the per-chunk round-trip cost and every timing-
 // dependent symptom). Two are gate-observable through EXISTING seams and are
-// frozen RED below; the implementer fixes src/ (net_source.zig / net.zig /
+// frozen RED below; the developer fixes src/ (net_source.zig / net.zig /
 // index.zig) in a later round.
 //
 // NOT frozen — diagnosis bug #1 (the RANDOM ensureSlice holds the HttpRange
 // mutex ACROSS the ~1 s network GET, so the main thread's reads block ~1 s per
 // bg fetch = the UI freeze; the SEQUENTIAL path already unlocks while waiting,
 // net_source.ensureSliceSequentialLocked, and the RANDOM path must mirror it).
-// This is NOT gate-testable from the tests-only (planner) seat: reproducing the
+// This is NOT gate-testable from the tests-only (maintainer) seat: reproducing the
 // contention needs a PAUSABLE random fetchInto on the fake (a blocking gate +
-// an "entered-fetch" handshake on FakeServer in src/) that only the implementer
-// can add — a planner-only test referencing a not-yet-honored fixture field is
+// an "entered-fetch" handshake on FakeServer in src/) that only the developer
+// can add — a maintainer-only test referencing a not-yet-honored fixture field is
 // FALSE-GREEN against the current src (the fake never pauses, so no contention),
 // which fails RED-for-the-right-reason; and the two-thread "the present-byte
 // read returns without blocking on the paused fetch" assertion is a negative /
@@ -9366,7 +9366,7 @@ test "mf8: AC1 a filter changes WHICH rows the window holds, not the per-cell ve
 // rows_done / budget_capped / advance-count behaviors are RED (empty output,
 // never stalls, rows_done 0, never capped, 0 advances); the lifecycle hygiene
 // (empty/out-of-range rects DONE-0, cancel/drain leak nothing) + the ABI link /
-// enum-value pins are GREEN-by-construction. RED -> GREEN: the implementer builds
+// enum-value pins are GREEN-by-construction. RED -> GREEN: the developer builds
 // the row-major sweep + TSV framing here, reusing window.zig's forward COPY
 // CURSOR (behind ls_cell_copy).
 // ===========================================================================
@@ -9726,7 +9726,7 @@ test "cp_abi: the streaming-copy symbols link through extern linkage; ls_copy_st
 // here is a behavior failure, never a compile error.
 //
 // Wave-1 seam: the `@setRuntimeSafety(false)` carve-out enumeration and its bench
-// justification (AC-a3/AC-a4) are the implementer's work under src/; this guard
+// justification (AC-a3/AC-a4) are the developer's work under src/; this guard
 // pins only the GLOBAL shipped mode, not the carve-out list.
 test "shipped optimize mode is ReleaseSafe (security-hardening MUST a / AC-a1)" {
     try std.testing.expectEqual(std.builtin.OptimizeMode.ReleaseSafe, @import("builtin").mode);
@@ -9736,16 +9736,16 @@ test "shipped optimize mode is ReleaseSafe (security-hardening MUST a / AC-a1)" 
 // Security-hardening MUST (e) network hardening, (f) copy formula-injection
 // neutralization (ARCH-security-hardening; amended 2026-07-24, CR sec_w2b).
 // ---------------------------------------------------------------------------
-// Planner-frozen behavior tests for Wave 2b. Each maps to a [gate] acceptance
+// maintainer-frozen behavior tests for Wave 2b. Each maps to a [gate] acceptance
 // criterion of ARCH-security-hardening. They ride the EXISTING seams (the
 // NetFixture injected transport + openUrlStartFake, the copy helpers); (e) also
 // rides the two Zig-only NetFixture fields (`redirect_downgrade`,
-// `short_body_at`). The api/ ABI is byte-identical -- the root-planner freeze
+// `short_body_at`). The api/ ABI is byte-identical -- the root-maintainer freeze
 // carries LS_NET_ERROR_INSECURE_REDIRECT / _SHORT_BODY + the number-aware
 // copy-output prose (and NO ls_scan_progress expansion/bomb field).
 //
 // AMENDED 2026-07-24 (CR sec_w2b, adjudicated APPROVED per the signed ARCH
-// amendment + the author sign-off; see .aidev/DECISION-2.md):
+// amendment and the recorded security requirements):
 //   * (d) the gzip-bomb ratio cap is WITHDRAWN -- work-amplification is an
 //     accepted known risk (memory stays O(viewport) at any expansion ratio and
 //     scanning is user-cancellable; the CR bench proved NO core-available signal
@@ -9776,7 +9776,7 @@ test "shipped optimize mode is ReleaseSafe (security-hardening MUST a / AC-a1)" 
 // clipboard/banner ACs) are reviewer/human probes, not gate.
 
 test "sec_e2: an https->http redirect downgrade is refused (INSECURE_REDIRECT); a same-scheme/upgrade chain within the cap still opens (AC-e2)" {
-    // The frozen enum value (root-planner freeze).
+    // The frozen enum value (root-maintainer freeze).
     try std.testing.expectEqual(@as(c_int, 8), @intFromEnum(api.NetStatus.insecure_redirect));
     const body = "a,b\n1,2\n";
     // A redirect whose Location downgrades the transport https->http is REFUSED with a
@@ -9801,7 +9801,7 @@ test "sec_e2: an https->http redirect downgrade is refused (INSECURE_REDIRECT); 
 }
 
 test "sec_e3: a short/zero range body at open fails SHORT_BODY and is never served as document content (AC-e3)" {
-    // The frozen enum value (root-planner freeze).
+    // The frozen enum value (root-maintainer freeze).
     try std.testing.expectEqual(@as(c_int, 9), @intFromEnum(api.NetStatus.short_body));
     const gpa = std.testing.allocator;
     const body = try genFixedRows(gpa, 5_000); // advertised in full
@@ -9964,9 +9964,9 @@ test "sec_f3: display, search, and filter see the RAW cell -- neutralization is 
 }
 
 // ===========================================================================
-// FRONTIER COMMIT GUARD + the span-boundary row-count DRIFT — planner-frozen
+// FRONTIER COMMIT GUARD + the span-boundary row-count DRIFT — maintainer-frozen
 // locks filed forward by the reviewer of cell `net_peek_mutex`
-// (review/REVIEW-net-peek-mutex.md, "Filed forward").
+// (the network peek mutex regression investigation).
 // ---------------------------------------------------------------------------
 // fcg1/fcg2/fcg3 lock the guard that landed in a5c3a69: a row is committed to the
 // frontier only when `row_end + max_lookahead <= present_extent`, or `row_end` is
@@ -9990,7 +9990,7 @@ test "sec_f3: display, search, and filter see the RAW cell -- neutralization is 
 // byte, if it is a LONE LF, is swallowed as that CRLF's LF instead of terminating
 // its own (empty) row. The bulk span walk then counts one row FEWER than the
 // streaming lexer from that boundary onward, so every checkpoint-anchored re-lex
-// serves row T+k for row T. The fix belongs to the implementer; this test is the
+// serves row T+k for row T. The fix belongs to the developer; this test is the
 // lock that must go GREEN with it, and it must never have been absent from
 // history while the row-count semantics changed.
 // ===========================================================================
@@ -10472,7 +10472,7 @@ test "drift1: a CRLF pair ending a span, followed by a lone LF — the bulk span
 // INDEPENDENT OF drift1 BY CONSTRUCTION, in both directions: one-byte spans cannot
 // put a CRLF PAIR inside a single span, which is precisely what drift1's defect
 // needs, so this test fires on the cross-call defect alone; and drift1's dense
-// stretch is phase-aligned so no span there ends on a bare CR. The implementer must
+// stretch is phase-aligned so no span there ends on a bare CR. The developer must
 // be able to see the two fail and pass separately.
 //
 // The `gzForceChunkBytes` seam (AC12 — gz_ac12 uses it the same way) makes a
@@ -10556,7 +10556,7 @@ test "drift2: a batch boundary between a CR and its LF must not lose the pending
 // between-CR-and-LF frontier: drift2's overcount, deterministically, on plain
 // sequential network CSV. `commitBound` documents the same trap at
 // net_source.zig:985-989 and works around it with a second FAR-BYTE demand.
-// Orchestrator measurements on the two implementation rounds, same construction as
+// maintainer measurements on the two implementation rounds, same construction as
 // below: DELTA=+1 (sequential net 8001 vs local 8000, cell contents disagreeing
 // too) at 9edeeec; DELTA=0 at 5936132.
 //
@@ -10653,7 +10653,7 @@ test "seqnet1: a CR on the last byte of a span settles from the successor's own 
 // `std.compress.flate` into a ReleaseSafe `integer overflow` panic inside
 // `takeBits` (Decompress.zig:548) during the open head inflate, on BOTH the
 // `withhold` and `drop_after` arms (task #40, the flate guard — reproduction in
-// the planner report). Until #40 lands, that path cannot carry a frozen test.
+// the maintainer report). Until #40 lands, that path cannot carry a frozen test.
 // The reviewer's OTHER residual — a replay lane publishing a lower `op_physical`
 // than a forward-lane chunk did — is not constructible through any existing seam
 // either: an inversion needs two publishes whose op-window ENDS invert; forward
@@ -10827,7 +10827,7 @@ fn expectTruncationHandled(
         // Keyed on the row's IDENTITY, not the probe INDEX: the probe set
         // collapses for a small salvage (`rc.count / 2 == last` when `rc.count`
         // is 1 or 2), which put the EXACT check on the very row this rule exempts
-        // (adjudicated CHANGE-REQUEST, see review/REVIEW-flate-feed-guard.md).
+        // (the flate feed-guard regression investigation).
         if (k == 3 or row == last) {
             // The final row may be cut mid-row: a PREFIX is correct, garbage is not.
             try std.testing.expect(std.mem.startsWith(u8, expect_buf[0..want.len], got));
@@ -10942,7 +10942,7 @@ test "flate_b1: a gz stream truncated at any byte offset inside a DEFLATE block 
     }
 }
 
-// AC-b2 is frozen as TWO independent signals, so the implementer can see them fail
+// AC-b2 is frozen as TWO independent signals, so the developer can see them fail
 // and pass separately (the drift1/drift2 lesson): `flate_b2a` is the criterion's
 // literal requirement — a fetch stopping on a chunk boundary must not drive the
 // inflater into a panic — and `flate_b2b` is its resolution requirement — the

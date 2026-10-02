@@ -2,10 +2,8 @@
 //! harness. NOT part of any gate (AC-c3: "not gate-blocking, one-time cadence").
 //!
 //! Why a build graph of its own rather than a step in `backend/build.zig`:
-//! `backend/build.zig` is a FROZEN dependency path (`backend/.aidev/profile.sh`
-//! `DEPENDENCY_PATHS=( "build.zig" )`) and an implementer may not edit it. This
-//! file reaches into the component instead, exactly the way the component
-//! already reaches out to `tools/csvgen` — it rebuilds the same two-module graph
+//! This keeps development tooling separate from shipped artifacts. It rebuilds
+//! the same two-module graph
 //! `backend/build.zig` builds (implementation `src/root.zig` <-> frozen contract
 //! `contracts/api.zig`, mutually imported, libc linked), so the harness compiles
 //! the SAME code the shipped static library compiles, including the contract's

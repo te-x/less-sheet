@@ -1,3 +1,3 @@
 /// less-sheet macOS frontend — thin shell over the core's C ABI.
-/// Implementation lands here via the aidev pipeline; Sources/Contracts and Tests are planner-owned.
+/// Shared document and presentation logic used by the native macOS app.
 public enum LessSheetKit {}

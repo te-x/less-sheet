@@ -1,4 +1,4 @@
-// Frozen behavior test — thin-frontend-shared-core Phase 2 (planner-owned).
+// Frozen behavior test — thin-frontend-shared-core Phase 2 (shared).
 // ARCH-thin-frontend-shared-core Phase 2 AC1: the core's streaming-copy path
 // (surfaced by `DocumentSession.openCopy` -> `ls_copy_open`/`next`/`close`)
 // produces TSV BYTE-FOR-BYTE identical to the CURRENT `TSVCopyBuilder`
@@ -18,7 +18,7 @@
 //
 // RED at freeze: `CoreDocumentSession` does NOT yet override `openCopy`, so the
 // protocol's RED default (returns nil) answers every call — `#require(openCopy)`
-// fails on nil (a BEHAVIOR red). The implementer flips it GREEN by overriding
+// fails on nil (a BEHAVIOR red). The developer flips it GREEN by overriding
 // `openCopy` to open an `ls_copy_open` job wrapped as a `CopyStreaming`.
 //
 // Semantics are normative in api/lesssheet.h "STREAMING COPY EXTENSION" and

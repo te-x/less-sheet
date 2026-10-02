@@ -1,5 +1,5 @@
 // Frozen behavior test — settings-panel-redesign AC23 contract guard
-// (planner-owned). The inline-Settings amendment is a UI COMPOSITION + ROUTING
+// (shared). The inline-Settings amendment is a UI COMPOSITION + ROUTING
 // change ONLY: relative to the shipped column-config baseline, both the frozen
 // C ABI `api/lesssheet.h` and the public Swift contracts in
 // `apps/macos/Sources/Contracts/ColumnPanel.swift` must have an EMPTY DIFF, so
@@ -9,7 +9,7 @@
 //
 // This is a REGRESSION-LOCK, not a red seed: it is GREEN at freeze (both files
 // are the committed baseline) and must STAY green through the build — if the
-// implementer edits either file to move the surface, this fails immediately,
+// developer edits either file to move the surface, this fails immediately,
 // BEFORE the deterministic frozen-path gate would. It complements the existing
 // `ColumnPanelTests` conformance pins (which exercise the reused
 // `ColumnPanelLayouting` / `ColumnLabelSearching` symbols): those catch a symbol
@@ -18,7 +18,7 @@
 // Both files are located from THIS file's compile-time path (#filePath), the
 // same root-relative technique CorpusColdOpenTests uses, so the check is
 // independent of the test runner's working directory. If a FUTURE, architect-
-// approved feature legitimately extends `api/lesssheet.h`, its planner updates
+// approved feature legitimately extends `api/lesssheet.h`, its maintainer updates
 // the pinned baseline below through the change-authority process — this
 // amendment must not.
 import Foundation
@@ -69,7 +69,7 @@ struct AmendmentContractGuardTests {
         // else drives it, because a net document gets no background filter scan. A
         // frontend author reading only that list would not anticipate the state, and
         // could render it as a user cancellation instead of a partial count. Wording
-        // endorsed by the reviewer in review/REVIEW-netgz-mutex-wedge.md. ZERO
+        // verified during the network mutex regression investigation. ZERO
         // struct / enum / signature / constant / layout change -- ls_filter_state's
         // values are untouched -- so the ABI is byte-compatible; only the comment
         // bytes moved, which this guard deliberately notices.
@@ -77,16 +77,16 @@ struct AmendmentContractGuardTests {
         // amendment: ONE additive appended block (the MATCH-FLAGS EXTENSION —
         // the single new prototype ls_window_match_flags), with struct / enum /
         // signature / constant LAYOUT above it BYTE-IDENTICAL (verified by the
-        // root planner: the only change is the appended block). Updated through
+        // root maintainer: the only change is the appended block). Updated through
         // the change-authority process, exactly as this guard provides for an
         // architect-approved header amendment.
         // Baseline re-bumped for the ARCH-never-full-download-streaming amendment:
         // THREE documentation / sentinel changes (the LS_BYTES_TOTAL_UNKNOWN
         // sentinel + the network demand-driven / search-demand-bounded doc
         // carve-outs) with BYTE-IDENTICAL struct/enum/signature LAYOUT (verified
-        // by the root planner: the only non-comment change is the one #define).
+        // by the root maintainer: the only non-comment change is the one #define).
         // Prior bump: the ARCH-network-source additive block (ls_open_url_* +
-        // ls_net_*). Updated by the planner through the change-authority process,
+        // ls_net_*). Updated by the maintainer through the change-authority process,
         // exactly as this guard's contract provides for an architect-approved
         // header amendment.
         // Baseline re-bumped for the ARCH-thin-frontend-shared-core Phase 2
@@ -94,7 +94,7 @@ struct AmendmentContractGuardTests {
         // LS_COPY_MAX_CELLS + ls_copy_rect / ls_copy_step / ls_copy_progress /
         // ls_copy_job + ls_copy_open / ls_copy_next / ls_copy_close), with struct /
         // enum / signature / constant / prototype LAYOUT above it (incl. the Phase 1
-        // MATCH-FLAGS EXTENSION) BYTE-IDENTICAL (verified by the root planner: the
+        // MATCH-FLAGS EXTENSION) BYTE-IDENTICAL (verified by the root maintainer: the
         // only change is the appended block). Updated through the change-authority
         // process, exactly as this guard provides for an approved header amendment.
         // Baseline re-bumped for the ARCH-search-case-mode amendment (authorized:
@@ -119,7 +119,7 @@ struct AmendmentContractGuardTests {
         // process. See docs/architecture/ARCH-security-hardening.md.
         expectEmptyDiff("api/lesssheet.h",
         // Baseline re-bumped for the ARCH-sort-by-column freeze (authorized: signed
-        // ARCH, user sign-off 2026-09-06, root-planner freeze). The header gains the
+        // ARCH, user sign-off 2026-09-06, root-maintainer freeze). The header gains the
         // SORTED VIEWS block — ls_sort_direction / ls_sort_state / ls_sort_error /
         // ls_sort_status and ls_sort_set / _clear / _poll — plus amendment (d) to the
         // never-full-download demand list and the prose that a row INDEX means a

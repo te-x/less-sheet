@@ -1,4 +1,4 @@
-// Frozen behavior tests — native-grid slice (planner-owned).
+// Frozen behavior tests — native-grid slice (shared).
 //
 // ARCH-native-grid is an ENGINE SWAP (SwiftUI ScrollView grid -> NSTableView-backed
 // grid) with exactly ONE new behavioral requirement — any landing (jump / find /
@@ -6,7 +6,7 @@
 // otherwise. No new ABI, no new Kit protocols: the contract of this slice is the
 // app's existing env-probe surface (log formats + values), pinned here by
 // PROCESS-LAUNCHING the built LessSheet binary headless and asserting on its
-// stderr probe lines. The probes live in implementer-owned Sources — this file
+// stderr probe lines. The probes live in internal Sources — this file
 // pins their formats and required values; gutting or rewiring an instrument to
 // dodge a bound is visible in the Sources diff and is the reviewer's escape to
 // catch (the gate catches drift, the reviewer catches fraud).

@@ -1,5 +1,5 @@
 // Frozen behavior tests — settings-panel-redesign discovery + Settings lifecycle
-// (planner-owned). ARCH-column-config amendment: the adaptive discovery boundary
+// (shared). ARCH-column-config amendment: the adaptive discovery boundary
 // and `#N` direct addressing (criteria 12/13), the bounded ten-result cap +
 // overflow (criterion 12), and the deterministic Settings selection/search/
 // disclosure lifecycle (criteria 17/19/22). PURE, no GUI, no core: the AppKit
@@ -9,7 +9,7 @@
 // deep-link, session reset) are pinned by SettingsRedesignProbeTests; the frozen
 // C ABI + ColumnPanel.swift empty-diff by AmendmentContractGuardTests.
 //
-// RED SEED (Sources/LessSheetKit/ColumnDiscoveryLogic.swift, implementer-owned):
+// RED SEED (Sources/LessSheetKit/ColumnDiscoveryLogic.swift, internal):
 // `ColumnDiscovery` always reports `.fullList`, recognizes no `#N`
 // (`resolveDirectAddress` returns nil), and retains every match uncapped;
 // `SettingsLifecycleReducer` never validates/collapses/clears. So the new-value

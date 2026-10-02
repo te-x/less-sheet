@@ -1,5 +1,5 @@
 // Frozen behavior tests — macOS keyboard cell-navigation (ARCH-macos-kbdnav),
-// the PURE half. Planner-owned.
+// the PURE half. shared.
 //
 // This slice brings macOS to keyboard-navigation parity with the signed GTK
 // a11y slice: arrows always move a cell cursor (seeding at the top-left visible
@@ -37,12 +37,12 @@
 //     escapeHandlerDispatchesOnResolver — handleEscape routes through the
 //     resolver (structural source check).
 //
-// RED SEED (planner freeze) — RED on BEHAVIOR, never compile/import: the
+// RED SEED (maintainer freeze) — RED on BEHAVIOR, never compile/import: the
 // LessSheetKit seeds return trivial results (navigate → the input unchanged;
 // reveal → no move; resolve → .none). So every G test below fails on behavior
 // while the tree compiles (the conformances hold).
 //
-// RED → GREEN (implementer): implement the seeds per the Contracts doc-comments
+// RED → GREEN (developer): implement the seeds per the Contracts doc-comments
 // (KeyboardNavigationLogic.swift) — KeyboardNavigator COMPOSING the frozen
 // Selecting — and wire the App (key routing, clip scroll, accent outline, and
 // handleEscape dispatching on EscapeResolver). No frozen path changes.
@@ -355,7 +355,7 @@ struct KeyboardNavigationTests {
     /// duplicating the branch logic. Locates the App source from this file's
     /// compile-time path (the same technique as AmendmentContractGuardTests),
     /// so it is independent of the runner's working directory. RED at freeze
-    /// (handleEscape still branches inline); GREEN once the implementer routes
+    /// (handleEscape still branches inline); GREEN once the developer routes
     /// it through `EscapeResolver`.
     @Test func escapeHandlerDispatchesOnResolver() throws {
         let file = URL(fileURLWithPath: #filePath)

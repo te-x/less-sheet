@@ -1,0 +1,31 @@
+#!/usr/bin/env python3
+"""Compile and test the production Swift update parser without the app/core.
+
+Works with Swift 6 on macOS or Linux; optionally checks an existing SHA256SUMS.
+"""
+
+import pathlib
+import shutil
+import subprocess
+import sys
+import tempfile
+
+
+def main():
+    if len(sys.argv) > 2:
+        raise SystemExit("usage: check_update_release_swift [SHA256SUMS]")
+    compiler = shutil.which("swiftc")
+    if compiler is None:
+        raise SystemExit("check_update_release_swift: Swift 6 compiler is required")
+    root = pathlib.Path(__file__).resolve().parents[2]
+    production = root / "apps/macos/Sources/LessSheetApp/UpdateRelease.swift"
+    tests = root / "tools/tests/update_release_swift_tests.swift"
+    with tempfile.TemporaryDirectory(prefix="less-sheet-swift-update-") as temporary:
+        executable = pathlib.Path(temporary) / "update-release-tests"
+        subprocess.run([compiler, "-swift-version", "6", "-warnings-as-errors", str(production),
+                        str(tests), "-o", str(executable)], check=True)
+        subprocess.run([str(executable), *sys.argv[1:]], check=True)
+
+
+if __name__ == "__main__":
+    main()

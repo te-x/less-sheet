@@ -114,8 +114,8 @@ def die(msg):
 def find_app(explicit):
     """The freshly built binary — and NEVER a silent fallback to an older one.
 
-    This cost a 400-second dead run. `apps/macos/.aidev/profile.sh`'s conformance
-    step does `rm -rf .build/*/release/LessSheet` before rebuilding, so ANY gate
+    This cost a 400-second dead run. Rebuilding the core requires removing the
+    old linked `.build/*/release/LessSheet` first, so a validation
     run can leave that path missing for a while. The first version of this
     function then fell back to /Applications/less-sheet.app — an installed copy
     from two days earlier that predates CaptureProbe, so no capture_window marker
