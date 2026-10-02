@@ -37,14 +37,18 @@ jobs:
           --case unicode_emoji --case eol_crlf --case wide_100k_cols
           --case enc_utf16le --case happy_numeric
           --seed 1337 --out apps/macos/.build/corpus-cache
-      - name: Build, lint and test the macOS frontend
+      - name: Build and lint the macOS frontend
         working-directory: apps/macos
         run: |
           swift build -Xswiftc -warnings-as-errors
           swiftlint lint --strict Sources
-          swift test
       - name: Test the Swift update release parser
         run: python3 tools/tests/check_update_release_swift
+      - name: Test the macOS frontend
+        working-directory: apps/macos
+        # These tests launch native apps and measure elapsed time. Running
+        # unrelated suites together makes their windows compete for resources.
+        run: swift test --no-parallel
 
   gtk-release-parser:
     runs-on: ubuntu-24.04
