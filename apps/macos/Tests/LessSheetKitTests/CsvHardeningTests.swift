@@ -1,4 +1,4 @@
-// Frozen behavior tests — csv-hardening slice (planner-owned).
+// Frozen behavior tests — csv-hardening slice (shared).
 // ARCH-csv-hardening app criteria 18-20 (the "Text encoding" picker view-model,
 // the encoding re-open path, and the per-cell truncation indicator's data), plus
 // the frontend-observable slices of the encoding + display-cap behavior verified

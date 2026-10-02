@@ -79,7 +79,7 @@ work is not redone when Windows lands):**
 | `source.zig:381`; `net_source.zig:461` | `c.unlink` | `std.fs` delete (e.g. `Dir.deleteFile`) |
 | `source.zig:379`; `net_source.zig:459` | `c.getpid` (temp-name uniqueness only) | a portable uniqueness source (thread id / counter / random) — not `getpid` |
 
-The exact std signatures/wrappers are the planner's (contracts) and implementer's (src) call — this
+The exact std signatures/wrappers are the maintainer's (contracts) and developer's (src) call — this
 table fixes the **direction and rationale**, not code.
 
 **C. Stays platform-specific behind the Source seam (NOT ported now — the Windows plug-in point):**
@@ -101,8 +101,7 @@ Apple ld64's 8-byte member alignment. That is a **macOS-only** step: for a Linux
 **skipped**, and the zig-native archive installed directly (lld links musl-static archives fine).
 Make the repack conditional on the resolved target being macOS
 (`target.result.os.tag == .macos`); otherwise `b.addInstallArtifact`/install the library artifact as
-produced. `build.zig` is a `DEPENDENCY_PATH` in `backend/.aidev/profile.sh` — **planner-owned**; this
-change is assigned to the planner, not the implementer.
+produced.
 
 ## Gate: cross-compile assertion (deterministic, in-gate)
 
@@ -113,7 +112,7 @@ full static library, `net.zig` included). This is the exact build step `bench_le
 performs, so a green gate means the bench runner's build phase is green. **Compile-only:** cross tests
 cannot run in-gate (`zig build test` for a Linux triple would produce a non-executable-on-host
 binary), and Linux TLS cannot be exercised headlessly — those are human-runtime ACs. The assertion
-lives in the gate/profile layer (orchestrator/planner-owned `.aidev/`), never in `src/`.
+lives in `tools/check`, rather than the runtime sources.
 
 ## Linux network/TLS verification (human, real host — in scope now)
 
@@ -125,7 +124,7 @@ no net-capable Linux harness exists today (the bench binary is CSV-local only), 
 against a real HTTPS range-serving host and prints the first rows — shipped/run via the same
 cross-compile-and-ship mechanism as `bench_lesssheet_on` (e.g. `tools/`). Without it the "verify
 Linux net now" criterion is not human-runnable. Placement/reuse (extend the bench runner vs a
-sibling tool) is the planner's call; the requirement is that H3 below is runnable.
+sibling tool) is the maintainer's call; the requirement is that H3 below is runnable.
 
 ## Non-functional constraints (unchanged, must hold)
 
@@ -155,11 +154,11 @@ sibling tool) is the planner's call; the requirement is that H3 below is runnabl
    is deliberately excluded from the gate set.
 5. **Linux net/TLS verified now, by the human, on real hosts** (not gate-able headlessly); a minimal
    cross-compilable net-probe is delivered so the check is runnable.
-6. **`build.zig` repack made macOS-target-conditional** (planner-owned dependency file).
+6. **`build.zig` repack made macOS-target-conditional** (shared dependency file).
 
 ## Acceptance criteria
 
-Each is testable. **GATE** = deterministic, run in-gate by the orchestrator. **HUMAN-RUNTIME** =
+Each is testable. **GATE** = deterministic, run in-gate by the maintainer. **HUMAN-RUNTIME** =
 run by the human on real hardware (compiling ≠ running; Linux TLS is not headless-verifiable).
 
 ### GATE (automated, must stay green)
@@ -173,7 +172,7 @@ run by the human on real hardware (compiling ≠ running; Linux TLS is not headl
   behavior change** (the pthread→`std.Thread` swap and file/stat swaps are semantically identical).
 - **G5.** **Zero ABI change:** `api/lesssheet.h` is byte-identical to its pre-feature state (root
   gate `api/` integrity check).
-- **G6.** macOS app gate stays green: the root gate (which chains `apps/macos/.aidev/gate.sh`)
+- **G6.** macOS app gate stays green: `bash tools/check macos`
   passes — the Swift frontend links and its tests pass against the unchanged ABI.
 - **G7.** For a Linux target build, the Apple `libtool` repack does **not** run and the installed
   `liblesssheet.a` is the zig-native archive (implied by G1/G2 succeeding without invoking

@@ -8,7 +8,7 @@ internal refactor: NO `api/` change, NO behavior change, no perf regression** �
 
 **Read first:** the prior reorg (commit `4a392ad`, `root.zig` → modules) for the house style; `backend/src/`
 (`lexer.zig`, `window.zig`, `index.zig`, `nav.zig`, `search.zig`, `filter.zig`, `sniff.zig`, `base.zig`,
-`root.zig`, `encoding.zig`); the workspace `CLAUDE.md` (Zig 0.16 docs-first; the O(head)/O(viewport)/frontier
+`root.zig`, `encoding.zig`); the workspace `docs/architecture/PROJECT.md` (Zig 0.16 docs-first; the O(head)/O(viewport)/frontier
 guarantees). `[[formats-roadmap]]`.
 
 ## Problem (from the survey)
@@ -25,7 +25,7 @@ The core operates on two small internal interfaces; CSV is one Reader impl behin
 code lives in one place per format. csv.gz (Source) + Parquet (Reader) then plug in without touching the
 core. Byte-for-byte the same behavior + perf for CSV today.
 
-## Design direction (the two seams; implementer works out the exact Zig shape)
+## Design direction (the two seams; developer works out the exact Zig shape)
 - **Source** — the byte provider the byte-oriented Readers consume. Today: the read-only `mmap` slice
   (`doc.content` + `data_start`). Add a Source seam so a Reader gets bytes via it: an mmap Source (identity,
   zero-copy — unchanged perf) and, later, a gzip Source (inflate + inflate-checkpoints so a behind-frontier
@@ -82,7 +82,7 @@ core. Byte-for-byte the same behavior + perf for CSV today.
 NONE frozen changes: `api/lesssheet.h`, `backend/contracts/api.zig`, and all frozen tests are UNCHANGED (the
 refactor must keep them green). Internal-only: new `backend/src/reader.zig` (+ `source.zig`) interfaces + a
 `csv_reader.zig` (the CSV Reader wrapping `lexer`/`encoding`/`sniff`), and edits to `window`/`index`/`nav`/
-`search`/`filter`/`root` to route through them. Implementer + reviewer (no planner freeze — no contract change).
+`search`/`filter`/`root` to route through them. developer + reviewer (no maintainer freeze — no contract change).
 
 ## Sequencing
 Runs AFTER select-copy is committed (both touch `window.zig`/`cellCopy`; avoid the conflict). Then: this
@@ -91,4 +91,4 @@ reorg → csv.gz (Source plugin) + the select-copy streaming copy accessor (a cu
 
 ## Open questions
 None blocking — the Reader op set + the opaque-position are the design; the exact Zig dispatch shape
-(comptime vs vtable) is the implementer's call under the zero-cost constraint.
+(comptime vs vtable) is the developer's call under the zero-cost constraint.

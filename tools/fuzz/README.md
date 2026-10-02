@@ -3,7 +3,7 @@
 Coverage-guided fuzzing over the less-sheet C ABI. This is the dev tool for
 **security-hardening wave (c)** (`docs/architecture/ARCH-security-hardening.md`,
 AC-c1 / AC-c2 / AC-c3). It is **not gate-blocking** — AC-c3 calls the campaign a
-one-time pre-launch cadence, so nothing here runs in `.aidev/gate.sh`.
+one-time pre-launch cadence, so the campaign is run separately from routine checks.
 
 ## The one command
 
@@ -206,8 +206,7 @@ That change fails **silently**, which is why it gets a value oracle rather than 
 crash target. A missed lane is a false negative, so the field runs past its real
 end, swallows its separator and mis-lexes the row; a wrong lane index reports a
 structural byte where there is none, and every offset this scan returns is one a
-caller may publish as a **row start** (`review/REVIEW-row-count-drift.md` — "a
-terminator is consumed whole, or not at all" rests on the offset being exact).
+caller may publish as a **row start** ("a terminator is consumed whole, or not at all" rests on the offset being exact).
 No crash either way.
 
 The property is total equivalence with the implementation it replaced, plus an
@@ -350,9 +349,8 @@ progress** — which is precisely the four the table above catches.
 | `campaign/` | campaign logs |
 
 `build.zig` here is a **separate dev build graph** rather than a step in
-`backend/build.zig`, because that file is a frozen dependency path
-(`backend/.aidev/profile.sh`: `DEPENDENCY_PATHS=( "build.zig" )`) an implementer
-may not edit. This graph rebuilds the same two-module core the shipped static
+`backend/build.zig`, keeping the development harness separate from shipped
+artifacts. This graph rebuilds the same two-module core the shipped static
 library is built from (`src/root.zig` ⇄ `contracts/api.zig`, libc linked), so the
 harness compiles the same code — the contract's comptime C-ABI signature pins
 included.
@@ -373,7 +371,7 @@ included.
    the 4 KiB cap), a 30 KB never-closed quote, ragged records, the
    formula-injection vectors (`=`/`+`/`-`/`@`), and number-grammar edges.
 3. **The gzip damage matrix and the two `flate_b1` regression cuts** — fixture A
-   cut 50 and fixture B cut 16891 (`review/REVIEW-flate-feed-guard.md`), the
+   cut 50 and fixture B cut 16891, the
    mid-symbol truncations that produced a *complete, exact, wrong* document before
    the wave-(b) fix. They are byte-exact because `gzbuild.zig` reproduces the
    frozen suite's `deflateRaw`/`gzMember` settings and the generator computes the

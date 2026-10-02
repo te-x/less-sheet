@@ -12,7 +12,7 @@ AT-SPI table. Pure `apps/gtk/src/main.c` (+ possibly one new pure logic module) 
 untouched** C ABI — `IMPLEMENTATION_PATHS=(src)`; `include/` + `tests/` (the frozen surface) are not changed
 and the contract is not amended.
 
-**Read first:** `docs/architecture/PROJECT.md`, `CLAUDE.md` (workspace guide + budgets),
+**Read first:** `docs/architecture/PROJECT.md`, `docs/architecture/PROJECT.md` (workspace guide + budgets),
 `ARCH-gtk-frontend.md` (the signed parent — Decision 4 + H6), and — as the authoritative interaction
 template — the macOS grid's keyboard-selection model (`apps/macos/Sources/LessSheetApp/NativeGridChrome.swift`,
 `ViewerModel+Selection.swift`). This slice **deliberately goes one step beyond** the macOS template where
@@ -226,7 +226,7 @@ subtitle label, and the named (×) button. Standard Adwaita chrome remains acces
   accent** (the same `AdwStyleManager` accent resolution the find highlights already use) — no literal color
   constant; follows light/dark + live accent changes.
 - **No new runtime dependency** beyond the GNOME stack already in `meson.build` — with the Decision 1
-  version-floor bump (GTK 4.16 → 4.20, libadwaita 1.6 → 1.8) applied by the planner. No contract/API impact.
+  version-floor bump (GTK 4.16 → 4.20, libadwaita 1.6 → 1.8) applied by the maintainer. No contract/API impact.
 - **Announcement politeness.** Cursor moves are LOW priority (queued, non-interrupting); discrete
   confirmations are MEDIUM. Frequent/among-noise events (scroll, scan ticks, estimate growth) are silent.
 
@@ -266,7 +266,7 @@ All changes are in `apps/gtk/src/`. Existing parts touched:
 
 This mirrors the parent ARCH's layered "pure logic is headlessly testable; only rendering/AT needs a
 display" discipline and the macOS `Contracts/Selection.swift` + `SelectCopyLogic` split. Auto-scroll geometry
-can reuse `lsg_grid_geometry`. The exact module boundary is the planner's call; the **requirement** is that
+can reuse `lsg_grid_geometry`. The exact module boundary is the maintainer's call; the **requirement** is that
 the cursor algebra + string/description builders + accel table are pure and gate-tested.
 
 **Data flow:** key event → grid controller → pure cursor reducer → update `sel_*` + compute reveal target →
@@ -310,8 +310,8 @@ amendments (the author-approved 2026-07-21, recorded in the parent ARCH):** the 
 **1.6 → 1.8** and, since libadwaita 1.8 is paired to its GNOME-49-cycle GTK, the GTK floor rises **4.16 →
 4.20**; the gate container rises **fedora:42 → fedora:43** (ships GTK 4.20 / libadwaita 1.8.1). **Accepted
 trade-off:** minimum distro support narrows by ~1 year (drops GNOME 47/48, e.g. Debian trixie / older Ubuntu
-LTS). *The planner applies the concrete `meson.build` floors (`gtk4 >= 4.20`, `libadwaita-1 >= 1.8`) and the
-`fedora:43` container tag during the freeze — see "Target values for the planner" below.*
+LTS). *The maintainer applies the concrete `meson.build` floors (`gtk4 >= 4.20`, `libadwaita-1 >= 1.8`) and the
+`fedora:43` container tag during the freeze — see "Target values for the maintainer" below.*
 
 *Alternative considered and rejected (kept for the record):* **`GtkShortcutsWindow` + version-macro pin**
 (`GDK_VERSION_MIN_REQUIRED / MAX_ALLOWED = GDK_VERSION_4_16` + the libadwaita equivalents), which would let
@@ -319,7 +319,7 @@ the deprecated widget compile at the 4.16 surface under `-Werror` with **no floo
 because it builds on a widget removed in GTK 5 (future migration debt) and reads against "prefer native and
 latest"; the ~1-year reach cost of Option A was accepted instead.
 
-**Target values for the planner (apply during the freeze; do not derive elsewhere):**
+**Target values for the maintainer (apply during the freeze; do not derive elsewhere):**
 - `apps/gtk/meson.build`: `gtk4 >= 4.20`, `libadwaita-1 >= 1.8` (confirm the exact minimums libadwaita 1.8
   pulls against fedora:43's pkg-config in-container; do not go below these).
 - `apps/gtk/.ci/Dockerfile`: base image `fedora:43` (GTK 4.20 / libadwaita 1.8.1 / GNOME 49), explicit tag +
@@ -328,7 +328,7 @@ latest"; the ~1-year reach cost of Option A was accepted instead.
 ### Decision 2 — pure logic extracted to a display-free module (gate-testable)
 
 The cursor/selection reducer, the announcement/description string builders, and the accelerator table are
-**pure C** in an `lsg_*` module (new `lsg_a11y.*` or folded into an existing one — planner's call), so the
+**pure C** in an `lsg_*` module (new `lsg_a11y.*` or folded into an existing one — maintainer's call), so the
 gate verifies the behavior headlessly (mirrors the parent's layered discipline; matches macOS's
 `Contracts/Selection.swift` split). Only the actual key-event routing, Cairo outline paint, and
 `gtk_accessible_announce`/AT wiring remain display/AT-dependent (human pass). *Feature-local.*
@@ -336,10 +336,10 @@ gate verifies the behavior headlessly (mirrors the parent's layered discipline; 
 ### Decision 3 — grid accessible role = labeled region
 
 `app->area` gets a role appropriate for a **labeled region** (e.g. `GTK_ACCESSIBLE_ROLE_GROUP`, or a more
-specific landmark/region role if the implementer verifies it exists and reads better in Orca at the 4.16
+specific landmark/region role if the developer verifies it exists and reads better in Orca at the 4.16
 floor) + accessible name + dynamic description + `gtk_accessible_announce` live announcements. **NOT** the
 per-cell `GRID`/`ROW`/`GRID_CELL`/`COLUMN_HEADER` tree (the deliberately-deferred deepening). The exact role
-enum is verified in-container by the implementer; the architecture requirement is "named region + dynamic
+enum is verified in-container by the developer; the architecture requirement is "named region + dynamic
 description + polite live announcements," not a specific enum. *Feature-local (per the author's given #1).*
 
 ### Decision 4 — announcements via `gtk_accessible_announce`

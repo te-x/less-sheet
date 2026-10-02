@@ -1,4 +1,4 @@
-// Frozen behavior tests — window-budget slice, the macOS half (planner-owned).
+// Frozen behavior tests — window-budget slice, the macOS half (shared).
 // ARCH-window-budget AC7 / req. 8 / Technology decision 4: the pending-to-
 // resolved window poll decision, implemented in LessSheetKit as `WindowPoll`
 // (`WindowPolling`). Same pattern as DelayedProgressTests: the pure, no-GUI,
@@ -36,7 +36,7 @@
 //   AC7 idleFullResolvedWindowStopsPolling ... complete, full, nothing active →
 //        stop (idle documents cost nothing, no regression).
 //
-// RED SEED (planner freeze) — RED on BEHAVIOR, never compile/import: the Kit
+// RED SEED (maintainer freeze) — RED on BEHAVIOR, never compile/import: the Kit
 // seed `WindowPoll.decide` reproduces the PRE-AC7 behaviour (a short window is
 // not by itself a reason to keep polling / re-issue), so the AC7 "keeps
 // polling / re-issues while short + index complete" assertions FAIL while the

@@ -1,4 +1,4 @@
-// Frozen behavior test — thin-frontend-shared-core Phase 1 (planner-owned).
+// Frozen behavior test — thin-frontend-shared-core Phase 1 (shared).
 // ARCH-thin-frontend-shared-core Phase 1 AC1/AC2/AC3: the core's
 // `ls_window_match_flags` path (surfaced by `DocumentSession.windowMatchFlags`)
 // is the SINGLE source of per-cell find / predicate highlight verdicts — the

@@ -555,8 +555,7 @@ test_bridge_composes_with_filter (void)
  *     header promises only `min(K, rows the pass has scanned so far)` servable
  *     rows — zero before the core's worker commits its first chunk — and that
  *     the call never blocks, so that assertion was unsatisfiable by any
- *     implementation here (30 runs, 30 failures). See
- *     `apps/gtk/.aidev/DECISION-2.md`.
+ *     implementation here (30 runs, 30 failures).
  *
  *     What it does NOT prove, stated so nobody assumes it does: that the
  * bridge did not WAIT. On find.csv that is unobservable — the pass reaches

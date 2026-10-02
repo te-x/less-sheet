@@ -168,7 +168,7 @@ progress signals (copy sweep position; index/jump/filter polls). The C ABI stays
 7. **Copy wall-clock ceiling (GATING) + ship.** End-to-end through the real `TSVCopyBuilder` +
    `copyCell` + `ls_cell_copy` in the macOS suite, a **100k-row × ~10-col** full-selection copy completes
    **under 5 s** on the dev box (deliberately generous vs the expected sub-second-to-low-seconds — ~28×
-   headroom over the ~140 s today — so machine load can't false-fail; the planner may tighten). This gates
+   headroom over the ~140 s today — so machine load can't false-fail; the maintainer may tighten). This gates
    alongside AC3's interval-invariant count. On green, the assembled `.app` is reassembled so select-copy
    finally **SHIPS**.
 8. **Copy progress ≥ 500 ms.** A copy running past ~500 ms shows a subtle progress indicator appearing
@@ -185,7 +185,7 @@ progress signals (copy sweep position; index/jump/filter polls). The C ABI stays
 ## Isolation note (for the parallel fan-out)
 Backend edits are confined to `window.zig` + `base.zig` (+ maybe a small `nav.zig` helper); frontend edits
 are macOS-only (progress affordance + wiring). Both are **disjoint from the sibling csv.gz feature**
-(backend-only: `source.zig` + `root.zig`'s open path). So stream-copy and csv.gz remain aidev §5 **parallel
+(backend-only: `source.zig` + `root.zig`'s open path). So stream-copy and csv.gz remain **parallel
 build cells on one tree** — no git worktrees/merge. *Within* stream-copy, the backend cursor cell and the
 frontend progress cell are the usual backend∥frontend split (the macOS wall-clock probe links the real
 core → red until the cursor lands; listed, not chased). If the build surfaces an unforeseen shared write

@@ -88,7 +88,7 @@ rather than a block on a lock.
 
 The shape — a loop that keeps asking for bytes without terminating — is the same
 *family* as the wave-(b) `inflateStep` re-entry defect
-(`review/REVIEW-flate-feed-guard.md`, defect 2: "returned progress whenever
+("returned progress whenever
 `r.end > r.seek` before consulting `dec.err`, so it re-entered forever"), but here
 it is reached through the **encoding** path, with a **valid, complete** gzip member
 (and with no gzip at all on the network arm), so the wave-(b) feed guard does not

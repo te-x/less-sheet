@@ -1,6 +1,6 @@
 # less-sheet — Build & Release Runbook
 
-**Purpose:** how to build the app, publish the first version, and ship updates — for the author (who executes) and the orchestrator (who can later script it).
+**Purpose:** how to build the app, publish the first version, and ship updates — for the author (who executes) and the maintainer (who can later script it).
 
 > **Status (2026-08-05):** Pre-launch. **Building and packaging are now scripted and exercised**; publishing still is not. `tools/release/make_release` builds the macOS `.zip`/`.dmg` and the Linux `.tar.gz` (aarch64 + x86_64), verifies each artifact by **running it**, and writes `SHA256SUMS` + `manifest.json`. Nothing is uploaded, notarized, or submitted anywhere, and no Developer ID is used.
 >
@@ -64,8 +64,7 @@ Both live outside `apps/gtk` and are deliberately left to a separate pass; until
    `$(cat "$REPO/VERSION")` into the copy it lays into the bundle (it already copies the plist, so
    this is one `sed` on the copy; the in-repo file must keep the placeholder or the number is
    duplicated again). Leave `CFBundleVersion` (the build counter, `1`) alone — it is a different
-   fact from the marketing version. Note `apps/macos` is its own aidev component with its own
-   frozen paths: route this through that component's planner.
+   fact from the marketing version.
 2. **`make_release`.** Replace `resolve_version()`'s two-place reconciliation with a read of the
    root `VERSION` (still honouring `--version` as an override), and delete the disagreement
    warning along with it — there is nothing left to disagree. It should fail loudly if `VERSION`
@@ -141,7 +140,7 @@ libadwaita 1.8.6 normally. Emulation is a viable route.
 > **Fix:** bundle compiler-rt into the static library in `backend/build.zig` (confirmed:
 > `zig build-lib -fcompiler-rt` *defines* the symbol, `-fno-compiler-rt` does not).
 > `backend/build.zig` is a frozen `DEPENDENCY_PATH`, so this needs a **CHANGE-REQUEST** through
-> the planner — it is deliberately not patched here. `make_release` pre-flights the archive and
+> the maintainer — it is deliberately not patched here. `make_release` pre-flights the archive and
 > skips the arch with this explanation rather than emitting a wall of linker errors.
 
 To produce the x86_64 tarball natively in minutes on an x86_64 Linux box instead, do there what
@@ -211,7 +210,7 @@ xcrun stapler staple "$APP"
 # 5. Build the shippable DMG (hdiutil create / create-dmg) and staple the DMG too
 ```
 - Verify before shipping: `codesign -dv --verbose=4 "$APP"` (Authority = Developer ID) and `spctl -a -vvv "$APP"` (accepted).
-- When ready, ask the orchestrator to generate a parameterized `apps/macos/scripts/package-macos.sh` that wraps steps 1–5 (identity + creds via env/args). **Not written yet — nothing is signed here.**
+- When ready, ask the maintainer to generate a parameterized `apps/macos/scripts/package-macos.sh` that wraps steps 1–5 (identity + creds via env/args). **Not written yet — nothing is signed here.**
 
 ---
 
@@ -250,7 +249,7 @@ flatpak-builder --force-clean --repo=repo build-dir com.lesssheet.LessSheet.yaml
 flatpak-builder --run build-dir com.lesssheet.LessSheet.yaml less-sheet   # smoke-run
 flatpak build-bundle --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo repo less-sheet.flatpak com.lesssheet.LessSheet   # self-host artifact; the runtime repo lets a Flathub-less machine resolve the GNOME runtime
 ```
-> The orchestrator can draft this manifest, but it must be **built + smoke-tested on your Linux box** (flatpak-builder isn't available on the macOS dev host). **Not written yet.**
+> The maintainer can draft this manifest, but it must be **built + smoke-tested on your Linux box** (flatpak-builder isn't available on the macOS dev host). **Not written yet.**
 
 ### 4d. Publish
 - **Flathub (recommended, widest reach + auto-updates):** fork `flathub/flathub`, add `com.lesssheet.LessSheet.yaml` + the metainfo, open a PR, pass their review. After merge it's published and auto-built on updates. Needs your GitHub/Flathub account.
@@ -334,8 +333,7 @@ owns the repository uses GitHub Free or GitHub Free for organizations, the repos
 
 The source is MIT, so there is nothing a second repository would protect, and one repository means one
 place for downloads, bug reports and the page: the name a user sees in a download URL is the repository
-they can read. The whole development record — `.aidev/`, `review/`, `docs/architecture/` — is published
-with it, on purpose; write those files knowing that.
+they can read. Source and technical documentation are published together.
 
 ### 7.2 Settings, once
 

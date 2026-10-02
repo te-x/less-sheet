@@ -206,7 +206,7 @@ a giant row's tail remains a match even when the display window can show only it
   identity changes and document teardown.
 - **`backend/src/reader.zig`, `backend/src/csv_reader.zig`, and `backend/src/source.zig`** provide bounded
   Reader/Source operations and work measurements at span/operation granularity. The existing mmap direct
-  path is reused rather than replaced. Exact implementation names remain planner-owned.
+  path is reused rather than replaced. Exact implementation names remain
 - **`backend/src/nav.zig` and `backend/src/search.zig`** supply the #6 work instrumentation and, if red,
   resumable counted-region navigation using the existing search worker and poll states.
 - **Existing frontier/filter/search machinery** remains the sole owner of full-file and full-cell scans;

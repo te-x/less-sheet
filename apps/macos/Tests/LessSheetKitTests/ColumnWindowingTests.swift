@@ -1,4 +1,4 @@
-// Frozen behavior tests — column-windowing slice (planner-owned).
+// Frozen behavior tests — column-windowing slice (shared).
 //
 // ARCH-column-windowing makes the macOS frontend's cold-open first-paint and
 // each scroll tick O(visible column range), not O(total columns) — the
@@ -34,7 +34,7 @@
 //     content never changes another's width; and horizontal scroll never churns
 //     an established width (out of view and back = identical).
 //
-// RED SEED (planner freeze) — RED on BEHAVIOR, never compile/import:
+// RED SEED (maintainer freeze) — RED on BEHAVIOR, never compile/import:
 // `LessSheetKit.ColumnLayout` is a stub reproducing today's un-windowed frontend
 // — `window` returns the WHOLE column range (`count == widths.count`), `grown`
 // returns widths unchanged. So:
@@ -48,7 +48,7 @@
 //     it is the no-regression guard that must stay green as the window becomes
 //     real, so it is deliberately satisfiable by the seed.
 //
-// RED -> GREEN (implementer): implement `ColumnLayouting` for real (prefix-sum +
+// RED -> GREEN (developer): implement `ColumnLayouting` for real (prefix-sum +
 // binary-search window; monotone per-column width merge — see the contract doc
 // and the seed's header) and route the App's measure/fetch/layout/draw + width
 // establishment/growth through it. That same wiring is what carries
@@ -71,7 +71,7 @@ private let overscan = 8          // a representative small overscan; assertions
 private var viewportColumns: Int { Int((viewportW / columnW).rounded(.up)) } // 12
 
 /// A generous "a few hundred" ceiling: decisively sub-linear in a 100k-column
-/// document, yet loose enough never to constrain the implementer's overscan.
+/// document, yet loose enough never to constrain the developer's overscan.
 private let viewportBound = 256
 
 @Suite("column-windowing")

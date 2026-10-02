@@ -43,7 +43,7 @@ pub const cache_ceiling: u64 = 16 * 1024 * 1024; // 16 MiB resident RAM bound (A
 const open_bytes: u64 = base.net_head_budget;
 const redirect_cap: u32 = 3; // Zig std's small fixed redirect cap (AC12)
 
-// NOT DELIVERABLE IN v1, see `.aidev/CHANGE-REQUEST.md`
+// Not available in v1; see the network timeout discussion below.
 // (sec_w2b2). There is NO connect deadline and NO idle-read deadline on the real
 // transport in Zig 0.16, and deliberately NO knob that pretends otherwise:
 //   * connect: `std.http.Client.ConnectTcpOptions.timeout` is DECLARED AND NEVER
@@ -486,8 +486,7 @@ pub const RealTransport = struct {
         // DETECT-AND-DISCARD, not prevention: std's `Request.redirect`
         // (Client.zig:1211-1277) reconnects and re-sends inside `receiveHead`, so
         // by the time we look the plaintext GET has already been issued and
-        // answered; we discard the response. See `.aidev/CHANGE-REQUEST.md`
-        // (sec_w2b2) for the ARCH wording amendment. `uri.scheme` is the
+        // answered; we discard the response. `uri.scheme` is the
         // already-parsed origin scheme -- the single source of truth (no second
         // hand-rolled scheme scan).
         if (redirectDowngrades(uri.scheme, req.uri.scheme)) return .{ .err = .insecure_redirect };
@@ -771,7 +770,7 @@ pub const HttpRange = struct {
     /// length but delivered fewer bytes, or a zero body).
     /// buildNet reads it right after the head fetch to fail the OPEN with
     /// LS_NET_ERROR_SHORT_BODY; post-open it only records that the un-fetched
-    /// tail stays not-present (no post-open error state -- root-planner boundary).
+    /// tail stays not-present (no post-open error state -- root-maintainer boundary).
     short_fetch: std.atomic.Value(bool) = .init(false),
 
     pub fn lock(self: *HttpRange) void {
@@ -1341,7 +1340,7 @@ pub fn buildNet(gpa: std.mem.Allocator, transport: Transport, opts: NetBuildOpts
     // open with LS_NET_ERROR_SHORT_BODY rather
     // than serving zero-filled (un-fetched) bytes as document content. (A short
     // range fetched POST-open is handled by the present-prefix clamp in
-    // ensureSlice; there is no post-open error state -- root-planner boundary.)
+    // ensureSlice; there is no post-open error state -- root-maintainer boundary.)
     if (hr.short_fetch.load(.acquire)) {
         err_out.* = .short_body;
         hr.deinit();

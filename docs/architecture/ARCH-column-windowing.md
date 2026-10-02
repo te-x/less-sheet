@@ -5,7 +5,7 @@
 wide-doc cold-start gap: opening a 100k-column file takes 3034 ms to first paint (must be < 500 ms).
 
 **Read first:** `docs/architecture/ARCH-csv-corpus.md` (AC5, the frozen probe that measures this),
-the workspace `CLAUDE.md` cold-start budget, `[[outlier-budget-policy]]` (wide docs: relax memory/time,
+the workspace `docs/architecture/PROJECT.md` cold-start budget, `[[outlier-budget-policy]]` (wide docs: relax memory/time,
 NEVER responsiveness — "byte-budget the frontend window"), and `NativeGrid.swift` / `ViewerModel.swift`.
 
 ## Problem (measured + code-confirmed)
@@ -41,9 +41,9 @@ the viewport render byte-for-byte as today** (no regression).
   `ViewerModel:612/787/801`) is unaffected — that consumer wants non-hidden columns and keeps its meaning.
 - **No `api/` change expected.** `ls_cell(row, col)` + `ls_window_set` already let the frontend fetch any
   column on demand; the backend is already O(head). If a column-RANGE fetch proves genuinely necessary for
-  the budget, that is a root-planner decision to bring back — default: no api change.
+  the budget, that is a root-maintainer decision to bring back — default: no api change.
 
-## Design direction (planner works out the mechanism)
+## Design direction (maintainer works out the mechanism)
 Introduce a **horizontal column window**, mirroring the row window:
 - **Column x-offset prefix-sums** in the model: a cumulative-width array so any column's x is O(1) and the
   viewport x-range → `[firstCol, lastCol]` is an O(log cols) binary search. Rebuilt only when a width batch
@@ -95,11 +95,11 @@ affects F. This holds for files of any width; viewport-fitting files behave exac
 6. **Gates green** (backend + macOS + root), csv-corpus AC5 included; cold-start budget held; memory O(cols)
    for the offset array only (100k floats ≈ 0.8 MB — acceptable), never O(cells).
 
-## Contract surface (planner freezes)
+## Contract surface (maintainer freezes)
 Frontend-only: `apps/macos/Sources/LessSheetApp/{NativeGrid,ViewerModel}.swift` (+ possibly a new
 non-frozen column-window helper). New FROZEN frontend tests under `apps/macos/Tests/` locking AC2–5
 (the O(viewport) unit test, the scroll probe, a no-regression layout pin). If the design needs a new
-protocol in `Sources/Contracts/`, the planner freezes it. **`api/` unchanged** (default). csv-corpus's
+protocol in `Sources/Contracts/`, the maintainer freezes it. **`api/` unchanged** (default). csv-corpus's
 frozen `CorpusColdOpenTests` AC5 is the acceptance for AC1 and is NOT modified.
 
 ## Open questions
@@ -108,7 +108,7 @@ None. The column-width behaviour is decided (see "Column-width behaviour" above)
 ## Amendment — round 2: window the cell-FETCH too (2026-07-10, measured; user-directed)
 Round 1 (measure + draw windowing) shipped and is correct: `wide_100k_cols` 2974 → 579 ms (5.4×), all
 tests green EXCEPT AC5's own < 500 ms budget. Measurement (build-cell instrumentation, verified by the
-orchestrator's gate run: 73 tests, only AC5 red at 579 ms) showed the residual is
+maintainer's gate run: 73 tests, only AC5 red at 579 ms) showed the residual is
 `CoreDocumentSession.setWindow` fetching ALL columns — the frozen `RowWindow` is contractually DENSE
 ("each row exactly `columnCount` cells wide") — at 2 FFI calls/cell (`ls_cell` + `ls_cell_truncated`) =
 ~600k calls / ~180 ms for this fixture, AND it runs on EVERY vertical-scroll materialize (a latent
@@ -131,6 +131,6 @@ unaffected: give the window transfer a column window (e.g. `setWindow` gains an 
 `ColumnWindow`; `RowWindow` gains `firstColumn` defaulting to 0 = full/dense for back-compat), so the
 frontend's `materialize` fetches only the visible columns and column-relative consumers index off
 `firstColumn`. **No `api/`/backend change** — `ls_cell` already serves any single cell; the change is
-Swift-only. The planner amends + refreezes (`aidev: amend contract — column-fetch window`); a round-2
-implementer completes the impl (`CoreDocumentSession.setWindow` + the column-relative consumers) on top of
+Swift-only. Update the contract and its regression tests; a round-2
+developer completes the impl (`CoreDocumentSession.setWindow` + the column-relative consumers) on top of
 the round-1 measure/draw windowing.

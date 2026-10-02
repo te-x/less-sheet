@@ -104,7 +104,6 @@ number as the audit trail. 'unresolved' does not discriminate (316 vs 323).
 Re-resolved against the matching binary:
 
 ======= COVERAGE REPORT =======
-binary      : /private/tmp/claude-502/-Users-te-x-Documents-projects-less-sheet/32531dbe-61e2-401b-9eed-c4249688ec40/scratchpad/baseline/lsfuzz-armB-10min
 coverage    : .zig-cache/v/f39cd1d242a01f86
 runs        : 704689
 unique runs : 11153

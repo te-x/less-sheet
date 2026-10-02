@@ -10,7 +10,7 @@ keyboard navigation ONLY.** VoiceOver / `NSAccessibility` exposure is explicitly
 non-goal of this slice — no screen-reader work, no live announcements, no accessible-role/description surface
 (the GTK a11y items FR3/FR4/FR5 have no macOS counterpart here).
 
-**Read first:** `docs/architecture/PROJECT.md`, `CLAUDE.md` (workspace guide + the cold-start budget),
+**Read first:** `docs/architecture/PROJECT.md`, `docs/architecture/PROJECT.md` (workspace guide + the cold-start budget),
 `ARCH-select-copy.md` (the signed selection/copy parent this extends), and — as the authoritative interaction
 template — `ARCH-gtk-a11y.md` FR1/FR2. Grounding survey (2026-07-22) of the macOS frontend:
 `apps/macos/Sources/Contracts/Selection.swift` (the frozen `Selecting` geometry), `Sources/LessSheetKit/
@@ -200,7 +200,7 @@ resolution the find highlights already use).
 ## Component decomposition & data flow
 
 All changes are in the macOS frontend implementation targets (`Sources/LessSheetKit`, `Sources/LessSheetApp`)
-plus **one new pure-logic contract** the planner freezes (see Decision 1). Existing parts touched:
+plus **one new pure-logic contract** the maintainer freezes (see Decision 1). Existing parts touched:
 
 - **New pure reducer (Decision 1)** — a display-free keyboard-navigation reducer: `(current Selection?, a
   navigation context, a key command) → new Selection?`, where the navigation context carries the `GridExtent`,
@@ -208,11 +208,11 @@ plus **one new pure-logic contract** the planner freezes (see Decision 1). Exist
   handles seed-no-step, visible-column stepping, page / document / line targets, and clamping, and it produces
   its result by delegating the final geometry to the **frozen `Selecting`** (`select` / `extend(_:to:in:)`) —
   no duplicated clamping, no new selection algebra (Decision 2). Lives as a new protocol in
-  `Sources/Contracts` (planner-frozen) + an implementation in `Sources/LessSheetKit`, pinned by a frozen
+  `Sources/Contracts` (maintainer-frozen) + an implementation in `Sources/LessSheetKit`, pinned by a frozen
   conformance test, exactly like `Selecting`/`SelectionModel`.
 - **New pure reveal-target math (Decision 1)** — `(active cell + a viewport-geometry descriptor) → minimal new
   clip origin | no-move`. Pure arithmetic mirroring `landOn`'s clamp; gate-testable byte-exact. May be a
-  sibling type or folded into the reducer's output — the planner's call; the requirement is that it is pure
+  sibling type or folded into the reducer's output — the maintainer's call; the requirement is that it is pure
   and gate-tested.
 - **New pure Escape-precedence resolver (Decision 2)** — `(popupOpen/searchActive, copyInFlight, hasSelection)
   → one action` in the FR3 priority order; `handleEscape` calls it (no branch logic duplicated in the
@@ -248,7 +248,7 @@ Cmd+C is unchanged (`copySelection` → the existing streaming path; a 1×1 rect
 - **AppKit (existing usage, extended):** `NSResponder.interpretKeyEvents` + additional
   `NSStandardKeyBindingResponding` action overrides on `SheetTableView`; `NSColor.controlAccentColor`;
   `NSClipView.scroll(to:)` / `reflectScrolledClipView` (already used by `landOn`).
-- **New (planner-frozen) Swift contract:** the keyboard-navigation reducer protocol + its supporting value
+- **New (maintainer-frozen) Swift contract:** the keyboard-navigation reducer protocol + its supporting value
   types (command enum, navigation context, reveal target), in a NEW `Sources/Contracts` file — pinned by a
   frozen conformance test. This is additive; it edits neither AC23-pinned file.
 
@@ -263,7 +263,7 @@ stable choice).
 ### Decision 1 — Pure, gate-testable logic (reducer + reveal math) in a new frozen Swift contract
 
 The keyboard-navigation reducer and the minimal-reveal auto-scroll math are **pure** (no AppKit, no pixels):
-a new protocol in `Sources/Contracts` (planner-frozen) with its implementation in `Sources/LessSheetKit`,
+a new protocol in `Sources/Contracts` (maintainer-frozen) with its implementation in `Sources/LessSheetKit`,
 pinned by a frozen conformance test — exactly the layering the frozen `Selecting`/`SelectionModel` and the
 `ColumnLayouting`/`ColumnLayout` split already use, and the direct analog of `ARCH-gtk-a11y.md` Decision 2's
 `lsg_*` pure module. Only the key-event routing, the clip scroll, and the outline paint stay
@@ -298,7 +298,7 @@ and would need its own light/dark tuning.
 Key routing extends today's mechanism: `SheetTableView` overrides the relevant `NSStandardKeyBindingResponding`
 actions (arrows already; adding page / document-begin-end / line-begin-end and their `…AndModifySelection:`
 variants), with `interpretKeyEvents` doing the key→action translation — no hand-rolled keyCode switch, and
-focus-scoping inherited from the responder chain. *Implementer docs-first note:* the exact selector each
+focus-scoping inherited from the responder chain. *developer docs-first note:* the exact selector each
 physical key/Cmd-combo maps to (e.g. Home/End and Cmd+↑/↓ vs. `scrollTo…`/`moveTo…Beginning/EndOfDocument:`,
 Cmd+←/→ vs. `moveTo…EndOfLine:`) must be verified against the installed AppKit key-binding behavior (a small
 probe), not assumed — the same "verify the API, don't trust memory" discipline the workspace applies to Zig.

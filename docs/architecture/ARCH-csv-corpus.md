@@ -7,7 +7,7 @@ oracle, and huge-row verification stops depending on the author's hand-built `/t
 
 **Read first:** `tools/csvgen/README.md` (corpus + `manifest.json` oracle schema), the frozen
 `api/lesssheet.h` (TEXT AND ENCODING, THE SCAN FRONTIER, WINDOW), `backend/tests/all_tests.zig`
-helpers (`makeFixture`/`openWith`/`expectDims`/`elapsedMs`), and the workspace `CLAUDE.md` cold-start
+helpers (`makeFixture`/`openWith`/`expectDims`/`elapsedMs`), and the workspace `docs/architecture/PROJECT.md` cold-start
 budget. Related: `[[formats-roadmap]]` (`.csv.gz` is deferred here — see Non-goals).
 
 ## Problem / motivation
@@ -86,7 +86,7 @@ cold-open + landing asserts prove). Note `wide_100k_cols` (2.5 MB, 100k columns 
 case and stays LIGHT — its cold-open (materializing ~300k tiny cells) is asserted < 500 ms in the fast gate
 (AC4); it is a natural width representative for the UI sample (AC5).
 
-## Design direction (planner works out the mechanism)
+## Design direction (maintainer works out the mechanism)
 - **Generate-at-test wiring (`backend/build.zig`, not frozen):** a `b.addSystemCommand` runs
   `python3 tools/csvgen/gen.py --all --seed <fixed> --out <cache>` (and `manifest-only` is implied — the
   manifest is always written); the behavior-test run depends on it; the cache dir path is injected into the
@@ -153,17 +153,17 @@ case and stays LIGHT — its cold-open (materializing ~300k tiny cells) is asser
 - **Heavy cases in the fast gate** — never; on-demand perf lane only.
 - **Row-count estimator fix** (tiny-head/fat-tail) — separate backlog item.
 
-## Contract surface (planner freezes)
+## Contract surface (maintainer freezes)
 - `backend/tests/all_tests.zig` — new frozen `§corpus-conformance` + `§corpus-cold-open` tests (AC2–4),
   reading the injected corpus dir + `manifest.json`. RED at freeze (corpus/oracle assertions unmet by a seed).
 - `backend/build.zig` (not frozen) — generate-at-test system command + `addOptions` corpus-path injection;
   test step depends on it. Set up at freeze so the RED test compiles.
 - `apps/macos/Tests/` — frozen extension of the `first_rows_visible_ms` probe to representative corpus
   files (AC5), plus its corpus-availability wiring.
-- `.aidev` perf/gate scripts (not frozen) — `selftest.py` oracle guard (AC7) and the `profile.sh` huge-row
+- Build and test scripts — `selftest.py` oracle guard (AC7) and the huge-row
   perf lane (AC6).
-- `api/lesssheet.h` — **no change** (default). If the planner finds a genuine need to expose something new
-  across the ABI, that's a root-planner decision to bring back — not expected.
+- `api/lesssheet.h` — **no change** (default). If the maintainer finds a genuine need to expose something new
+  across the ABI, that's a root-maintainer decision to bring back — not expected.
 
 ## Open questions
 None. Both design forks (fixture delivery, timing scope) are decided; the exactness rule (AC2/3) resolves

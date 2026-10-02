@@ -5,7 +5,7 @@ Status: APPROVED — signed off by the author 2026-07-17 (decisions 7 & 8 ratifi
 Prerequisite MET: backend Linux portability merged to master (`4b2b338`) — the core cross-compiles and
 runs on `aarch64`/`x86_64` Linux (`ARCH-backend-linux-portability.md`).
 
-**Read first:** `docs/architecture/PROJECT.md` (brief, hard constraints, glossary), `CLAUDE.md` (workspace
+**Read first:** `docs/architecture/PROJECT.md` (brief, hard constraints, glossary), `docs/architecture/PROJECT.md` (workspace
 guide, budgets), the frozen `api/lesssheet.h` (the entire ABI this frontend consumes), and — as the
 **authoritative design baseline** — `apps/macos/` (the already-settled interaction model, the O(viewport)
 grid technique, the two-lane threading discipline). This feature REPLICATES the settled macOS design on
@@ -136,7 +136,7 @@ Every item below is INHERITED from `apps/macos/` and must behave equivalently (i
 
 ## Component decomposition & data flow
 
-New component `apps/gtk/` (greenfield, scaffolded via the `c-gtk` aidev profile after sign-off). Layered to
+New component `apps/gtk/`. Layered to
 mirror the macOS separation (binding shim → core session wrapper → pure logic → widgets/app), so the
 non-GUI logic is unit-testable headlessly and only rendering needs a display.
 
@@ -203,7 +203,7 @@ them when he signs off this ARCH (no separate question round).
 
 1. **Stack = C + GTK4 + libadwaita.** Direct C-ABI call into `liblesssheet.a` with zero FFI shim (the
    frontend is a pure consumer that reimplements nothing), the smallest binary (size budget), and it
-   matches the workspace's existing `c-gtk` aidev profile. *Alternatives rejected:* **Rust + gtk4-rs**
+   matches the workspace's native C toolchain. *Alternatives rejected:* **Rust + gtk4-rs**
    (memory safety we don't need for a thin caller, at the cost of an FFI wrapper + a large cargo tree +
    bigger binary); **Vala** (ergonomic but niche tooling, compiles through C anyway). *(the author.)*
 2. **Grid = custom `GtkDrawingArea`** (Cairo + PangoCairo via its `draw_func`, GSK-composited; hand-driven `GtkAdjustment` + `GtkScrollbar`,
@@ -246,7 +246,7 @@ them when he signs off this ARCH (no separate question round).
    **AMENDED 2026-07-21 (the author-signed, by the a11y slice `ARCH-gtk-a11y.md`): the pinned gate-container
    image bumps `fedora:42` → `fedora:43`** (GTK 4.20 / libadwaita 1.8.1 / GNOME 49). Reason: the a11y slice
    adopts `AdwShortcutsDialog`, which requires libadwaita 1.8 (see decision 7's amendment); fedora:42 ships
-   only libadwaita 1.7, so the symbol is absent there. The planner re-pins the `.ci/Dockerfile` base to
+   only libadwaita 1.7, so the symbol is absent there. The maintainer re-pins the `.ci/Dockerfile` base to
    `fedora:43` with a fresh digest during that slice's freeze.
 7. **CONFIRMED (the author 2026-07-17) — Minimum versions = GTK 4.16 / libadwaita 1.6 (GNOME 47, Sept 2024) floor;
    build against latest stable (GTK 4.22 / libadwaita 1.9 / GNOME 50).** Rationale: following the *system
@@ -261,7 +261,7 @@ them when he signs off this ARCH (no separate question round).
    GTK 4.18 and is removed in GTK 5). libadwaita 1.8 is paired to its GNOME-49-cycle GTK, so the GTK floor
    rises to 4.20 alongside it. *Accepted trade-off (the author):* the minimum supported distro base narrows by
    ~1 year (drops GNOME 47/48 — e.g. Debian trixie / older Ubuntu LTS); accepted under "prefer native and
-   latest" over building on a GTK-5-removed widget. The planner sets `gtk4 >= 4.20` / `libadwaita-1 >= 1.8`
+   latest" over building on a GTK-5-removed widget. The maintainer sets `gtk4 >= 4.20` / `libadwaita-1 >= 1.8`
    in `apps/gtk/meson.build` during the a11y freeze (confirming the exact minimums libadwaita 1.8 pulls
    in-container). "Build against latest stable" is unchanged.
 8. **CONFIRMED (the author 2026-07-17) — Locale/number-format stack = GLib/GIO + the C-library locale + `GDateTime`,

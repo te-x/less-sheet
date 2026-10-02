@@ -1,4 +1,4 @@
-// Frozen behavior tests — sort-by-column slice (planner-owned).
+// Frozen behavior tests — sort-by-column slice (shared).
 // ARCH-sort-by-column app criterion AC-s14 (Amendments 1 and 3): the pure
 // three-state CYCLE that ⇧⌘S drives, the header CONTEXT MENU's three stateful
 // entries, the header indicator, the one declaration of the titles +
@@ -346,8 +346,7 @@ private func menuEntries(
 // The frozen header promises only `min(K, rows the pass has scanned so far)`
 // servable rows — zero before the core's worker commits its first chunk — and
 // that the call never blocks, so that assertion was unsatisfiable by any
-// implementation here. See `apps/macos/.aidev/DECISION-1.md` for the evidence
-// (5/5 `immediate_rows=0`) and the ruling.
+// implementation here (5/5 runs observed `immediate_rows=0`).
 //
 // The property splits in two, because ONE fixture cannot show both halves:
 //   * WHAT is served — the sorted order, never the pre-sort order, from the

@@ -1,5 +1,5 @@
 // Frozen behavior test — select-copy: the lossless full-cell COPY BRIDGE
-// (ARCH-select-copy AC3), the real-core half. Planner-owned.
+// (ARCH-select-copy AC3), the real-core half. shared.
 //
 // Copy must be LOSSLESS: a cell longer than the 4 KiB display cap (LS_CELL_MAX_
 // BYTES) is searchable but NOT readable through `ls_cell` / the windowed
@@ -18,7 +18,7 @@
 // materialized in microseconds; no polling. A temp file (not a frozen binary
 // fixture), like HugeRowBudgetTests.
 //
-// RED SEED (planner freeze) — RED on BEHAVIOR, never compile/import:
+// RED SEED (maintainer freeze) — RED on BEHAVIOR, never compile/import:
 // `CoreDocumentSession` does NOT yet override `copyCell`, so it resolves to the
 // DEFAULT protocol-extension impl (DocumentSession.swift), which returns
 // `.noCell` for EVERY cell — nothing copies. The assertions below then fail on
@@ -26,7 +26,7 @@
 // content). The tree still COMPILES (the default keeps every conformer building,
 // including this call site).
 //
-// RED → GREEN (implementer): OVERRIDE `copyCell` in `CoreDocumentSession` to call
+// RED → GREEN (developer): OVERRIDE `copyCell` in `CoreDocumentSession` to call
 // `ls_cell_copy(doc, row, col, buf, maxBytes, &outLen, &outTruncated)` into a
 // `maxBytes` buffer and map `ls_copy_result` → `CopiedCell` (.served/.pending/.noCell,
 // the written UTF-8 bytes as `text`, `outTruncated` as `truncated`); route the

@@ -1,6 +1,6 @@
 # ARCH — frontpage redesign (`site/index.html`)
 
-Status: **AGREED — signed off by the author (2026-07-30); ready for the planner**
+Status: **AGREED — signed off by the author (2026-07-30); ready for the maintainer**
 Date: 2026-07-30 · Role: architect (interactive, relayed)
 Sign-off record: §7.3 accepted (system theme only, no manual toggle); §7.4 stands as specced;
 §3.3 approved in full (5 shots × 4 variants = 20 files), capture automated per §7.7.
@@ -23,7 +23,7 @@ future roles to re-open a settled decision. Affected passages carry an *(amended
 repository. Publishing release artifacts and the built landing page to **public** repositories.
 
 **Still forbidden, unchanged and without exception.** Source of any kind — `backend/`, `apps/`,
-`api/`, `.aidev/`, `review/`, `docs/` — reaching a public repository. A leaked push is
+`api/` and `docs/` — reaching a public repository. A leaked push is
 irreversible: GitHub retains forks and caches. Adding, retargeting or force-pushing a remote
 remains the author's action alone; no role does it.
 
@@ -31,7 +31,7 @@ remains the author's action alone; no role does it.
 
 | repository | visibility | contents |
 | --- | --- | --- |
-| `te-x/less-sheet` | **private** | the workspace: source, `.aidev/`, `review/`, `docs/`, `site/` |
+| `te-x/less-sheet` | **private** | the workspace: source, `docs/`, `site/` |
 | the site repo (target of `deploy-site.yml`) | public | the built landing page only; Pages serves it |
 | `homebrew-tap` | public | the cask — not yet created |
 
@@ -104,7 +104,7 @@ Scope: a full redesign of `site/index.html` and its screenshot assets, per the a
 |---|---|---|
 | Screenshot set (§3.3: 5 shots × 2 platforms × 2 themes = 20 files) | Deterministic capture tool (§7.7); residual manual steps: one-time macOS Screen Recording grant, hero composition choice, review of outputs (the author) | Not started |
 | Benchmark figures re-measured on the shipped ReleaseSafe build | Queued measurement task; needs a quiet machine | Queued |
-| Download artifacts | Built & launch-verified 2026-07-30: `less-sheet-0.1-macos-arm64.dmg` 3.34 MB (macOS 26.0+, arm64); `less-sheet-0.1-linux-aarch64.tar.gz` 0.65 MB (glibc ≥ 2.34, GTK4 ≥ 4.20, libadwaita ≥ 1.8); `SHA256SUMS` + `manifest.json`. The zip is a build byproduct, never offered. Linux x86_64 blocked on a core link fix (`__zig_probe_stack`), planner pass in flight | Exist; unhosted |
+| Download artifacts | Built & launch-verified 2026-07-30: `less-sheet-0.1-macos-arm64.dmg` 3.34 MB (macOS 26.0+, arm64); `less-sheet-0.1-linux-aarch64.tar.gz` 0.65 MB (glibc ≥ 2.34, GTK4 ≥ 4.20, libadwaita ≥ 1.8); `SHA256SUMS` + `manifest.json`. The zip is a build byproduct, never offered. Linux x86_64 blocked on a core link fix (`__zig_probe_stack`), maintainer pass in flight | Exist; unhosted |
 | Hosting | **Decided 2026-07-30: GitHub Releases (artifacts + `SHA256SUMS`) + GitHub Pages (page)**, from a public site-only repo (§9.1). Repo creation, Pages enablement, and pushes are the author's actions alone | Repo not yet created |
 | Release tag / version | Single-sourcing task in flight (macOS `Info.plist` says 0.1, `apps/gtk/meson.build` says 0.0.0); the tag drives every download URL, so page links derive from the one version — never hand-typed | In flight |
 | Ticket-tracker URL (GitHub, issues-only) | Not created; no git remote exists today | Planned, not live |

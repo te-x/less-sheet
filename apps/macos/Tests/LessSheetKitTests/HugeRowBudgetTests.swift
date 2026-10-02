@@ -1,4 +1,4 @@
-// Frozen behavior tests — huge-row-budget slice (planner-owned).
+// Frozen behavior tests — huge-row-budget slice (shared).
 // ARCH-huge-row-budget app criterion 7 (the HEADLESS half): the per-row
 // OVERSIZED flag surfaces through the CoreDocumentSession bridge
 // (RowWindow.oversized) against a huge-row fixture, verified against the REAL

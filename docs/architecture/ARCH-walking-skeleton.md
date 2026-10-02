@@ -11,7 +11,7 @@ green. Every later slice deepens a layer of what this slice wires up.
 - Open a CSV via three user paths sharing one internal entry: File › Open… dialog,
   launch-with-file (Finder double-click / `open -a LessSheet file.csv` via file-type
   association), and a CLI path argument to the binary.
-- Parse the **head** of the file — enough to serve the first **N = 200** data rows (planner may
+- Parse the **head** of the file — enough to serve the first **N = 200** data rows (maintainer may
   pin N as a named constant; it must overfill any current screen) — with a **quote-aware
   RFC-4180 lexer**: quoted fields, embedded commas and newlines inside quotes, `""` escapes,
   LF and CRLF row endings. Comma delimiter only.
@@ -60,7 +60,7 @@ Edge inputs and their defined outcomes:
 - Numeric cell definition (for the heuristic): after ASCII-whitespace trim, non-empty and fully
   matching an integer/float grammar (optional sign, digits, optional fraction, optional
   exponent). `"1e5"` is numeric; `""`, `"0x1F"`, `"1,000"`, `"12 "` (trailing junk after trim
-  rules — planner pins the exact grammar) are not.
+  rules — maintainer pins the exact grammar) are not.
 
 ## Functional requirements
 
@@ -69,9 +69,9 @@ Edge inputs and their defined outcomes:
 3. The core exposes, over the C ABI: open → handle or distinct error code; loaded dimensions
    (row count ≤ N+1, column count); borrowed cell text access by (row, column); the header
    suggestion (row-1-all-numeric fact or equivalent); close. Exact C signatures are the
-   planner's to freeze in `api/` — a single C header is the entire cross-component surface.
+   maintainer's to freeze in `api/` — a single C header is the entire cross-component surface.
 4. Memory ownership across the ABI: the core owns all storage; cell text crosses as borrowed
-   UTF-8 (pointer + length) valid until document close (planner pins the exact validity
+   UTF-8 (pointer + length) valid until document close (maintainer pins the exact validity
    window); no per-cell heap allocation on the access path; Swift copies at the render boundary.
 5. Opening must not block the main thread (structure: open on a background queue, results
    published to the UI); with head-only reads it will be near-instant regardless.
@@ -90,13 +90,13 @@ Edge inputs and their defined outcomes:
   (median of 3 cold launches, release build).
 - **Memory**: peak RSS after opening the 1 GB fixture **< 100 MB** (proves no full-file load).
 - **Binary budget**: the assembled `.app` totals **single-digit MB**.
-- Zig 0.16.0 pinned (gate-enforced); docs-first rule from `CLAUDE.md` applies to all Zig work.
+- Zig 0.16.0 is required by the build and test checks.
 
 ## Component decomposition & data flow
 
 - **`api/` (root-frozen)** — one C header: opaque document handle, open/close, dimensions,
   borrowed cell access, header suggestion, error codes. The only cross-language surface.
-- **`backend/` (Zig core)** — bounded head reader (mmap or bounded read — implementer's choice
+- **`backend/` (Zig core)** — bounded head reader (mmap or bounded read — developer's choice
   within the O(viewport) constraint), quote-aware lexer, head-window materializer (≤ N+1 rows),
   numeric-cell test + header suggestion, error mapping. Implements exactly the `api/` header.
 - **`apps/macos/`** —
@@ -113,7 +113,7 @@ head cells into an immutable snapshot → view model derives (header mode, colum
 Table renders; marker emitted on first data frame. Errors short-circuit to the error panel.
 
 Build/gate flow: `backend` gate = `zig build` + `zig build test`. `apps/macos` gate builds the
-core artifact first (mechanism is the planner's — e.g. its conformance command invoking the
+core artifact first (mechanism is the maintainer's — e.g. its conformance command invoking the
 backend build) then `swift build` + `swift test`; Swift tests exercise the REAL linked core
 through the ABI (fixture-based integration, not mocks). Root gate chains both after checking
 `api/` integrity.

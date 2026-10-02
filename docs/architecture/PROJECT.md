@@ -15,9 +15,6 @@ in seconds and choke on large files; for less-sheet, **time-to-first-rows is the
 - **core**: Zig **0.16.0** (pinned, gate-enforced) — a static library exposing a **C ABI**;
   no runtime dependencies; mmap-based file access. The C headers in `api/` are the frozen,
   language-neutral cross-component contract.
-- **Docs-first Zig**: 0.16.0 postdates most training data and the language churns — every agent
-  verifies Zig APIs against the locally installed std source / docs (pointers in `CLAUDE.md`),
-  never from memory.
 - **macOS frontend**: Swift 6 / SwiftPM, **minimum macOS 26** (approved 2026-07-13 with column-config —
   enables the chromeless Liquid-Glass control panel + native exact-decimal/ISO FormatStyles). SwiftUI
   baseline, AppKit escape hatch if the cold-start budget demands it. Links the core **statically — in-process, no helper process, no IPC** (a
@@ -29,7 +26,7 @@ in seconds and choke on large files; for less-sheet, **time-to-first-rows is the
   path is a DIY mmap lexer (Zig std only); ODS/Parquet library-vs-DIY decided at their slices
   (Arrow/DuckDB-class readers are excluded by the budget).
 - **Build & gate**: `zig build` / `zig build test` (core), `swift build` / `swift test` (macOS).
-  Per-component `.aidev/gate.sh`, chained by the workspace root gate.
+  `tools/check` runs the build, format and test checks for each component.
 - **Shipped core = `ReleaseSafe`** (runtime safety checks ON — since it ingests untrusted local and
   network input, a parser/decompressor bug must fault cleanly, never become UB). `@setRuntimeSafety(false)`
   carve-outs are allowed **only** on loops the differential C-ABI scan bench proves miss budget, each

@@ -9,13 +9,12 @@ complete before less-sheet ships as a **free, public, closed-source** desktop ut
 Zig `backend/` core, the frozen `api/`, and both frontends (`apps/macos`, `apps/gtk`). Decisions in
 this document were made interactively with the author on 2026-07-23 (two decision batches, all recorded
 below). This document **prioritizes and bounds** the program: a **PRE-LAUNCH MUST** set and a
-**DEFERRED** set. It does not write code, tests, or contracts — the planner freezes the acceptance
+**DEFERRED** set. It does not write code, tests, or contracts — the maintainer freezes the acceptance
 criteria below.
 
 ## Amendment — 2026-07-24 (CHANGE-REQUEST sec_w2b, adjudicated; the author sign-off)
 
-The implementer's contract change request (`backend/.aidev/CHANGE-REQUEST.md`, build cell
-`sec_w2b`) proved two frozen-test contradictions and one std limitation, with measured evidence.
+The security investigation on 2026-07-24 proved two frozen-test contradictions and one std limitation, with measured evidence.
 the author decided all three on 2026-07-24; this document is amended in place to match — affected
 sections carry an *(amended 2026-07-24)* tag. Summary of the decisions:
 
@@ -30,13 +29,13 @@ sections carry an *(amended 2026-07-24)* tag. Summary of the decisions:
    AC-d3's own "finalized by bench against real CSV ratios" caveat); the (d) ACs are retired; the
    frozen `ScanProgress.expansion_capped` ABI field, the `sec_d1`/`sec_d1_net` tests, and the
    dormant guard plumbing are to be retired downstream (no-backcompat v1: retire dead behavior
-   fully; requires a root `api/` re-freeze + AC23 re-bump).
+   fully; requires a root `api/` update + AC23 re-bump).
 2. **(f) copy neutralization — NUMBER-AWARE.** A leading `=` or `@` is always neutralized; a
    leading `+` or `-` only when the cell is NOT a plain number (grammar in AC-f1) — a plain number
    like `-3` / `+2.5` copies RAW; it is not an injection vector. This dissolves the
    `cp1`-vs-`sec_f1` contradiction in `cp1`'s favor (its raw `-3` golden is correct, unchanged);
-   `sec_f1`/`sec_f2` must be re-frozen to exercise `+`/`-` with non-number values, and the frozen
-   `api/` COPY OUTPUT SAFETY prose gains the number-aware caveat in the same root re-freeze.
+   `sec_f1`/`sec_f2` must be updated to exercise `+`/`-` with non-number values, and the frozen
+   `api/` COPY OUTPUT SAFETY prose gains the number-aware caveat in the same root update.
 3. **(e) timeouts — CONNECT-TIMEOUT ONLY for v1.** *(SUPERSEDED by the 2026-07-28 amendment below:
    the connect timeout proved infeasible and does NOT ship.)* Zig 0.16 `std.http.Client` exposes no
    per-read deadline hook, so the idle-read timeout is DEFERRED; the connect timeout ships. A stalled
@@ -46,9 +45,7 @@ Downstream convergence order for these amendments: see the Sequencing note at th
 
 ## Amendment — 2026-07-28 (CHANGE-REQUEST sec_w2b2, adjudicated; the author sign-off)
 
-The `sec_w2b2` build cell's contract change request (`backend/.aidev/CHANGE-REQUEST.md`, signed by
-the implementer, **co-signed by the reviewer**; decision records `review/REVIEW-security-w2b-net.md`
-and `review/REVIEW-net-close-hang.md`) proved that two (e) network statements in the 2026-07-24
+The security investigation on 2026-07-28 proved that two (e) network statements in the 2026-07-24
 amendment claim enforcement `std.http.Client` in Zig 0.16.0 cannot deliver, and the reviewer
 attached one verification-status condition. This document is amended in place; affected sections
 carry an *(re-amended 2026-07-28)* tag. **Wording/documentation only** — no code, contract, or test
@@ -96,7 +93,7 @@ and departs from the two earlier texts as follows:
   reason: `windowSetFiltered` holds the Document mutex across a `Cursor.peekHttp` deliberately not
   capped by the fetched extent, so a frontier read can issue an unbounded fetch and `ls_close`
   blocks at `d.lock()` before it can cancel anything. That route is a pre-existing OPEN SHIP-BLOCKER
-  tracked as its own cell (`review/REVIEW-net-close-hang.md`). AC-e1 below states the current
+  tracked as a separate network-close regression. AC-e1 below states the current
   mechanism and the current residual hole rather than the co-signed mechanism.
 - **Item 2 adds the reviewer's required refinement** (name what travels in cleartext) on top of the
   CR's option-(a) wording; no other change.
@@ -249,16 +246,16 @@ and departs from the two earlier texts as follows:
 | (a) ReleaseSafe + carve-out | `build.zig` default → ReleaseSafe; enumerated `@setRuntimeSafety(false)` list | — | `assemble-app.sh`, GTK core cross-build, bench all build ReleaseSafe | **gate-mode fix**: every gate builds+tests ReleaseSafe; bench measures the delta |
 | (b) #40 flate guard | `source.zig` / `net_source.zig` inflater feed | — | — | regression test + fuzz seed |
 | (c) fuzz campaign | fuzzable entry surface | — | — | **C-ABI libFuzzer/AFL++ harness** (reuses the bench's `#include api/lesssheet.h` + link `.a` pattern) + corpus |
-| (d) *(WITHDRAWN 2026-07-24)* | remove the dormant ratio guard + plumbing | remove `expansion_capped` (amendment root re-freeze) | no banner (AC-d4 retired) | — |
+| (d) *(WITHDRAWN 2026-07-24)* | remove the dormant ratio guard + plumbing | remove `expansion_capped` (amendment root update) | no banner (AC-d4 retired) | — |
 | (e) network hardening *(re-amended 2026-07-28: NO deadlines)* | `net.zig` / `net_source.zig` (redirect downgrade detect-and-discard, short-body error; cancellable executor tasks instead of deadlines) | error-code prose | surface new network errors (reuse `NetworkOpenError`) | net fake-fixture fault paths |
-| (f) copy neutralization *(amended: number-aware)* | `root.zig` `frameCell` + single-cell copy | **frozen copy-surface delta (root planner)** | inherit for free; bridge tests assert clipboard bytes | — |
+| (f) copy neutralization *(amended: number-aware)* | `root.zig` `frameCell` + single-cell copy | **frozen copy-surface delta (root maintainer)** | inherit for free; bridge tests assert clipboard bytes | — |
 | (g) SIGBUS handler | core installs scoped chained `sigaction` at the mmap access sites | — | frontend gates stay green with the handler installed (integration) | — |
 | (h) outlier caps | `open.zig` column backstop; `net_source.zig` download cap | error prose | download-cap banner | — |
 
 **Cross-component note — frozen `api/` for (d), (e), (f):**
 - **(f) is the load-bearing one.** Putting copy neutralization in the core `frameCell` changes the
   **documented copy-output contract** (what bytes a consumer receives), so `api/lesssheet.h` is a
-  **frozen-surface delta** even though no signature/struct changes. The **ROOT planner** freezes the
+  **frozen-surface delta** even though no signature/struct changes. The **ROOT maintainer** freezes the
   `api/` change, and the macOS guard
   `AmendmentContractGuardTests.frozenCAbiHeaderHasEmptyDiff` — current baseline SHA-256
   `df0436b6ea29211fd0634c40c857b626b6d85466db2a802c190d4a77c85cdd42` — **must be re-bumped in that
@@ -266,10 +263,10 @@ and departs from the two earlier texts as follows:
   applies: we own `api/` + backend + both frontends and rebuild lock-step, so change the surface to
   its simplest shape, no compat shim.
 - (d)'s trip flag and (e)'s new error codes are likewise additive `api/` prose/enum changes frozen by
-  the root planner and folded into the same AC23 re-bump.
+  the root maintainer and folded into the same AC23 re-bump.
 - *(Amended 2026-07-24)* That original freeze has since been applied (the `expansion_capped` field
   and copy prose are in the frozen header today). The amendment requires a **SECOND root `api/`
-  re-freeze**: REMOVE the (d) `ScanProgress.expansion_capped` field and its "abnormal expansion"
+  update**: REMOVE the (d) `ScanProgress.expansion_capped` field and its "abnormal expansion"
   prose (retire dead behavior fully — no-backcompat v1), add the number-aware caveat to the (f)
   COPY OUTPUT SAFETY prose, and drop any idle-read-specific timeout error prose (connect-timeout,
   redirect-downgrade, short-body, and download-cap states stay). The macOS AC23 guard baseline is
@@ -277,9 +274,9 @@ and departs from the two earlier texts as follows:
 
 ## External interfaces
 
-- **`api/lesssheet.h`** — behavioral deltas only, frozen by the root planner (see cross-
+- **`api/lesssheet.h`** — behavioral deltas only, frozen by the root maintainer (see cross-
   component note): (f) copy-output neutralization semantics *(number-aware, amended 2026-07-24)*;
-  (d) *(withdrawn)* the "abnormal expansion" trip flag is RETIRED — the amendment re-freeze removes
+  (d) *(withdrawn)* the "abnormal expansion" trip flag is RETIRED — the amendment update removes
   `expansion_capped`; (e) distinct network error codes (the timeout taxonomy — fake-driven only in
   v1, see AC-e1 —, redirect-downgrade detected-and-discarded *(re-amended 2026-07-28)*,
   short-body, download-cap — no idle-read code for v1). Every existing symbol/layout stays
@@ -291,7 +288,7 @@ and departs from the two earlier texts as follows:
   per-read deadline hook; deferred)*; the redirect downgrade check compares `uri.scheme` AFTER std
   has internally followed the hop inside `receiveHead` (detect-and-discard, AC-e2); TLS
   verification stays ON (system roots, hostname check — already correct, no change).
-- **Dev tooling** — a C-ABI fuzz harness (libFuzzer or AFL++, implementer's reversible choice within
+- **Dev tooling** — a C-ABI fuzz harness (libFuzzer or AFL++, developer's reversible choice within
   that family) and the fuzz corpus, committed but not gate-blocking (one-time cadence).
 
 ## Technology decisions
@@ -327,7 +324,7 @@ and departs from the two earlier texts as follows:
    the original decision, and it still cannot separate the two `scanToEnd` cases). Accepting the
    risk is sound because there is no memory threat to cap: memory stays O(viewport) at any
    expansion ratio and scanning is user-cancellable — a bomb wastes only cancellable CPU.
-   Downstream: retire the (d) ACs, the frozen `expansion_capped` field (root re-freeze + AC23
+   Downstream: retire the (d) ACs, the frozen `expansion_capped` field (root update + AC23
    re-bump), the `sec_d1`/`sec_d1_net` tests, and the dormant guard plumbing.
 4. **Copy neutralization: core `frameCell`, always-on, no opt-out.** Rejected: per-frontend
    presentation — duplicates logic across macOS + GTK + future Windows and risks divergence, against
@@ -364,7 +361,7 @@ and departs from the two earlier texts as follows:
 
 Each criterion is tagged **[gate]** (deterministic gate test), **[bench]** (measured via the
 differential C-ABI bench, reported as NFR evidence, not gate-blocking), or **[fuzz]** (verified by the
-one-time campaign). The planner turns these into frozen tests.
+one-time campaign). The maintainer turns these into frozen tests.
 
 ### PRE-LAUNCH MUST
 
@@ -411,7 +408,7 @@ Campaign: **902,418 runs / 8,081 unique, ReleaseSafe, ZERO crashes / OOMs / hang
 criterion 200,000 iterations per target, log committed under `tools/fuzz/campaign/`. All seven
 AC-c1 hotspots entered and CHECKED (the coverage decoder exits non-zero if any was missed):
 `csv_reader` 559/749, `encoding` 426/475, `source` 325/521, `window` 227/370, `index` 177/316,
-`net_source` 193/364, `search` 118/433. Record: `review/REVIEW-fuzz-campaign.md`.
+`net_source` 193/364, `search` 118/433.
 
 It found one defect, on its own seed corpus before the campaign ran: **`ls_open` never returned** on
 a UTF-16 stream ending mid code unit over either STREAMING source, reachable from 3 bytes with
@@ -428,10 +425,10 @@ where to point the fuzzer next, and the net arm of that defect is not lockable i
   user-cancellable scanning). What AC-d2 protected — every legitimate `.csv.gz` opens and fully
   scans — remains covered by the existing gz suite (`gz_ac7/15/16/17`, `gzfs_*`), which now must
   never be constrained by any expansion guard.
-- **Downstream retirement (tracked in the Sequencing note):** root `api/` re-freeze removes
-  `ScanProgress.expansion_capped` (+ AC23 re-bump); backend planner retires `sec_d1`/`sec_d1_net`
+- **Downstream retirement (tracked in the Sequencing note):** root `api/` update removes
+  `ScanProgress.expansion_capped` (+ AC23 re-bump); backend maintainer retires `sec_d1`/`sec_d1_net`
   (and `sec_d2`, whose only assertion is that the retired flag stays false — it cannot outlive the
-  field); implementer removes the dormant guard plumbing.
+  field); developer removes the dormant guard plumbing.
 
 **(e) Network hardening (backend; apps surface errors)**
 - **AC-e1** *(amended 2026-07-24 — connect-timeout only; re-amended 2026-07-28 — NO real-transport
@@ -453,7 +450,7 @@ where to point the fuzzer next, and the net arm of that defect is not lockable i
     executor task (net_close_hang fix, commit `b69f765`), so `ls_close` cancels an in-flight fetch
     on a silent peer (measured 0.003 s; previously never returned).
   - **That route is now CLOSED for plain net CSV** *(fact correction 2026-07-29, cell
-    `net_peek_mutex`, `review/REVIEW-net-peek-mutex.md`)*. It was real and reproduced:
+    `net_peek_mutex`)*. It was real and reproduced:
     `windowSetFiltered` held the Document mutex across a `Cursor.peekHttp` deliberately not capped
     by the fetched extent, so a frontier read issued an unbounded fetch and `ls_close` then blocked
     at `d.lock()` before it could cancel anything. Fixed on the **frontier-commit** side rather than
@@ -471,7 +468,7 @@ where to point the fuzzer next, and the net arm of that defect is not lockable i
     non-fetching twin of `ensureCompressed` for everyone else. A permit-less read parks resumably
     rather than touching the transport. Locked by frozen `netgz1` (foreground reads) and `netgz2`
     (the `windowSetFiltered` path this document named as the ship-blocker), both asserting on a
-    fetch-attempt tally; reviewer-PASS, record `review/REVIEW-netgz-mutex-wedge.md`.
+    fetch-attempt tally, verified by the network gzip mutex regression tests.
     So **"bounded by user cancel" now holds for open, for close-via-the-worker, for plain net CSV
     AND for network gzip.** `column.zig`'s mutex-held gzip-lane acquire (`waitUncancelable`) remains
     a latent lane-starvation hazard rather than a drivable wedge: it acquires with the mutex held, so
@@ -523,17 +520,17 @@ where to point the fuzzer next, and the net arm of that defect is not lockable i
 - **AC-f2 [gate]** *(amended 2026-07-24)* — Cells not starting with `=`, `+`, `-`, `@` — AND
   plain-number cells with a leading `+`/`-` — are byte-identical to today (no over-neutralization);
   the prefix is applied exactly once (idempotent framing).
-- ***(Amendment consequence, for the backend planner)*** — the pre-existing `cp1` golden (raw
+- ***(Amendment consequence, for the backend maintainer)*** — the pre-existing `cp1` golden (raw
   `-3`) is CORRECT under the number-aware rule and must NOT change; `sec_f1`/`sec_f2` (which
   currently assert `-5` → `'-5`) must be RE-FROZEN so their `+`/`-` trigger cases use non-number
   values (e.g. `+cmd`, `-1+x`) and plain-number cases assert RAW.
 - **AC-f3 [gate, apps]** — macOS (`.tabularText`/`.string`) and GTK (`gdk_clipboard` text) clipboard
   payloads carry the neutralized bytes end-to-end (bridge tests over the real core).
 - **AC-f4 [change-authority, not an ordinary gate test]** — The frozen `api/lesssheet.h` copy-output
-  contract is updated by the **ROOT planner**, and the macOS AC23 guard baseline
+  contract is updated by the **ROOT maintainer**, and the macOS AC23 guard baseline
   (`frozenCAbiHeaderHasEmptyDiff`; `df0436b6…` at original signing) is re-bumped **in the same
   freeze**. Verified by the guard staying green post-freeze against the new baseline.
-  *(Amended 2026-07-24: the amendment requires a SECOND root re-freeze — number-aware COPY OUTPUT
+  *(Amended 2026-07-24: the amendment requires a SECOND root update — number-aware COPY OUTPUT
   SAFETY prose + removal of `expansion_capped` — with another AC23 re-bump; the baseline moves with
   every authorized freeze.)*
 
@@ -576,32 +573,32 @@ where to point the fuzzer next, and the net arm of that defect is not lockable i
 - gzip work-amplification cap *(accepted known risk 2026-07-24)* — no buildable ratio/work signal
   separates a bomb from legit compressible CSV (Decision 3); memory O(viewport), CPU cancellable.
 
-## Sequencing note (for the planner / build orchestration)
-- (f) requires a **root-planner `api/` freeze + AC23 re-bump** before its build cell — it is the one
+## Sequencing note (for the maintainer / build orchestration)
+- (f) requires a **root-maintainer `api/` freeze + AC23 re-bump** before its build cell — it is the one
   cross-component contract change and should be sequenced first among the api-touching items so (d)/(e)
-  prose deltas can fold into the same freeze. *(Applied; superseded by the amendment re-freeze below.)*
+  prose deltas can fold into the same freeze. *(Applied; superseded by the amendment update below.)*
 - (a)'s carve-out decision **depends on** the (a) `ReleaseSafe`-vs-`ReleaseFast` bench (AC-a3); run the
   measurement before deciding any `@setRuntimeSafety(false)`.
 - (b) is a prerequisite for a clean (c) gz corpus (a known crash would mask campaign findings); fix (b)
   first, then seed it as an (c) regression case.
 
 ### Amendment convergence plan (2026-07-24 — the order the roles converge)
-1. **Root planner — one `api/` re-freeze:** remove `ScanProgress.expansion_capped` and its
+1. **Root maintainer — one `api/` update:** remove `ScanProgress.expansion_capped` and its
    "abnormal expansion" prose (retire, not deprecate — no-backcompat v1); add the number-aware
    caveat to the COPY OUTPUT SAFETY prose (grammar per AC-f1); drop any idle-read-timeout error
    prose (keep connect-timeout, redirect-downgrade, short-body, download-cap); re-bump the macOS
    AC23 guard baseline (`frozenCAbiHeaderHasEmptyDiff`) in the same freeze commit.
-2. **Backend planner — adjudicate CR sec_w2b as APPROVED per this amendment, re-freeze tests,
+2. **Backend maintainer — adjudicate CR sec_w2b as APPROVED per this amendment, update tests,
    commit (re-arms the gate):** retire `sec_d1`/`sec_d1_net` (and `sec_d2` — it asserts only that
-   the retired flag stays false and cannot outlive the field); re-freeze `sec_f1`/`sec_f2`
+   the retired flag stays false and cannot outlive the field); update `sec_f1`/`sec_f2`
    number-aware (`=`/`@` cases unchanged; `+`/`-` trigger cases switched to non-number values such
    as `+cmd`/`-1+x`; plain-number cases assert RAW; grammar-edge cases from AC-f1's examples);
    leave the `cp1` golden UNCHANGED (it is correct under the amended rule); confirm no frozen test
    asserts an idle-read timeout; align the frozen contract prose with this amendment.
-3. **Implementer (backend):** remove the dormant (d) plumbing — the `base.gz_expansion_ratio_max`
+3. **developer (backend):** remove the dormant (d) plumbing — the `base.gz_expansion_ratio_max`
    knob, the `source.Gzip.produce` sliding-window guard, `source.expansionCapped`, and the
    `index.indexPoll`/ABI plumbing for the removed field; make the single copy choke point
-   number-aware per the AC-f1 grammar; no idle-read work. Gate green against the re-frozen set.
+   number-aware per the AC-f1 grammar; no idle-read work. Gate green against the updated set.
 4. **Frontends (macOS + GTK):** nothing to build for (d) — AC-d4 (banner) is retired; remove any
    already-landed surfacing of `expansion_capped` if present; rebuild lock-step against the
-   re-frozen header (the AC23 guard verifies the new baseline).
+   updated header (the AC23 guard verifies the new baseline).

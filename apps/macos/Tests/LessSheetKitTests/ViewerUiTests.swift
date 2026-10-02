@@ -1,4 +1,4 @@
-// Frozen behavior tests — viewer-ui slice (planner-owned).
+// Frozen behavior tests — viewer-ui slice (shared).
 // The headless-gateable app criteria of ARCH-viewer-ui (contract conformance
 // pins, ABI agreement, dialect state propagation, windowed session bridging,
 // hidden-column model, jump/cancel view-model semantics, timing-marker rules)

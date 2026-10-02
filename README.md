@@ -21,6 +21,11 @@ Website, screenshots and downloads: <https://te-x.github.io/less-sheet/>
 
 ## Building
 
+Run build, format and test checks with `tools/check`. Select a component with
+`tools/check backend`, `tools/check macos` or `tools/check gtk`. The core needs
+Zig 0.16.0; macOS checks also need Swift and SwiftLint. GTK checks use a native
+toolchain on Linux or the Fedora container through Docker/Podman.
+
 **Engine** — needs zig 0.16.0 exactly:
 
 ```sh

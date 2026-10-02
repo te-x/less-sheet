@@ -1,7 +1,7 @@
 # less-sheet backlog review
 
-**Decision date:** 2026-07-12  
-**Scope:** triage and implementation order after `.csv.gz` shipped  
+**Decision date:** 2026-07-12
+**Scope:** triage and implementation order after `.csv.gz` shipped
 **Status:** proposed for the author's sign-off
 
 ## Executive decision
@@ -70,7 +70,6 @@ from this backlog because it is obsolete or subsumed.
 | Parquet | **Modify** | Deferred; full feature interview later | No implementation, dependency, fixture, or remote-Parquet work now. Preserve a format-neutral, parameterizable type metadata shape so the later interview does not begin from a knowingly CSV-only ABI. |
 | Wide-document window byte budget | **Keep** | Residual safety hardening | Row and column counts alone do not bound a viewport full of large cells. Revisit after formatting because rendered and decoded byte costs will then be measurable; responsiveness remains mandatory. |
 | Linux frontend | **Keep** | Later roadmap; full toolkit interview | It remains valuable but does not advance the current macOS dogfood path. GTK4 vs Qt and packaging/runtime cost remain undecided. |
-| aidev role→skill palettes | **Keep** | Separate tooling lane | Useful internal leverage, but it is neither a user-facing less-sheet capability nor a blocker for the product sequence. Do not interleave it with core/UI feature work. |
 | macOS 26 target bump | **Modify** | Deferred project-wide decision | A target bump may simplify the chromeless Liquid-Glass direction but changes the supported-user set. Require an explicit compatibility/distribution decision, not an incidental build-setting edit. |
 | Pending Find live pass | **Keep** | Continuous validation, start now | Exercise result navigation, cancellation, and >500 ms progress behavior; promote observed failures by severity. |
 | Pending dark-mode live pass | **Keep** | Continuous validation, start now | Required visual/accessibility validation for glass, warnings, selection, and future format states; not a reason to delay safe backend work. |
@@ -280,7 +279,7 @@ aggregate byte ceiling and partial-window semantics are user-visible. The macOS 
 product sign-off and a project-wide `PROJECT.md` update if approved, even though the mechanical edit is
 small.
 
-### Focused architect decision, then small planner/implementer slice
+### Focused architect decision, then small maintainer/developer slice
 
 - #7: pin aggregate budget and partial/pending semantics, then implement against existing window/frontier
   machinery.
@@ -288,7 +287,7 @@ small.
 - #5: pin estimator error/monotonicity behavior without changing exact-count convergence.
 - #9: pin the required timing margin and representative wide-row probes.
 
-### Small planner/implementer or review slices
+### Small maintainer/developer or review slices
 
 - #10 dump coverage and #11 perf-lane wiring;
 - `.csv.gz` generator fixtures;

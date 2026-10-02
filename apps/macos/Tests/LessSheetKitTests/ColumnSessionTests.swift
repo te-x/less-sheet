@@ -1,4 +1,4 @@
-// Frozen behavior tests — column-config SESSION model (planner-owned).
+// Frozen behavior tests — column-config SESSION model (shared).
 // ARCH-column-config criterion 19 (session reset / no persistence) + criterion
 // 18 (strict, transactional internal-re-open mapping). Pure, no GUI, no core:
 // `ColumnSessionModeling` owns the two decisions the frontend makes — clear all

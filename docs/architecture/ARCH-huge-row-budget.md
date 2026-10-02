@@ -2,9 +2,9 @@
 
 **Feature:** bound the synchronous byte scan in window materialization so huge rows/cells can never
 block the UI thread. **Type:** responsiveness fix on the window/serve path; touches the shared `api/`
-contract (root planner) + `backend/` + `apps/macos/`.
+contract (root maintainer) + `backend/` + `apps/macos/`.
 
-**Inputs to read:** `review/DIAGNOSIS-huge-row-hang-1.md` (proven root cause, repro, control),
+**Inputs to read:** the root-cause and reproduction notes below,
 `docs/architecture/PROJECT.md` (hard constraints; outlier-budget policy), `api/lesssheet.h`
 (WINDOW lane, `ls_cell_truncated`, `record1_capped` requirement 9).
 
@@ -66,10 +66,10 @@ UI-responsive (the diagnosis confirmed the past-EOF background scan on `sparse5g
 ## Known limitation (accepted; documented, not a bug)
 The per-row cap bounds each row, not the window aggregate: a viewport spanning many (hundreds of) ~1 MB
 rows could still scan hundreds of MB synchronously — a rarer, softer form of the hang. `sparse5g` is
-unaffected (its ~36 giant rows cost ~36 MB ≈ ~36 ms). **Optional future tightening** (planner's discretion,
+unaffected (its ~36 giant rows cost ~36 MB ≈ ~36 ms). **Optional future tightening** (maintainer's discretion,
 one extra counter): a per-window aggregate scan ceiling — stop materializing further rows once cumulative
 scanned bytes exceed a ceiling; the remainder are not-yet-servable and fill via scroll. Deferred unless
-the planner elects to include it.
+the maintainer elects to include it.
 
 ## Acceptance criteria (testable; no open questions)
 1. **Primary (the hang):** `LESSSHEET_JUMP="253000000,53820" LESSSHEET_DUMP_EXIT=1 <release-binary>
@@ -93,12 +93,11 @@ the planner elects to include it.
 7. **Frontend marker:** an oversized row shows the distinct gutter marker + tooltip; normal rows show
    none; the marker is distinct from the cell "…". (Headless: the per-row oversized flag surfaces through
    the macOS bridge — a `bridge…OversizedRow…` test; the live visual is a human-eyes check.)
-8. **Gates green:** `bash backend/.aidev/gate.sh backend`, `bash apps/macos/.aidev/gate.sh apps/macos`
-   (still 65 + the new bridge test), `bash .aidev/gate.sh` (root) all PASS.
+8. **Checks green:** `bash tools/check backend` and `bash tools/check macos` pass.
 
-## Contract surface (root planner freezes)
+## Contract surface (root maintainer freezes)
 - `api/lesssheet.h`: new constant `LS_WINDOW_ROW_SCAN_MAX_BYTES`; new per-row accessor
-  `ls_row_oversized(doc, row) -> bool` (or an equivalent flag in the window metadata — planner picks the
+  `ls_row_oversized(doc, row) -> bool` (or an equivalent flag in the window metadata — maintainer picks the
   exact shape), window/borrow domain identical to `ls_source_row`; re-qualified `ls_window_set` cost doc.
 - `backend/`: `window.zig` (bound the skip + materialize loops to the cap; set oversized; use the
   post-oversized checkpoints), `index.zig` (detect oversized rows during the frontier scan; persist the
@@ -111,4 +110,4 @@ the planner elects to include it.
 The `sparse5g` jump proxy above is the signal (`materialize → setWindow` is the same path as scroll
 landing). NOTE: `LESSSHEET_LANDING_STALL`'s heartbeat also freezes during a true wedge, so `submit→landed`
 wall-clock is the reliable measure; a small probe reporting the `ls_window_set` call duration directly
-would sharpen the pinned regression test (the planner owns `Tests/`).
+would sharpen the pinned regression test (the maintainer owns `Tests/`).

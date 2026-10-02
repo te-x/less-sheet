@@ -2,10 +2,9 @@
 
 **Feature:** extend the huge-row-budget responsiveness guarantee to the FILTERED view path, so a
 filtered view over a huge-row file can't block the UI thread. Backend-focused; may touch the frozen
-`api/` only if the planner proves it necessary (default: no `api/` change — see below).
+`api/` only if the maintainer proves it necessary (default: no `api/` change — see below).
 
-**Read first:** `review/REVIEW-huge-row-budget-1.md` (finding 1 — the gap + design direction),
-`review/DIAGNOSIS-huge-row-hang-1.md`, `docs/architecture/ARCH-huge-row-budget.md` (the identity-view
+**Read first:** `docs/architecture/ARCH-huge-row-budget.md` (the identity-view
 fix this extends), and the frozen `api/lesssheet.h` FILTERED VIEWS + THREADING sections.
 
 ## Problem (proven, from the huge-row-budget review)
@@ -28,20 +27,20 @@ never by a foreground prefix. The window path must NOT re-decide a row's match b
 synchronously. So the fix is not "bound the match-test lex" (that would decide matches on a prefix —
 wrong); it's "don't re-test in the foreground at all — use what the background scan already computed."
 
-## Design direction (planner works out the mechanism — this is low-level design)
+## Design direction (maintainer works out the mechanism — this is low-level design)
 - The background filter-scan already determines matches full-cell and maintains the per-block match
   counters. Locate the `materialize` matching rows via those counters (`nav.nthMatchLocation` /
   `positionOf`) rather than the current forward walk that re-tests every candidate.
 - The remaining unbounded spots to bound: (a) the forward walk skipping non-matching rows to reach the
   next match, and (b) `nthMatchLocation`'s bounded in-block re-lex — BOTH re-lex row bytes and blow up
   on a giant row. Use the `oversized_checkpoints` the frontier already drops after each oversized row so
-  these walks SKIP a giant row's bytes instead of re-lexing them. The planner determines what the
+  these walks SKIP a giant row's bytes instead of re-lexing them. The maintainer determines what the
   background scan must record (e.g. a giant row's match result / oversized-ness) so the window path can
   honor the full-cell match without re-scanning.
 - Serve a giant MATCHING row as a bounded prefix (display cap) with `ls_row_oversized` true — same as
   the identity path. Reuse `LS_WINDOW_ROW_SCAN_MAX_BYTES` (1 MiB), `oversized_checkpoints`,
   `ls_row_oversized`. Prefer NO new `api/` surface; if the scan must expose per-match oversized info
-  across the ABI, that's a root-planner contract touch — flag it as a decision.
+  across the ABI, that's a root-maintainer contract touch — flag it as a decision.
 - Fold in the two non-blocking huge-row-budget review findings while here: **(2)** `drainOversized`
   dedup guard — append a staged oversized checkpoint only if its `.row` exceeds the last entry's `.row`
   (keeps `oversized_checkpoints` sorted by construction, robust against a future second mid-block-frontier
@@ -62,7 +61,7 @@ wrong); it's "don't re-test in the foreground at all — use what the background
 6. Gates green (backend + macOS + root); no regression to the identity-view huge-row path, cold-start,
    memory (O(checkpoints)/O(oversized rows), never O(rows)/O(matches)).
 
-## Contract surface (planner freezes)
+## Contract surface (maintainer freezes)
 Expected backend-only: `backend/src/{window,nav,filter,index,base}.zig` (impl) + a new RED frozen test
 in `backend/tests/` locking criterion 1/2/4. `api/lesssheet.h`: re-qualify the FILTERED VIEWS "still no
 scan / safe in either view" note if needed to match reality, and add a per-match oversized signal ONLY

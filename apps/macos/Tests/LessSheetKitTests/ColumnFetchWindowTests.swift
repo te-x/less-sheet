@@ -1,4 +1,4 @@
-// Frozen behavior test — column-windowing ROUND 2 (the cell-FETCH), planner-owned.
+// Frozen behavior test — column-windowing ROUND 2 (the cell-FETCH), shared.
 //
 // ARCH-column-windowing "Amendment — round 2: window the cell-FETCH too" / AC7.
 // Round 1 made the frontend's MEASURE + DRAW O(visible columns) (pinned purely,
@@ -30,7 +30,7 @@
 // COMPILE-TIME conformance pin for the additive contract surface (a signature
 // drift fails this build).
 //
-// RED SEED (planner freeze) — RED on BEHAVIOR, never compile/import:
+// RED SEED (maintainer freeze) — RED on BEHAVIOR, never compile/import:
 // `CoreDocumentSession` does NOT yet override the column overload, so it resolves
 // to the DEFAULT protocol-extension impl (DocumentSession.swift), which IGNORES
 // `columns` and returns the DENSE window from `setWindow(firstRow:rowCount:)` —
@@ -40,7 +40,7 @@
 // the requested slice). The tree still COMPILES (the default keeps every
 // conformer, incl. the round-1 impl's dense `setWindow` calls, building).
 //
-// RED → GREEN (round-2 implementer): OVERRIDE
+// RED → GREEN (round-2 developer): OVERRIDE
 // `setWindow(firstRow:rowCount:columns:)` in `CoreDocumentSession` to issue
 // `ls_window_set` + read cells/flags for ONLY the (clamped) `columns` range,
 // returning `RowWindow(firstColumn: columns.lowerBound, …)`, and route

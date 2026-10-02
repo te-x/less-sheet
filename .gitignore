@@ -14,7 +14,7 @@ __pycache__/
 
 # Benchmark reports: less_sheet_bench.py writes bench-<host>-<ts>.txt into the
 # directory under test, so they land wherever a run happens. Results worth keeping
-# get summarised into review/ or the ARCH, not committed raw.
+# are kept as benchmark data, not committed as raw machine logs.
 bench-*.txt
 
 # Release artifacts built by tools/release/make_release (.dmg/.zip/.tar.gz +
