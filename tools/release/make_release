@@ -164,6 +164,8 @@ WHAT THIS BINARY NEEDS AT RUNTIME
     plus the usual GNOME stack these pull in (glib, gio, gobject, pango,
     pangocairo, cairo).
 
+The menu's "Check for Updates" command also needs curl on PATH.
+
 The GTK4/libadwaita floors are REAL, not advisory: the app uses
 AdwShortcutsDialog and the AdwStyleManager accent-color API, which do not exist
 before libadwaita 1.8 (GNOME 49). On an older stack the binary fails to start

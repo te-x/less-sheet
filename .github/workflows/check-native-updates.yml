@@ -1,0 +1,58 @@
+name: Check native update menus
+
+on:
+  push:
+    paths:
+      - 'apps/macos/**'
+      - 'apps/gtk/src/**'
+      - 'tools/tests/**'
+      - '.github/workflows/check-native-updates.yml'
+  pull_request:
+    paths:
+      - 'apps/macos/**'
+      - 'apps/gtk/src/**'
+      - 'tools/tests/**'
+      - '.github/workflows/check-native-updates.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Zig 0.16.0 and SwiftLint
+        run: |
+          curl -fsSLO https://ziglang.org/download/0.16.0/zig-aarch64-macos-0.16.0.tar.xz
+          tar -xf zig-aarch64-macos-0.16.0.tar.xz
+          echo "$PWD/zig-aarch64-macos-0.16.0" >> "$GITHUB_PATH"
+          brew install swiftlint
+      - name: Build the core in ReleaseSafe mode
+        working-directory: backend
+        run: zig build -Doptimize=ReleaseSafe
+      - name: Generate the macOS test corpus
+        run: >-
+          python3 tools/csvgen/gen.py
+          --case unicode_emoji --case eol_crlf --case wide_100k_cols
+          --case enc_utf16le --case happy_numeric
+          --seed 1337 --out apps/macos/.build/corpus-cache
+      - name: Build, lint and test the macOS frontend
+        working-directory: apps/macos
+        run: |
+          swift build -Xswiftc -warnings-as-errors
+          swiftlint lint --strict Sources
+          swift test
+      - name: Test the Swift update release parser
+        run: python3 tools/tests/check_update_release_swift
+
+  gtk-release-parser:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install GLib development headers
+        run: sudo apt-get update && sudo apt-get install -y libglib2.0-dev
+      - name: Test the GTK update release parser
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror tools/tests/gtk_update_release.c $(pkg-config --cflags --libs glib-2.0) -o /tmp/gtk-update-release-tests
+          /tmp/gtk-update-release-tests

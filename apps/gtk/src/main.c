@@ -19,6 +19,7 @@
 
 /* Private (src-local) pure helper — the jump field's arrow-key stepping. */
 #include "lsg_jump_step.h"
+#include "lsg_update_release.h"
 
 #include <lsg_a11y.h>
 #include <lsg_column.h>
@@ -6537,7 +6538,215 @@ dialect_popover_create (GtkMenuButton *button, gpointer data)
       button, GTK_WIDGET (build_dialect_dropdown_popover (data, kind)));
 }
 
-/* -------- primary menu: Preferences / Keyboard Shortcuts / About --------- */
+/* -------- primary menu -------------------------------------------------- */
+
+typedef struct
+{
+  GWeakRef dialog;
+  GSubprocess *process;
+  GCancellable *cancellable;
+  GSimpleAction *action;
+  GApplication *application;
+  gboolean cancelled;
+} LsgUpdateCheck;
+
+static const char *
+update_asset_suffix (void)
+{
+#if defined(__x86_64__)
+  return g_file_test ("/.flatpak-info", G_FILE_TEST_EXISTS)
+             ? "-x86_64.flatpak"
+             : "-linux-x86_64.tar.gz";
+#elif defined(__aarch64__)
+  return g_file_test ("/.flatpak-info", G_FILE_TEST_EXISTS)
+             ? "-aarch64.flatpak"
+             : "-linux-aarch64.tar.gz";
+#else
+  return NULL;
+#endif
+}
+
+static void
+update_download_finished (GObject *source, GAsyncResult *result, gpointer data)
+{
+  GtkWindow *window = data;
+  g_autoptr (GError) error = NULL;
+  if (!gtk_uri_launcher_launch_finish (GTK_URI_LAUNCHER (source), result,
+                                       &error)
+      && !g_error_matches (error, GTK_DIALOG_ERROR, GTK_DIALOG_ERROR_DISMISSED)
+      && gtk_widget_get_visible (GTK_WIDGET (window)))
+    {
+      AdwDialog *dialog
+          = adw_alert_dialog_new ("Could Not Open Download", error->message);
+      adw_alert_dialog_add_response (ADW_ALERT_DIALOG (dialog), "close",
+                                     "Close");
+      adw_dialog_present (dialog, GTK_WIDGET (window));
+    }
+  g_object_unref (window);
+}
+
+static void
+update_download_response (AdwAlertDialog *dialog, const char *response,
+                          GtkWindow *window)
+{
+  if (strcmp (response, "download") != 0)
+    return;
+  const char *uri
+      = g_object_get_data (G_OBJECT (dialog), "lsg-update-download-uri");
+  g_autoptr (GtkUriLauncher) launcher = gtk_uri_launcher_new (uri);
+  gtk_uri_launcher_launch (launcher, window, NULL, update_download_finished,
+                           g_object_ref (window));
+}
+
+static void
+update_check_cancel (LsgUpdateCheck *check)
+{
+  check->cancelled = TRUE;
+  g_subprocess_force_exit (check->process);
+  g_cancellable_cancel (check->cancellable);
+}
+
+static void
+update_check_closed (AdwDialog *dialog, gpointer data)
+{
+  (void)dialog;
+  update_check_cancel (data);
+}
+
+static void
+update_check_shutdown (GApplication *application, gpointer data)
+{
+  (void)application;
+  update_check_cancel (data);
+}
+
+static void
+update_check_finished (GObject *source, GAsyncResult *result, gpointer data)
+{
+  LsgUpdateCheck *check = data;
+  g_autoptr (GError) error = NULL;
+  g_autofree char *output = NULL;
+  gboolean success = g_subprocess_communicate_utf8_finish (
+      G_SUBPROCESS (source), result, &output, NULL, &error);
+  g_autoptr (AdwAlertDialog) dialog = g_weak_ref_get (&check->dialog);
+  g_signal_handlers_disconnect_by_data (check->application, check);
+  g_simple_action_set_enabled (check->action, TRUE);
+  if (dialog != NULL)
+    g_signal_handlers_disconnect_by_data (dialog, check);
+  if (!check->cancelled && dialog != NULL)
+    {
+      adw_alert_dialog_remove_response (dialog, "cancel");
+      adw_alert_dialog_add_response (dialog, "close", "Close");
+      adw_alert_dialog_set_close_response (dialog, "close");
+      adw_alert_dialog_set_default_response (dialog, "close");
+      g_autofree char *version = NULL;
+      g_autofree char *uri = NULL;
+      LsgUpdateVersion current, latest;
+      if (!success || !g_subprocess_get_successful (check->process))
+        {
+          adw_alert_dialog_set_heading (dialog, "Could Not Check for Updates");
+          adw_alert_dialog_set_body (
+              dialog, "Check your internet connection and try again.");
+        }
+      else if (!lsg_update_release_parse (output, strlen (output),
+                                          update_asset_suffix (), &version,
+                                          &uri)
+               || !lsg_update_version_parse (version, &latest)
+               || !lsg_update_version_parse (LSG_VERSION, &current))
+        {
+          adw_alert_dialog_set_heading (dialog, "Could Not Check for Updates");
+          adw_alert_dialog_set_body (
+              dialog, "The latest release has no valid download for this "
+                      "installation. Please try again later.");
+        }
+      else if (lsg_update_version_compare (&latest, &current) <= 0)
+        {
+          adw_alert_dialog_set_heading (dialog, "You're Up to Date");
+          g_autofree char *body
+              = g_strdup_printf ("less-sheet %s is up to date.", LSG_VERSION);
+          adw_alert_dialog_set_body (dialog, body);
+        }
+      else
+        {
+          adw_alert_dialog_set_heading (dialog, "Update Available");
+          g_autofree char *body = g_strdup_printf (
+              "less-sheet %s is available. You have version %s.", version,
+              LSG_VERSION);
+          adw_alert_dialog_set_body (dialog, body);
+          adw_alert_dialog_add_response (dialog, "download", "Download");
+          adw_alert_dialog_set_response_appearance (dialog, "download",
+                                                    ADW_RESPONSE_SUGGESTED);
+          adw_alert_dialog_set_default_response (dialog, "download");
+          g_object_set_data_full (G_OBJECT (dialog), "lsg-update-download-uri",
+                                  g_steal_pointer (&uri), g_free);
+          GtkRoot *root = gtk_widget_get_root (GTK_WIDGET (dialog));
+          if (GTK_IS_WINDOW (root))
+            g_signal_connect_object (dialog, "response",
+                                     G_CALLBACK (update_download_response),
+                                     root, 0);
+        }
+    }
+  g_weak_ref_clear (&check->dialog);
+  g_object_unref (check->process);
+  g_object_unref (check->cancellable);
+  g_object_unref (check->action);
+  g_object_unref (check->application);
+  g_free (check);
+}
+
+static void
+action_check_updates (GSimpleAction *action, GVariant *parameter,
+                      gpointer data)
+{
+  (void)parameter;
+  App *app = data;
+  if (app->window == NULL)
+    return;
+  AdwDialog *dialog = adw_alert_dialog_new ("Checking for Updates…",
+                                            "Looking for the latest "
+                                            "version of less-sheet.");
+  adw_alert_dialog_add_response (ADW_ALERT_DIALOG (dialog), "cancel",
+                                 "Cancel");
+  adw_alert_dialog_set_close_response (ADW_ALERT_DIALOG (dialog), "cancel");
+  g_autoptr (GError) error = NULL;
+  g_autofree char *limit = g_strdup_printf ("%u", LSG_UPDATE_METADATA_LIMIT);
+  GSubprocess *process = g_subprocess_new (
+      G_SUBPROCESS_FLAGS_STDOUT_PIPE | G_SUBPROCESS_FLAGS_STDERR_SILENCE,
+      &error, "curl", "-q", "--silent", "--fail", "--location", "--proto",
+      "=https", "--proto-redir", "=https", "--connect-timeout", "10",
+      "--max-time", "30", "--max-filesize", limit, LSG_UPDATE_CHECKSUMS_URL,
+      NULL);
+  if (process == NULL)
+    {
+      adw_alert_dialog_set_heading (ADW_ALERT_DIALOG (dialog),
+                                    "Could Not Check for Updates");
+      adw_alert_dialog_set_body (
+          ADW_ALERT_DIALOG (dialog),
+          "The download helper could not start. Make sure curl is installed "
+          "and try again.");
+      adw_alert_dialog_remove_response (ADW_ALERT_DIALOG (dialog), "cancel");
+      adw_alert_dialog_add_response (ADW_ALERT_DIALOG (dialog), "close",
+                                     "Close");
+      adw_alert_dialog_set_close_response (ADW_ALERT_DIALOG (dialog), "close");
+    }
+  else
+    {
+      LsgUpdateCheck *check = g_new0 (LsgUpdateCheck, 1);
+      g_weak_ref_init (&check->dialog, dialog);
+      check->process = process;
+      check->cancellable = g_cancellable_new ();
+      check->action = g_object_ref (action);
+      check->application = g_object_ref (G_APPLICATION (app->app));
+      g_simple_action_set_enabled (action, FALSE);
+      g_signal_connect (dialog, "closed", G_CALLBACK (update_check_closed),
+                        check);
+      g_signal_connect (app->app, "shutdown",
+                        G_CALLBACK (update_check_shutdown), check);
+      g_subprocess_communicate_utf8_async (process, NULL, check->cancellable,
+                                           update_check_finished, check);
+    }
+  adw_dialog_present (dialog, GTK_WIDGET (app->window));
+}
 
 /* The shortcuts window, generated ENTIRELY from the single lsg_a11y
  * accelerator table: one section per group, one item per command, no
@@ -6638,6 +6847,7 @@ build_primary_menu (App *app)
   GMenu *menu = g_menu_new ();
   g_menu_append (menu, "Preferences", "app.preferences");
   g_menu_append (menu, "Keyboard Shortcuts", "app.shortcuts");
+  g_menu_append (menu, "Check for Updates…", "app.check-updates");
   g_menu_append (menu, "About less-sheet", "app.about");
   return G_MENU_MODEL (menu);
 }
@@ -8201,6 +8411,7 @@ register_app_shortcuts (App *app, GApplication *gapp)
     { "jump", act_jump, NULL, NULL, NULL, { 0, 0, 0 } },
     { "preferences", action_preferences, NULL, NULL, NULL, { 0, 0, 0 } },
     { "shortcuts", action_shortcuts, NULL, NULL, NULL, { 0, 0, 0 } },
+    { "check-updates", action_check_updates, NULL, NULL, NULL, { 0, 0, 0 } },
     { "about", action_about, NULL, NULL, NULL, { 0, 0, 0 } },
   };
   g_action_map_add_action_entries (G_ACTION_MAP (gapp), entries,
