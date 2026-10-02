@@ -1,6 +1,12 @@
 name: Check native update menus
 
 on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Optional source revision to validate
+        type: string
+        required: false
   push:
     paths:
       - 'apps/macos/**'
@@ -22,6 +28,8 @@ jobs:
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref || github.sha }}
       - name: Install Zig 0.16.0 and SwiftLint
         run: |
           curl -fsSLO https://ziglang.org/download/0.16.0/zig-aarch64-macos-0.16.0.tar.xz
@@ -43,6 +51,7 @@ jobs:
           swift build -Xswiftc -warnings-as-errors
           swiftlint lint --strict Sources
       - name: Test the Swift update release parser
+        if: hashFiles('tools/tests/check_update_release_swift') != ''
         run: python3 tools/tests/check_update_release_swift
       - name: Test the macOS frontend
         working-directory: apps/macos
