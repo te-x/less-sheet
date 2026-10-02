@@ -9,8 +9,7 @@ Build the downloadable less-sheet artifacts, verify each one RUNS, and checksum 
 
 PREPARES artifacts only. It never uploads, publishes, notarizes, or submits
 anything, and it never signs with a Developer ID unless you explicitly export
-LESSSHEET_CODESIGN_IDENTITY yourself. Publishing is a separate, deliberate act
-(docs/RELEASE.md).
+LESSSHEET_CODESIGN_IDENTITY yourself. Publish with tools/release/publish.sh.
 
 What it produces in --out (default <repo>/dist):
 
@@ -74,9 +73,6 @@ ARCH_PLATFORM = {"aarch64": "linux/arm64", "x86_64": "linux/amd64"}
 HOST_ARCH_ALIASES = {"arm64": "aarch64", "aarch64": "aarch64",
                      "x86_64": "x86_64", "amd64": "x86_64", "AMD64": "x86_64"}
 
-# The GTK app id the code already uses (data/dev.lesssheet.Gtk.svg + main.c's
-# gtk_window_set_icon_name). docs/RELEASE.md flags the final Flatpak app-id as
-# still-to-confirm, so this follows the code rather than inventing a new one.
 # The GTK app id, read from the app's OWN single definition rather than copied.
 # A copy here shipped the wrong value: after the rename to com.lesssheet.LessSheet
 # (`5ac88d7`) this constant still said `dev.lesssheet.Gtk`, which would have put
@@ -288,14 +284,14 @@ def resolve_version(repo, override):
                 "falling back to the macOS plist" % root_path)
     elif mac_ver and mac_ver != root_ver:
         warn = ("macOS Info.plist still hardcodes %s while the single source "
-                "(VERSION) says %s — apps/macos has not been wired to it yet "
-                "(docs/RELEASE.md 1a item 1)" % (mac_ver, root_ver))
+                "(VERSION) says %s — use the __LESSSHEET_VERSION__ placeholder "
+                "in Info.plist for apps/macos/scripts/assemble-app.sh" % (mac_ver, root_ver))
     return (override or root_ver or mac_ver or "0.0.0"), warn
 
 
 # Legal text is not decoration here. The Linux tarball ships a
-# binary linked against LGPL libraries, and docs/RELEASE.md 4a makes shipping the
-# notices half of what keeps that compliant — the other half being that GTK stays
+# binary linked against LGPL libraries. Shipping the notices is half of what
+# keeps that compliant — the other half being that GTK stays
 # dynamically linked. A template placeholder reaching a user is the same class of
 # bug as a surviving Info.plist version placeholder, so it gets the same guard.
 LEGAL_FILES = ("LICENSE", "THIRD-PARTY-NOTICES.md")
@@ -1042,8 +1038,7 @@ def main():
     if getattr(args, "cask_base", None):
         cpath = write_cask(repo, out, ordered, version, args.cask_base)
         if cpath:
-            print("wrote %s (paste into your homebrew-tap; see "
-                  "packaging/homebrew/README.md)" % cpath)
+            print("wrote %s (copy into your homebrew-tap's Casks/less-sheet.rb)" % cpath)
         else:
             print("no .zip artifact in this run, so no cask was written "
                   "(the cask installs the zip)")
@@ -1051,8 +1046,7 @@ def main():
         print("\nNOTES / THINGS THAT NEED A DECISION:")
         for n in notes:
             print("  - " + n)
-    print("\nNothing has been published. Uploading these is a separate, deliberate "
-          "step (docs/RELEASE.md).")
+    print("\nArtifacts are ready. Publish with tools/release/publish.sh.")
 
 
 if __name__ == "__main__":

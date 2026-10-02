@@ -8,6 +8,21 @@ xcuserdata/
 *.o
 *.a
 
+# Local development guides, plans, reviews and assistant configuration.
+.aidev/
+.claude/
+.codex/
+.agents/
+CLAUDE.md
+CLAUDE.MD
+AGENTS.md
+docs/
+review/
+/packaging/**/README.md
+/tools/**/README.md
+/tools/fuzz/campaign/
+/tools/fuzz/findings/
+
 # Generated icon artifacts (source of truth: branding/icon.svg)
 branding/generated/
 __pycache__/
