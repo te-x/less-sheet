@@ -55,9 +55,9 @@ jobs:
         run: python3 tools/tests/check_update_release_swift
       - name: Test the macOS frontend
         working-directory: apps/macos
-        # These tests launch native apps and measure elapsed time. Running
-        # unrelated suites together makes their windows compete for resources.
-        run: swift test --no-parallel
+        # Test the optimized frontend used in releases, including its timing
+        # probes. Run serially so app windows do not compete for resources.
+        run: swift test -c release --no-parallel
 
   gtk-release-parser:
     runs-on: ubuntu-24.04

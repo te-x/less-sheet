@@ -144,7 +144,10 @@ struct AmendmentContractGuardTests {
         // reachable, and tested, where the pass is not being driven (MANUAL
         // between drives; network documents). PROSE ONLY — the code was accepted
         // as implemented and nothing about the ABI moved.
-                        baseline: "484bd2f7c86911a042107f954e3b298a81f64b701e9c0f2adbc6247f6f99206c")
+        // Updated for the user-authorized Parquet reader: three additive
+        // functions (format/status facts and a projected window). Existing
+        // declarations, enum values and struct layouts remain unchanged.
+                        baseline: "96c126c8ad34755243d3d4a4af1f59c3c069c0d7c4a6a344550443c2dad789b8")
     }
 
     // AC23 — the public Swift search/layout contracts are byte-identical:
