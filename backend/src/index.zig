@@ -70,7 +70,7 @@ pub fn headScan(doc: *Document) void {
     // and must not pull a second one over the wire, and a row withheld here costs
     // nothing -- the first demand scan (jump / search nav / filtered jump) picks it
     // up with the full demand.
-    const guarded = doc.source.commitGuarded();
+    const guarded = doc.reader == .csv and doc.source.commitGuarded();
     const commit_end = if (guarded) doc.source.commitBoundNoFetch() else std.math.maxInt(u64);
     while (!doc.reader.atEnd(doc.source, pos)) {
         const b = doc.reader.boundsAfter(doc.source, pos, lim);
@@ -143,6 +143,21 @@ pub fn workerMain(doc: *Document) void {
             doc.waitWork();
             continue;
         }
+        // Remote Parquet knows all row coordinates from its footer, while
+        // individual pages remain absent. Viewport/copy demand is independent
+        // of the CSV frontier and runs without holding the control mutex.
+        if (doc.reader == .parquet and doc.reader.parquet.data.hasPending()) {
+            const faults_before = base.sourceFaultCount(doc);
+            doc.unlock();
+            doc.reader.parquet.data.fetchPending();
+            doc.lock();
+            if (base.sourceFaultCount(doc) != faults_before) base.reportSourceFaultLocked(doc);
+            continue;
+        }
+        if (doc.reader == .parquet and doc.net and doc.jump_state == .scanning and doc.filter_total_exact and doc.filter_state != .idle) {
+            filter.resolveFilterJumpLocked(doc);
+            continue;
+        }
         // Slot priority: a scanning jump owns the frontier; else a scanning
         // search (find — which runs even after the index is complete; it must
         // re-lex behind the frontier to COUNT); else exact filtered navigation;
@@ -161,9 +176,9 @@ pub fn workerMain(doc: *Document) void {
         const sort_first = doc.sort_state == .building and doc.sort_build != null;
         const do_jump = !sort_first and doc.jump_state == .scanning and (doc.filter_state != .idle or !doc.complete);
         const do_search = !sort_first and !do_jump and doc.search_state == .scanning;
-        const do_nav = !sort_first and !do_jump and !do_search and !sort.presented(doc) and doc.filter_state != .idle and
+        const do_nav = !sort_first and !do_jump and !do_search and !sort.presented(doc) and
             doc.nav_pending and doc.search_nav == .searching and
-            doc.search_state == .done and doc.filter_total_exact;
+            doc.search_state == .done and ((doc.filter_state != .idle and doc.filter_total_exact) or (doc.reader == .parquet and doc.net and doc.filter_state == .idle));
         // A NETWORK document has NO background frontier drive — neither the
         // AUTO indexer nor the filter's
         // auto-drive-to-completion. The frontier advances only on concrete demand
@@ -260,7 +275,7 @@ pub fn workerMain(doc: *Document) void {
             const anchor = doc.nav_anchor;
             const dir = doc.nav_dir;
             const pctx = doc.w_ctx;
-            const fctx = doc.wf_ctx;
+            const fctx = if (doc.filter_state != .idle) doc.wf_ctx else null;
             const faults_before = base.sourceFaultCount(doc);
             doc.unlock();
 

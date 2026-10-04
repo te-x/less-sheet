@@ -1,4 +1,4 @@
-//! Local Parquet transport and bounded, page-level decoding. No row group is
+//! Parquet transport and bounded, page-level decoding. No row group is
 //! converted to CSV or materialized in full. All cached values remain private;
 //! callers copy display text into their own window storage.
 const std = @import("std");
@@ -6,13 +6,23 @@ const pq = @import("parquet");
 const low = pq.internals.reader;
 const decoder = pq.internals.column_decoder;
 const format = pq.format;
+const remote_mod = @import("parquet_remote.zig");
+pub const RemoteSource = remote_mod.Source;
 
-pub const Error = error{ OutOfMemory, InvalidParquet, UnsupportedParquet };
+pub const Error = remote_mod.Error;
 const metadata_limit = 8 * 1024 * 1024;
 const page_limit = 16 * 1024 * 1024;
 const page_values_limit = 1 << 20;
 const memory_limit = 64 * 1024 * 1024;
 const cache_slots = 64;
+
+const Request = struct { row: u64, column: u32 };
+const Pending = struct {
+    mutex: std.Io.Mutex = .init,
+    items: [cache_slots]Request = undefined,
+    count: usize = 0,
+    active: ?Request = null,
+};
 
 /// Limits allocations made by the decoder, including malicious Thrift counts.
 const Budget = struct {
@@ -83,12 +93,29 @@ pub const Data = struct {
     failed: std.atomic.Value(bool) = .init(false),
     pages_decoded: u64 = 0,
     decoded_bytes: u64 = 0,
+    remote: ?remote_mod.Source = null,
+    navigators: [cache_slots]remote_mod.Navigator = @splat(.{}),
+    pending: Pending = .{},
 
     pub fn isParquet(bytes: []const u8) bool {
         return bytes.len >= 4 and (std.mem.eql(u8, bytes[0..4], "PAR1") or std.mem.eql(u8, bytes[0..4], "PARE"));
     }
 
     pub fn init(gpa: std.mem.Allocator, bytes: []const u8) Error!*Data {
+        return initSource(gpa, bytes, null);
+    }
+
+    pub fn initRemote(gpa: std.mem.Allocator, bytes: []const u8, remote: remote_mod.Source) Error!*Data {
+        if (bytes.len < 12) return error.InvalidParquet;
+        const tail = try remote.slice(bytes.len - 8, 8);
+        if (!std.mem.eql(u8, tail[4..], "PAR1")) return error.InvalidParquet;
+        const footer_len = std.mem.readInt(u32, tail[0..4], .little);
+        if (footer_len > metadata_limit or footer_len > bytes.len - 12) return error.InvalidParquet;
+        _ = try remote.slice(bytes.len - 8 - footer_len, footer_len);
+        return initSource(gpa, bytes, remote);
+    }
+
+    fn initSource(gpa: std.mem.Allocator, bytes: []const u8, remote: ?remote_mod.Source) Error!*Data {
         if (bytes.len < 12 or !std.mem.eql(u8, bytes[0..4], "PAR1") or !std.mem.eql(u8, bytes[bytes.len - 4 ..], "PAR1")) return error.InvalidParquet;
         const footer_len = std.mem.readInt(u32, bytes[bytes.len - 8 ..][0..4], .little);
         if (footer_len > metadata_limit or footer_len > bytes.len - 12) return error.InvalidParquet;
@@ -140,11 +167,15 @@ pub const Data = struct {
         self.failed = .init(false);
         self.pages_decoded = 0;
         self.decoded_bytes = 0;
+        self.remote = remote;
+        self.navigators = @splat(.{});
+        self.pending = .{};
         return self;
     }
 
     pub fn deinit(self: *Data) void {
         for (&self.pages) |*page| page.clear();
+        for (&self.navigators) |*navigator| navigator.clear();
         // Metadata, transport wrapper and unused DynamicReader byte arena are
         // all arena-owned; deinit first releases their internal references.
         self.reader.deinit();
@@ -161,7 +192,13 @@ pub const Data = struct {
     pub fn appendCell(self: *Data, row: u64, column: u32, cap: usize, out: *std.ArrayList(u8), gpa: std.mem.Allocator) Error!bool {
         if (row >= self.rows or column >= self.columns) return error.InvalidParquet;
         const io = @import("sysio.zig").io();
-        self.mutex.lockUncancelable(io);
+        const foreground = if (self.remote) |remote| !remote.can_fetch() else false;
+        if (foreground) {
+            if (!self.mutex.tryLock()) {
+                self.request(row, column);
+                return error.WouldBlock;
+            }
+        } else self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         const group = self.groupForRow(row);
         const first = if (group == 0) 0 else self.group_ends[group - 1];
@@ -172,6 +209,10 @@ pub const Data = struct {
                 page.used = self.clock;
                 return appendValue(page.values[@intCast(local - page.first)], self.reader.metadata.schema[@as(usize, column) + 1], cap, out, gpa);
             }
+        }
+        if (foreground and self.remote.?.peek == null) {
+            self.request(row, column);
+            return error.WouldBlock;
         }
         var slot: *Page = &self.pages[0];
         for (&self.pages) |*page| {
@@ -188,15 +229,69 @@ pub const Data = struct {
             for (&self.pages) |*page| if (page.arena != null and (victim == null or page.used < victim.?.used)) {
                 victim = page;
             };
-            if (victim) |v| v.clear() else break;
+            if (victim) |v| {
+                v.clear();
+            } else {
+                var map: ?*remote_mod.Navigator = null;
+                for (&self.navigators) |*nav| if (nav.arena != null and (map == null or nav.used < map.?.used)) {
+                    map = nav;
+                };
+                if (map) |v| v.clear() else break;
+            }
         }
         self.loadPage(slot, group, column, local) catch |err| {
             slot.clear();
+            if (err == error.WouldBlock) {
+                self.request(row, column);
+                return err;
+            }
             self.failed.store(true, .release);
             return err;
         };
         slot.used = self.clock;
         return appendValue(slot.values[@intCast(local - slot.first)], self.reader.metadata.schema[@as(usize, column) + 1], cap, out, gpa);
+    }
+
+    fn request(self: *Data, row: u64, column: u32) void {
+        const io = @import("sysio.zig").io();
+        self.pending.mutex.lockUncancelable(io);
+        defer self.pending.mutex.unlock(io);
+        if (self.failed.load(.acquire)) return;
+        if (self.pending.active) |active| if (active.row == row and active.column == column) return;
+        for (self.pending.items[0..self.pending.count]) |item| if (item.row == row and item.column == column) return;
+        // Bounded queue. A short window/copy retries any request that didn't fit.
+        if (self.pending.count == cache_slots) return;
+        self.pending.items[self.pending.count] = .{ .row = row, .column = column };
+        self.pending.count += 1;
+    }
+
+    pub fn hasPending(self: *Data) bool {
+        const io = @import("sysio.zig").io();
+        self.pending.mutex.lockUncancelable(io);
+        defer self.pending.mutex.unlock(io);
+        return self.pending.count != 0 or self.pending.active != null;
+    }
+
+    /// Called by the document's cancellable network worker, mutex released.
+    /// One page per turn lets control calls and other jobs arbitrate regularly.
+    pub fn fetchPending(self: *Data) void {
+        const io = @import("sysio.zig").io();
+        self.pending.mutex.lockUncancelable(io);
+        if (self.pending.count == 0) {
+            self.pending.mutex.unlock(io);
+            return;
+        }
+        const item = self.pending.items[0];
+        self.pending.count -= 1;
+        std.mem.copyForwards(Request, self.pending.items[0..self.pending.count], self.pending.items[1 .. self.pending.count + 1]);
+        self.pending.active = item;
+        self.pending.mutex.unlock(io);
+        var text: std.ArrayList(u8) = .empty;
+        _ = self.appendCell(item.row, item.column, 0, &text, self.gpa) catch {};
+        self.pending.mutex.lockUncancelable(io);
+        self.pending.active = null;
+        if (self.failed.load(.acquire)) self.pending.count = 0;
+        self.pending.mutex.unlock(io);
     }
 
     fn groupForRow(self: *const Data, row: u64) usize {
@@ -212,6 +307,7 @@ pub const Data = struct {
     fn loadPage(self: *Data, slot: *Page, group: usize, column: u32, row: u64) Error!void {
         slot.arena = std.heap.ArenaAllocator.init(self.budget.allocator());
         const alloc = slot.arena.?.allocator();
+        if (self.remote) |remote| return self.loadRemotePage(slot, alloc, remote, group, column, row);
         const meta = self.reader.metadata.row_groups[group].columns[column].meta_data.?;
         const schema = self.reader.metadata.schema[@as(usize, column) + 1];
         const start: usize = @intCast(if (meta.dictionary_page_offset) |d| if (d > 0) d else meta.data_page_offset else meta.data_page_offset);
@@ -249,6 +345,57 @@ pub const Data = struct {
             return;
         }
         return error.InvalidParquet;
+    }
+
+    fn loadRemotePage(self: *Data, slot: *Page, alloc: std.mem.Allocator, remote: remote_mod.Source, group: usize, column: u32, row: u64) Error!void {
+        const row_group = self.reader.metadata.row_groups[group];
+        const chunk = row_group.columns[column];
+        const meta = chunk.meta_data.?;
+        const schema = self.reader.metadata.schema[@as(usize, column) + 1];
+        var navigator: ?*remote_mod.Navigator = null;
+        for (&self.navigators) |*nav| if (nav.arena != null and nav.group == group and nav.column == column) {
+            navigator = nav;
+            break;
+        };
+        if (navigator == null) {
+            var victim = &self.navigators[0];
+            for (&self.navigators) |*nav| {
+                if (nav.arena == null) {
+                    victim = nav;
+                    break;
+                }
+                if (nav.used < victim.used) victim = nav;
+            }
+            try victim.init(self.budget.allocator(), remote, chunk, @intCast(row_group.num_rows), self.bytes.len, group, column);
+            navigator = victim;
+        }
+        navigator.?.used = self.clock;
+        var located = try navigator.?.locate(self.budget.allocator(), remote, chunk, @intCast(row_group.num_rows), row);
+        defer located.header.deinit();
+        try located.header.body(remote);
+        const page = located.header.info;
+        try checkCrc(page.header, page.body);
+        var dict = low.DictionarySet.init(alloc);
+        const encoding = if (page.header.data_page_header) |h| h.encoding else page.header.data_page_header_v2.?.encoding;
+        if (encoding == .plain_dictionary or encoding == .rle_dictionary) {
+            const offset = meta.dictionary_page_offset orelse return error.InvalidParquet;
+            if (offset < 4 or offset >= meta.data_page_offset) return error.InvalidParquet;
+            var dictionary = try remote_mod.readHeader(self.budget.allocator(), remote, @intCast(offset), @intCast(meta.data_page_offset));
+            defer dictionary.deinit();
+            const dict_header = dictionary.info.header.dictionary_page_header orelse return error.InvalidParquet;
+            if (dict_header.num_values < 0 or dict_header.num_values > page_values_limit) return error.InvalidParquet;
+            try dictionary.body(remote);
+            try checkCrc(dictionary.info.header, dictionary.info.body);
+            dict.initFromPage(dictionary.info.body, @intCast(dict_header.num_values), schema.type_, schema.type_length, meta.codec, @intCast(dictionary.info.header.uncompressed_page_size)) catch |err| return convertError(err);
+        }
+        const decoded = decodePage(alloc, schema, meta.codec, page, &dict) catch |err| return convertError(err);
+        if (decoded.values.len != located.count or row < located.first or row - located.first >= located.count) return error.InvalidParquet;
+        slot.group = group;
+        slot.column = column;
+        slot.first = located.first;
+        slot.values = decoded.values;
+        self.pages_decoded += 1;
+        self.decoded_bytes += @intCast(page.header.uncompressed_page_size);
     }
 };
 

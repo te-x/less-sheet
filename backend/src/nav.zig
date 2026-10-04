@@ -59,6 +59,7 @@ fn relexBlock(doc: *Document, filter_ctx: ?MatchCtx, primary_ctx: MatchCtx, b: u
     var result: ?Match = null;
     while (row < hi and !doc.reader.atEnd(doc.source, pos)) : (row += 1) {
         const res = @import("reader.zig").readerMatchRow(doc.reader, doc.source, pos, primary_ctx, filter_ctx, .{});
+        if (res.next.logical == pos.logical) return null;
         chargeNav(doc, pos, res.next);
         if (res.matched_col) |col| {
             result = .{ .row = row, .col = col };
@@ -114,6 +115,7 @@ fn countInBlockUpTo(doc: *Document, filter_ctx: ?MatchCtx, primary_ctx: MatchCtx
     var count: u64 = 0;
     while (r <= row and !doc.reader.atEnd(doc.source, pos)) : (r += 1) {
         const res = @import("reader.zig").readerMatchRow(doc.reader, doc.source, pos, primary_ctx, filter_ctx, .{});
+        if (res.next.logical == pos.logical) return 0;
         chargeNav(doc, pos, res.next);
         if (res.matched_col != null) count += 1;
         pos = res.next;
@@ -216,7 +218,8 @@ fn nthMatchInBlock(doc: *Document, ctx: MatchCtx, b: u64, hi_bound: u64, need: u
         const row_limit = doc.reader.posAtByteBudget(doc.source, pos, api.window_row_scan_max_bytes);
         doc.nav_scratch.clearRetainingCapacity();
         doc.nav_refs.clearRetainingCapacity();
-        const res = doc.reader.materialize(doc.source, pos, doc.column_count, null, row_limit, &doc.nav_scratch, &doc.nav_refs, doc.gpa) catch return null;
+        const tested = filterCandidate(doc, pos, row_limit, ctx) orelse return null;
+        const res = tested.result;
         // Count this ROW TESTED (the copy path's source-row-advance count) when
         // the caller wants it; every other caller passes null and pays nothing.
         if (advances) |a| a.* += 1;
@@ -237,7 +240,7 @@ fn nthMatchInBlock(doc: *Document, ctx: MatchCtx, b: u64, hi_bound: u64, need: u
             }
             continue;
         }
-        if (matcher.matchRecord(ctx, doc.nav_scratch.items, doc.nav_refs.items) != null) {
+        if (tested.matched) {
             if (seen == need) return .{ .row = row, .pos = row_pos };
             seen += 1;
         }
@@ -363,7 +366,8 @@ pub fn nthMatchForwardFrom(doc: *Document, ctx: MatchCtx, hi_bound: u64, from_ro
         const row_limit = doc.reader.posAtByteBudget(doc.source, pos, api.window_row_scan_max_bytes);
         doc.nav_scratch.clearRetainingCapacity();
         doc.nav_refs.clearRetainingCapacity();
-        const res = doc.reader.materialize(doc.source, pos, doc.column_count, null, row_limit, &doc.nav_scratch, &doc.nav_refs, doc.gpa) catch return null;
+        const tested = filterCandidate(doc, pos, row_limit, ctx) orelse return null;
+        const res = tested.result;
         advances.* += 1;
         if (res.capped) {
             const matched = oversizedMatch(doc.filter_oversized_matches.items, row) orelse false;
@@ -376,7 +380,7 @@ pub fn nthMatchForwardFrom(doc: *Document, ctx: MatchCtx, hi_bound: u64, from_ro
             row = skip_cp.row;
             continue;
         }
-        if (matcher.matchRecord(ctx, doc.nav_scratch.items, doc.nav_refs.items) != null) {
+        if (tested.matched) {
             seen += 1;
             if (seen == skip) return .{ .row = row, .pos = row_pos };
         }
@@ -384,4 +388,15 @@ pub fn nthMatchForwardFrom(doc: *Document, ctx: MatchCtx, hi_bound: u64, from_ro
         row += 1;
     }
     return null;
+}
+
+const FilterCandidate = struct { result: @import("reader.zig").MaterializeResult, matched: bool };
+fn filterCandidate(doc: *Document, pos: Pos, limit: Pos, ctx: MatchCtx) ?FilterCandidate {
+    if (doc.reader == .parquet and doc.net) {
+        const matched = @import("reader.zig").readerMatchRow(doc.reader, doc.source, pos, ctx, null, .{});
+        if (matched.next.logical == pos.logical) return null;
+        return .{ .result = .{ .next = matched.next, .capped = matched.capped }, .matched = matched.matched_col != null };
+    }
+    const result = doc.reader.materialize(doc.source, pos, doc.column_count, null, limit, &doc.nav_scratch, &doc.nav_refs, doc.gpa) catch return null;
+    return .{ .result = result, .matched = matcher.matchRecord(ctx, doc.nav_scratch.items, doc.nav_refs.items) != null };
 }

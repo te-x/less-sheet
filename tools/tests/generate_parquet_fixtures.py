@@ -50,6 +50,18 @@ many = pa.table({'id': pa.array(range(5000), type=pa.int64()),
                  'name': ['last' if i == 4999 else 'row' for i in range(5000)]})
 pq.write_table(many, root / 'blocks.parquet', row_group_size=5000,
                data_page_size=1024, compression='snappy', write_page_index=True)
+# Remote navigation spans several HTTP cache chunks in one row group.
+# No dictionary on the numeric columns; the string column exercises it.
+remote_rows = 65536
+remote = pa.table({'id': pa.array(range(remote_rows), type=pa.int64()),
+                   'noise': pa.array([(i * 6364136223846793005 + 1442695040888963407) % 2**64
+                                      for i in range(remote_rows)], type=pa.uint64()),
+                   'label': ['last' if i == remote_rows - 1 else 'row' for i in range(remote_rows)]})
+for indexed in (False, True):
+    pq.write_table(remote, root / ('remote-indexed.parquet' if indexed else 'remote-unindexed.parquet'),
+                   row_group_size=remote_rows, compression='snappy',
+                   use_dictionary=['label'], data_page_size=4096, write_batch_size=256,
+                   write_page_index=indexed, write_page_checksum=True)
 if args.large:
     args.large.mkdir(parents=True, exist_ok=True)
     # Pages are small; the 10M-row group must never be eagerly decoded on open.

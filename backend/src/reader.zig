@@ -26,6 +26,7 @@ const csv_reader = @import("csv_reader.zig");
 const parquet_reader = @import("parquet_reader.zig");
 
 pub const Source = source_mod.Source;
+pub const ReadError = error{ OutOfMemory, WouldBlock };
 pub const CellRef = base.CellRef;
 
 /// Opaque row position. CSV records the immutable logical inflated offset and
@@ -35,7 +36,7 @@ pub const Pos = struct { logical: u64, physical: u64 };
 
 pub const BoundsResult = struct { next: Pos, capped: bool };
 pub const MaterializeResult = struct { next: Pos, capped: bool };
-pub const CellResult = struct { len: usize, truncated: bool };
+pub const CellResult = struct { len: usize, truncated: bool, pending: bool = false };
 pub const ScanRowsResult = struct { next: Pos, rows: u64, eof: bool };
 pub const SelectedStep = csv_reader.SelectedStep;
 
@@ -57,7 +58,7 @@ pub const SelectedScanner = union(enum) {
         }
     }
 
-    pub fn step(self: *SelectedScanner, selected: []const u32, cap: usize, work_budget: u64, row_budget: u64, buf: *std.ArrayList(u8), refs: *std.ArrayList(CellRef), gpa: std.mem.Allocator) std.mem.Allocator.Error!SelectedStep {
+    pub fn step(self: *SelectedScanner, selected: []const u32, cap: usize, work_budget: u64, row_budget: u64, buf: *std.ArrayList(u8), refs: *std.ArrayList(CellRef), gpa: std.mem.Allocator) ReadError!SelectedStep {
         return switch (self.*) {
             .csv => |*scanner| scanner.step(selected, cap, work_budget, row_budget, buf, refs, gpa),
             .parquet => |*scanner| scanner.step(selected, cap, work_budget, row_budget, buf, refs, gpa),
@@ -174,7 +175,7 @@ pub const Reader = union(enum) {
         buf: *std.ArrayList(u8),
         refs: *std.ArrayList(CellRef),
         gpa: std.mem.Allocator,
-    ) std.mem.Allocator.Error!MaterializeResult {
+    ) ReadError!MaterializeResult {
         return switch (self) {
             .csv => |r| r.materialize(source, pos, want, cap, limit, buf, refs, gpa),
             .parquet => |r| r.materialize(source, pos, want, cap, limit, buf, refs, gpa),
@@ -182,7 +183,7 @@ pub const Reader = union(enum) {
     }
 
     /// Window-only projection; background jobs always see the full reader.
-    pub fn materializeWindow(self: Reader, source: Source, pos: Pos, want: u32, first_col: u32, last_col: u32, cap: usize, limit: ?Pos, buf: *std.ArrayList(u8), refs: *std.ArrayList(CellRef), gpa: std.mem.Allocator) std.mem.Allocator.Error!MaterializeResult {
+    pub fn materializeWindow(self: Reader, source: Source, pos: Pos, want: u32, first_col: u32, last_col: u32, cap: usize, limit: ?Pos, buf: *std.ArrayList(u8), refs: *std.ArrayList(CellRef), gpa: std.mem.Allocator) ReadError!MaterializeResult {
         return switch (self) {
             .csv => |r| r.materialize(source, pos, want, cap, limit, buf, refs, gpa),
             .parquet => |r| r.materializeWindow(source, pos, want, first_col, last_col, cap, limit, buf, refs, gpa),
@@ -201,7 +202,7 @@ pub const Reader = union(enum) {
         buf: *std.ArrayList(u8),
         refs: *std.ArrayList(CellRef),
         gpa: std.mem.Allocator,
-    ) std.mem.Allocator.Error!MaterializeResult {
+    ) ReadError!MaterializeResult {
         return switch (self) {
             .csv => |r| r.materializeSelected(source, pos, selected, cap, limit, buf, refs, gpa),
             .parquet => |r| r.materializeSelected(source, pos, selected, cap, limit, buf, refs, gpa),

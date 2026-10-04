@@ -1078,11 +1078,15 @@ void ls_close(ls_doc *doc);
 /* Document facts (constant after open; zero-alloc; total)                    */
 /* ------------------------------------------------------------------------- */
 
-/* Local Parquet files are detected by magic, always use their schema as the
+/* Local and HTTP(S) Parquet files are detected by magic, use their schema as the
  * header, and ignore delimited-text open options. Nested/repeated schemas and
  * encrypted files are not supported. Decoded pages and metadata have a bounded
  * cache. Window and full-cell copy may allocate on a Parquet page-cache miss.
  * Unsupported, malformed or over-budget input fails with LS_ERROR_IO.
+ * HTTP reads use cached byte ranges; a server without range support downloads
+ * the whole file during asynchronous open. Exact row count does not mean all
+ * pages are downloaded: a short window is retried, and full-cell copy returns
+ * LS_COPY_PENDING until its page arrives. Foreground calls never fetch.
  * Poll document_status after a window/copy to detect a later page failure. */
 bool ls_document_is_parquet(const ls_doc *doc);
 ls_status ls_document_status(const ls_doc *doc);

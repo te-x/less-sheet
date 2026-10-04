@@ -32,6 +32,17 @@ const sort_mod = @import("sort.zig");
 const posix = std.posix;
 const sysio = @import("sysio.zig");
 
+// A remote Parquet page may be absent even behind the exact row frontier.
+// Track control-lock ownership on this thread so reader callbacks never fetch
+// while a navigation/commit holds a document mutex.
+threadlocal var control_lock_depth: usize = 0;
+pub fn controlLocked() bool {
+    return control_lock_depth != 0;
+}
+pub fn parquetPending(doc: *Document) bool {
+    return doc.reader == .parquet and doc.reader.parquet.data.remote != null and doc.reader.parquet.data.hasPending();
+}
+
 /// Re-exported so sibling modules can keep writing `base.Pos` (matching how
 /// they already reference `base.CellRef`/`base.Checkpoint`) without a
 /// separate import of reader.zig. See reader.zig's module doc for what
@@ -719,8 +730,10 @@ pub const Document = struct {
 
     pub fn lock(self: *Document) void {
         self.mutex.lockUncancelable(sysio.io());
+        control_lock_depth += 1;
     }
     pub fn unlock(self: *Document) void {
+        control_lock_depth -= 1;
         self.mutex.unlock(sysio.io());
     }
     pub fn wakeWorker(self: *Document) void {

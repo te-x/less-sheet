@@ -34,7 +34,7 @@ pub const ParquetReader = struct {
         const next = if (self.atEnd(source, pos)) pos else self.coordinate(pos.logical / stride + 1);
         return .{ .next = if (limit) |l| if (next.logical > l.logical) l else next else next, .capped = if (limit) |l| next.logical > l.logical else false };
     }
-    fn append(self: ParquetReader, pos: Pos, column: u32, cap: usize, buf: *std.ArrayList(u8), refs: *std.ArrayList(base.CellRef), gpa: std.mem.Allocator) std.mem.Allocator.Error!void {
+    fn append(self: ParquetReader, pos: Pos, column: u32, cap: usize, buf: *std.ArrayList(u8), refs: *std.ArrayList(base.CellRef), gpa: std.mem.Allocator) seam.ReadError!void {
         const cell_start = buf.items.len;
         var truncated = false;
         if (column < self.data.columns) {
@@ -45,6 +45,7 @@ pub const ParquetReader = struct {
                 truncated = len < name.len;
             } else {
                 truncated = self.data.appendCell(pos.logical / stride - 1, column, cap, buf, gpa) catch |err| {
+                    if (err == error.WouldBlock) return error.WouldBlock;
                     self.data.failed.store(true, .release);
                     if (err == error.OutOfMemory) return error.OutOfMemory;
                     return;
@@ -53,32 +54,68 @@ pub const ParquetReader = struct {
         }
         try refs.append(gpa, .{ .start = cell_start, .len = buf.items.len - cell_start, .truncated = truncated });
     }
-    pub fn materialize(self: ParquetReader, source: seam.Source, pos: Pos, want: ?u32, cap: ?usize, limit: ?Pos, buf: *std.ArrayList(u8), refs: *std.ArrayList(base.CellRef), gpa: std.mem.Allocator) std.mem.Allocator.Error!seam.MaterializeResult {
+    pub fn materialize(self: ParquetReader, source: seam.Source, pos: Pos, want: ?u32, cap: ?usize, limit: ?Pos, buf: *std.ArrayList(u8), refs: *std.ArrayList(base.CellRef), gpa: std.mem.Allocator) seam.ReadError!seam.MaterializeResult {
+        const buf_mark = buf.items.len;
+        const refs_mark = refs.items.len;
+        errdefer {
+            buf.items.len = buf_mark;
+            refs.items.len = refs_mark;
+        }
+        var pending = false;
         const bounds = self.boundsAfter(source, pos, limit);
         if (self.atEnd(source, pos)) return .{ .next = pos, .capped = false };
         for (0..(want orelse self.data.columns)) |col| {
-            try self.append(pos, @intCast(col), cap orelse std.math.maxInt(usize), buf, refs, gpa);
+            self.append(pos, @intCast(col), cap orelse std.math.maxInt(usize), buf, refs, gpa) catch |err| {
+                if (err == error.WouldBlock) {
+                    pending = true;
+                } else return err;
+            };
             if (self.data.failed.load(.acquire)) break;
         }
+        if (pending) return error.WouldBlock;
         return .{ .next = bounds.next, .capped = bounds.capped };
     }
-    pub fn materializeWindow(self: ParquetReader, source: seam.Source, pos: Pos, want: u32, first_col: u32, last_col: u32, cap: usize, limit: ?Pos, buf: *std.ArrayList(u8), refs: *std.ArrayList(base.CellRef), gpa: std.mem.Allocator) std.mem.Allocator.Error!seam.MaterializeResult {
+    pub fn materializeWindow(self: ParquetReader, source: seam.Source, pos: Pos, want: u32, first_col: u32, last_col: u32, cap: usize, limit: ?Pos, buf: *std.ArrayList(u8), refs: *std.ArrayList(base.CellRef), gpa: std.mem.Allocator) seam.ReadError!seam.MaterializeResult {
+        const buf_mark = buf.items.len;
+        const refs_mark = refs.items.len;
+        errdefer {
+            buf.items.len = buf_mark;
+            refs.items.len = refs_mark;
+        }
+        var pending = false;
         const bounds = self.boundsAfter(source, pos, limit);
         if (!self.atEnd(source, pos)) for (0..want) |column| {
             const col: u32 = @intCast(column);
             if (col >= first_col and col < last_col) {
-                try self.append(pos, col, cap, buf, refs, gpa);
+                self.append(pos, col, cap, buf, refs, gpa) catch |err| {
+                    if (err == error.WouldBlock) {
+                        pending = true;
+                    } else return err;
+                };
             } else try refs.append(gpa, .{ .start = buf.items.len, .len = 0, .truncated = false });
             if (self.data.failed.load(.acquire)) break;
         };
+        if (pending) return error.WouldBlock;
         return .{ .next = bounds.next, .capped = bounds.capped };
     }
-    pub fn materializeSelected(self: ParquetReader, source: seam.Source, pos: Pos, selected: []const u32, cap: usize, limit: ?Pos, buf: *std.ArrayList(u8), refs: *std.ArrayList(base.CellRef), gpa: std.mem.Allocator) std.mem.Allocator.Error!seam.MaterializeResult {
+    pub fn materializeSelected(self: ParquetReader, source: seam.Source, pos: Pos, selected: []const u32, cap: usize, limit: ?Pos, buf: *std.ArrayList(u8), refs: *std.ArrayList(base.CellRef), gpa: std.mem.Allocator) seam.ReadError!seam.MaterializeResult {
+        const buf_mark = buf.items.len;
+        const refs_mark = refs.items.len;
+        errdefer {
+            buf.items.len = buf_mark;
+            refs.items.len = refs_mark;
+        }
+        var pending = false;
         const bounds = self.boundsAfter(source, pos, limit);
         if (!self.atEnd(source, pos)) for (selected) |col| {
-            try self.append(pos, col, cap, buf, refs, gpa);
+            self.append(pos, col, cap, buf, refs, gpa) catch |err| {
+                if (err == error.WouldBlock) {
+                    pending = true;
+                } else return err;
+            };
             if (self.data.failed.load(.acquire)) break;
         };
+        if (pending) return error.WouldBlock;
         return .{ .next = bounds.next, .capped = bounds.capped };
     }
     pub fn cell(self: ParquetReader, source: seam.Source, pos: Pos, col: u32, _: ?Pos, output: ?[*]u8, capacity: usize) seam.CellResult {
@@ -86,7 +123,8 @@ pub const ParquetReader = struct {
         // Use caller storage directly. A page-cache hit needs no allocation.
         const cap = if (output != null) capacity else 0;
         var text: std.ArrayList(u8) = .{ .items = if (output) |p| p[0..0] else &.{}, .capacity = cap };
-        const truncated = self.data.appendCell(pos.logical / stride - 1, col, cap, &text, self.data.gpa) catch {
+        const truncated = self.data.appendCell(pos.logical / stride - 1, col, cap, &text, self.data.gpa) catch |err| {
+            if (err == error.WouldBlock) return .{ .len = 0, .truncated = false, .pending = true };
             self.data.failed.store(true, .release);
             return .{ .len = 0, .truncated = true };
         };
@@ -107,7 +145,8 @@ pub const ParquetReader = struct {
             const f = if (filter_ctx) |ctx| relevant(ctx, col) and !filtered else false;
             if (!p and !f) continue;
             text.clearRetainingCapacity();
-            _ = self.data.appendCell(pos.logical / stride - 1, col, std.math.maxInt(usize), &text, self.data.gpa) catch {
+            _ = self.data.appendCell(pos.logical / stride - 1, col, std.math.maxInt(usize), &text, self.data.gpa) catch |err| {
+                if (err == error.WouldBlock) return .{ .next = pos, .matched_col = null, .filter_matched = false, .capped = false, .end = .inflating };
                 self.data.failed.store(true, .release);
                 break;
             };
@@ -129,7 +168,7 @@ pub const SelectedScanner = struct {
     pos: Pos,
     pub fn deinit(_: *SelectedScanner) void {}
     pub fn releaseLane(_: *SelectedScanner) void {}
-    pub fn step(self: *SelectedScanner, selected: []const u32, cap: usize, _: u64, _: u64, buf: *std.ArrayList(u8), refs: *std.ArrayList(base.CellRef), gpa: std.mem.Allocator) std.mem.Allocator.Error!seam.SelectedStep {
+    pub fn step(self: *SelectedScanner, selected: []const u32, cap: usize, _: u64, _: u64, buf: *std.ArrayList(u8), refs: *std.ArrayList(base.CellRef), gpa: std.mem.Allocator) seam.ReadError!seam.SelectedStep {
         const result = try self.reader.materializeSelected(self.source, self.pos, selected, cap, null, buf, refs, gpa);
         self.pos = result.next;
         return .{ .done = result.next };

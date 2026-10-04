@@ -97,3 +97,90 @@ test "Parquet decimals stored as integers and time logical values" {
         try std.testing.expectEqualStrings("12:34:56.789000000", text.items);
     }
 }
+
+threadlocal var remote_fetch_allowed: bool = true;
+const RemoteFixture = struct {
+    bytes: []const u8,
+    fetched: u64 = 0,
+    requests: u64 = 0,
+    header_reads: u64 = 0,
+    fetching_data: ?*Data = null,
+    saw_active_pending: bool = false,
+    fn canFetch() bool {
+        return remote_fetch_allowed;
+    }
+    fn read(ctx: *anyopaque, offset: u64, length: u64) []const u8 {
+        const self: *RemoteFixture = @ptrCast(@alignCast(ctx));
+        std.debug.assert(remote_fetch_allowed);
+        if (self.fetching_data) |data| self.saw_active_pending = data.hasPending();
+        self.fetched += length;
+        self.requests += 1;
+        if (length == 4096) self.header_reads += 1;
+        if (offset > self.bytes.len or length > self.bytes.len - offset) return &.{};
+        return self.bytes[@intCast(offset)..][0..@intCast(length)];
+    }
+    fn source(self: *RemoteFixture) @import("parquet_data").RemoteSource {
+        return .{ .ctx = self, .read = read, .can_fetch = canFetch };
+    }
+};
+
+test "remote Parquet pages use ranges, yield without IO and retain navigation" {
+    inline for (.{ @embedFile("fixtures/parquet/remote-indexed.parquet"), @embedFile("fixtures/parquet/remote-unindexed.parquet") }, 0..) |input, variant| {
+        var fixture: RemoteFixture = .{ .bytes = input };
+        const data = try Data.initRemote(gpa, input, fixture.source());
+        defer data.deinit();
+        try std.testing.expect(fixture.fetched < 16 * 1024);
+        var text: std.ArrayList(u8) = .empty;
+        defer text.deinit(gpa);
+        const before = fixture.requests;
+        remote_fetch_allowed = false;
+        defer remote_fetch_allowed = true;
+        try std.testing.expectError(error.WouldBlock, data.appendCell(65535, 1, 64, &text, gpa));
+        try std.testing.expect(!data.failed.load(.acquire));
+        try std.testing.expectEqual(before, fixture.requests);
+        try std.testing.expect(data.hasPending());
+        remote_fetch_allowed = true;
+        fixture.fetching_data = data;
+        data.fetchPending();
+        fixture.fetching_data = null;
+        try std.testing.expect(fixture.saw_active_pending);
+        try std.testing.expect(!data.failed.load(.acquire));
+        try std.testing.expect(!data.hasPending());
+        const headers_before = fixture.header_reads;
+        _ = try data.appendCell(65535, 1, 64, &text, gpa);
+        try std.testing.expectEqualStrings("12673362341216059938", text.items);
+        if (variant == 0) try std.testing.expect(headers_before <= 2) else try std.testing.expect(headers_before > 50);
+        text.clearRetainingCapacity();
+        // Read a different, earlier page without scanning its predecessors again.
+        _ = try data.appendCell(60000, 1, 64, &text, gpa);
+        try std.testing.expect(fixture.header_reads <= headers_before + 1);
+        try std.testing.expect(data.budget.peak <= 64 * 1024 * 1024);
+        remote_fetch_allowed = false;
+        const fetched = fixture.requests;
+        text.clearRetainingCapacity();
+        _ = try data.appendCell(60000, 1, 64, &text, gpa);
+        try std.testing.expectEqual(fetched, fixture.requests);
+        remote_fetch_allowed = true;
+    }
+}
+
+test "remote Parquet codecs, dictionaries, page versions and logical types" {
+    inline for (cases) |input| {
+        var fixture: RemoteFixture = .{ .bytes = input };
+        const data = try Data.initRemote(gpa, input, fixture.source());
+        defer data.deinit();
+        var text: std.ArrayList(u8) = .empty;
+        defer text.deinit(gpa);
+        _ = try data.appendCell(6, 1, 64, &text, gpa);
+        try std.testing.expectEqualStrings("東京", text.items);
+        text.clearRetainingCapacity();
+        _ = try data.appendCell(0, 7, 64, &text, gpa);
+        try std.testing.expectEqualStrings("18446744073709551615", text.items);
+        text.clearRetainingCapacity();
+        _ = try data.appendCell(1, 6, 64, &text, gpa);
+        try std.testing.expectEqualStrings("-0.0012", text.items);
+        text.clearRetainingCapacity();
+        _ = try data.appendCell(2, 3, 64, &text, gpa);
+        try std.testing.expectEqualStrings("", text.items);
+    }
+}

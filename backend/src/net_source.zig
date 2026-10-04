@@ -239,7 +239,7 @@ pub fn parseContentRangeTotal(head_bytes: []const u8) ?u64 {
 /// (`RealTransport.probe`), which must not keep a body that does not begin at
 /// byte 0. Splitting these into two scanners would be two places to get the same
 /// header wrong. Either field is null when absent, `*`, or unparseable.
-const ContentRange = struct { start: ?u64 = null, total: ?u64 = null };
+const ContentRange = struct { start: ?u64 = null, end: ?u64 = null, total: ?u64 = null };
 
 fn parseContentRange(head_bytes: []const u8) ContentRange {
     var lines = std.mem.splitSequence(u8, head_bytes, "\r\n");
@@ -269,9 +269,24 @@ fn parseContentRange(head_bytes: []const u8) ContentRange {
             std.fmt.parseInt(u64, rng[0..dash], 10) catch null
         else
             null;
-        return .{ .start = start, .total = total };
+        const end: ?u64 = if (std.mem.indexOfScalar(u8, rng, '-')) |dash|
+            std.fmt.parseInt(u64, rng[dash + 1 ..], 10) catch null
+        else
+            null;
+        return .{ .start = start, .end = end, .total = total };
     }
     return .{};
+}
+
+fn headerValue(head_bytes: []const u8, name: []const u8) ?[]const u8 {
+    var lines = std.mem.splitSequence(u8, head_bytes, "\r\n");
+    _ = lines.next();
+    while (lines.next()) |line| {
+        if (line.len == 0) break;
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        if (std.ascii.eqlIgnoreCase(line[0..colon], name)) return std.mem.trim(u8, line[colon + 1 ..], " \t");
+    }
+    return null;
 }
 
 /// The pure fill-strategy / length classification from a SUCCESSFUL (2xx)
@@ -351,6 +366,9 @@ pub const RealTransport = struct {
     /// otherwise.
     head_buf: []u8 = &.{},
     head_len: u64 = 0,
+    resource_total: ?u64 = null,
+    etag: ?[]u8 = null,
+    last_modified: ?[]u8 = null,
 
     pub fn init(gpa: std.mem.Allocator, url: []const u8) !*RealTransport {
         const self = try gpa.create(RealTransport);
@@ -364,6 +382,8 @@ pub const RealTransport = struct {
 
     pub fn deinit(self: *RealTransport) void {
         self.releaseHead();
+        if (self.etag) |etag| self.gpa.free(etag);
+        if (self.last_modified) |modified| self.gpa.free(modified);
         if (self.seq) |ss| {
             ss.req.deinit();
             self.gpa.destroy(ss);
@@ -392,7 +412,10 @@ pub const RealTransport = struct {
                 self.gpa.destroy(ss);
                 return .{ .n = 0, .eof = true };
             };
-            ss.* = .{ .req = self.client.request(.GET, uri, .{ .redirect_behavior = .init(redirect_cap) }) catch {
+            ss.* = .{ .req = self.client.request(.GET, uri, .{
+                .redirect_behavior = .init(redirect_cap),
+                .headers = .{ .accept_encoding = .{ .override = "identity" } },
+            }) catch {
                 self.gpa.destroy(ss);
                 return .{ .n = 0, .eof = true };
             }, .response = undefined };
@@ -408,7 +431,7 @@ pub const RealTransport = struct {
                 return .{ .n = 0, .eof = true };
             };
             const code = @intFromEnum(ss.response.head.status);
-            if (code < 200 or code >= 300) {
+            if (code < 200 or code >= 300 or ss.response.head.content_encoding != .identity) {
                 abandonBody(&ss.response); // as in `probe`, and for the same reason
                 ss.req.deinit();
                 self.gpa.destroy(ss);
@@ -471,6 +494,7 @@ pub const RealTransport = struct {
         // handshake against an unscanned CA bundle. Never hand-roll this.
         var req = self.client.request(.GET, uri, .{
             .redirect_behavior = .init(redirect_cap),
+            .headers = .{ .accept_encoding = .{ .override = "identity" } },
             .extra_headers = &.{.{ .name = "range", .value = range_val }},
         }) catch return .{ .err = .unreachable_ };
         defer req.deinit();
@@ -495,6 +519,10 @@ pub const RealTransport = struct {
             abandonBody(&response); // or `req.deinit` drains it — see abandonBody
             return .{ .err = .http_status, .http_status = code };
         }
+        if (response.head.content_encoding != .identity) {
+            abandonBody(&response);
+            return .{ .err = .io };
+        }
         // Extract every needed field from `response.head` (a view into
         // `redirect_buf`) BEFORE touching the body reader below — reading the
         // body can reuse/overwrite that same buffer, so any head-field slice
@@ -503,6 +531,20 @@ pub const RealTransport = struct {
         const content_length: ?u64 = response.head.content_length;
         const cr: ContentRange = if (code == 206) parseContentRange(response.head.bytes) else .{};
         const range_total: ?u64 = cr.total;
+        if (code == 206 and cr.total != null) {
+            const total = cr.total.?;
+            if (total == 0 or cr.start == null or cr.start.? != 0 or cr.end == null or cr.end.? != @min(total, open_bytes) - 1 or
+                !std.ascii.startsWithIgnoreCase(headerValue(response.head.bytes, "content-range") orelse "", "bytes "))
+            {
+                abandonBody(&response);
+                return .{ .err = .io };
+            }
+            self.resource_total = total;
+            if (headerValue(response.head.bytes, "etag")) |etag| {
+                if (!std.mem.startsWith(u8, etag, "W/")) self.etag = self.gpa.dupe(u8, etag) catch return .{ .err = .io };
+            }
+            if (headerValue(response.head.bytes, "last-modified")) |modified| self.last_modified = self.gpa.dupe(u8, modified) catch return .{ .err = .io };
+        }
         // Is this response the RANDOM-fill head, i.e. is its body the very bytes
         // `buildNet` is about to demand? Exactly when `decideProbe` will answer
         // `.range` (206 + a usable total) AND the server actually served from
@@ -580,10 +622,21 @@ pub const RealTransport = struct {
         const uri = std.Uri.parse(self.url) catch return .failed;
         var range_buf: [64]u8 = undefined;
         const range_val = std.fmt.bufPrint(&range_buf, "bytes={d}-{d}", .{ at, at + out.len - 1 }) catch return .failed;
+        var headers: [2]std.http.Header = undefined;
+        headers[0] = .{ .name = "range", .value = range_val };
+        var header_count: usize = 1;
+        if (self.etag) |etag| {
+            headers[1] = .{ .name = "if-match", .value = etag };
+            header_count = 2;
+        } else if (self.last_modified) |modified| {
+            headers[1] = .{ .name = "if-unmodified-since", .value = modified };
+            header_count = 2;
+        }
         // See `probe()`: `request()` owns connect (TLS prelude / `client.now`).
         var req = self.client.request(.GET, uri, .{
             .redirect_behavior = .init(redirect_cap),
-            .extra_headers = &.{.{ .name = "range", .value = range_val }},
+            .headers = .{ .accept_encoding = .{ .override = "identity" } },
+            .extra_headers = headers[0..header_count],
         }) catch return .failed;
         defer req.deinit();
         req.sendBodiless() catch return .failed;
@@ -593,7 +646,18 @@ pub const RealTransport = struct {
         // detect-and-discard, and `uri.scheme` is the origin).
         if (redirectDowngrades(uri.scheme, req.uri.scheme)) return .failed;
         const code = @intFromEnum(response.head.status);
-        if (code < 200 or code >= 300) {
+        const cr = parseContentRange(response.head.bytes);
+        const valid_range = code == 206 and cr.start != null and cr.start.? == at and cr.end != null and
+            cr.end.? == at + out.len - 1 and cr.total == self.resource_total and response.head.content_encoding == .identity and
+            (response.head.content_length == null or response.head.content_length.? == out.len) and
+            std.ascii.startsWithIgnoreCase(headerValue(response.head.bytes, "content-range") orelse "", "bytes ");
+        const same_object = if (self.etag) |etag|
+            if (headerValue(response.head.bytes, "etag")) |current| std.mem.eql(u8, etag, current) else true
+        else if (self.last_modified) |modified|
+            if (headerValue(response.head.bytes, "last-modified")) |current| std.mem.eql(u8, modified, current) else true
+        else
+            true;
+        if (!valid_range or !same_object) {
             abandonBody(&response); // as in `probe`, and for the same reason
             return .failed;
         }
@@ -1117,6 +1181,25 @@ pub const HttpRange = struct {
         return self.spool[@intCast(internal)..@intCast(served_end)];
     }
 
+    /// Random-access cached bytes only. Never waits for the transport or its
+    /// mutex, and never exposes a sparse-spool hole as file contents.
+    pub fn presentSlice(self: *HttpRange, offset: u64, length: u64) []const u8 {
+        if (!self.mutex.tryLock()) return &.{};
+        defer self.unlock();
+        const total = self.physicalTotal() orelse return &.{};
+        if (offset > total or length > total - offset) return &.{};
+        const end = offset + length;
+        if (length == 0) return &.{};
+        if (self.range_mode == 2) {
+            if (end > self.seq_hw.load(.acquire)) return &.{};
+        } else {
+            const first: usize = @intCast(offset / chunk_bytes);
+            const last: usize = @intCast((end - 1) / chunk_bytes);
+            for (self.present[first .. last + 1]) |present| if (!present) return &.{};
+        }
+        return self.spool[@intCast(offset)..@intCast(end)];
+    }
+
     /// gzip compressed provider: ensure the contiguous compressed prefix
     /// is fetched up to `want` and return the present high-water. The inflater
     /// consumes compressed bytes strictly forward; checkpoint replay reads only
@@ -1352,6 +1435,28 @@ pub fn buildNet(gpa: std.mem.Allocator, transport: Transport, opts: NetBuildOpts
     // directly and fetches the full O(head) plain prefix now.
     const seen: u64 = if (opts.range) @min(hr.total, chunk_bytes) else hr.seq_hw.load(.monotonic);
     const is_gz = seen >= 2 and hr.spool.len >= 2 and hr.spool[0] == 0x1f and hr.spool[1] == 0x8b;
+    if (seen >= 4 and @import("parquet_data.zig").Data.isParquet(hr.spool[0..4])) {
+        // A footer-based format needs the tail. Range servers fetch it later
+        // through Data.initRemote; sequential servers must reach EOF first.
+        hr.head_len = @min(seen, open_bytes);
+        if (!opts.range) {
+            while (!hr.eof.load(.acquire) and !hr.shutdown.load(.acquire)) {
+                const at = hr.seq_hw.load(.acquire);
+                _ = hr.ensureSlice(at, 1);
+            }
+            const size = hr.seq_hw.load(.acquire);
+            if (hr.shutdown.load(.acquire) or (opts.total_known and size != opts.total)) {
+                err_out.* = .short_body;
+                hr.deinit();
+                return null;
+            }
+        }
+        const size = hr.physicalTotal() orelse {
+            hr.deinit();
+            return null;
+        };
+        return .{ .source = .{ .http_range = hr }, .mapping = null, .file_size = size, .range_mode = hr.range_mode, .length_known = true, .head_fetched = hr.spool_bytes };
+    }
     if (is_gz) {
         const g = source_mod.gzipOverProvider(gpa, hr) orelse {
             hr.deinit();

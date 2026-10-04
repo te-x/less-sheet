@@ -1,15 +1,16 @@
 # less-sheet
 
-A viewer for very large CSV and local Parquet files, with native frontends for
+A viewer for very large CSV and Parquet files, with native frontends for
 macOS (Swift 6 / AppKit) and Linux (GTK4 + libadwaita) over a Zig engine.
-Cold open through the first visible table has a target of **under 200 ms**.
+Local cold open through the first visible table has a target of **under 200 ms**.
 Parquet opens from footer metadata and decodes only pages needed by the viewport;
-CSV and CSV.gz also support HTTP(S).
+CSV, CSV.gz and Parquet also support HTTP(S). Remote Parquet uses byte ranges
+and cached pages; servers without range support require a full download.
 
 Parquet supports flat scalar schemas, nullable values, dictionary and plain
 encoding, data pages V1/V2, and Snappy, Zstandard, gzip, Brotli and LZ4 compression.
 Schema names supply the headers. Nested/repeated schemas, encrypted files and
-remote Parquet are not supported in this first implementation. Metadata and
+external column files are not supported. Metadata and
 page allocations are bounded; files exceeding those limits fail cleanly.
 
 Website, screenshots and downloads: <https://te-x.github.io/less-sheet/>

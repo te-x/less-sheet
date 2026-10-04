@@ -59,14 +59,22 @@ pub fn buildDocument(
     const from_mmap = source == .mmap;
     const is_gzip = source == .gzip;
     const head_bytes: []const u8 = if (from_mmap) source.mmap.bytes else source.openHead();
-    if (@import("parquet_data.zig").Data.isParquet(head_bytes) and (fd == null or !from_mmap)) {
+    if (@import("parquet_data.zig").Data.isParquet(head_bytes) and !from_mmap and source != .http_range) {
         fault_guard.disarm(fault_slot);
         if (mapping) |m| posix.munmap(m);
         if (fd) |h| sysio.close(h);
         return null;
     }
-    const is_parquet = from_mmap and @import("parquet_data.zig").Data.isParquet(head_bytes);
-    const parquet = if (is_parquet) @import("parquet_data.zig").Data.init(gpa, head_bytes) catch {
+    const is_parquet = @import("parquet_data.zig").Data.isParquet(head_bytes);
+    const parquet = if (is_parquet) (if (source == .http_range)
+        @import("parquet_data.zig").Data.initRemote(gpa, source.http_range.spool[0..@intCast(file_size)], .{
+            .ctx = source.http_range,
+            .read = parquetRead,
+            .peek = parquetPeek,
+            .can_fetch = parquetCanFetch,
+        })
+    else
+        @import("parquet_data.zig").Data.init(gpa, head_bytes)) catch {
         fault_guard.disarm(fault_slot);
         if (mapping) |m| posix.munmap(m);
         if (fd) |h| sysio.close(h);
@@ -248,6 +256,20 @@ pub fn buildDocument(
     source_mod.sourceFinishOpen(&doc.source);
     doc.startWorker(index.workerMain);
     return doc;
+}
+
+fn parquetRead(ctx: *anyopaque, offset: u64, length: u64) []const u8 {
+    const source: *@import("net_source.zig").HttpRange = @ptrCast(@alignCast(ctx));
+    return source.ensureSlice(offset, length);
+}
+
+fn parquetCanFetch() bool {
+    return source_mod.fetchPermitted() and !base.controlLocked();
+}
+
+fn parquetPeek(ctx: *anyopaque, offset: u64, length: u64) []const u8 {
+    const source: *@import("net_source.zig").HttpRange = @ptrCast(@alignCast(ctx));
+    return source.presentSlice(offset, length);
 }
 
 /// Decode record 1, fix the column count, decide the header, and (when the

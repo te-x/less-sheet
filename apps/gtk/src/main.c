@@ -2132,9 +2132,9 @@ action_open_url (GtkButton *button, gpointer data)
   App *app = data;
 
   AdwDialog *dialog = adw_alert_dialog_new ("Open URL", NULL);
-  adw_alert_dialog_set_body (
-      ADW_ALERT_DIALOG (dialog),
-      "Enter an http:// or https:// address of a .csv or .csv.gz file.");
+  adw_alert_dialog_set_body (ADW_ALERT_DIALOG (dialog),
+                             "Enter an http:// or https:// address of a CSV, "
+                             "CSV.gz or Parquet file.");
 
   GtkWidget *entry = gtk_entry_new ();
   gtk_entry_set_input_purpose (GTK_ENTRY (entry), GTK_INPUT_PURPOSE_URL);

@@ -1386,7 +1386,7 @@ fn scanChunk(d: *Document, b: *Build, start_pos: Pos, start_row: u64, pause_limi
     base.beginOversizedChunk(d);
     b.stage.clearRetainingCapacity();
     b.stage_offs.clearRetainingCapacity();
-    const guarded = d.source.commitGuarded();
+    const guarded = d.reader == .csv and d.source.commitGuarded();
     while (row < target) {
         if (d.stop_atomic.load(.monotonic) or d.sort_scan_interrupt.load(.acquire))
             return .{ .end_pos = pos, .end_row = row, .interrupted = true };

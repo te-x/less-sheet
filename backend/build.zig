@@ -56,6 +56,7 @@ pub fn build(b: *std.Build) void {
         \\    pub const reader = @import("core/reader_mod.zig");
         \\    pub const column_decoder = @import("core/column_decoder.zig");
         \\    pub const compress = @import("core/compress/mod.zig");
+        \\    pub const thrift = @import("core/thrift/mod.zig");
         \\};
     );
     const parquet_mod = b.createModule(.{
