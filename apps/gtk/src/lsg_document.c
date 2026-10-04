@@ -156,6 +156,19 @@ lsg_document_column_count (const LsgDocument *doc)
   return ls_column_count (doc->doc);
 }
 
+gboolean
+lsg_document_read_failed (const LsgDocument *doc)
+{
+  return doc != NULL && doc->doc != NULL
+         && ls_document_status (doc->doc) != LS_OK;
+}
+
+gboolean
+lsg_document_is_parquet (const LsgDocument *doc)
+{
+  return doc != NULL && doc->doc != NULL && ls_document_is_parquet (doc->doc);
+}
+
 LsgDialect
 lsg_document_dialect (const LsgDocument *doc)
 {
@@ -249,7 +262,8 @@ lsg_document_set_window (LsgDocument *doc, guint64 first_row,
 
   /* The core clamps row_count to LS_WINDOW_MAX_ROWS and never scans; the
    * returned range starts at the requested first_row. */
-  ls_row_range r = ls_window_set (doc->doc, first_row, row_count);
+  ls_row_range r
+      = ls_window_set_columns (doc->doc, first_row, row_count, fc, cc);
   guint32 rc = (r.row_count > (guint64)LS_WINDOW_MAX_ROWS)
                    ? LS_WINDOW_MAX_ROWS
                    : (guint32)r.row_count;

@@ -94,7 +94,7 @@ extension DocumentModel {
     private func columnFetchRange() -> Range<Int> {
         guard columnCount > 0 else { return 0..<0 }
         guard !columnWindow.isEmpty else {
-            return 0..<min(columnCount, GridMetrics.initialColumnFetchCount)
+            return 0..<min(columnCount, isParquet ? 24 : GridMetrics.initialColumnFetchCount)
         }
         let target = absoluteColumnWindow()
         let buffer = GridMetrics.columnFetchBuffer
@@ -182,6 +182,7 @@ extension DocumentModel {
         let started = progressClock.now
         let columns = columnFetchRange()
         window = session.setWindow(firstRow: desiredStart, rowCount: desiredCount, columns: columns)
+        if session.readFailed { phase = .failure(.ioFailure, path: path) }
         lastWindowFetch = progressClock.now - started
         // The visible bytes just changed, even when the geometry happens to match
         // the previous window, so the highlight mask must refetch.

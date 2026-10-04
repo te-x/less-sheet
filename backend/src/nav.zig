@@ -47,8 +47,8 @@ fn chargeNav(doc: *Document, from: Pos, to: Pos) void {
 /// Re-lex block `b` and evaluate rows [lo, hi); return the first (FORWARD) or
 /// last (BACKWARD) matching row+col, or null. Caller holds the mutex.
 fn relexBlock(doc: *Document, filter_ctx: ?MatchCtx, primary_ctx: MatchCtx, b: u64, lo: u64, hi: u64, dir: api.SearchDir) ?Match {
-    if (b >= doc.checkpoints.items.len) return null;
-    const cp = doc.checkpoints.items[@intCast(b)];
+    if (b >= base.checkpointCount(doc)) return null;
+    const cp = base.checkpointAt(doc, @intCast(b));
     var pos = cp.pos;
     var row = cp.row;
     while (row < lo and !doc.reader.atEnd(doc.source, pos)) : (row += 1) {
@@ -107,8 +107,8 @@ pub fn findBackwardMatch(doc: *Document, block_counts: []const u64, filter_ctx: 
 
 /// Count matches in block `b` for rows [b*interval, row]. Caller holds the mutex.
 fn countInBlockUpTo(doc: *Document, filter_ctx: ?MatchCtx, primary_ctx: MatchCtx, b: u64, row: u64) u64 {
-    if (b >= doc.checkpoints.items.len) return 0;
-    const cp = doc.checkpoints.items[@intCast(b)];
+    if (b >= base.checkpointCount(doc)) return 0;
+    const cp = base.checkpointAt(doc, @intCast(b));
     var pos = cp.pos;
     var r = cp.row;
     var count: u64 = 0;
@@ -159,6 +159,7 @@ fn findCheckpoint(checkpoints: []const Checkpoint, row: u64) Checkpoint {
 /// scanning it. Caller holds the document mutex (reads `d.checkpoints` /
 /// `d.oversized_checkpoints`).
 pub fn bestCheckpoint(d: *Document, row: u64) Checkpoint {
+    if (d.reader.positionForRow(row)) |pos| return .{ .row = row, .pos = pos };
     return bestCheckpointIn(d.checkpoints.items, d.oversized_checkpoints.items, row);
 }
 
@@ -204,8 +205,8 @@ pub fn oversizedMatch(list: []const OversizedMatch, row: u64) ?bool {
 /// the checkpoint the frontier drops immediately after it rather than by
 /// re-scanning its remaining bytes. Caller holds the mutex.
 fn nthMatchInBlock(doc: *Document, ctx: MatchCtx, b: u64, hi_bound: u64, need: u64, advances: ?*u64) ?SourceLoc {
-    if (b >= doc.checkpoints.items.len) return null;
-    const cp = doc.checkpoints.items[@intCast(b)];
+    if (b >= base.checkpointCount(doc)) return null;
+    const cp = base.checkpointAt(doc, @intCast(b));
     const block_hi = @min((b + 1) * checkpoint_interval, hi_bound);
     var pos = cp.pos;
     var row = cp.row;

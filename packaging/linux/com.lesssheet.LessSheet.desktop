@@ -7,5 +7,5 @@ Exec=less-sheet-gtk %f
 Icon=com.lesssheet.LessSheet
 Terminal=false
 Categories=Office;Spreadsheet;
-MimeType=text/csv;application/csv;text/comma-separated-values;
+MimeType=application/vnd.apache.parquet;text/csv;application/csv;text/comma-separated-values;
 StartupNotify=true

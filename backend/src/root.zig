@@ -202,6 +202,16 @@ pub export fn ls_close(doc: *api.Doc) callconv(.c) void {
 // Document facts — zero allocation, total functions.
 // ---------------------------------------------------------------------------
 
+/// CSV parsing controls are meaningful only for a delimited-text document.
+pub export fn ls_document_is_parquet(doc: *const api.Doc) callconv(.c) bool {
+    return asDoc(doc).reader == .parquet;
+}
+/// Reports a failed Parquet page decode without returning invented cells.
+pub export fn ls_document_status(doc: *const api.Doc) callconv(.c) api.Status {
+    const d = asDoc(doc);
+    return if (d.reader == .parquet and d.reader.parquet.data.failed.load(.acquire)) .io else .ok;
+}
+
 /// See api/lesssheet.h `ls_dialect_get`.
 pub export fn ls_dialect_get(doc: *const api.Doc) callconv(.c) api.Dialect {
     return asDoc(doc).dialect;
@@ -236,7 +246,16 @@ pub export fn ls_index_poll(doc: *const api.Doc) callconv(.c) api.ScanProgress {
 /// decoded through `decodeUnit` (the document's resolved encoding) and
 /// display-capped to LS_CELL_MAX_BYTES.
 pub export fn ls_window_set(doc: *api.Doc, first_row: u64, row_count: u32) callconv(.c) api.RowRange {
+    return ls_window_set_columns(doc, first_row, row_count, 0, ls_column_count(doc));
+}
+
+pub export fn ls_window_set_columns(doc: *api.Doc, first_row: u64, row_count: u32, first_col: u32, col_count: u32) callconv(.c) api.RowRange {
     const d: *Document = @ptrCast(@alignCast(doc));
+    const last = @min(d.column_count, first_col +| col_count);
+    const first = @min(first_col, last);
+    if (d.win_first_col != first or d.win_last_col != last) d.win_request_valid = false;
+    d.win_first_col = first;
+    d.win_last_col = last;
     const result = window.windowSet(d, first_row, row_count);
     column.windowMaterialized(d);
     return result;

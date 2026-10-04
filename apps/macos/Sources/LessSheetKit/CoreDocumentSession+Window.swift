@@ -24,8 +24,10 @@ extension CoreDocumentSession {
         lock.lock()
         defer { lock.unlock() }
         let clamped = UInt32(clamping: max(rowCount, 0))
-        let range = ls_window_set(doc, firstRow, clamped)
-        return fetchWindow(range, columns: columns.clamped(to: 0..<columnCount))
+        let projected = columns.clamped(to: 0..<columnCount)
+        let range = ls_window_set_columns(
+            doc, firstRow, clamped, UInt32(projected.lowerBound), UInt32(projected.count))
+        return fetchWindow(range, columns: projected)
     }
 
     /// Copies cells, truncation and oversized flags for exactly `columns`

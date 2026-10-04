@@ -25,10 +25,11 @@ container_tool() {
 check_backend() (
     need_zig
     cd backend
-    zig fmt --check src contracts tests build.zig
+    zig fmt --check src contracts tests build.zig build.zig.zon
     zig build -Dtarget=aarch64-linux-musl -Doptimize=ReleaseSafe
     zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe
     zig build -Doptimize=ReleaseSafe
+    zig build test-parquet-data test-parquet -Doptimize=ReleaseSafe
     zig build test -Doptimize=ReleaseSafe
     if [ "$(uname -s)" != Linux ]; then
         check_container="$(container_tool)"

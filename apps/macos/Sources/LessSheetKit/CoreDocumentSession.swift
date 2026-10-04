@@ -130,6 +130,13 @@ public final class CoreDocumentSession: DocumentSession, @unchecked Sendable {
     var copyBuffer: [UInt8] = []
 
     public let columnCount: Int
+    public var readFailed: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return !isClosed && ls_document_status(doc) != LS_OK
+    }
+
+    public let isParquet: Bool
     public let dialect: DialectReport
     /// Required by the `DocumentSession` contract, but never used by the live
     /// app — it reads `columnLabels(_:)` instead, so opening a wide document
@@ -159,6 +166,7 @@ public final class CoreDocumentSession: DocumentSession, @unchecked Sendable {
         self.doc = doc
 
         columnCount = Int(ls_column_count(doc))
+        isParquet = ls_document_is_parquet(doc)
         let rawDialect = ls_dialect_get(doc)
         dialect = DialectReport(
             separator: rawDialect.separator,
@@ -177,6 +185,7 @@ public final class CoreDocumentSession: DocumentSession, @unchecked Sendable {
     private init(adopting doc: OpaquePointer) {
         self.doc = doc
         columnCount = Int(ls_column_count(doc))
+        isParquet = ls_document_is_parquet(doc)
         let rawDialect = ls_dialect_get(doc)
         dialect = DialectReport(
             separator: rawDialect.separator,

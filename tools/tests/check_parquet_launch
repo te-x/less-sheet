@@ -1,0 +1,44 @@
+#!/usr/bin/env python3
+"""Measure fresh native GTK processes through the first data-bearing paint.
+
+Run on a real Wayland/X11 desktop, after building the native frontend. This is
+process cold start, not a promise that OS filesystem caches have been flushed.
+"""
+import argparse
+import os
+from pathlib import Path
+import re
+import statistics
+import subprocess
+
+parser = argparse.ArgumentParser()
+parser.add_argument('binary', type=Path)
+parser.add_argument('files', nargs='+', type=Path)
+parser.add_argument('--runs', type=int, default=3)
+parser.add_argument('--evict-input', action='store_true',
+                    help='Ask Linux to discard cached pages of each input before launch')
+args = parser.parse_args()
+env = dict(os.environ, LESSSHEET_GTK_TIMING='1', GTK_A11Y='none')
+failed = False
+for file in args.files:
+    values = []
+    for _ in range(args.runs):
+        if args.evict_input:
+            with file.open('rb') as source:
+                os.posix_fadvise(source.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+        process = subprocess.Popen([str(args.binary.resolve()), str(file.resolve())],
+                                   env=env, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, text=True)
+        try:
+            _, stderr = process.communicate(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.terminate()
+            _, stderr = process.communicate(timeout=5)
+        match = re.search(r'first-rows-visible \(main -> first frame\): ([0-9.]+) ms', stderr)
+        if not match:
+            print(stderr, flush=True)
+            raise SystemExit('No first painted rows marker; window launch failed')
+        values.append(float(match[1]))
+    print(f'{file.name}: {values} ms; median {statistics.median(values):.1f} ms', flush=True)
+    failed |= max(values) >= 200
+raise SystemExit(1 if failed else 0)

@@ -136,6 +136,10 @@ public enum JumpStatus: Equatable, Sendable {
 public protocol DocumentSession: AnyObject, Sendable {
     /// Column count (fixed at open; 0 for an empty document).
     var columnCount: Int { get }
+    /// True for a self-describing local Parquet document.
+    var isParquet: Bool { get }
+    /// A malformed or unsupported page was encountered after opening.
+    var readFailed: Bool { get }
     /// The effective dialect report (fixed at open) — feeds the pills.
     var dialect: DialectReport { get }
     /// The effective header record's cells (exactly `columnCount` of them),
@@ -344,6 +348,9 @@ public protocol DocumentSession: AnyObject, Sendable {
 }
 
 public extension DocumentSession {
+    var isParquet: Bool { false }
+    var readFailed: Bool { false }
+
     /// DEFAULT (dense fallback) for the column-windowed `setWindow`: ignores
     /// `columns` and returns the full-width window from the dense
     /// `setWindow(firstRow:rowCount:)` (`firstColumn == 0`, every row

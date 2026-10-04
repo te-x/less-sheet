@@ -32,6 +32,59 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    // Pin the Zig 0.16-compatible sources and use only native Zig codecs.
+    // The upstream package also builds a C API and fetches optional C codecs;
+    // neither is needed by the viewer.
+    const parquet_dep = b.dependency("parquet", .{});
+    const parquet_options = b.addOptions();
+    inline for (.{ "zstd", "snappy", "gzip", "lz4", "brotli" }) |codec| {
+        parquet_options.addOption(bool, "enable_" ++ codec, false);
+        parquet_options.addOption(bool, "enable_zig_" ++ codec, true);
+        parquet_options.addOption(bool, "supports_" ++ codec, true);
+    }
+    parquet_options.addOption([]const u8, "version", "0.2.0");
+    const parquet_sources = b.addWriteFiles();
+    _ = parquet_sources.addCopyDirectory(parquet_dep.path("zig-parquet/src"), "parquet-src", .{});
+    // Import the reader directly: upstream lib.zig also exports its entire C
+    // writer API at comptime, unnecessarily adding code to every native app.
+    const parquet_root = parquet_sources.add("parquet-src/lesssheet.zig",
+        \\pub const format = @import("core/format.zig");
+        \\pub const Value = @import("core/value.zig").Value;
+        \\pub const DynamicReader = @import("core/dynamic_reader.zig").DynamicReader;
+        \\pub const openBufferDynamic = @import("api/zig/reader.zig").openBufferDynamic;
+        \\pub const internals = struct {
+        \\    pub const reader = @import("core/reader_mod.zig");
+        \\    pub const column_decoder = @import("core/column_decoder.zig");
+        \\    pub const compress = @import("core/compress/mod.zig");
+        \\};
+    );
+    const parquet_mod = b.createModule(.{
+        .root_source_file = parquet_root,
+        .target = target,
+        .optimize = optimize,
+    });
+    parquet_mod.addImport("build_options", parquet_options.createModule());
+    core_mod.addImport("parquet", parquet_mod);
+    const parquet_data_mod = b.createModule(.{
+        .root_source_file = b.path("src/parquet_data.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    parquet_data_mod.addImport("parquet", parquet_mod);
+    const parquet_data_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/parquet_data_tests.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{.{ .name = "parquet_data", .module = parquet_data_mod }},
+        }),
+    });
+    const run_parquet_data = b.addRunArtifact(parquet_data_tests);
+    run_parquet_data.skip_foreign_checks = true;
+    b.step("test-parquet-data", "Test bounded Parquet decoding against independent fixtures")
+        .dependOn(&run_parquet_data.step);
 
     // Frozen contract module (shared, contracts/). It imports the
     // implementation to run the comptime signature pins, and the
@@ -44,6 +97,20 @@ pub fn build(b: *std.Build) void {
     });
     api_mod.addImport("core", core_mod);
     core_mod.addImport("api", api_mod);
+
+    const parquet_core_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/parquet_core_tests.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{.{ .name = "api", .module = api_mod }},
+        }),
+    });
+    const run_parquet_core = b.addRunArtifact(parquet_core_tests);
+    run_parquet_core.skip_foreign_checks = true;
+    b.step("test-parquet", "Test Parquet through the public document API")
+        .dependOn(&run_parquet_core.step);
 
     // The static library is rooted at the CONTRACT: building it compiles the
     // pins (conformance) and emits the `ls_*` C-ABI exports from src/.
@@ -234,6 +301,8 @@ pub fn build(b: *std.Build) void {
     run_behavior_tests.skip_foreign_checks = true;
 
     const test_step = b.step("test", "Run behavior tests (foreign target: build + install only)");
+    test_step.dependOn(&run_parquet_data.step);
+    test_step.dependOn(&run_parquet_core.step);
     test_step.dependOn(&install_behavior_tests.step);
     test_step.dependOn(&run_behavior_tests.step);
 }

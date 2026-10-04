@@ -48,6 +48,65 @@ fn publicType(ty: api.ColumnType) api.ColumnType {
     return result;
 }
 
+fn declaredType(doc: *const Document, col: u32) ?api.ColumnType {
+    if (doc.reader != .parquet) return null;
+    const schema = doc.reader.parquet.data.reader.metadata.schema[@as(usize, col) + 1];
+    var ty = typeOf(switch (schema.type_.?) {
+        .boolean => .boolean,
+        .int32, .int64 => .integer,
+        .float, .double => .decimal,
+        .int96 => .datetime,
+        .byte_array, .fixed_len_byte_array => .text,
+    });
+    if (schema.logical_type) |logical| switch (logical) {
+        .decimal => |d| {
+            ty.kind = .decimal;
+            ty.decimal_precision = @intCast(d.precision);
+            ty.decimal_scale = d.scale;
+        },
+        .date => ty.kind = .date,
+        .time => ty.kind = .text,
+        .timestamp => |ts| {
+            ty.kind = .datetime;
+            ty.datetime_semantics = if (ts.is_adjusted_to_utc) .zoned else .naive;
+            ty.datetime_fraction_digits = switch (ts.unit) {
+                .millis => 3,
+                .micros => 6,
+                .nanos => 9,
+            };
+        },
+        else => {},
+    } else if (schema.converted_type) |legacy| switch (legacy) {
+        5 => {
+            ty.kind = .decimal;
+            ty.decimal_precision = @intCast(schema.precision orelse 0);
+            ty.decimal_scale = schema.scale orelse 0;
+        },
+        6 => ty.kind = .date,
+        9, 10 => {
+            ty.kind = .datetime;
+            ty.datetime_semantics = .zoned;
+            ty.datetime_fraction_digits = if (legacy == 9) 3 else 6;
+        },
+        else => {},
+    };
+    return ty;
+}
+fn initialState(doc: *const Document, col: u32) State {
+    var state = State.init(col);
+    state.declared = declaredType(doc, col);
+    if (state.declared != null) state.head_sampled = true;
+    return state;
+}
+fn undeclaredSnapshot(doc: *const Document, col: u32) api.ColumnMetadata {
+    if (declaredType(doc, col)) |ty| {
+        var state = State.init(col);
+        state.declared = ty;
+        return snapshot(&state);
+    }
+    return synthUnknown(col);
+}
+
 fn synthUnknown(col: u32) api.ColumnMetadata {
     const u = unknownType();
     return .{
@@ -166,7 +225,7 @@ fn getOrCreateLocked(doc: *Document, column: u32) error{OutOfMemory}!*State {
     try doc.column_store.states.ensureUnusedCapacity(doc.gpa, 1);
     try doc.column_store.state_index.ensureUnusedCapacity(doc.gpa, 1);
     const index = doc.column_store.states.items.len;
-    doc.column_store.states.appendAssumeCapacity(State.init(column));
+    doc.column_store.states.appendAssumeCapacity(initialState(doc, column));
     doc.column_store.state_index.putAssumeCapacity(column, index);
     return &doc.column_store.states.items[index];
 }
@@ -240,7 +299,7 @@ pub fn inferenceRequest(doc: *Document, ids: ?[*]const u32, count: u32) api.Colu
     for (normalized) |id| {
         const state = doc.column_store.find(id) orelse blk: {
             const index = doc.column_store.states.items.len;
-            doc.column_store.states.appendAssumeCapacity(State.init(id));
+            doc.column_store.states.appendAssumeCapacity(initialState(doc, id));
             doc.column_store.state_index.putAssumeCapacity(id, index);
             break :blk &doc.column_store.states.items[index];
         };
@@ -257,6 +316,13 @@ pub fn inferenceRequest(doc: *Document, ids: ?[*]const u32, count: u32) api.Colu
         }
     }
     _ = nextCounter(&doc.column_store.request_generation);
+    if (doc.reader == .parquet) {
+        doc.column_head_active = false;
+        doc.column_store.job_state = .done;
+        doc.column_store.completed_column_count = @intCast(normalized.len);
+        doc.column_store.progress = 1.0;
+        return .ok;
+    }
     restartHeadLocked(doc);
     doc.column_window_events.clearRetainingCapacity();
     doc.column_event_index = 0;
@@ -308,7 +374,7 @@ pub fn inferenceCancel(doc: *Document) void {
 pub fn windowMaterialized(doc: *Document) void {
     doc.lock();
     defer doc.unlock();
-    if (doc.column_store.desired.items.len == 0) return;
+    if (doc.reader == .parquet or doc.column_store.desired.items.len == 0) return;
     const count = @min(doc.win_source.items.len, @min(doc.win_pos.items.len, doc.win_oversized.items.len));
     doc.column_window_events.clearRetainingCapacity();
     var i: usize = 0;
@@ -564,7 +630,7 @@ pub fn trimmedCell(raw: []const u8) []const u8 {
 /// Column `col`'s EFFECTIVE type — override > published inference > declared >
 /// unknown, exactly `ls_column_metadata.effective`. Caller holds the mutex.
 pub fn effectiveType(doc: *Document, col: u32) api.ColumnType {
-    const state = doc.column_store.find(col) orelse return unknownType();
+    const state = doc.column_store.find(col) orelse return declaredType(doc, col) orelse unknownType();
     return snapshot(state).effective;
 }
 
@@ -1245,7 +1311,7 @@ pub fn metadataGetMany(doc: *Document, ids: ?[*]const u32, count: u32, out: ?[*]
     defer doc.unlock();
     const generation = doc.column_store.metadata_generation;
     i = 0;
-    while (i < count) : (i += 1) items[i] = if (doc.column_store.findConst(p[i])) |state| snapshot(state) else synthUnknown(p[i]);
+    while (i < count) : (i += 1) items[i] = if (doc.column_store.findConst(p[i])) |state| snapshot(state) else undeclaredSnapshot(doc, p[i]);
     out_gen.* = generation;
     return .ok;
 }

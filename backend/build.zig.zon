@@ -1,0 +1,13 @@
+.{
+    .name = .less_sheet,
+    .version = "0.1.6",
+    .fingerprint = 0x7d3cc87b7ed6d65d,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .parquet = .{
+            .url = "https://codeload.github.com/akeating/zig-parquet/tar.gz/38dec45c665037f2092db1464676afb8406a90d4",
+            .hash = "N-V-__8AAJ4GOwG7-WdhOJbGxl3IbKSxQcpTgFWWJQXikwDU",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src", "contracts", "tests" },
+}

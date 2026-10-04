@@ -84,6 +84,7 @@ final class DocumentModel {
     var columnInferenceProgress: Double?
     var settingsLifecycle = SettingsLifecycleState()
     var settingsDiscoveryRows: [Int] = []
+    var isParquet = false
     var dialect = DialectReport(
         separator: 0x2C, quote: 0x22, hasHeader: false,
         separatorForced: false, quoteForced: false, headerForced: false

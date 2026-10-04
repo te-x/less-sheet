@@ -225,7 +225,7 @@ fn windowSetInner(d: *Document, first_row: u64, row_count: u32) api.RowRange {
         const row_limit = d.reader.posAtByteBudget(d.source, pos, allowance);
         const buf_mark = d.win_buf.items.len;
         const refs_mark = d.win_refs.items.len;
-        const res = d.reader.materialize(d.source, pos, d.column_count, api.cell_max_bytes, row_limit, &d.win_buf, &d.win_refs, d.gpa) catch break;
+        const res = d.reader.materializeWindow(d.source, pos, d.column_count, d.win_first_col, d.win_last_col, api.cell_max_bytes, row_limit, &d.win_buf, &d.win_refs, d.gpa) catch break;
         charge(d, pos, res.next);
         if (res.capped and allowance < api.window_row_scan_max_bytes) {
             d.win_buf.items.len = buf_mark;
@@ -357,7 +357,7 @@ fn windowSetSorted(d: *Document, first_row: u64, clamped: u64, filtered: bool, f
         const row_limit = d.reader.posAtByteBudget(d.source, pos, allowance);
         const buf_mark = d.win_buf.items.len;
         const refs_mark = d.win_refs.items.len;
-        const res = d.reader.materialize(d.source, pos, d.column_count, api.cell_max_bytes, row_limit, &d.win_buf, &d.win_refs, d.gpa) catch break;
+        const res = d.reader.materializeWindow(d.source, pos, d.column_count, d.win_first_col, d.win_last_col, api.cell_max_bytes, row_limit, &d.win_buf, &d.win_refs, d.gpa) catch break;
         charge(d, pos, res.next);
         if (res.capped and allowance < api.window_row_scan_max_bytes) {
             d.win_buf.items.len = buf_mark;
@@ -409,9 +409,9 @@ fn windowSetFiltered(d: *Document, first_row: u64, clamped: u64) api.RowRange {
             if (cum + count > first_row) break;
             cum += count;
         }
-        if (b >= d.filter_block_counts.items.len or b >= d.checkpoints.items.len)
+        if (b >= d.filter_block_counts.items.len or b >= base.checkpointCount(d))
             return .{ .first_row = first_row, .row_count = d.win_rows };
-        const cp = d.checkpoints.items[b];
+        const cp = base.checkpointAt(d, b);
         d.win_cursor_pos = cp.pos;
         d.win_cursor_row = cp.row;
         d.win_cursor_valid = true;
@@ -481,7 +481,7 @@ fn windowSetFiltered(d: *Document, first_row: u64, clamped: u64) api.RowRange {
         const row_limit = d.reader.posAtByteBudget(d.source, pos, allowance);
         const buf_mark = d.win_buf.items.len;
         const refs_mark = d.win_refs.items.len;
-        const display_res = d.reader.materialize(d.source, pos, d.column_count, api.cell_max_bytes, row_limit, &d.win_buf, &d.win_refs, d.gpa) catch break;
+        const display_res = d.reader.materializeWindow(d.source, pos, d.column_count, d.win_first_col, d.win_last_col, api.cell_max_bytes, row_limit, &d.win_buf, &d.win_refs, d.gpa) catch break;
         charge(d, pos, display_res.next);
         if (display_res.capped and allowance < api.window_row_scan_max_bytes) {
             d.win_buf.items.len = buf_mark;

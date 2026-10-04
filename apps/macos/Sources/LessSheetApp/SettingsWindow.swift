@@ -85,6 +85,7 @@ struct SettingsView: View {
                         }
                     }
                 }
+                .disabled(model.isParquet)
                 .background(SettingsProbeMarker(name: "parsing"))
             }
             .formStyle(.grouped)
