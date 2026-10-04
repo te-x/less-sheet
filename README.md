@@ -1,7 +1,7 @@
 # less-sheet
 
-A viewer for very large CSV and Parquet files, with native frontends for
-macOS (Swift 6 / AppKit) and Linux (GTK4 + libadwaita) over a Zig engine.
+A tabular data viewer for very large CSV and Parquet files, with native frontends
+for macOS (Swift 6 / AppKit) and Linux (GTK4 + libadwaita) over a Zig engine.
 Local cold open through the first visible table has a target of **under 200 ms**.
 Parquet opens from footer metadata and decodes only pages needed by the viewport;
 CSV, CSV.gz and Parquet also support HTTP(S). Remote Parquet uses byte ranges
