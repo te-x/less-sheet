@@ -1,8 +1,8 @@
 [Desktop Entry]
 Type=Application
 Name=less-sheet
-GenericName=CSV Viewer
-Comment=Open huge CSV files instantly
+GenericName=Tabular Data Viewer
+Comment=Open huge CSV and Parquet files instantly
 Exec=less-sheet-gtk %f
 Icon=com.lesssheet.LessSheet
 Terminal=false

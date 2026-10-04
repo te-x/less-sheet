@@ -8,7 +8,7 @@ cask "less-sheet" do
 
   url "DOWNLOAD_BASE/less-sheet-#{version}-macos-arm64.zip"
   name "less-sheet"
-  desc "Read-only viewer for spreadsheet-sized CSV, plain, gzipped or over HTTP"
+  desc "Native tabular data viewer for CSV and Parquet files"
   homepage "HOMEPAGE"
 
   # Apple silicon only, and the app genuinely refuses to start below its floor
