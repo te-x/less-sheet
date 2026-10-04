@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>less-sheet — open huge spreadsheets instantly</title>
-<meta name="description" content="A native, read-only viewer for spreadsheet-sized data. It reads CSV — plain, gzipped, or streamed from a URL — and nothing else, which is why it opens 10 GB as fast as 10 MB.">
+<title>less-sheet — a fast, native tabular data viewer</title>
+<meta name="description" content="A native, read-only tabular data viewer for large CSV, CSV.gz and Parquet files. Open local files or HTTP(S) URLs on macOS and Linux.">
 <link rel="icon" href="assets/logo.svg">
 <style>
   /* -------------------------------------------------------------------------
@@ -248,11 +248,10 @@
   <div class="col">
     <div class="prose">
       <div class="rn">01</div>
-      <h1>Open any CSV instantly.</h1>
-      <p class="lede">less-sheet is a native, read-only viewer for
-        spreadsheet-sized data, focused on <b>speed and low memory use whatever
-        the file size</b>. Today it reads CSV — plain or gzipped, local or
-        streamed from a URL — with more formats coming.</p>
+      <h1>Open huge tables instantly.</h1>
+      <p class="lede">less-sheet is a native, read-only tabular data viewer,
+        focused on <b>speed and low memory use whatever the file size</b>.
+        It supports CSV, CSV.gz and Parquet, from local files or HTTP(S) URLs.</p>
       <p class="lede">It never loads the whole file into memory, only the
         minimum needed to fill the window.</p>
       <p class="lede">Open from the file picker, the command line, a URL, or
@@ -351,9 +350,9 @@
     <div class="prose">
       <div class="rn">03</div>
       <h2>Quick toggles for the most common parameters.</h2>
-      <p>Separator, quote character, header row and text encoding are detected
-        from the file itself. You open the file and read it — there is no
-        import step.</p>
+      <p>For CSV files, separator, quote character, header row and text encoding
+        are detected from the file itself. You open the file and read it —
+        there is no import step.</p>
       <p>When a guess is wrong, each of those is a live control: change it and
         the open document re-renders in place. No closing, no re-importing, no
         starting over.</p>
@@ -393,7 +392,7 @@
       <p>Completed searches are remembered while you move between Find, Where
         and filtering, so returning to the same query does not scan the file
         again.</p>
-      <p>Copying returns the original bytes, regardless of any formatting you
+      <p>Copying returns the underlying values, regardless of any formatting you
         applied in the viewer.</p>
     </div>
     <div class="figs">
@@ -462,7 +461,7 @@
         <tbody>
           <tr><td>opening</td>
               <td>Imports the whole file before showing anything</td>
-              <td>Shows the viewport; reads nothing else</td></tr>
+              <td>Reads only what is needed for the viewport</td></tr>
           <tr><td>row limit</td>
               <td>1,048,576</td>
               <td>None</td></tr>
