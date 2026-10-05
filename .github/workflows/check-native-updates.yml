@@ -48,16 +48,20 @@ jobs:
       - name: Build and lint the macOS frontend
         working-directory: apps/macos
         run: |
-          swift build -Xswiftc -warnings-as-errors
+          swift build -c release -Xswiftc -warnings-as-errors
           swiftlint lint --strict Sources
       - name: Test the Swift update release parser
         if: hashFiles('tools/tests/check_update_release_swift') != ''
         run: python3 tools/tests/check_update_release_swift
       - name: Test the macOS frontend
         working-directory: apps/macos
-        # Test the optimized frontend used in releases, including its timing
-        # probes. Run serially so app windows do not compete for resources.
-        run: swift test -c release --no-parallel
+        # Match the published timing method: fresh processes with framework
+        # and driver caches warm. Keep every timing limit unchanged and run
+        # serially so app windows do not compete for resources.
+        run: |
+          native_bin_dir="$(swift build -c release --show-bin-path)"
+          env LESSSHEET_DUMP_EXIT=1 "$native_bin_dir/LessSheet" Tests/LessSheetKitTests/Fixtures/people.csv
+          swift test -c release --no-parallel
 
   gtk-release-parser:
     runs-on: ubuntu-24.04
