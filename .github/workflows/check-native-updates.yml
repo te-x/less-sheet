@@ -7,6 +7,13 @@ on:
         description: Optional source revision to validate
         type: string
         required: false
+      macos_runner:
+        description: macOS runner (Intel is a fallback when arm64 capacity is unavailable)
+        type: choice
+        options:
+          - macos-26
+          - macos-26-intel
+        default: macos-26
   push:
     paths:
       - 'apps/macos/**'
@@ -25,16 +32,17 @@ permissions:
 
 jobs:
   macos:
-    runs-on: macos-26
+    runs-on: ${{ inputs.macos_runner || 'macos-26' }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.source_ref || github.sha }}
       - name: Install Zig 0.16.0 and SwiftLint
         run: |
-          curl -fsSLO https://ziglang.org/download/0.16.0/zig-aarch64-macos-0.16.0.tar.xz
-          tar -xf zig-aarch64-macos-0.16.0.tar.xz
-          echo "$PWD/zig-aarch64-macos-0.16.0" >> "$GITHUB_PATH"
+          zig_arch="${{ runner.arch == 'ARM64' && 'aarch64' || 'x86_64' }}"
+          curl -fsSLO "https://ziglang.org/download/0.16.0/zig-$zig_arch-macos-0.16.0.tar.xz"
+          tar -xf "zig-$zig_arch-macos-0.16.0.tar.xz"
+          echo "$PWD/zig-$zig_arch-macos-0.16.0" >> "$GITHUB_PATH"
           brew install swiftlint
       - name: Build the core in ReleaseSafe mode
         working-directory: backend
