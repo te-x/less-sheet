@@ -62,7 +62,7 @@
   </screenshots>
 
   <releases>
-    <release version="0.1.7" date="2026-10-04">
+    <release version="0.1.7" date="2026-10-05">
       <description>
         <p>Added local and HTTP(S) Parquet support with bounded page decoding.</p>
       </description>
