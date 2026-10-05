@@ -131,7 +131,8 @@ extension DocumentModel {
     /// selection is invalid (`DialectComposing` rejected it).
     @discardableResult
     func applyDialectChange(_ change: DialectChange) -> Bool {
-        guard case .document = phase, let override = composer.compose(from: dialect, changing: change) else {
+        guard !isParquet, case .document = phase,
+              let override = composer.compose(from: dialect, changing: change) else {
             return false
         }
         let path = self.path

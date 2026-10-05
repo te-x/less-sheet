@@ -59,7 +59,30 @@ pub fn buildDocument(
     const from_mmap = source == .mmap;
     const is_gzip = source == .gzip;
     const head_bytes: []const u8 = if (from_mmap) source.mmap.bytes else source.openHead();
-    const oh = csv_reader.openHead(head_bytes, opt, encoding_sample_bytes);
+    if (@import("parquet_data.zig").Data.isParquet(head_bytes) and !from_mmap and source != .http_range) {
+        fault_guard.disarm(fault_slot);
+        if (mapping) |m| posix.munmap(m);
+        if (fd) |h| sysio.close(h);
+        return null;
+    }
+    const is_parquet = @import("parquet_data.zig").Data.isParquet(head_bytes);
+    const parquet = if (is_parquet) (if (source == .http_range)
+        @import("parquet_data.zig").Data.initRemote(gpa, source.http_range.spool[0..@intCast(file_size)], .{
+            .ctx = source.http_range,
+            .read = parquetRead,
+            .peek = parquetPeek,
+            .can_fetch = parquetCanFetch,
+        })
+    else
+        @import("parquet_data.zig").Data.init(gpa, head_bytes)) catch {
+        fault_guard.disarm(fault_slot);
+        if (mapping) |m| posix.munmap(m);
+        if (fd) |h| sysio.close(h);
+        return null;
+    } else null;
+    var parquet_owned = parquet != null;
+    defer if (parquet_owned) parquet.?.deinit();
+    const oh = csv_reader.openHead(if (is_parquet) "" else head_bytes, opt, encoding_sample_bytes);
     source_mod.rebaseBom(&source, oh.bom_len);
 
     const content_len: u64 = if (is_gzip) file_size else source.len();
@@ -76,7 +99,7 @@ pub fn buildDocument(
         .fault_slot = fault_slot,
         .fd = fd,
         .source = source,
-        .reader = .{ .csv = oh.reader },
+        .reader = if (parquet) |p| .{ .parquet = .{ .data = p } } else .{ .csv = oh.reader },
         .content_len = content_len,
         .file_size = file_size,
         .bom_len = oh.bom_len,
@@ -165,6 +188,7 @@ pub fn buildDocument(
         .win_rows = 0,
     };
     source_owned = false;
+    parquet_owned = false;
 
     // The lazy-frontier gate keys strictly on source kind — true for a network
     // Source (http_range, or gzip composed over http_range), false for every
@@ -185,7 +209,20 @@ pub fn buildDocument(
     doc.search_pos = start_pos;
     doc.filter_pos = start_pos;
 
-    if (oh.content.len > 0) {
+    if (parquet) |p| {
+        var schema_opt = opt;
+        schema_opt.header = api.header_on;
+        if (!buildShape(doc, schema_opt)) {
+            freeDoc(doc);
+            return null;
+        }
+        doc.frontier_rows = p.rows;
+        doc.total_rows = p.rows;
+        doc.complete = true;
+        doc.frontier_pos = doc.reader.positionForRow(p.rows).?;
+        doc.search_pos = doc.data_start;
+        doc.filter_pos = doc.data_start;
+    } else if (oh.content.len > 0) {
         if (!buildShape(doc, opt)) {
             freeDoc(doc);
             return null;
@@ -219,6 +256,20 @@ pub fn buildDocument(
     source_mod.sourceFinishOpen(&doc.source);
     doc.startWorker(index.workerMain);
     return doc;
+}
+
+fn parquetRead(ctx: *anyopaque, offset: u64, length: u64) []const u8 {
+    const source: *@import("net_source.zig").HttpRange = @ptrCast(@alignCast(ctx));
+    return source.ensureSlice(offset, length);
+}
+
+fn parquetCanFetch() bool {
+    return source_mod.fetchPermitted() and !base.controlLocked();
+}
+
+fn parquetPeek(ctx: *anyopaque, offset: u64, length: u64) []const u8 {
+    const source: *@import("net_source.zig").HttpRange = @ptrCast(@alignCast(ctx));
+    return source.presentSlice(offset, length);
 }
 
 /// Decode record 1, fix the column count, decide the header, and (when the

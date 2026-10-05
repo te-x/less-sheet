@@ -1061,6 +1061,14 @@ static gboolean
 grid_poll_tick (gpointer data)
 {
   App *app = data;
+  if (lsg_document_read_failed (app->doc))
+    {
+      show_error (
+          app, "Could not read Parquet file",
+          "A page is corrupt, unsupported, or exceeds the memory limit.");
+      app->poll_id = 0;
+      return G_SOURCE_REMOVE;
+    }
   if (app->doc == NULL)
     {
       app->poll_id = 0;
@@ -1555,8 +1563,9 @@ measure_font (App *app)
 static void
 sample_column_widths (App *app)
 {
-  guint32 sample_cols
-      = (app->n_cols < WIDTH_SAMPLE_COLS) ? app->n_cols : WIDTH_SAMPLE_COLS;
+  guint32 sample_limit
+      = lsg_document_is_parquet (app->doc) ? 24 : WIDTH_SAMPLE_COLS;
+  guint32 sample_cols = MIN (app->n_cols, sample_limit);
   double default_w = width_default (app);
   /* The cold-start worker may have materialized this exact head window while
    * the toolkit was starting; take it, or materialize it here. */
@@ -1738,7 +1747,9 @@ prefetch_worker (gpointer data)
     return NULL;
   app->prefetch_sample = lsg_document_set_window (
       app->prefetch_doc, 0, WIDTH_SAMPLE_ROWS, 0,
-      (n < WIDTH_SAMPLE_COLS) ? n : WIDTH_SAMPLE_COLS);
+      MIN (n, lsg_document_is_parquet (app->prefetch_doc)
+                  ? 24
+                  : WIDTH_SAMPLE_COLS));
   return NULL;
 }
 
@@ -2121,9 +2132,9 @@ action_open_url (GtkButton *button, gpointer data)
   App *app = data;
 
   AdwDialog *dialog = adw_alert_dialog_new ("Open URL", NULL);
-  adw_alert_dialog_set_body (
-      ADW_ALERT_DIALOG (dialog),
-      "Enter an http:// or https:// address of a .csv or .csv.gz file.");
+  adw_alert_dialog_set_body (ADW_ALERT_DIALOG (dialog),
+                             "Enter an http:// or https:// address of a CSV, "
+                             "CSV.gz or Parquet file.");
 
   GtkWidget *entry = gtk_entry_new ();
   gtk_entry_set_input_purpose (GTK_ENTRY (entry), GTK_INPUT_PURPOSE_URL);
@@ -5627,7 +5638,7 @@ build_launch_page (App *app)
   gtk_widget_add_css_class (hint, "caption");
   gtk_widget_set_margin_top (hint, 6);
   gtk_box_append (GTK_BOX (box), hint);
-  GtkWidget *formats = gtk_label_new ("CSV · TSV · CSV.gz");
+  GtkWidget *formats = gtk_label_new ("CSV · TSV · CSV.gz · Parquet");
   gtk_widget_add_css_class (formats, "dim-label");
   gtk_widget_add_css_class (formats, "caption");
   gtk_box_append (GTK_BOX (box), formats);
@@ -6058,6 +6069,8 @@ dialect_apply_change (App *app, LsgDialectChange change)
 {
   if (app->doc == NULL)
     return;
+  if (lsg_document_is_parquet (app->doc))
+    return;
   LsgDialect report = lsg_document_dialect (app->doc);
   LsgDialectCompose c = lsg_dialect_compose (report, change);
   if (!c.accepted)
@@ -6358,6 +6371,13 @@ dialect_sync_quick_controls (App *app)
   if (app->doc == NULL)
     return;
   LsgDialect d = lsg_document_dialect (app->doc);
+  gboolean text_format = !lsg_document_is_parquet (app->doc);
+  if (app->header_toggle != NULL)
+    gtk_widget_set_sensitive (GTK_WIDGET (app->header_toggle), text_format);
+  if (app->sep_button != NULL)
+    gtk_widget_set_sensitive (GTK_WIDGET (app->sep_button), text_format);
+  if (app->quote_button != NULL)
+    gtk_widget_set_sensitive (GTK_WIDGET (app->quote_button), text_format);
   app->dialect_ui_guard = TRUE;
   if (app->header_toggle != NULL)
     gtk_toggle_button_set_active (app->header_toggle, d.header);
@@ -6370,6 +6390,12 @@ dialect_sync_quick_controls (App *app)
     gtk_label_set_text (app->quote_glyph_label,
                         quote_glyph (d.has_quote, d.quote));
   parsing_page_sync (app, d);
+  GtkWidget *parsing_rows[] = { app->prefs_header_row,   app->prefs_sep_row,
+                                app->prefs_sep_custom,   app->prefs_quote_row,
+                                app->prefs_quote_custom, app->prefs_enc_row };
+  for (guint i = 0; i < G_N_ELEMENTS (parsing_rows); i++)
+    if (parsing_rows[i] != NULL)
+      gtk_widget_set_sensitive (parsing_rows[i], text_format);
   app->dialect_ui_guard = FALSE;
 }
 
@@ -7064,8 +7090,16 @@ build_parsing_page (App *app)
   if (app->doc != NULL)
     {
       LsgDialect d = lsg_document_dialect (app->doc);
+      gboolean text_format = !lsg_document_is_parquet (app->doc);
       app->dialect_ui_guard = TRUE;
       parsing_page_sync (app, d);
+      GtkWidget *parsing_rows[]
+          = { app->prefs_header_row,   app->prefs_sep_row,
+              app->prefs_sep_custom,   app->prefs_quote_row,
+              app->prefs_quote_custom, app->prefs_enc_row };
+      for (guint i = 0; i < G_N_ELEMENTS (parsing_rows); i++)
+        if (parsing_rows[i] != NULL)
+          gtk_widget_set_sensitive (parsing_rows[i], text_format);
       app->dialect_ui_guard = FALSE;
     }
   return page;

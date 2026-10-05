@@ -1,10 +1,17 @@
 # less-sheet
 
-A no-nonsense viewer for very large CSV files: a Zig engine behind a frozen
-C ABI, with native frontends for macOS (Swift 6 / AppKit) and Linux
-(C / GTK4 + libadwaita). Opening is O(viewport), never O(file) — first rows
-are on screen in well under 500 ms regardless of file size, for local files
-and for files streamed over HTTP(S).
+A tabular data viewer for very large CSV and Parquet files, with native frontends
+for macOS (Swift 6 / AppKit) and Linux (GTK4 + libadwaita) over a Zig engine.
+Local cold open through the first visible table has a target of **under 200 ms**.
+Parquet opens from footer metadata and decodes only pages needed by the viewport;
+CSV, CSV.gz and Parquet also support HTTP(S). Remote Parquet uses byte ranges
+and cached pages; servers without range support require a full download.
+
+Parquet supports flat scalar schemas, nullable values, dictionary and plain
+encoding, data pages V1/V2, and Snappy, Zstandard, gzip, Brotli and LZ4 compression.
+Schema names supply the headers. Nested/repeated schemas, encrypted files and
+external column files are not supported. Metadata and
+page allocations are bounded; files exceeding those limits fail cleanly.
 
 Website, screenshots and downloads: <https://te-x.github.io/less-sheet/>
 
@@ -32,6 +39,7 @@ toolchain on Linux or the Fedora container through Docker/Podman.
 cd backend
 zig build        # → zig-out/lib/liblesssheet.a
 zig build test   # behavior tests
+zig build test-parquet-data # independent Parquet fixtures
 ```
 
 **macOS app** — build the engine first, then:

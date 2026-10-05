@@ -150,6 +150,9 @@ void lsg_document_close (LsgDocument *doc);
 guint32 lsg_document_column_count (const LsgDocument *doc);
 
 /* The effective dialect report (copied-out snapshot). */
+gboolean lsg_document_is_parquet (const LsgDocument *doc);
+gboolean lsg_document_read_failed (const LsgDocument *doc);
+
 LsgDialect lsg_document_dialect (const LsgDocument *doc);
 
 /* Whether record 1 is the effective header. */

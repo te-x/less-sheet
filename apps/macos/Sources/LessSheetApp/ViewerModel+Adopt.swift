@@ -165,6 +165,7 @@ extension DocumentModel {
         self.path = adoption.path
         self.columnCount = session.columnCount
         self.dialect = session.dialect
+        self.isParquet = session.isParquet
         // A different document can present the SAME window geometry — a re-open
         // at row 0 with a matching column count — so the mask's content epoch
         // must move or a stale key would serve the old mask over the new rows.
@@ -188,7 +189,7 @@ extension DocumentModel {
         self.setJumpFlow(.idle)
         resetFindFilterSelectionState()
         applyAdoptedManualWidths(adoption: adoption)
-        self.phase = .document
+        self.phase = session.readFailed ? .failure(.ioFailure, path: adoption.path) : .document
         startPolling()
     }
 

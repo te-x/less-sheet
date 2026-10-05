@@ -1,8 +1,8 @@
 //! The Reader interface: the format→rows/cells parser the format-agnostic
 //! core (window/index/nav/search/filter — the C ABI in root.zig) calls
 //! INSTEAD of a format's own parser directly (see docs/architecture/
-//! ARCH-reader-interface.md). CSV (src/csv_reader.zig) is the only member
-//! today; a future Parquet or ODS/XLSX Reader would add a sibling variant to
+//! ARCH-reader-interface.md). CSV and local Parquet implement this interface. Future readers add
+//! a sibling variant to
 //! the `Reader` union below with NO change to window/index/nav/search/filter/
 //! root.
 //!
@@ -23,8 +23,10 @@ const api = @import("api");
 const base = @import("base.zig");
 const source_mod = @import("source.zig");
 const csv_reader = @import("csv_reader.zig");
+const parquet_reader = @import("parquet_reader.zig");
 
 pub const Source = source_mod.Source;
+pub const ReadError = error{ OutOfMemory, WouldBlock };
 pub const CellRef = base.CellRef;
 
 /// Opaque row position. CSV records the immutable logical inflated offset and
@@ -34,46 +36,63 @@ pub const Pos = struct { logical: u64, physical: u64 };
 
 pub const BoundsResult = struct { next: Pos, capped: bool };
 pub const MaterializeResult = struct { next: Pos, capped: bool };
-pub const CellResult = struct { len: usize, truncated: bool };
+pub const CellResult = struct { len: usize, truncated: bool, pending: bool = false };
 pub const ScanRowsResult = struct { next: Pos, rows: u64, eof: bool };
 pub const SelectedStep = csv_reader.SelectedStep;
 
 pub const SelectedScanner = union(enum) {
     csv: csv_reader.SelectedScanner,
+    parquet: parquet_reader.SelectedScanner,
 
     pub fn deinit(self: *SelectedScanner) void {
         switch (self.*) {
             .csv => |*scanner| scanner.deinit(),
+            .parquet => |*scanner| scanner.deinit(),
         }
     }
 
     pub fn releaseLane(self: *SelectedScanner) void {
         switch (self.*) {
             .csv => |*scanner| scanner.releaseLane(),
+            .parquet => |*scanner| scanner.releaseLane(),
         }
     }
 
-    pub fn step(self: *SelectedScanner, selected: []const u32, cap: usize, work_budget: u64, row_budget: u64, buf: *std.ArrayList(u8), refs: *std.ArrayList(CellRef), gpa: std.mem.Allocator) std.mem.Allocator.Error!SelectedStep {
+    pub fn step(self: *SelectedScanner, selected: []const u32, cap: usize, work_budget: u64, row_budget: u64, buf: *std.ArrayList(u8), refs: *std.ArrayList(CellRef), gpa: std.mem.Allocator) ReadError!SelectedStep {
         return switch (self.*) {
             .csv => |*scanner| scanner.step(selected, cap, work_budget, row_budget, buf, refs, gpa),
+            .parquet => |*scanner| scanner.step(selected, cap, work_budget, row_budget, buf, refs, gpa),
         };
     }
 };
 
-/// A pluggable format Reader. One tagged-union variant per format — CSV is
-/// the only member today (see csv_reader.CsvReader). Every op takes the
+/// A pluggable format Reader. One tagged-union variant per format. Every op takes the
 /// `Source` explicitly (a Reader never owns one), so the same Reader value
 /// can serve different byte providers across calls.
 ///
 /// Dispatch is a single `switch` per call — no vtable, no heap indirection.
-/// With one variant this costs at most one (trivially-predicted, often
-/// wholly-elided) branch.
+/// CSV retains its direct lexer path; Parquet dispatches to its page cache.
 pub const Reader = union(enum) {
     csv: csv_reader.CsvReader,
+    parquet: parquet_reader.ParquetReader,
+
+    pub fn positionForRow(self: Reader, row: u64) ?Pos {
+        return switch (self) {
+            .csv => null,
+            .parquet => |r| r.positionForRow(row),
+        };
+    }
+    pub fn deinit(self: Reader) void {
+        switch (self) {
+            .csv => {},
+            .parquet => |r| r.data.deinit(),
+        }
+    }
 
     pub fn selectedScanner(self: Reader, source: Source, pos: Pos) SelectedScanner {
         return switch (self) {
             .csv => |r| .{ .csv = csv_reader.SelectedScanner.init(r, source, pos) },
+            .parquet => |r| .{ .parquet = .{ .reader = r, .source = source, .pos = pos } },
         };
     }
 
@@ -81,6 +100,7 @@ pub const Reader = union(enum) {
     pub fn start(self: Reader, source: Source) Pos {
         return switch (self) {
             .csv => |r| r.start(source),
+            .parquet => |r| r.start(source),
         };
     }
 
@@ -88,6 +108,7 @@ pub const Reader = union(enum) {
     pub fn atEnd(self: Reader, source: Source, pos: Pos) bool {
         return switch (self) {
             .csv => |r| r.atEnd(source, pos),
+            .parquet => |r| r.atEnd(source, pos),
         };
     }
 
@@ -101,6 +122,7 @@ pub const Reader = union(enum) {
     pub fn posAtByteBudget(self: Reader, source: Source, from: Pos, budget: u64) Pos {
         return switch (self) {
             .csv => |r| r.posAtByteBudget(source, from, budget),
+            .parquet => |r| r.posAtByteBudget(source, from, budget),
         };
     }
 
@@ -111,6 +133,7 @@ pub const Reader = union(enum) {
     pub fn bytesConsumed(self: Reader, source: Source, pos: Pos) u64 {
         return switch (self) {
             .csv => |r| r.bytesConsumed(source, pos),
+            .parquet => |r| r.bytesConsumed(source, pos),
         };
     }
 
@@ -132,6 +155,7 @@ pub const Reader = union(enum) {
     pub fn boundsAfter(self: Reader, source: Source, pos: Pos, limit: ?Pos) BoundsResult {
         return switch (self) {
             .csv => |r| r.boundsAfter(source, pos, limit),
+            .parquet => |r| r.boundsAfter(source, pos, limit),
         };
     }
 
@@ -151,9 +175,18 @@ pub const Reader = union(enum) {
         buf: *std.ArrayList(u8),
         refs: *std.ArrayList(CellRef),
         gpa: std.mem.Allocator,
-    ) std.mem.Allocator.Error!MaterializeResult {
+    ) ReadError!MaterializeResult {
         return switch (self) {
             .csv => |r| r.materialize(source, pos, want, cap, limit, buf, refs, gpa),
+            .parquet => |r| r.materialize(source, pos, want, cap, limit, buf, refs, gpa),
+        };
+    }
+
+    /// Window-only projection; background jobs always see the full reader.
+    pub fn materializeWindow(self: Reader, source: Source, pos: Pos, want: u32, first_col: u32, last_col: u32, cap: usize, limit: ?Pos, buf: *std.ArrayList(u8), refs: *std.ArrayList(CellRef), gpa: std.mem.Allocator) ReadError!MaterializeResult {
+        return switch (self) {
+            .csv => |r| r.materialize(source, pos, want, cap, limit, buf, refs, gpa),
+            .parquet => |r| r.materializeWindow(source, pos, want, first_col, last_col, cap, limit, buf, refs, gpa),
         };
     }
 
@@ -169,9 +202,10 @@ pub const Reader = union(enum) {
         buf: *std.ArrayList(u8),
         refs: *std.ArrayList(CellRef),
         gpa: std.mem.Allocator,
-    ) std.mem.Allocator.Error!MaterializeResult {
+    ) ReadError!MaterializeResult {
         return switch (self) {
             .csv => |r| r.materializeSelected(source, pos, selected, cap, limit, buf, refs, gpa),
+            .parquet => |r| r.materializeSelected(source, pos, selected, cap, limit, buf, refs, gpa),
         };
     }
 
@@ -190,6 +224,7 @@ pub const Reader = union(enum) {
     ) CellResult {
         return switch (self) {
             .csv => |r| r.cell(source, pos, col, limit, buf, buf_len),
+            .parquet => |r| r.cell(source, pos, col, limit, buf, buf_len),
         };
     }
 
@@ -198,6 +233,7 @@ pub const Reader = union(enum) {
     pub fn scanRows(self: Reader, source: Source, pos: Pos, max_rows: u64) ScanRowsResult {
         return switch (self) {
             .csv => |r| r.scanRows(source, pos, max_rows),
+            .parquet => |r| r.scanRows(source, pos, max_rows),
         };
     }
 };
@@ -267,6 +303,7 @@ pub fn readerMatchRowAtScanCursor(
 ) MatchRowResult {
     return switch (self) {
         .csv => |r| r.matchRowAtScanCursor(cursor, primary, filter_ctx),
+        .parquet => unreachable,
     };
 }
 
@@ -280,5 +317,6 @@ pub fn readerMatchRow(
 ) MatchRowResult {
     return switch (self) {
         .csv => |r| r.matchRow(source, pos, primary, filter_ctx, limit),
+        .parquet => |r| r.matchRow(source, pos, primary, filter_ctx, limit),
     };
 }

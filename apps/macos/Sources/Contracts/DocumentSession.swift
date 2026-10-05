@@ -1,12 +1,7 @@
-/// The live windowed document session — the ONLY way the app reads document
-/// data in the viewer-ui slice (supersedes the walking skeleton's
-/// copy-and-close head snapshot). A session wraps one open core handle
-/// (`ls_doc`) for its whole lifetime; rows are paged through `setWindow` as
-/// the user scrolls, and background indexing / jump scans / match-scans are
-/// observed by polling. A FILTER (setFilter / clearFilter / filterStatus /
-/// sourceRow) is an in-place VIEW MODE: while active, the same accessors serve
-/// only the matching rows in filtered coordinates, with each row's original
-/// number retrievable — see api/lesssheet.h FILTERED VIEWS.
+/// A live windowed session wraps one core handle (`ls_doc`). Rows are paged
+/// through `setWindow`; background indexing, jumps and match scans are polled.
+/// An active filter serves matching rows in filtered coordinates, with original
+/// row numbers retrievable — see api/lesssheet.h FILTERED VIEWS.
 ///
 /// Contract (mirrors api/lesssheet.h; see it for full semantics):
 /// - All strings returned by a session OWN their storage: implementations
@@ -136,6 +131,10 @@ public enum JumpStatus: Equatable, Sendable {
 public protocol DocumentSession: AnyObject, Sendable {
     /// Column count (fixed at open; 0 for an empty document).
     var columnCount: Int { get }
+    /// True for a self-describing local Parquet document.
+    var isParquet: Bool { get }
+    /// A malformed or unsupported page was encountered after opening.
+    var readFailed: Bool { get }
     /// The effective dialect report (fixed at open) — feeds the pills.
     var dialect: DialectReport { get }
     /// The effective header record's cells (exactly `columnCount` of them),
@@ -344,6 +343,9 @@ public protocol DocumentSession: AnyObject, Sendable {
 }
 
 public extension DocumentSession {
+    var isParquet: Bool { false }
+    var readFailed: Bool { false }
+
     /// DEFAULT (dense fallback) for the column-windowed `setWindow`: ignores
     /// `columns` and returns the full-width window from the dense
     /// `setWindow(firstRow:rowCount:)` (`firstColumn == 0`, every row

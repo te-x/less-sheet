@@ -225,10 +225,34 @@ test_utf8_sanitize (void)
   g_free (empty);
 }
 
+static void
+test_parquet_schema_and_projected_window (void)
+{
+  LsgOpenError error = LSG_OPEN_IO;
+  LsgDocument *doc = lsg_document_open_local (PARQUET_FIXTURE_PATH, NULL, &error);
+  g_assert_nonnull (doc);
+  g_assert_cmpint (error, ==, LSG_OPEN_OK);
+  g_assert_true (lsg_document_is_parquet (doc));
+  g_assert_true (lsg_document_has_header (doc));
+  g_assert_cmpuint (lsg_document_column_count (doc), ==, 8);
+  LsgRowCount rows = lsg_document_row_count (doc);
+  g_assert_true (rows.exact);
+  g_assert_cmpuint (rows.count, ==, 8);
+  LsgWindow *window = lsg_document_set_window (doc, 6, 2, 1, 1);
+  g_assert_cmpuint (lsg_window_row_count (window), ==, 2);
+  g_assert_cmpuint (lsg_window_first_col (window), ==, 1);
+  g_assert_cmpstr (lsg_window_cell (window, 0, 0), ==, "東京");
+  g_assert_cmpstr (lsg_window_cell (window, 1, 0), ==, "last");
+  g_assert_false (lsg_document_read_failed (doc));
+  lsg_window_free (window);
+  lsg_document_close (doc);
+}
+
 int
 main (int argc, char *argv[])
 {
   g_test_init (&argc, &argv, NULL);
+  g_test_add_func ("/document/parquet-schema-and-projection", test_parquet_schema_and_projected_window);
   g_test_add_func ("/document/open-error-mapping", test_open_error_mapping);
   g_test_add_func ("/document/scan-progress-fraction", test_scan_progress_fraction);
   g_test_add_func ("/document/open-tiny-facts", test_open_tiny_facts);

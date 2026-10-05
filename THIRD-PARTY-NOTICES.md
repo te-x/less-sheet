@@ -30,3 +30,29 @@ Source & license: https://github.com/ziglang/zig — MIT License.
 The LGPL-licensed libraries (GTK 4, libadwaita, GLib) are used **unmodified** and linked **dynamically**. On Linux they are supplied by the Flatpak `org.gnome.Platform` runtime (or the system), so a user can replace them with a modified version — satisfying the LGPL relink requirement without any source disclosure of less-sheet's own (closed) code. If a future build statically bundles any LGPL library, this section and the distribution method must be revisited to preserve that relink right (e.g. by providing linkable object files).
 
 *Full license texts (LGPL-2.1, MIT) should be included alongside this file in the shipped package.*
+
+## zig-parquet — MIT / Apache-2.0
+
+Reader and native Zig codecs from https://github.com/akeating/zig-parquet,
+pinned to commit 38dec45c665037f2092db1464676afb8406a90d4. Distributed under
+the MIT license below. Optional C compression libraries are not linked.
+
+MIT License
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

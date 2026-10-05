@@ -1,0 +1,142 @@
+#!/usr/bin/env python3
+"""Exercise the real HTTP transport through the C ABI against a local server.
+
+Compile tools/tests/parquet_http_probe.c against the native core archive, then
+pass the probe executable here. --large accepts a 10M-row benchmark fixture.
+"""
+import argparse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
+from pathlib import Path
+import re
+import ssl
+import tempfile
+import subprocess
+import threading
+import time
+
+parser = argparse.ArgumentParser()
+parser.add_argument('probe', type=Path)
+parser.add_argument('--large', type=Path)
+parser.add_argument('--https', help='Also verify a public HTTPS Parquet URL using system certificate trust')
+args = parser.parse_args()
+root = Path(__file__).resolve().parents[2]
+files = {name: root / 'backend/tests/fixtures/parquet' / f'remote-{name}.parquet'
+         for name in ('indexed', 'unindexed')}
+if args.large:
+    files['large'] = args.large
+records = []
+record_lock = threading.Lock()
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = 'HTTP/1.1'
+    def log_message(self, *_):
+        pass
+    def do_GET(self):
+        mode, name = self.path.strip('/').split('/')
+        path = files[name]
+        size = path.stat().st_size
+        match = re.fullmatch(r'bytes=(\d+)-(\d+)', self.headers.get('Range', ''))
+        start, end = (int(match[1]), min(int(match[2]), size - 1)) if match else (0, size - 1)
+        ranged = match is not None and mode != 'sequential'
+        with record_lock:
+            records.append({'start': start, 'end': end, 'mode': mode, 'name': name,
+                            'if_match': self.headers.get('If-Match')})
+        middle = 0 < start < (size // 262144) * 262144
+        if mode == 'changed' and start:
+            assert self.headers.get('If-Match') == '"fixture-v1"'
+            self.send_response(412)
+            self.send_header('Content-Length', '0')
+            self.end_headers()
+            return
+        self.send_response(206 if ranged else 200)
+        self.send_header('ETag', '"fixture-v2"' if mode == 'etag-page' and middle else '"fixture-v1"')
+        if ranged:
+            cr_start = start + 1 if mode == 'wrong-range' and middle else start
+            cr_total = size + 1 if mode == 'wrong-total' and start else size
+            self.send_header('Content-Range', f'bytes {cr_start}-{end}/{cr_total}')
+        length = end - start + 1 if ranged else size
+        self.send_header('Content-Length', str(length))
+        self.end_headers()
+        if mode == 'stall-open' or (mode == 'stall-page' and middle):
+            self.close_connection = True
+            time.sleep(3)
+            return
+        try:
+            with path.open('rb') as source:
+                source.seek(start if ranged else 0)
+                while length:
+                    chunk = source.read(min(65536, length))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    length -= len(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+server.daemon_threads = True
+thread = threading.Thread(target=server.serve_forever, daemon=True)
+thread.start()
+base = f'http://127.0.0.1:{server.server_port}'
+
+def run(mode, name='indexed', probe_mode='ok'):
+    with record_lock:
+        records.clear()
+    result = subprocess.run([str(args.probe.resolve()), f'{base}/{mode}/{name}', probe_mode],
+                            capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, f'{mode}/{name}: {result.stderr} {result.stdout} exit {result.returncode}'
+    with record_lock:
+        log = list(records)
+    transferred = sum(item['end'] - item['start'] + 1 for item in log)
+    metadata = json.loads(result.stdout) if result.stdout.strip() else {}
+    print(f'{mode}/{name}: {metadata}; {len(log)} requests, {transferred} requested bytes', flush=True)
+    return metadata, log, transferred
+
+try:
+    for name in ('indexed', 'unindexed'):
+        _, log, _ = run('range', name)
+        assert all(item['if_match'] == '"fixture-v1"' for item in log[1:])
+    _, _, transferred = run('range', probe_mode='first')
+    assert transferred < files['indexed'].stat().st_size, 'first viewport downloaded the whole file'
+    run('sequential')
+    run('changed', probe_mode='open-error')
+    run('wrong-total', probe_mode='open-error')
+    run('wrong-range', probe_mode='page-error')
+    run('etag-page', probe_mode='page-error')
+    run('stall-open', probe_mode='cancel-open')
+    run('stall-page', probe_mode='cancel-page')
+    if args.large:
+        _, _, transferred = run('range', 'large')
+        assert transferred < files['large'].stat().st_size // 8
+    # An untrusted HTTPS certificate must fail; never disable verification.
+    with tempfile.TemporaryDirectory(prefix='less-sheet-https-') as directory:
+        cert, key = Path(directory) / 'cert.pem', Path(directory) / 'key.pem'
+        subprocess.run(['openssl', 'req', '-x509', '-newkey', 'ec', '-pkeyopt',
+                        'ec_paramgen_curve:prime256v1', '-nodes', '-days', '1',
+                        '-subj', '/CN=localhost', '-addext', 'subjectAltName=DNS:localhost',
+                        '-keyout', str(key), '-out', str(cert)],
+                       check=True, capture_output=True)
+        tls = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(cert, key)
+        tls.socket = context.wrap_socket(tls.socket, server_side=True)
+        threading.Thread(target=tls.serve_forever, daemon=True).start()
+        try:
+            result = subprocess.run([str(args.probe.resolve()),
+                                     f'https://localhost:{tls.server_port}/range/indexed', 'open-error'],
+                                    capture_output=True, text=True, timeout=20)
+            assert result.returncode == 0, f'untrusted TLS certificate accepted: {result.stderr}'
+            print('HTTPS: untrusted certificate rejected', flush=True)
+        finally:
+            tls.shutdown()
+            tls.server_close()
+    if args.https:
+        result = subprocess.run([str(args.probe.resolve()), args.https, 'types'],
+                                capture_output=True, text=True, timeout=30)
+        assert result.returncode == 0, f'HTTPS Parquet: {result.stderr} exit {result.returncode}'
+        print(f'HTTPS Parquet: {result.stdout.strip()}', flush=True)
+    print('HTTP Parquet transport checks passed', flush=True)
+finally:
+    server.shutdown()
+    server.server_close()

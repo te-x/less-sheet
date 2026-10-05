@@ -130,7 +130,7 @@ pub fn filterScanChunk(doc: *Document, start_pos: Pos, start_row: u64, generatio
     doc.filter_oversized_stage.clearRetainingCapacity(); // ARCH-huge-row-filtered
     // FRONTIER COMMIT GUARD (source.Source.commitBound) -- see the hoist and the
     // withhold in search.searchScanChunk; identical rule, identical reasons.
-    const guarded = doc.source.commitGuarded();
+    const guarded = doc.reader == .csv and doc.source.commitGuarded();
     while (row < target) {
         if (doc.stop_atomic.load(.monotonic)) {
             doc.endMatchScanIf(.filter, generation);
@@ -250,13 +250,15 @@ pub fn resolveFilterJumpLocked(doc: *Document) void {
     const fctx = filterCtx(doc);
     if (target < counted) {
         if (nav.findForwardMatch(doc, doc.filter_block_counts.items, null, fctx, target, counted)) |m| {
+            const position = nav.positionOf(doc, doc.filter_block_counts.items, null, fctx, m.row);
+            if (base.parquetPending(doc)) return;
             doc.jump_state = .done;
-            doc.jump_landed = nav.positionOf(doc, doc.filter_block_counts.items, null, fctx, m.row) - 1;
+            doc.jump_landed = position - 1;
             doc.jump_progress = 1.0;
             return;
         }
     }
-    if (doc.filter_total_exact) {
+    if (doc.filter_total_exact and !base.parquetPending(doc)) {
         // EOF: no match at/after target anywhere -> clamp to the last match
         // (0 for an empty filtered view).
         doc.jump_state = .done;
@@ -281,15 +283,18 @@ pub fn jumpStartFiltered(d: *Document, target_row: u64) void {
     // Instant path 1: already answerable from the filter's counted region.
     if (target_row < d.filter_rows) {
         if (nav.findForwardMatch(d, d.filter_block_counts.items, null, fctx, target_row, d.filter_rows)) |m| {
-            d.jump_state = .done;
-            d.jump_landed = nav.positionOf(d, d.filter_block_counts.items, null, fctx, m.row) - 1;
-            d.jump_progress = 1.0;
-            return;
+            const position = nav.positionOf(d, d.filter_block_counts.items, null, fctx, m.row);
+            if (!base.parquetPending(d)) {
+                d.jump_state = .done;
+                d.jump_landed = position - 1;
+                d.jump_progress = 1.0;
+                return;
+            }
         }
     }
     // Instant path 2: the filter is exact and there is no match at/after
     // target anywhere -> clamp to the last match (0 for an empty view).
-    if (d.filter_total_exact) {
+    if (d.filter_total_exact and !base.parquetPending(d)) {
         d.jump_state = .done;
         d.jump_landed = if (d.filter_total > 0) d.filter_total - 1 else 0;
         d.jump_progress = 1.0;

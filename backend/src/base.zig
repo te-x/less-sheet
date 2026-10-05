@@ -32,6 +32,17 @@ const sort_mod = @import("sort.zig");
 const posix = std.posix;
 const sysio = @import("sysio.zig");
 
+// A remote Parquet page may be absent even behind the exact row frontier.
+// Track control-lock ownership on this thread so reader callbacks never fetch
+// while a navigation/commit holds a document mutex.
+threadlocal var control_lock_depth: usize = 0;
+pub fn controlLocked() bool {
+    return control_lock_depth != 0;
+}
+pub fn parquetPending(doc: *Document) bool {
+    return doc.reader == .parquet and doc.reader.parquet.data.remote != null and doc.reader.parquet.data.hasPending();
+}
+
 /// Re-exported so sibling modules can keep writing `base.Pos` (matching how
 /// they already reference `base.CellRef`/`base.Checkpoint`) without a
 /// separate import of reader.zig. See reader.zig's module doc for what
@@ -539,6 +550,8 @@ pub const Document = struct {
     // SORTED view can find "which materialized row is at view position i"
     // without a linear scan (see window.windowSlot). Memoized on `win_gen`
     // exactly like the match-flags buffer, and freed in freeDoc.
+    win_first_col: u32 = 0,
+    win_last_col: u32 = 0,
     win_src_index: std.ArrayList(u32) = .empty,
     win_src_valid: bool = false,
     win_src_gen: u64 = 0,
@@ -717,8 +730,10 @@ pub const Document = struct {
 
     pub fn lock(self: *Document) void {
         self.mutex.lockUncancelable(sysio.io());
+        control_lock_depth += 1;
     }
     pub fn unlock(self: *Document) void {
+        control_lock_depth -= 1;
         self.mutex.unlock(sysio.io());
     }
     pub fn wakeWorker(self: *Document) void {
@@ -887,6 +902,7 @@ pub fn freeDoc(doc: *Document) void {
     if (doc.header_refs.len > 0) doc.gpa.free(doc.header_refs);
     if (doc.row0_pinned_buf.len > 0) doc.gpa.free(doc.row0_pinned_buf);
     if (doc.row0_pinned_refs.len > 0) doc.gpa.free(doc.row0_pinned_refs);
+    doc.reader.deinit();
     source_mod.sourceDeinit(&doc.source);
     // Stop guarding BEFORE unmapping: once the range is gone the kernel may hand
     // it to an unrelated mapping, and a fault there is not ours to adopt.
@@ -895,6 +911,17 @@ pub fn freeDoc(doc: *Document) void {
     if (doc.fd) |fd| sysio.close(fd);
     // std.Io.Mutex/Condition need no explicit destroy (unlike pthread_*_destroy).
     doc.gpa.destroy(doc);
+}
+
+/// Indexed formats calculate checkpoints instead of retaining one per block.
+pub fn checkpointCount(doc: *const Document) usize {
+    if (doc.reader == .parquet) return @intCast((doc.total_rows + checkpoint_interval - 1) / checkpoint_interval);
+    return doc.checkpoints.items.len;
+}
+pub fn checkpointAt(doc: *const Document, block: usize) Checkpoint {
+    if (doc.reader.positionForRow(@as(u64, block) * checkpoint_interval)) |pos|
+        return .{ .row = @as(u64, block) * checkpoint_interval, .pos = pos };
+    return doc.checkpoints.items[block];
 }
 
 /// SOURCE-FAULT GUARD, caller side.
@@ -911,7 +938,7 @@ pub fn freeDoc(doc: *Document) void {
 /// happen under this operation" has to be answerable separately from "has this
 /// document ever faulted".
 pub fn sourceFaultCount(doc: *const Document) u32 {
-    return fault_guard.faultCount(doc.fault_slot);
+    return fault_guard.faultCount(doc.fault_slot) +| @as(u32, if (doc.reader == .parquet and doc.reader.parquet.data.failed.load(.acquire)) 1 else 0);
 }
 
 /// The BACKSTOP for reporting a fault, as opposed to discarding the work that
@@ -927,7 +954,7 @@ pub fn sourceFaultCount(doc: *const Document) u32 {
 /// remembered in `fault_reported`, so a document that faults again after already
 /// being complete re-clamps rather than being ignored). Mutex held.
 pub fn reportSourceFaultLocked(doc: *Document) void {
-    const n = fault_guard.faultCount(doc.fault_slot);
+    const n = sourceFaultCount(doc);
     if (n == doc.fault_reported) return;
     doc.fault_reported = n;
     goTerminalOnSourceFaultLocked(doc);
@@ -955,8 +982,8 @@ pub fn reportSourceFaultLocked(doc: *Document) void {
 /// and this degrades to the plain damaged-source shape. Idempotent: a second call
 /// re-derives the same clamp and changes nothing. Mutex held.
 fn goTerminalOnSourceFaultLocked(doc: *Document) void {
-    var keep_rows = doc.frontier_rows;
-    var keep_pos = doc.frontier_pos;
+    var keep_rows = if (doc.reader == .parquet) @as(u64, 0) else doc.frontier_rows;
+    var keep_pos = if (doc.reader == .parquet) doc.data_start else doc.frontier_pos;
     if (doc.fd) |fd| {
         if (sysio.file(fd).stat(sysio.io())) |st| {
             const now: u64 = st.size;

@@ -84,6 +84,7 @@ fn appendRowMetadata(d: *Document, source_row: u64, pos: Pos, oversized: bool, b
 /// "has ever faulted" flag — that is what lets a truncated document keep serving
 /// the rows it CAN still read instead of going permanently blank.
 pub fn windowSet(d: *Document, first_row: u64, row_count: u32) api.RowRange {
+    defer wakeParquet(d);
     const faults_before = base.sourceFaultCount(d);
     const res = windowSetInner(d, first_row, row_count);
     if (base.sourceFaultCount(d) == faults_before) return res;
@@ -225,7 +226,7 @@ fn windowSetInner(d: *Document, first_row: u64, row_count: u32) api.RowRange {
         const row_limit = d.reader.posAtByteBudget(d.source, pos, allowance);
         const buf_mark = d.win_buf.items.len;
         const refs_mark = d.win_refs.items.len;
-        const res = d.reader.materialize(d.source, pos, d.column_count, api.cell_max_bytes, row_limit, &d.win_buf, &d.win_refs, d.gpa) catch break;
+        const res = d.reader.materializeWindow(d.source, pos, d.column_count, d.win_first_col, d.win_last_col, api.cell_max_bytes, row_limit, &d.win_buf, &d.win_refs, d.gpa) catch break;
         charge(d, pos, res.next);
         if (res.capped and allowance < api.window_row_scan_max_bytes) {
             d.win_buf.items.len = buf_mark;
@@ -357,7 +358,7 @@ fn windowSetSorted(d: *Document, first_row: u64, clamped: u64, filtered: bool, f
         const row_limit = d.reader.posAtByteBudget(d.source, pos, allowance);
         const buf_mark = d.win_buf.items.len;
         const refs_mark = d.win_refs.items.len;
-        const res = d.reader.materialize(d.source, pos, d.column_count, api.cell_max_bytes, row_limit, &d.win_buf, &d.win_refs, d.gpa) catch break;
+        const res = d.reader.materializeWindow(d.source, pos, d.column_count, d.win_first_col, d.win_last_col, api.cell_max_bytes, row_limit, &d.win_buf, &d.win_refs, d.gpa) catch break;
         charge(d, pos, res.next);
         if (res.capped and allowance < api.window_row_scan_max_bytes) {
             d.win_buf.items.len = buf_mark;
@@ -409,9 +410,9 @@ fn windowSetFiltered(d: *Document, first_row: u64, clamped: u64) api.RowRange {
             if (cum + count > first_row) break;
             cum += count;
         }
-        if (b >= d.filter_block_counts.items.len or b >= d.checkpoints.items.len)
+        if (b >= d.filter_block_counts.items.len or b >= base.checkpointCount(d))
             return .{ .first_row = first_row, .row_count = d.win_rows };
-        const cp = d.checkpoints.items[b];
+        const cp = base.checkpointAt(d, b);
         d.win_cursor_pos = cp.pos;
         d.win_cursor_row = cp.row;
         d.win_cursor_valid = true;
@@ -428,7 +429,15 @@ fn windowSetFiltered(d: *Document, first_row: u64, clamped: u64) api.RowRange {
             const row_limit = d.reader.posAtByteBudget(d.source, pos, allowance);
             d.nav_scratch.clearRetainingCapacity();
             d.nav_refs.clearRetainingCapacity();
-            const test_res = d.reader.materialize(d.source, pos, d.column_count, null, row_limit, &d.nav_scratch, &d.nav_refs, d.gpa) catch break;
+            var parquet_matched: ?bool = null;
+            const test_res = if (d.reader == .parquet and d.net) blk: {
+                // Test only the predicate's columns. Unrelated remote columns
+                // must not hold a projected filtered viewport hostage.
+                const matched = @import("reader.zig").readerMatchRow(d.reader, d.source, pos, fctx, null, .{});
+                if (matched.next.logical == pos.logical) break;
+                parquet_matched = matched.matched_col != null;
+                break :blk @as(@import("reader.zig").MaterializeResult, .{ .next = matched.next, .capped = matched.capped });
+            } else d.reader.materialize(d.source, pos, d.column_count, null, row_limit, &d.nav_scratch, &d.nav_refs, d.gpa) catch break;
             charge(d, pos, test_res.next);
             if (test_res.capped and allowance < api.window_row_scan_max_bytes) break;
 
@@ -437,7 +446,7 @@ fn windowSetFiltered(d: *Document, first_row: u64, clamped: u64) api.RowRange {
             d.win_candidate_matched = if (test_res.capped)
                 nav.oversizedMatch(d.filter_oversized_matches.items, d.win_cursor_row) orelse false
             else
-                matcher.matchRecord(fctx, d.nav_scratch.items, d.nav_refs.items) != null;
+                parquet_matched orelse (matcher.matchRecord(fctx, d.nav_scratch.items, d.nav_refs.items) != null);
             if (test_res.capped) {
                 const cp = nav.bestCheckpoint(d, d.win_cursor_row + 1);
                 d.win_candidate_next_pos = cp.pos;
@@ -481,7 +490,7 @@ fn windowSetFiltered(d: *Document, first_row: u64, clamped: u64) api.RowRange {
         const row_limit = d.reader.posAtByteBudget(d.source, pos, allowance);
         const buf_mark = d.win_buf.items.len;
         const refs_mark = d.win_refs.items.len;
-        const display_res = d.reader.materialize(d.source, pos, d.column_count, api.cell_max_bytes, row_limit, &d.win_buf, &d.win_refs, d.gpa) catch break;
+        const display_res = d.reader.materializeWindow(d.source, pos, d.column_count, d.win_first_col, d.win_last_col, api.cell_max_bytes, row_limit, &d.win_buf, &d.win_refs, d.gpa) catch break;
         charge(d, pos, display_res.next);
         if (display_res.capped and allowance < api.window_row_scan_max_bytes) {
             d.win_buf.items.len = buf_mark;
@@ -883,6 +892,7 @@ pub fn copyFaulted(d: *Document, faults_before: u32) bool {
 }
 
 pub fn cellCopy(d: *Document, row: u64, col: u32, buf: ?[*]u8, buf_len: usize, out_len: *usize, out_truncated: *bool) api.CopyResult {
+    defer wakeParquet(d);
     out_len.* = 0;
     out_truncated.* = false;
     if (d.column_count == 0 or col >= d.column_count) return .no_cell;
@@ -1169,6 +1179,7 @@ fn cellCopyFilteredLocked(d: *Document, row: u64, col: u32, buf: ?[*]u8, buf_len
 fn decodeCellAt(d: *Document, pos: Pos, col: u32, buf: ?[*]u8, buf_len: usize, out_len: *usize, out_truncated: *bool) api.CopyResult {
     const row_limit = d.reader.posAtByteBudget(d.source, pos, api.window_row_scan_max_bytes);
     const res = d.reader.cell(d.source, pos, col, row_limit, buf, buf_len);
+    if (res.pending) return .pending;
     out_len.* = res.len;
     out_truncated.* = res.truncated;
     // Neutralize a formula-injection lead byte on the COPY output only. This is
@@ -1179,6 +1190,13 @@ fn decodeCellAt(d: *Document, pos: Pos, col: u32, buf: ?[*]u8, buf_len: usize, o
     // they keep the RAW bytes.
     neutralizeCopyCell(buf, buf_len, out_len, out_truncated);
     return .ok;
+}
+
+fn wakeParquet(d: *Document) void {
+    if (d.reader != .parquet or d.reader.parquet.data.remote == null) return;
+    d.lock();
+    defer d.unlock();
+    if (d.reader.parquet.data.hasPending()) d.wakeWorker();
 }
 
 /// The NUMBER-AWARE copy formula-injection decision (single source of truth;

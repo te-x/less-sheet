@@ -114,6 +114,11 @@ fn failLocked(job: *NetOpenJob, err: api.NetStatus) void {
 /// state, so poll never blocks on a slow open.
 fn publish(job: *NetOpenJob, built: ?net_source.BuiltSource, build_err: api.NetStatus) void {
     const b = built orelse return failLocked(job, build_err);
+    // The open job can be released while the document continues fetching.
+    // Detach its callback before buildDocument starts the document worker;
+    // retaining it would let a later page fetch call into a freed job.
+    const provider = source_mod.netProviderOf(b.source);
+    if (provider) |hr| hr.progress = null;
     // No SOURCE-FAULT GUARD slot and no fd: that guard is scoped to a LOCAL
     // file's mapping, and a network document's spool is a file this process
     // creates, holds open and extends itself — not one another process truncates.
@@ -136,7 +141,7 @@ fn publish(job: *NetOpenJob, built: ?net_source.BuiltSource, build_err: api.NetS
     // would falsely imply a full download. progress = 1.0 means "open complete",
     // NOT "downloaded" (the ABI's LS_NET_OPEN_DONE semantics).
     job.bytes_total = if (b.length_known) b.file_size else 0;
-    job.bytes_fetched = b.head_fetched;
+    job.bytes_fetched = if (provider) |hr| hr.spool_bytes else b.head_fetched;
     job.progress = 1.0;
     job.state = .done;
 }

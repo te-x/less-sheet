@@ -428,6 +428,9 @@ pub const SnapshotProbe = struct {
 pub const ls_open = core.ls_open;
 pub const ls_close = core.ls_close;
 pub const ls_dialect_get = core.ls_dialect_get;
+pub const ls_document_is_parquet = core.ls_document_is_parquet;
+pub const ls_document_status = core.ls_document_status;
+pub const ls_window_set_columns = core.ls_window_set_columns;
 pub const ls_column_count = core.ls_column_count;
 pub const ls_row_count_get = core.ls_row_count_get;
 pub const ls_index_poll = core.ls_index_poll;
@@ -630,6 +633,12 @@ comptime {
         @compileError("signature drift: ls_open");
     if (@TypeOf(core.ls_close) != fn (*Doc) callconv(.c) void)
         @compileError("signature drift: ls_close");
+    if (@TypeOf(core.ls_document_is_parquet) != fn (*const Doc) callconv(.c) bool)
+        @compileError("signature drift: ls_document_is_parquet");
+    if (@TypeOf(core.ls_document_status) != fn (*const Doc) callconv(.c) Status)
+        @compileError("signature drift: ls_document_status");
+    if (@TypeOf(core.ls_window_set_columns) != fn (*Doc, u64, u32, u32, u32) callconv(.c) RowRange)
+        @compileError("signature drift: ls_window_set_columns");
     if (@TypeOf(core.ls_dialect_get) != fn (*const Doc) callconv(.c) Dialect)
         @compileError("signature drift: ls_dialect_get");
     if (@TypeOf(core.ls_column_count) != fn (*const Doc) callconv(.c) u32)

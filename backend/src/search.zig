@@ -114,7 +114,7 @@ pub fn searchScanChunk(doc: *Document, start_pos: Pos, start_row: u64, filtered:
     doc.search_match_stage.clearRetainingCapacity();
     // FRONTIER COMMIT GUARD (source.Source.commitBound), hoisted out of the row
     // loop: a LOCAL document pays one register test per row, no call.
-    const guarded = doc.source.commitGuarded();
+    const guarded = doc.reader == .csv and doc.source.commitGuarded();
     while (row < target) {
         if (doc.stop_atomic.load(.monotonic)) {
             doc.endMatchScanIf(.search, generation);
@@ -309,17 +309,21 @@ fn maybeAdvanceFilterFromSearch(doc: *Document, block: u64, res: SearchChunk) vo
 /// strictly before it (m.row itself satisfies the filter: rowMatch checked
 /// it to find it at all), via the filter's OWN counted region.
 fn setFound(doc: *Document, m: Match) void {
-    doc.search_found_col = m.col;
-    doc.search_position = nav.positionOf(doc, doc.block_counts.items, filter.activeFilterCtxOrNull(doc), docCtx(doc), m.row);
-    doc.search_found_row = if (doc.filter_state != .idle)
-        nav.positionOf(doc, doc.filter_block_counts.items, null, filter.filterCtx(doc), m.row) - 1
+    const position = nav.positionOf(doc, doc.block_counts.items, filter.activeFilterCtxOrNull(doc), docCtx(doc), m.row);
+    const filtered_position = if (doc.filter_state != .idle)
+        nav.positionOf(doc, doc.filter_block_counts.items, null, filter.filterCtx(doc), m.row)
     else
-        m.row;
+        m.row + 1;
+    if (base.parquetPending(doc)) return;
+    doc.search_found_col = m.col;
+    doc.search_position = position;
+    doc.search_found_row = filtered_position - 1;
     doc.search_nav = .found;
     doc.nav_pending = false;
 }
 
 fn setExhausted(doc: *Document) void {
+    if (base.parquetPending(doc)) return;
     doc.search_nav = .exhausted;
     doc.nav_pending = false;
 }
@@ -337,14 +341,14 @@ fn setExhausted(doc: *Document) void {
 
 /// Source logical-byte offset at the START of counted checkpoint block `b`.
 fn blockStartByte(doc: *Document, b: usize) u64 {
-    return doc.reader.logicalBytes(doc.source, doc.checkpoints.items[b].pos);
+    return doc.reader.logicalBytes(doc.source, base.checkpointAt(doc, b).pos);
 }
 
 /// Source logical-byte offset at the END of counted checkpoint block `b` — the
 /// next block's checkpoint, or the current counted frontier for the last block.
 fn blockEndByte(doc: *Document, b: usize) u64 {
-    if (b + 1 < doc.checkpoints.items.len)
-        return doc.reader.logicalBytes(doc.source, doc.checkpoints.items[b + 1].pos);
+    if (b + 1 < base.checkpointCount(doc))
+        return doc.reader.logicalBytes(doc.source, base.checkpointAt(doc, b + 1).pos);
     return doc.reader.logicalBytes(doc.source, doc.search_pos);
 }
 
@@ -402,7 +406,7 @@ fn lastCombinedBlockTo(doc: *Document, upto_block: usize) ?usize {
 /// early-exit cases (no anchor row yet, nothing before filtered index 0) re-lex
 /// nothing and always "fit". Caller holds the mutex.
 fn filteredNavFitsBudget(doc: *Document) bool {
-    if (doc.checkpoints.items.len == 0) return true;
+    if (base.checkpointCount(doc) == 0) return true;
     var lo: usize = undefined;
     var hi: usize = undefined;
     if (doc.nav_dir == .forward) {
@@ -426,8 +430,8 @@ fn filteredNavFitsBudget(doc: *Document) bool {
             hi = lo;
         } else return true; // bound not established yet: re-lex nothing
     }
-    if (lo >= doc.checkpoints.items.len) return true;
-    if (hi >= doc.checkpoints.items.len) hi = doc.checkpoints.items.len - 1;
+    if (lo >= base.checkpointCount(doc)) return true;
+    if (hi >= base.checkpointCount(doc)) hi = base.checkpointCount(doc) - 1;
     if (hi < lo) hi = lo;
     return (blockEndByte(doc, hi) -| blockStartByte(doc, lo)) <= api.window_budget_max_bytes;
 }
@@ -441,6 +445,10 @@ fn filteredNavFitsBudget(doc: *Document) bool {
 /// are FILTERED indices").
 pub fn resolveNavLocked(doc: *Document) void {
     if (!doc.nav_pending) return;
+    if (doc.reader == .parquet and doc.net and doc.search_state == .done and !sort.presented(doc) and doc.worker != null) {
+        doc.wakeWorker();
+        return;
+    }
     if (sort.presented(doc)) {
         // FIND UNDER A SORT. Full coverage is the precondition on BOTH axes —
         // every row counted, and the order final — and neither has an honest
@@ -571,9 +579,9 @@ fn buildSortedCounters(doc: *Document, c: SortedNavCtx) bool {
             if (c.filtered and b < c.filter_block_counts.len) cum_filtered += c.filter_block_counts[b];
             continue;
         }
-        if (b >= c.checkpoints.len) break;
+        if (b >= base.checkpointCount(doc)) break;
         if (doc.stop_atomic.load(.monotonic) or doc.sort_scan_interrupt.load(.acquire)) return false;
-        const cp = c.checkpoints[b];
+        const cp = base.checkpointAt(doc, b);
         var pos = cp.pos;
         var row = cp.row;
         const block_hi = @min(block_start + checkpoint_interval, c.counted);
@@ -636,7 +644,7 @@ fn scanSortedBlock(doc: *Document, c: SortedNavCtx, plan: sort.NavPlan, position
     var cursor_valid = false;
     for (pairs.items) |pair| {
         if (doc.stop_atomic.load(.monotonic) or doc.sort_scan_interrupt.load(.acquire)) return false;
-        const cp = nav.bestCheckpointIn(c.checkpoints, c.oversized, pair.a);
+        const cp = if (doc.reader.positionForRow(pair.a)) |pos| Checkpoint{ .row = pair.a, .pos = pos } else nav.bestCheckpointIn(c.checkpoints, c.oversized, pair.a);
         var row = cp.row;
         var at = cp.pos;
         if (cursor_valid and cursor_row <= pair.a and cursor_row >= cp.row) {
@@ -893,7 +901,7 @@ pub const FilteredNavOutcome = struct {
 fn navJobCurrentLocked(doc: *Document, nav_gen: u64, search_gen: u64, filter_gen: u64) bool {
     return doc.nav_pending and doc.search_nav == .searching and
         doc.nav_gen == nav_gen and doc.search_gen == search_gen and
-        doc.filter_gen == filter_gen and doc.filter_state != .idle;
+        doc.filter_gen == filter_gen;
 }
 
 fn locateFilteredIndexJob(doc: *Document, nav_gen: u64, search_gen: u64, filter_gen: u64, fctx: MatchCtx, idx: u64) ?nav.SourceLoc {
@@ -909,11 +917,11 @@ fn locateFilteredIndexJob(doc: *Document, nav_gen: u64, search_gen: u64, filter_
         if (cum + count > idx) break;
         cum += count;
     }
-    if (b >= doc.filter_block_counts.items.len or b >= doc.checkpoints.items.len) {
+    if (b >= doc.filter_block_counts.items.len or b >= base.checkpointCount(doc)) {
         doc.unlock();
         return null;
     }
-    const cp = doc.checkpoints.items[b];
+    const cp = base.checkpointAt(doc, b);
     const hi = @min((@as(u64, @intCast(b)) + 1) * checkpoint_interval, doc.filter_rows);
     const need = idx - cum;
     doc.unlock();
@@ -934,7 +942,7 @@ fn locateFilteredIndexJob(doc: *Document, nav_gen: u64, search_gen: u64, filter_
     return null;
 }
 
-fn scanSearchBlockJob(doc: *Document, pctx: MatchCtx, fctx: MatchCtx, cp: Checkpoint, lo: u64, hi: u64, dir: api.SearchDir) ?Match {
+fn scanSearchBlockJob(doc: *Document, pctx: MatchCtx, fctx: ?MatchCtx, cp: Checkpoint, lo: u64, hi: u64, dir: api.SearchDir) ?Match {
     var pos = cp.pos;
     var row = cp.row;
     while (row < lo and !doc.reader.atEnd(doc.source, pos)) : (row += 1) {
@@ -954,19 +962,19 @@ fn scanSearchBlockJob(doc: *Document, pctx: MatchCtx, fctx: MatchCtx, cp: Checkp
     return found;
 }
 
-fn findSearchMatchJob(doc: *Document, nav_gen: u64, search_gen: u64, filter_gen: u64, pctx: MatchCtx, fctx: MatchCtx, bound: u64, dir: api.SearchDir) ?Match {
+fn findSearchMatchJob(doc: *Document, nav_gen: u64, search_gen: u64, filter_gen: u64, pctx: MatchCtx, fctx: ?MatchCtx, bound: u64, dir: api.SearchDir) ?Match {
     if (dir == .forward) {
         var b: u64 = bound / checkpoint_interval;
         while (true) : (b += 1) {
             doc.lock();
             if (!navJobCurrentLocked(doc, nav_gen, search_gen, filter_gen) or
-                b >= doc.block_counts.items.len or b >= doc.checkpoints.items.len)
+                b >= doc.block_counts.items.len or b >= base.checkpointCount(doc))
             {
                 doc.unlock();
                 return null;
             }
             const count = doc.block_counts.items[@intCast(b)];
-            const cp = doc.checkpoints.items[@intCast(b)];
+            const cp = base.checkpointAt(doc, @intCast(b));
             const hi = @min((b + 1) * checkpoint_interval, doc.search_rows);
             doc.unlock();
             if (count == 0) continue;
@@ -978,7 +986,7 @@ fn findSearchMatchJob(doc: *Document, nav_gen: u64, search_gen: u64, filter_gen:
     if (bound == 0) return null;
     doc.lock();
     // Both lists are indexed by block below, so the cursor must fit BOTH.
-    const blocks = @min(doc.block_counts.items.len, doc.checkpoints.items.len);
+    const blocks = @min(doc.block_counts.items.len, base.checkpointCount(doc));
     if (!navJobCurrentLocked(doc, nav_gen, search_gen, filter_gen) or blocks == 0) {
         doc.unlock();
         return null;
@@ -989,13 +997,13 @@ fn findSearchMatchJob(doc: *Document, nav_gen: u64, search_gen: u64, filter_gen:
     while (true) {
         doc.lock();
         if (!navJobCurrentLocked(doc, nav_gen, search_gen, filter_gen) or
-            b >= doc.block_counts.items.len or b >= doc.checkpoints.items.len)
+            b >= doc.block_counts.items.len or b >= base.checkpointCount(doc))
         {
             doc.unlock();
             return null;
         }
         const count = doc.block_counts.items[@intCast(b)];
-        const cp = doc.checkpoints.items[@intCast(b)];
+        const cp = base.checkpointAt(doc, @intCast(b));
         const hi = @min(@min((b + 1) * checkpoint_interval, bound), doc.search_rows);
         doc.unlock();
         if (count != 0) {
@@ -1006,12 +1014,12 @@ fn findSearchMatchJob(doc: *Document, nav_gen: u64, search_gen: u64, filter_gen:
     }
 }
 
-fn positionFilteredMatchJob(doc: *Document, nav_gen: u64, search_gen: u64, filter_gen: u64, pctx: MatchCtx, fctx: MatchCtx, found: Match) ?FilteredNavOutcome {
+fn positionFilteredMatchJob(doc: *Document, nav_gen: u64, search_gen: u64, filter_gen: u64, pctx: MatchCtx, fctx: ?MatchCtx, found: Match) ?FilteredNavOutcome {
     const b = found.row / checkpoint_interval;
     doc.lock();
     if (!navJobCurrentLocked(doc, nav_gen, search_gen, filter_gen) or
-        b >= doc.checkpoints.items.len or b >= doc.block_counts.items.len or
-        b >= doc.filter_block_counts.items.len)
+        b >= base.checkpointCount(doc) or b >= doc.block_counts.items.len or
+        (fctx != null and b >= doc.filter_block_counts.items.len))
     {
         doc.unlock();
         return null;
@@ -1021,9 +1029,9 @@ fn positionFilteredMatchJob(doc: *Document, nav_gen: u64, search_gen: u64, filte
     var i: usize = 0;
     while (i < b) : (i += 1) {
         search_before += doc.block_counts.items[i];
-        filter_before += doc.filter_block_counts.items[i];
+        if (fctx != null) filter_before += doc.filter_block_counts.items[i];
     }
-    const cp = doc.checkpoints.items[@intCast(b)];
+    const cp = base.checkpointAt(doc, @intCast(b));
     doc.unlock();
 
     var pos = cp.pos;
@@ -1040,7 +1048,7 @@ fn positionFilteredMatchJob(doc: *Document, nav_gen: u64, search_gen: u64, filte
     if (search_in_block == 0 or filter_in_block == 0) return null;
     return .{
         .found = true,
-        .row = filter_before + filter_in_block - 1,
+        .row = if (fctx != null) filter_before + filter_in_block - 1 else found.row,
         .col = found.col,
         .position = search_before + search_in_block,
     };
@@ -1048,30 +1056,34 @@ fn positionFilteredMatchJob(doc: *Document, nav_gen: u64, search_gen: u64, filte
 
 /// Resolve one exact filtered navigation on the worker. Called with the
 /// document mutex released; returns null only for a stale/cancelled job.
-pub fn resolveFilteredNavOffMain(doc: *Document, nav_gen: u64, search_gen: u64, filter_gen: u64, anchor: u64, dir: api.SearchDir, pctx: MatchCtx, fctx: MatchCtx) ?FilteredNavOutcome {
+pub fn resolveFilteredNavOffMain(doc: *Document, nav_gen: u64, search_gen: u64, filter_gen: u64, anchor: u64, dir: api.SearchDir, pctx: MatchCtx, fctx: ?MatchCtx) ?FilteredNavOutcome {
     doc.lock();
     if (!navJobCurrentLocked(doc, nav_gen, search_gen, filter_gen) or
-        doc.search_state != .done or !doc.filter_total_exact)
+        doc.search_state != .done or (fctx != null and !doc.filter_total_exact))
     {
         doc.unlock();
         return null;
     }
-    const total = doc.filter_total;
-    const filter_rows = doc.filter_rows;
+    const total = if (fctx != null) doc.filter_total else doc.search_rows;
+    const filter_rows = if (fctx != null) doc.filter_rows else doc.search_rows;
     doc.unlock();
 
     var source_bound: u64 = 0;
     if (dir == .forward) {
         if (anchor >= total) return .{ .found = false };
-        const loc = locateFilteredIndexJob(doc, nav_gen, search_gen, filter_gen, fctx, anchor) orelse return null;
-        source_bound = loc.row;
+        if (fctx) |ctx| {
+            const loc = locateFilteredIndexJob(doc, nav_gen, search_gen, filter_gen, ctx, anchor) orelse return null;
+            source_bound = loc.row;
+        } else source_bound = anchor;
     } else {
         if (anchor == 0 or total == 0) return .{ .found = false };
         if (anchor >= total) {
             source_bound = filter_rows;
         } else {
-            const loc = locateFilteredIndexJob(doc, nav_gen, search_gen, filter_gen, fctx, anchor - 1) orelse return null;
-            source_bound = loc.row + 1;
+            if (fctx) |ctx| {
+                const loc = locateFilteredIndexJob(doc, nav_gen, search_gen, filter_gen, ctx, anchor - 1) orelse return null;
+                source_bound = loc.row + 1;
+            } else source_bound = anchor;
         }
     }
 

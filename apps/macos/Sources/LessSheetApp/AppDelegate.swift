@@ -162,7 +162,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     static func openURLViaSheet() {
         let alert = NSAlert()
         alert.messageText = "Open URL"
-        alert.informativeText = "Enter the http:// or https:// address of a CSV or .csv.gz file."
+        alert.informativeText = "Enter the http:// or https:// address of a CSV, CSV.gz or Parquet file."
         alert.addButton(withTitle: "Open")
         alert.addButton(withTitle: "Cancel")
         let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))

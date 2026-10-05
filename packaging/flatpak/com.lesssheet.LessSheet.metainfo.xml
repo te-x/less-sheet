@@ -8,26 +8,24 @@
   <project_license>MIT</project_license>
 
   <name>less-sheet</name>
-  <summary>Open huge CSV files instantly</summary>
+  <summary>Open huge CSV and Parquet files instantly</summary>
 
   <description>
     <p>
-      A read-only viewer for spreadsheet-sized data. It reads CSV — plain,
-      gzipped, or streamed from a URL — and nothing else, which is why it opens
-      ten gigabytes as fast as ten megabytes.
+      A native, read-only tabular data viewer for CSV, CSV.gz and Parquet files,
+      opened locally or over HTTP(S).
     </p>
     <p>
-      Opening is proportional to the size of your screen, not the size of your
-      file: it reads only the rows it is about to draw. A ten gigabyte file of
-      a hundred and thirty-five million rows costs under three megabytes of
-      memory and appears in about a sixth of a second.
+      It reads only what is needed to show the table, keeping startup fast and
+      memory use bounded even for very large files.
     </p>
     <p>What it does:</p>
     <ul>
       <li>Find, filter and jump across the whole file without loading it</li>
       <li>Change the separator, quoting and encoding on the fly</li>
       <li>Read gzipped CSV without unpacking it first</li>
-      <li>Stream a file over HTTP without downloading all of it</li>
+      <li>Read Parquet columns on demand</li>
+      <li>Open HTTP(S) URLs, using byte ranges when available</li>
       <li>Copy cells, rows or a filtered view to the clipboard</li>
     </ul>
     <p>
@@ -64,6 +62,11 @@
   </screenshots>
 
   <releases>
+    <release version="0.1.7" date="2026-10-05">
+      <description>
+        <p>Added local and HTTP(S) Parquet support with bounded page decoding.</p>
+      </description>
+    </release>
     <release version="0.1.6" date="2026-10-03">
       <description>
         <p>Added Check for Updates to the app menu.</p>

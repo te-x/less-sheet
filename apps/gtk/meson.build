@@ -113,7 +113,8 @@ test_document = executable('test-document',
   dependencies : test_deps,
   link_with : lsgkit,
   include_directories : core_inc,
-  c_args : ['-DFIXTURE_PATH="' + fixture + '"'],
+  c_args : ['-DFIXTURE_PATH="' + fixture + '"',
+    '-DPARQUET_FIXTURE_PATH="' + meson.current_source_dir() / '../../backend/tests/fixtures/parquet/snappy-v2.parquet' + '"'],
   install : false,
 )
 test('document', test_document)
