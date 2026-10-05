@@ -81,6 +81,37 @@ test "Parquet cell cap keeps UTF-8 boundaries and reports truncation" {
     try std.testing.expectEqualStrings("Å", text.items);
 }
 
+test "wide dictionary pages remain cached across rows and backward scrolling" {
+    const input = @embedFile("fixtures/parquet/cache-pressure.parquet");
+    inline for (.{ false, true }) |remote| {
+        var fixture: RemoteFixture = .{ .bytes = input };
+        const data = if (remote) try Data.initRemote(gpa, input, fixture.source()) else try Data.init(gpa, input);
+        defer data.deinit();
+        var text: std.ArrayList(u8) = .empty;
+        defer text.deinit(gpa);
+        // Real-world writers commonly place 65K values in each of many columns.
+        // Reading a viewport must decode each column's page once, rather than
+        // evicting early columns and re-decoding every page for every screen row.
+        for (0..48) |row| for (0..32) |column| {
+            text.clearRetainingCapacity();
+            _ = try data.appendCell(row, @intCast(column), 512, &text, gpa);
+            if (row == 0) try std.testing.expectEqualStrings("", text.items);
+        };
+        try std.testing.expectEqual(32, data.pages_decoded);
+        text.clearRetainingCapacity();
+        _ = try data.appendCell(65535, 1, 512, &text, gpa);
+        try std.testing.expectEqualStrings("6.25", text.items);
+        // A writer may finish the chunk with a separate, short final page.
+        const after_tail = data.pages_decoded;
+        try std.testing.expect(after_tail <= 33);
+        text.clearRetainingCapacity();
+        _ = try data.appendCell(1, 0, 512, &text, gpa);
+        try std.testing.expectEqualStrings("0.25", text.items);
+        try std.testing.expectEqual(after_tail, data.pages_decoded);
+        try std.testing.expect(data.budget.peak <= 64 * 1024 * 1024);
+    }
+}
+
 test "Parquet decimals stored as integers and time logical values" {
     inline for (.{ @embedFile("fixtures/parquet/logical-v1.parquet"), @embedFile("fixtures/parquet/logical-v2.parquet") }) |bytes| {
         const data = try Data.init(gpa, bytes);
