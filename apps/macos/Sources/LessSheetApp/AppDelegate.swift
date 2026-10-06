@@ -28,6 +28,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var routedLaunchOpen = false
     private var mainWindow: NSWindow?
     private var settingsWindow: NSWindow?
+    var parquetMetadataWindow: NSWindow?
     private var updateChecker: UpdateChecker?
 
     override init() {

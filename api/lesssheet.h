@@ -1091,6 +1091,53 @@ void ls_close(ls_doc *doc);
 bool ls_document_is_parquet(const ls_doc *doc);
 ls_status ls_document_status(const ls_doc *doc);
 
+/* Parquet footer inspection. No allocation, page decoding or network requests.
+ * Safe alongside the window/control lanes; serialize against ls_close.
+ * Strings are immutable borrows valid until ls_close, independent of windows.
+ * Returns false and zeroes the output for a text document or invalid index.
+ * Row/group counts describe the file, unaffected by filtering or sorting.
+ * codec_mask uses Parquet codec numbers: 0=none, 1=Snappy, 2=Gzip, 3=LZO,
+ * 4=Brotli, 5=LZ4, 6=Zstd, 7=LZ4 raw. logical_type is NUL-terminated UTF-8.
+ * Summary work is O(footer column chunks); column access is O(1); row-group
+ * access is O(columns). Frontends should request bounded pages on demand. */
+typedef struct ls_parquet_info {
+    uint64_t file_bytes;
+    uint64_t rows;
+    uint64_t row_groups;
+    uint32_t columns;
+    int32_t format_version;
+    uint32_t codec_mask;
+    ls_str created_by;
+} ls_parquet_info;
+
+typedef struct ls_parquet_column {
+    ls_str name;
+    ls_str physical_type;
+    char logical_type[128];
+    bool nullable;
+} ls_parquet_column;
+
+typedef struct ls_parquet_row_group {
+    uint64_t first_row;
+    uint64_t rows;
+    uint64_t compressed_bytes;
+    uint64_t uncompressed_bytes;
+} ls_parquet_row_group;
+
+#ifdef __cplusplus
+#define LS_PARQUET_STATIC_ASSERT static_assert
+#else
+#define LS_PARQUET_STATIC_ASSERT _Static_assert
+#endif
+LS_PARQUET_STATIC_ASSERT(sizeof(ls_parquet_info) == 56, "ls_parquet_info ABI size");
+LS_PARQUET_STATIC_ASSERT(sizeof(ls_parquet_column) == 168, "ls_parquet_column ABI size");
+LS_PARQUET_STATIC_ASSERT(sizeof(ls_parquet_row_group) == 32, "ls_parquet_row_group ABI size");
+#undef LS_PARQUET_STATIC_ASSERT
+
+bool ls_parquet_info_get(const ls_doc *doc, ls_parquet_info *out);
+bool ls_parquet_column_get(const ls_doc *doc, uint32_t column, ls_parquet_column *out);
+bool ls_parquet_row_group_get(const ls_doc *doc, uint64_t group, ls_parquet_row_group *out);
+
 /* Column-projected window: same row/borrow rules as ls_window_set. Parquet
  * decodes only [first_col, first_col + col_count); ls_cell outside that range
  * returns empty. CSV retains its dense parser. Full-cell copy is unaffected.

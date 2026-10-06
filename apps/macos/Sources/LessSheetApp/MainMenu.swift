@@ -64,6 +64,7 @@ extension AppDelegate {
         menu.addItem(item("Open URL…", #selector(menuOpenURL(_:)), "o",
                           modifiers: [.command, .shift], target: self))
         menu.addItem(.separator())
+        menu.addItem(item("Parquet Metadata…", #selector(menuParquetMetadata(_:)), "", target: self))
         menu.addItem(item("Close", #selector(NSWindow.performClose(_:)), "w"))
         return menu
     }
@@ -155,6 +156,7 @@ extension AppDelegate {
     // MARK: - Actions
 
     @objc fileprivate func menuCheckForUpdates(_ sender: Any?) { checkForUpdates() }
+    @objc fileprivate func menuParquetMetadata(_ sender: Any?) { presentParquetMetadata() }
     @objc fileprivate func menuOpenFile(_ sender: Any?) { AppDelegate.openViaPanel() }
     @objc fileprivate func menuOpenURL(_ sender: Any?) { AppDelegate.openURLViaSheet() }
     @objc fileprivate func menuSortByColumn(_ sender: Any?) { DocumentModel.shared.cycleSortAtCursor() }
@@ -162,4 +164,13 @@ extension AppDelegate {
     @objc fileprivate func menuFind(_ sender: Any?) { DocumentModel.shared.requestFindFocus() }
     @objc fileprivate func menuFindNext(_ sender: Any?) { DocumentModel.shared.stepFind(.forward) }
     @objc fileprivate func menuFindPrevious(_ sender: Any?) { DocumentModel.shared.stepFind(.backward) }
+}
+
+extension AppDelegate: NSMenuItemValidation {
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        if menuItem.action == #selector(menuParquetMetadata(_:)) {
+            return DocumentModel.shared.isParquet && DocumentModel.shared.session != nil
+        }
+        return true
+    }
 }

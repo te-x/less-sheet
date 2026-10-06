@@ -96,9 +96,11 @@ struct OverlayView: View {
                     }
                     FindControlView(model: model)
                     JumpControlView(model: model)
-                    HeaderButton(model: model).disabled(model.isParquet)
-                    DialectPopupButton(kind: .separator, model: model).disabled(model.isParquet)
-                    DialectPopupButton(kind: .quote, model: model).disabled(model.isParquet)
+                    if !model.isParquet {
+                        HeaderButton(model: model)
+                        DialectPopupButton(kind: .separator, model: model)
+                        DialectPopupButton(kind: .quote, model: model)
+                    }
                     SettingsButton { AppDelegate.shared?.presentSettings() }
                 }
             }

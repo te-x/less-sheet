@@ -82,6 +82,46 @@ test "Parquet ABI schema, exact counts, random windows and projected copy" {
     try std.testing.expectEqualStrings("line\nfeed", api.ls_cell(doc, 4, 1).slice());
     try std.testing.expectEqual(api.Status.ok, api.ls_document_status(doc));
 }
+
+test "Parquet footer inspection reports original schema and groups without reading pages" {
+    var opened = try open(bytes);
+    defer opened.deinit();
+    var info: api.ParquetInfo = undefined;
+    try std.testing.expect(api.ls_parquet_info_get(opened.doc, &info));
+    try std.testing.expectEqual(bytes.len, info.file_bytes);
+    try std.testing.expectEqual(8, info.rows);
+    try std.testing.expectEqual(8, info.columns);
+    try std.testing.expectEqual(2, info.row_groups);
+    try std.testing.expectEqual(2, info.codec_mask);
+    try std.testing.expect(std.mem.indexOf(u8, info.created_by.slice(), "parquet") != null);
+    var col: api.ParquetColumn = undefined;
+    try std.testing.expect(api.ls_parquet_column_get(opened.doc, 6, &col));
+    try std.testing.expectEqualStrings("FIXED_LEN_BYTE_ARRAY", col.physical_type.slice());
+    try std.testing.expectEqualStrings("Decimal(20, 4)", std.mem.sliceTo(&col.logical_type, 0));
+    try std.testing.expect(col.nullable);
+    var group: api.ParquetRowGroup = undefined;
+    try std.testing.expect(api.ls_parquet_row_group_get(opened.doc, 1, &group));
+    try std.testing.expectEqual(4, group.first_row);
+    try std.testing.expectEqual(4, group.rows);
+    try std.testing.expect(group.compressed_bytes > 0 and group.uncompressed_bytes > 0);
+    // Footer borrows survive window changes; invalid indices clear the output.
+    _ = api.ls_window_set_columns(opened.doc, 0, 1, 0, 1);
+    try std.testing.expect(std.mem.indexOf(u8, info.created_by.slice(), "parquet") != null);
+    try std.testing.expect(!api.ls_parquet_column_get(opened.doc, 8, &col));
+    try std.testing.expectEqual(0, col.name.len);
+    try std.testing.expect(!api.ls_parquet_row_group_get(opened.doc, std.math.maxInt(u64), &group));
+    try std.testing.expectEqual(0, group.rows);
+}
+
+test "empty Parquet exposes schema and an empty row group" {
+    var opened = try open(@embedFile("fixtures/parquet/empty.parquet"));
+    defer opened.deinit();
+    var info: api.ParquetInfo = undefined;
+    try std.testing.expect(api.ls_parquet_info_get(opened.doc, &info));
+    try std.testing.expectEqual(0, info.rows);
+    try std.testing.expectEqual(1, info.columns);
+    try std.testing.expectEqual(1, info.row_groups);
+}
 test "Parquet search, navigation, filter and filtered windows" {
     var opened = try open(bytes);
     defer opened.deinit();

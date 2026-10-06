@@ -169,6 +169,70 @@ lsg_document_is_parquet (const LsgDocument *doc)
   return doc != NULL && doc->doc != NULL && ls_document_is_parquet (doc->doc);
 }
 
+gboolean
+lsg_document_parquet_info (const LsgDocument *doc, ls_parquet_info *out)
+{
+  *out = (ls_parquet_info){ 0 };
+  if (doc == NULL)
+    return FALSE;
+  g_mutex_lock (doc->control_lock);
+  gboolean ok = doc->doc != NULL && ls_parquet_info_get (doc->doc, out);
+  out->created_by = (ls_str){ (const uint8_t *)"", 0 };
+  g_mutex_unlock (doc->control_lock);
+  return ok;
+}
+
+char *
+lsg_document_parquet_writer_dup (const LsgDocument *doc)
+{
+  if (doc == NULL)
+    return g_strdup ("");
+  g_mutex_lock (doc->control_lock);
+  ls_parquet_info info = { 0 };
+  char *writer = doc->doc != NULL && ls_parquet_info_get (doc->doc, &info)
+      ? lsg_utf8_sanitize_dup (info.created_by.ptr, MIN (info.created_by.len, 4096))
+      : g_strdup ("");
+  g_mutex_unlock (doc->control_lock);
+  return writer;
+}
+
+gboolean
+lsg_document_parquet_column_dup (const LsgDocument *doc, guint32 column,
+                                 char **name, char **type)
+{
+  *name = NULL;
+  *type = NULL;
+  if (doc == NULL)
+    return FALSE;
+  g_mutex_lock (doc->control_lock);
+  ls_parquet_column info = { 0 };
+  gboolean ok = doc->doc != NULL && ls_parquet_column_get (doc->doc, column, &info);
+  if (ok)
+    {
+      *name = lsg_utf8_sanitize_dup (info.name.ptr, MIN (info.name.len, 1024));
+      char *physical = lsg_utf8_sanitize_dup (info.physical_type.ptr, info.physical_type.len);
+      *type = g_strdup_printf ("%s%s%s · %s", physical,
+                              info.logical_type[0] ? " · " : "", info.logical_type,
+                              info.nullable ? "Nullable" : "Required");
+      g_free (physical);
+    }
+  g_mutex_unlock (doc->control_lock);
+  return ok;
+}
+
+gboolean
+lsg_document_parquet_row_group (const LsgDocument *doc, guint64 group,
+                                ls_parquet_row_group *out)
+{
+  *out = (ls_parquet_row_group){ 0 };
+  if (doc == NULL)
+    return FALSE;
+  g_mutex_lock (doc->control_lock);
+  gboolean ok = doc->doc != NULL && ls_parquet_row_group_get (doc->doc, group, out);
+  g_mutex_unlock (doc->control_lock);
+  return ok;
+}
+
 LsgDialect
 lsg_document_dialect (const LsgDocument *doc)
 {
