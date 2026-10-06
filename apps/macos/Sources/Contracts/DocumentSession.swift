@@ -128,14 +128,11 @@ public enum JumpStatus: Equatable, Sendable {
 }
 
 /// A live windowed document. See the file header for the full contract.
-public protocol DocumentSession: AnyObject, Sendable {
+public protocol DocumentSession: AnyObject, Sendable, ParquetMetadataInspecting {
     /// Column count (fixed at open; 0 for an empty document).
     var columnCount: Int { get }
     /// True for a self-describing local Parquet document.
     var isParquet: Bool { get }
-    func parquetFileInfo() -> ParquetFileInfo?
-    func parquetSchemaColumn(_ index: Int) -> ParquetSchemaColumn?
-    func parquetRowGroup(_ index: UInt64) -> ParquetRowGroupInfo?
     /// A malformed or unsupported page was encountered after opening.
     var readFailed: Bool { get }
     /// The effective dialect report (fixed at open) — feeds the pills.
@@ -347,9 +344,6 @@ public protocol DocumentSession: AnyObject, Sendable {
 
 public extension DocumentSession {
     var isParquet: Bool { false }
-    func parquetFileInfo() -> ParquetFileInfo? { nil }
-    func parquetSchemaColumn(_ index: Int) -> ParquetSchemaColumn? { nil }
-    func parquetRowGroup(_ index: UInt64) -> ParquetRowGroupInfo? { nil }
     var readFailed: Bool { false }
 
     /// DEFAULT (dense fallback) for the column-windowed `setWindow`: ignores

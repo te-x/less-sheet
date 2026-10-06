@@ -46,7 +46,8 @@ struct ParquetMetadataView: View {
                     VStack(alignment: .leading, spacing: 4) {
                         Text("Row group \(group.id + 1)").font(.headline)
                         Text("\(group.rows.formatted()) rows · starts at row \((group.firstRow + 1).formatted())")
-                        Text("\(size(group.compressedBytes)) compressed · \(size(group.uncompressedBytes)) uncompressed")
+                        Text("\(size(group.compressedBytes)) compressed · "
+                             + "\(size(group.uncompressedBytes)) uncompressed")
                             .foregroundStyle(.secondary)
                     }
                     .padding(.vertical, 4)
@@ -103,7 +104,8 @@ extension AppDelegate {
         window.title = "Parquet Metadata"
         window.isReleasedWhenClosed = false
         window.contentMinSize = NSSize(width: 540, height: 400)
-        window.contentView = NSHostingView(rootView: ParquetMetadataView(session: session, info: info, name: model.path))
+        let content = ParquetMetadataView(session: session, info: info, name: model.path)
+        window.contentView = NSHostingView(rootView: content)
         window.center()
         window.makeKeyAndOrderFront(nil)
         parquetMetadataWindow = window

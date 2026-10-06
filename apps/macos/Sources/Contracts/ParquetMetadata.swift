@@ -1,4 +1,16 @@
 /// Footer facts copied from a Parquet document. Inspection never reads pages.
+public protocol ParquetMetadataInspecting: Sendable {
+    func parquetFileInfo() -> ParquetFileInfo?
+    func parquetSchemaColumn(_ index: Int) -> ParquetSchemaColumn?
+    func parquetRowGroup(_ index: UInt64) -> ParquetRowGroupInfo?
+}
+
+public extension ParquetMetadataInspecting {
+    func parquetFileInfo() -> ParquetFileInfo? { nil }
+    func parquetSchemaColumn(_ index: Int) -> ParquetSchemaColumn? { nil }
+    func parquetRowGroup(_ index: UInt64) -> ParquetRowGroupInfo? { nil }
+}
+
 public struct ParquetFileInfo: Sendable {
     public var fileBytes: UInt64
     public var rows: UInt64
