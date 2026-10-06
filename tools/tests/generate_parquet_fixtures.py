@@ -62,6 +62,17 @@ for indexed in (False, True):
                    row_group_size=remote_rows, compression='snappy',
                    use_dictionary=['label'], data_page_size=4096, write_batch_size=256,
                    write_page_index=indexed, write_page_checksum=True)
+# Many substantial dictionary pages must fit together in the bounded cache;
+# otherwise a row-major viewport decodes them again for every screen row.
+cache_rows = 65536
+cache_pressure = pa.table({
+    f'column_{c}': pa.array([None if i % 97 == 0 else ((i + c) % 251) / 4
+                            for i in range(cache_rows)], type=pa.float64())
+    for c in range(32)
+})
+pq.write_table(cache_pressure, root / 'cache-pressure.parquet',
+               row_group_size=cache_rows, compression='snappy',
+               data_page_size=8 * 1024 * 1024, write_page_checksum=True)
 if args.large:
     args.large.mkdir(parents=True, exist_ok=True)
     # Pages are small; the 10M-row group must never be eagerly decoded on open.

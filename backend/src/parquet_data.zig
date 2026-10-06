@@ -7,6 +7,7 @@ const low = pq.internals.reader;
 const decoder = pq.internals.column_decoder;
 const format = pq.format;
 const remote_mod = @import("parquet_remote.zig");
+const cached = @import("parquet_cache.zig");
 pub const RemoteSource = remote_mod.Source;
 
 pub const Error = remote_mod.Error;
@@ -69,12 +70,25 @@ const Page = struct {
     group: usize = 0,
     column: usize = 0,
     first: u64 = 0,
-    values: []const pq.Value = &.{},
+    values: cached.Values = .{ .bool_val = &.{} },
+    present: []const bool = &.{},
     used: u64 = 0,
 
     fn clear(self: *Page) void {
         if (self.arena) |*arena| arena.deinit();
         self.* = .{};
+    }
+
+    fn value(self: *const Page, index: usize) pq.Value {
+        return if (self.present[index]) self.values.at(index) else .null_val;
+    }
+
+    fn store(self: *Page, physical: format.PhysicalType, values: []const pq.Value) Error!void {
+        const alloc = self.arena.?.allocator();
+        const present = try alloc.alloc(bool, values.len);
+        for (values, present) |v, *p| p.* = v != .null_val;
+        self.present = present;
+        self.values = try cached.Values.init(alloc, physical, values);
     }
 };
 
@@ -205,9 +219,9 @@ pub const Data = struct {
         const local = row - first;
         self.clock +%= 1;
         for (&self.pages) |*page| {
-            if (page.arena != null and page.group == group and page.column == column and local >= page.first and local - page.first < page.values.len) {
+            if (page.arena != null and page.group == group and page.column == column and local >= page.first and local - page.first < page.present.len) {
                 page.used = self.clock;
-                return appendValue(page.values[@intCast(local - page.first)], self.reader.metadata.schema[@as(usize, column) + 1], cap, out, gpa);
+                return appendValue(page.value(@intCast(local - page.first)), self.reader.metadata.schema[@as(usize, column) + 1], cap, out, gpa);
             }
         }
         if (foreground and self.remote.?.peek == null) {
@@ -249,7 +263,7 @@ pub const Data = struct {
             return err;
         };
         slot.used = self.clock;
-        return appendValue(slot.values[@intCast(local - slot.first)], self.reader.metadata.schema[@as(usize, column) + 1], cap, out, gpa);
+        return appendValue(slot.value(@intCast(local - slot.first)), self.reader.metadata.schema[@as(usize, column) + 1], cap, out, gpa);
     }
 
     fn request(self: *Data, row: u64, column: u32) void {
@@ -306,7 +320,9 @@ pub const Data = struct {
 
     fn loadPage(self: *Data, slot: *Page, group: usize, column: u32, row: u64) Error!void {
         slot.arena = std.heap.ArenaAllocator.init(self.budget.allocator());
-        const alloc = slot.arena.?.allocator();
+        var scratch = std.heap.ArenaAllocator.init(self.budget.allocator());
+        defer scratch.deinit();
+        const alloc = scratch.allocator();
         if (self.remote) |remote| return self.loadRemotePage(slot, alloc, remote, group, column, row);
         const meta = self.reader.metadata.row_groups[group].columns[column].meta_data.?;
         const schema = self.reader.metadata.schema[@as(usize, column) + 1];
@@ -339,7 +355,7 @@ pub const Data = struct {
             slot.group = group;
             slot.column = column;
             slot.first = first;
-            slot.values = decoded.values;
+            try slot.store(schema.type_.?, decoded.values);
             self.pages_decoded += 1;
             self.decoded_bytes += @intCast(page.header.uncompressed_page_size);
             return;
@@ -393,7 +409,7 @@ pub const Data = struct {
         slot.group = group;
         slot.column = column;
         slot.first = located.first;
-        slot.values = decoded.values;
+        try slot.store(schema.type_.?, decoded.values);
         self.pages_decoded += 1;
         self.decoded_bytes += @intCast(page.header.uncompressed_page_size);
     }
