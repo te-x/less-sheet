@@ -86,6 +86,26 @@ int main(int argc, char **argv) {
     return 5;
   }
   ls_row_count total = ls_row_count_get(doc);
+  if (!strcmp(mode, "metadata")) {
+    ls_parquet_info info;
+    if (!ls_parquet_info_get(doc, &info) || info.rows != total.count)
+      return 12;
+    for (uint32_t i = 0; i < info.columns; i++) {
+      ls_parquet_column column;
+      if (!ls_parquet_column_get(doc, i, &column)) return 13;
+    }
+    uint64_t rows = 0;
+    for (uint64_t i = 0; i < info.row_groups; i++) {
+      ls_parquet_row_group group;
+      if (!ls_parquet_row_group_get(doc, i, &group) || group.first_row != rows) return 14;
+      rows += group.rows;
+    }
+    if (rows != info.rows) return 15;
+    printf("{\"metadata_ms\":%.3f,\"rows\":%llu,\"groups\":%llu}\n",
+           now() - metadata, (unsigned long long)rows, (unsigned long long)info.row_groups);
+    ls_close(doc);
+    return 0;
+  }
   uint32_t columns = ls_column_count(doc);
   if (columns > 12)
     columns = 12;

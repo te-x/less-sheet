@@ -11,6 +11,9 @@ const Opened = struct {
     }
 };
 fn open(input: []const u8) !Opened {
+    return openWithAllocator(std.heap.smp_allocator, input);
+}
+fn openWithAllocator(allocator: std.mem.Allocator, input: []const u8) !Opened {
     var tmp = std.testing.tmpDir(.{});
     errdefer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "data.parquet", .data = input });
@@ -21,7 +24,7 @@ fn open(input: []const u8) !Opened {
     // CSV overrides must not change a self-describing file's shape.
     const options: api.OpenOptions = .{ .header = api.header_off, .separator = ';', .index_mode = api.index_manual };
     var doc: ?*api.Doc = null;
-    try std.testing.expectEqual(api.Status.ok, api.ls_open(path, &options, &doc));
+    try std.testing.expectEqual(api.Status.ok, api.openWithAllocator(allocator, path, &options, &doc));
     return .{ .tmp = tmp, .doc = doc.? };
 }
 fn waitSearch(doc: *api.Doc) !api.SearchStatus {
@@ -121,6 +124,30 @@ test "empty Parquet exposes schema and an empty row group" {
     try std.testing.expectEqual(0, info.rows);
     try std.testing.expectEqual(1, info.columns);
     try std.testing.expectEqual(1, info.row_groups);
+}
+
+test "footer inspection allocates nothing and rejects CSV" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var opened = try openWithAllocator(failing.allocator(), bytes);
+    defer opened.deinit();
+    const allocations = failing.alloc_index;
+    failing.fail_index = allocations;
+    var info: api.ParquetInfo = undefined;
+    var col: api.ParquetColumn = undefined;
+    var group: api.ParquetRowGroup = undefined;
+    try std.testing.expect(api.ls_parquet_info_get(opened.doc, &info));
+    for (0..info.columns) |i| try std.testing.expect(api.ls_parquet_column_get(opened.doc, @intCast(i), &col));
+    for (0..info.row_groups) |i| try std.testing.expect(api.ls_parquet_row_group_get(opened.doc, i, &group));
+    try std.testing.expectEqual(allocations, failing.alloc_index);
+    try std.testing.expect(!failing.has_induced_failure);
+
+    var csv = try open("a;b\n1;2\n");
+    defer csv.deinit();
+    try std.testing.expect(!api.ls_parquet_info_get(csv.doc, &info));
+    try std.testing.expectEqual(0, info.rows);
+    try std.testing.expect(!api.ls_parquet_column_get(csv.doc, 0, &col));
+    try std.testing.expectEqual(0, col.name.len);
+    try std.testing.expect(!api.ls_parquet_row_group_get(csv.doc, 0, &group));
 }
 test "Parquet search, navigation, filter and filtered windows" {
     var opened = try open(bytes);
