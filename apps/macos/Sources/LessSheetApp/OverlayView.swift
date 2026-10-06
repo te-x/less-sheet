@@ -275,14 +275,13 @@ struct MetadataButton: View {
 
     var body: some View {
         Button(action: action) {
-            Label("Metadata", systemImage: "info.circle")
+            Image(systemName: "info.circle")
                 .font(.callout.weight(.semibold))
-                .padding(.horizontal, 12)
-                .frame(height: OverlayMetrics.controlSize)
-                .contentShape(Capsule())
+                .frame(width: OverlayMetrics.controlSize, height: OverlayMetrics.controlSize)
+                .contentShape(Circle())
         }
         .buttonStyle(.plain)
-        .glassChrome(.regular.interactive(), in: Capsule())
+        .glassChrome(.regular.interactive(), in: Circle())
         .help("Parquet schema, row groups and file information")
         .accessibilityLabel("Parquet metadata")
     }

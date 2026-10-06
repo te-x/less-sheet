@@ -8378,12 +8378,7 @@ ensure_window (App *app, GtkApplication *gtk_app)
   gtk_menu_button_set_create_popup_func (GTK_MENU_BUTTON (quote_btn),
                                          dialect_popover_create, app, NULL);
 
-  GtkWidget *metadata = gtk_button_new ();
-  GtkWidget *metadata_label = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 6);
-  gtk_box_append (GTK_BOX (metadata_label),
-                  gtk_image_new_from_icon_name ("document-properties-symbolic"));
-  gtk_box_append (GTK_BOX (metadata_label), gtk_label_new ("Metadata"));
-  gtk_button_set_child (GTK_BUTTON (metadata), metadata_label);
+  GtkWidget *metadata = gtk_button_new_from_icon_name ("dialog-information-symbolic");
   gtk_widget_add_css_class (metadata, "flat");
   gtk_widget_set_tooltip_text (metadata, "Parquet schema, row groups and file information");
   gtk_accessible_update_property (GTK_ACCESSIBLE (metadata),
