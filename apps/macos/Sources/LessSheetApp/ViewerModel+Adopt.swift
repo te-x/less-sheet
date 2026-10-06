@@ -17,6 +17,7 @@ extension DocumentModel {
     func openURL(
         _ url: String, forcing override: DialectOverride = .sniffAll, carrying previous: ColumnVisibility? = nil
     ) async {
+        AppDelegate.shared?.closeParquetMetadata()
         openRequestSequence += 1
         let request = openRequestSequence
         await stopPolling()

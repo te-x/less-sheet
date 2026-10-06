@@ -95,6 +95,10 @@ def run(mode, name='indexed', probe_mode='ok'):
 
 try:
     for name in ('indexed', 'unindexed'):
+        _, metadata_log, _ = run('range', name, probe_mode='metadata')
+        # Open fetches the head and footer. Inspection must not fetch data pages.
+        size = files[name].stat().st_size
+        assert all(item['start'] == 0 or item['end'] == size - 1 for item in metadata_log), metadata_log
         _, log, _ = run('range', name)
         assert all(item['if_match'] == '"fixture-v1"' for item in log[1:])
     _, _, transferred = run('range', probe_mode='first')

@@ -42,56 +42,57 @@ struct SettingsView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            Form {
-                Section("Parsing") {
-                    Toggle("First row is header", isOn: headerBinding)
+            if !model.isParquet {
+                Form {
+                    Section("Parsing") {
+                        Toggle("First row is header", isOn: headerBinding)
 
-                    Picker("Separator", selection: separatorChoiceBinding) {
-                        ForEach(separatorOptions, id: \.self) { byte in
-                            Text(DialectGlyph.separatorName(byte)).tag(SeparatorChoice.byte(byte))
+                        Picker("Separator", selection: separatorChoiceBinding) {
+                            ForEach(separatorOptions, id: \.self) { byte in
+                                Text(DialectGlyph.separatorName(byte)).tag(SeparatorChoice.byte(byte))
+                            }
+                            Text("Custom…").tag(SeparatorChoice.custom)
                         }
-                        Text("Custom…").tag(SeparatorChoice.custom)
-                    }
-                    if showSeparatorCustom {
-                        customCharField(text: $separatorCustomText, field: .separator) { byte in
-                            if model.applyDialectChange(.separator(byte)) { showSeparatorCustom = false }
-                            separatorCustomText = ""
+                        if showSeparatorCustom {
+                            customCharField(text: $separatorCustomText, field: .separator) { byte in
+                                if model.applyDialectChange(.separator(byte)) { showSeparatorCustom = false }
+                                separatorCustomText = ""
+                            }
                         }
-                    }
 
-                    Picker("Quote character", selection: quoteChoiceBinding) {
-                        Text("Double quote  \"").tag(QuoteChoice.byte(0x22))
-                        Text("Single quote  '").tag(QuoteChoice.byte(0x27))
-                        Text("None").tag(QuoteChoice.none)
-                        if let custom = customQuote {
-                            Text(DialectGlyph.quoteName(custom)).tag(QuoteChoice.byte(custom))
+                        Picker("Quote character", selection: quoteChoiceBinding) {
+                            Text("Double quote  \"").tag(QuoteChoice.byte(0x22))
+                            Text("Single quote  '").tag(QuoteChoice.byte(0x27))
+                            Text("None").tag(QuoteChoice.none)
+                            if let custom = customQuote {
+                                Text(DialectGlyph.quoteName(custom)).tag(QuoteChoice.byte(custom))
+                            }
+                            Text("Custom…").tag(QuoteChoice.custom)
                         }
-                        Text("Custom…").tag(QuoteChoice.custom)
-                    }
-                    if showQuoteCustom {
-                        customCharField(text: $quoteCustomText, field: .quote) { byte in
-                            if model.applyDialectChange(.quote(byte)) { showQuoteCustom = false }
-                            quoteCustomText = ""
+                        if showQuoteCustom {
+                            customCharField(text: $quoteCustomText, field: .quote) { byte in
+                                if model.applyDialectChange(.quote(byte)) { showQuoteCustom = false }
+                                quoteCustomText = ""
+                            }
                         }
-                    }
 
-                    // `EncodingOverride` (Contracts) isn't Hashable, so the picker
-                    // binds an INDEX into the pinned `EncodingPicker.options` order
-                    // rather than the enum itself; the labels + re-open semantics
-                    // still come straight from the Contracts view-model.
-                    Picker("Text encoding", selection: encodingIndexBinding) {
-                        ForEach(Array(EncodingPicker.options.enumerated()), id: \.offset) { index, option in
-                            Text(DialectGlyph.encodingOptionLabel(option, detected: detectedEncoding)).tag(index)
+                        // `EncodingOverride` (Contracts) isn't Hashable, so the picker
+                        // binds an INDEX into the pinned `EncodingPicker.options` order
+                        // rather than the enum itself; the labels + re-open semantics
+                        // still come straight from the Contracts view-model.
+                        Picker("Text encoding", selection: encodingIndexBinding) {
+                            ForEach(Array(EncodingPicker.options.enumerated()), id: \.offset) { index, option in
+                                Text(DialectGlyph.encodingOptionLabel(option, detected: detectedEncoding)).tag(index)
+                            }
                         }
                     }
+                    .background(SettingsProbeMarker(name: "parsing"))
                 }
-                .disabled(model.isParquet)
-                .background(SettingsProbeMarker(name: "parsing"))
-            }
-            .formStyle(.grouped)
-            .frame(height: (showSeparatorCustom || showQuoteCustom) ? 285 : 235)
+                .formStyle(.grouped)
+                .frame(height: (showSeparatorCustom || showQuoteCustom) ? 285 : 235)
 
-            Divider()
+                Divider()
+            }
             ColumnSettingsSection(model: model)
         }
         .frame(minWidth: 490, minHeight: 620)

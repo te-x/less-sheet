@@ -128,7 +128,7 @@ public enum JumpStatus: Equatable, Sendable {
 }
 
 /// A live windowed document. See the file header for the full contract.
-public protocol DocumentSession: AnyObject, Sendable {
+public protocol DocumentSession: AnyObject, Sendable, ParquetMetadataInspecting {
     /// Column count (fixed at open; 0 for an empty document).
     var columnCount: Int { get }
     /// True for a self-describing local Parquet document.

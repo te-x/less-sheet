@@ -96,9 +96,13 @@ struct OverlayView: View {
                     }
                     FindControlView(model: model)
                     JumpControlView(model: model)
-                    HeaderButton(model: model).disabled(model.isParquet)
-                    DialectPopupButton(kind: .separator, model: model).disabled(model.isParquet)
-                    DialectPopupButton(kind: .quote, model: model).disabled(model.isParquet)
+                    if model.isParquet {
+                        MetadataButton { AppDelegate.shared?.presentParquetMetadata() }
+                    } else {
+                        HeaderButton(model: model)
+                        DialectPopupButton(kind: .separator, model: model)
+                        DialectPopupButton(kind: .quote, model: model)
+                    }
                     SettingsButton { AppDelegate.shared?.presentSettings() }
                 }
             }
@@ -263,6 +267,23 @@ struct CopyNoticeView: View {
         .glassChrome(.regular, in: Capsule())
         .onExitCommand { if model.copyInFlight { model.cancelCopy() } }
         .accessibilityLabel(model.copyInFlight ? "\(text). Press Escape to cancel." : text)
+    }
+}
+
+struct MetadataButton: View {
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: "info.circle")
+                .font(.callout.weight(.semibold))
+                .frame(width: OverlayMetrics.controlSize, height: OverlayMetrics.controlSize)
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .glassChrome(.regular.interactive(), in: Circle())
+        .help("Parquet schema, row groups and file information")
+        .accessibilityLabel("Parquet metadata")
     }
 }
 

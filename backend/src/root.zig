@@ -212,6 +212,30 @@ pub export fn ls_document_status(doc: *const api.Doc) callconv(.c) api.Status {
     return if (d.reader == .parquet and d.reader.parquet.data.failed.load(.acquire)) .io else .ok;
 }
 
+pub export fn ls_parquet_info_get(doc: *const api.Doc, out: *api.ParquetInfo) callconv(.c) bool {
+    out.* = .{};
+    const d = asDoc(doc);
+    if (d.reader != .parquet) return false;
+    @import("parquet_metadata.zig").info(d.reader.parquet.data, out);
+    return true;
+}
+
+pub export fn ls_parquet_column_get(doc: *const api.Doc, column_index: u32, out: *api.ParquetColumn) callconv(.c) bool {
+    out.* = .{};
+    const d = asDoc(doc);
+    if (d.reader != .parquet or column_index >= d.column_count) return false;
+    @import("parquet_metadata.zig").column(d.reader.parquet.data, column_index, out);
+    return true;
+}
+
+pub export fn ls_parquet_row_group_get(doc: *const api.Doc, group: u64, out: *api.ParquetRowGroup) callconv(.c) bool {
+    out.* = .{};
+    const d = asDoc(doc);
+    if (d.reader != .parquet or group >= d.reader.parquet.data.group_ends.len) return false;
+    @import("parquet_metadata.zig").rowGroup(d.reader.parquet.data, @intCast(group), out);
+    return true;
+}
+
 /// See api/lesssheet.h `ls_dialect_get`.
 pub export fn ls_dialect_get(doc: *const api.Doc) callconv(.c) api.Dialect {
     return asDoc(doc).dialect;

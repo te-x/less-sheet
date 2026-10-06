@@ -32,6 +32,7 @@
 #include <lsg_grid_geometry.h>
 #include <lsg_jump.h>
 #include <lsg_net_open.h>
+#include <lsg_metadata_dialog.h>
 #include <lsg_sort.h>
 #include <lsg_window_poll.h>
 
@@ -355,6 +356,8 @@ typedef struct
   GtkWidget *header_glyph; /* GtkDrawingArea: the drawn "H" glyph */
   GtkMenuButton *sep_button;
   GtkMenuButton *quote_button;
+  GtkMenuButton *primary_menu_button;
+  GtkWidget *metadata_button;
   GtkLabel *sep_glyph_label; /* the CHARACTER line of the stacked Sep button */
   GtkLabel
       *quote_glyph_label; /* the CHARACTER line of the stacked Quote button */
@@ -364,6 +367,7 @@ typedef struct
   /* Preferences "Parsing" page rows (live only while the dialog is open;
    * NULL-reset when it closes). */
   AdwDialog *prefs;                /* current AdwPreferencesDialog, or NULL */
+  AdwDialog *metadata_dialog;
   GtkWidget *prefs_header_row;     /* AdwSwitchRow */
   GtkWidget *prefs_sep_row;        /* AdwComboRow */
   GtkWidget *prefs_sep_custom;     /* AdwEntryRow (revealed on "Custom…") */
@@ -653,6 +657,10 @@ static void capture_note_jump (App *app, gboolean landed, guint64 row);
 static void
 app_reset_document (App *app)
 {
+  if (app->metadata_dialog != NULL)
+    adw_dialog_force_close (app->metadata_dialog);
+  if (app->metadata_button != NULL)
+    gtk_widget_set_visible (app->metadata_button, FALSE);
   /* LEAF BEFORE ROOT: stop + join any copy worker (and close its job) BEFORE
    * the document is closed below — a job must never outlive its document. */
   copy_stop_and_join (app);
@@ -5829,8 +5837,11 @@ on_window_destroy (GtkWidget *widget, gpointer data)
   app->quote_glyph_label = NULL;
   app->sep_button = NULL;
   app->quote_button = NULL;
+  app->primary_menu_button = NULL;
+  app->metadata_button = NULL;
   app->toasts = NULL;
   app->prefs = NULL; /* the dialog is destroyed with the window */
+  app->metadata_dialog = NULL;
   app->prefs_header_row = NULL;
   app->prefs_sep_row = NULL;
   app->prefs_sep_custom = NULL;
@@ -6372,12 +6383,18 @@ dialect_sync_quick_controls (App *app)
     return;
   LsgDialect d = lsg_document_dialect (app->doc);
   gboolean text_format = !lsg_document_is_parquet (app->doc);
+  if (app->prefs != NULL && (app->prefs_header_row != NULL) != text_format)
+    adw_dialog_force_close (app->prefs);
+  if (app->primary_menu_button != NULL)
+    gtk_menu_button_set_menu_model (app->primary_menu_button, NULL);
   if (app->header_toggle != NULL)
-    gtk_widget_set_sensitive (GTK_WIDGET (app->header_toggle), text_format);
+    gtk_widget_set_visible (GTK_WIDGET (app->header_toggle), text_format);
   if (app->sep_button != NULL)
-    gtk_widget_set_sensitive (GTK_WIDGET (app->sep_button), text_format);
+    gtk_widget_set_visible (GTK_WIDGET (app->sep_button), text_format);
   if (app->quote_button != NULL)
-    gtk_widget_set_sensitive (GTK_WIDGET (app->quote_button), text_format);
+    gtk_widget_set_visible (GTK_WIDGET (app->quote_button), text_format);
+  if (app->metadata_button != NULL)
+    gtk_widget_set_visible (app->metadata_button, !text_format);
   app->dialect_ui_guard = TRUE;
   if (app->header_toggle != NULL)
     gtk_toggle_button_set_active (app->header_toggle, d.header);
@@ -6867,11 +6884,12 @@ action_preferences (GSimpleAction *a, GVariant *p, gpointer data)
 static GMenuModel *
 build_primary_menu (App *app)
 {
-  (void)app;
   /* Preferences / Shortcuts / About are APP-level GActions, so their
    * accelerators are real and the menu shares the one action set. */
   GMenu *menu = g_menu_new ();
   g_menu_append (menu, "Preferences", "app.preferences");
+  if (lsg_document_is_parquet (app->doc))
+    g_menu_append (menu, "Parquet Metadata…", "app.parquet-metadata");
   g_menu_append (menu, "Keyboard Shortcuts", "app.shortcuts");
   g_menu_append (menu, "Check for Updates…", "app.check-updates");
   g_menu_append (menu, "About less-sheet", "app.about");
@@ -6879,10 +6897,31 @@ build_primary_menu (App *app)
 }
 
 static void
+metadata_closed (AdwDialog *dialog, gpointer data)
+{
+  (void)dialog;
+  ((App *)data)->metadata_dialog = NULL;
+}
+
+static void
+action_parquet_metadata (GSimpleAction *action, GVariant *parameter, gpointer data)
+{
+  (void)action; (void)parameter;
+  App *app = data;
+  if (!lsg_document_is_parquet (app->doc) || app->window == NULL)
+    return;
+  if (app->metadata_dialog == NULL)
+    {
+      app->metadata_dialog = lsg_metadata_dialog_new (
+          app->doc, gtk_label_get_text (app->title_name));
+      g_signal_connect (app->metadata_dialog, "closed", G_CALLBACK (metadata_closed), app);
+    }
+  adw_dialog_present (app->metadata_dialog, GTK_WIDGET (app->window));
+}
+
+static void
 primary_menu_create (GtkMenuButton *button, gpointer data)
 {
-  if (gtk_menu_button_get_menu_model (button) != NULL)
-    return;
   GMenuModel *primary = build_primary_menu (data);
   gtk_menu_button_set_menu_model (button, primary);
   g_object_unref (primary); /* the button holds its own ref */
@@ -8096,8 +8135,9 @@ settings_present (App *app)
     return;
   AdwDialog *dlg = ADW_DIALOG (adw_preferences_dialog_new ());
   app->prefs = dlg;
-  adw_preferences_dialog_add (ADW_PREFERENCES_DIALOG (dlg),
-                              ADW_PREFERENCES_PAGE (build_parsing_page (app)));
+  if (!lsg_document_is_parquet (app->doc))
+    adw_preferences_dialog_add (ADW_PREFERENCES_DIALOG (dlg),
+                                ADW_PREFERENCES_PAGE (build_parsing_page (app)));
   adw_preferences_dialog_add (ADW_PREFERENCES_DIALOG (dlg),
                               ADW_PREFERENCES_PAGE (build_columns_page (app)));
   g_signal_connect (dlg, "closed", G_CALLBACK (on_prefs_closed), app);
@@ -8338,9 +8378,20 @@ ensure_window (App *app, GtkApplication *gtk_app)
   gtk_menu_button_set_create_popup_func (GTK_MENU_BUTTON (quote_btn),
                                          dialect_popover_create, app, NULL);
 
+  GtkWidget *metadata = gtk_button_new_from_icon_name ("dialog-information-symbolic");
+  gtk_widget_add_css_class (metadata, "flat");
+  gtk_widget_set_tooltip_text (metadata, "Parquet schema, row groups and file information");
+  gtk_accessible_update_property (GTK_ACCESSIBLE (metadata),
+                                  GTK_ACCESSIBLE_PROPERTY_LABEL,
+                                  "Parquet metadata", -1);
+  gtk_actionable_set_action_name (GTK_ACTIONABLE (metadata), "app.parquet-metadata");
+  gtk_widget_set_visible (metadata, FALSE);
+  app->metadata_button = metadata;
+
   /* Settings gear: the primary menu (Preferences + Keyboard Shortcuts +
    * About). */
   GtkWidget *settings_btn = gtk_menu_button_new ();
+  app->primary_menu_button = GTK_MENU_BUTTON (settings_btn);
   gtk_menu_button_set_icon_name (GTK_MENU_BUTTON (settings_btn),
                                  "open-menu-symbolic");
   gtk_widget_set_tooltip_text (settings_btn, "Main menu");
@@ -8361,6 +8412,7 @@ ensure_window (App *app, GtkApplication *gtk_app)
    * All controls occupy one compact, native header row. */
   adw_header_bar_pack_end (ADW_HEADER_BAR (header), settings_btn);
   adw_header_bar_pack_end (ADW_HEADER_BAR (header), columns);
+  adw_header_bar_pack_end (ADW_HEADER_BAR (header), metadata);
   adw_header_bar_pack_end (ADW_HEADER_BAR (header), quote_btn);
   adw_header_bar_pack_end (ADW_HEADER_BAR (header), sep_btn);
   adw_header_bar_pack_end (ADW_HEADER_BAR (header), hdr_toggle);
@@ -8444,6 +8496,7 @@ register_app_shortcuts (App *app, GApplication *gapp)
     { "find", act_find, NULL, NULL, NULL, { 0, 0, 0 } },
     { "jump", act_jump, NULL, NULL, NULL, { 0, 0, 0 } },
     { "preferences", action_preferences, NULL, NULL, NULL, { 0, 0, 0 } },
+    { "parquet-metadata", action_parquet_metadata, NULL, NULL, NULL, { 0, 0, 0 } },
     { "shortcuts", action_shortcuts, NULL, NULL, NULL, { 0, 0, 0 } },
     { "check-updates", action_check_updates, NULL, NULL, NULL, { 0, 0, 0 } },
     { "about", action_about, NULL, NULL, NULL, { 0, 0, 0 } },

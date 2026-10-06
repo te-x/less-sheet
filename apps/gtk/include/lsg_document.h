@@ -151,6 +151,14 @@ guint32 lsg_document_column_count (const LsgDocument *doc);
 
 /* The effective dialect report (copied-out snapshot). */
 gboolean lsg_document_is_parquet (const LsgDocument *doc);
+/* Footer-only inspection. Returned strings are owned (g_free); borrowed core
+ * strings never escape these wrappers. Summary's created_by is left empty. */
+gboolean lsg_document_parquet_info (const LsgDocument *doc, ls_parquet_info *out);
+char *lsg_document_parquet_writer_dup (const LsgDocument *doc);
+gboolean lsg_document_parquet_column_dup (const LsgDocument *doc, guint32 column,
+                                         char **name, char **type);
+gboolean lsg_document_parquet_row_group (const LsgDocument *doc, guint64 group,
+                                        ls_parquet_row_group *out);
 gboolean lsg_document_read_failed (const LsgDocument *doc);
 
 LsgDialect lsg_document_dialect (const LsgDocument *doc);

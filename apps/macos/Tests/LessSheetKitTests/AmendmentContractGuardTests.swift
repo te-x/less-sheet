@@ -147,7 +147,9 @@ struct AmendmentContractGuardTests {
         // Updated for the user-authorized Parquet reader: three additive
         // functions (format/status facts and a projected window). Existing
         // declarations, enum values and struct layouts remain unchanged.
-                        baseline: "96c126c8ad34755243d3d4a4af1f59c3c069c0d7c4a6a344550443c2dad789b8")
+        // Updated for user-authorized footer inspection: three additive
+        // accessors and new metadata structs; existing layouts are unchanged.
+                        baseline: "d100dfb2d32a2752c927a504cf17db8a4fe813b0608751d2066581a022537dcb")
     }
 
     // AC23 — the public Swift search/layout contracts are byte-identical:

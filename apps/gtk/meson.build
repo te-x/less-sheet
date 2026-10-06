@@ -82,6 +82,7 @@ app_resources = gnome.compile_resources(
 # that is the human GUI pass). The real grid/chrome is authored during build.
 executable('less-sheet-gtk',
   'src/main.c',
+  'src/lsg_metadata_dialog.c',
   app_resources,
   # The About dialog's version: taken from the ONE resolver, never re-typed.
   c_args : ['-DLSG_VERSION="' + meson.project_version() + '"'],

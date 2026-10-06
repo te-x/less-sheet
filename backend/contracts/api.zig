@@ -429,6 +429,30 @@ pub const ls_open = core.ls_open;
 pub const ls_close = core.ls_close;
 pub const ls_dialect_get = core.ls_dialect_get;
 pub const ls_document_is_parquet = core.ls_document_is_parquet;
+pub const ParquetInfo = extern struct {
+    file_bytes: u64 = 0,
+    rows: u64 = 0,
+    row_groups: u64 = 0,
+    columns: u32 = 0,
+    format_version: i32 = 0,
+    codec_mask: u32 = 0,
+    created_by: Str = .{ .ptr = "".ptr, .len = 0 },
+};
+pub const ParquetColumn = extern struct {
+    name: Str = .{ .ptr = "".ptr, .len = 0 },
+    physical_type: Str = .{ .ptr = "".ptr, .len = 0 },
+    logical_type: [128]u8 = @splat(0),
+    nullable: bool = false,
+};
+pub const ParquetRowGroup = extern struct {
+    first_row: u64 = 0,
+    rows: u64 = 0,
+    compressed_bytes: u64 = 0,
+    uncompressed_bytes: u64 = 0,
+};
+pub const ls_parquet_info_get = core.ls_parquet_info_get;
+pub const ls_parquet_column_get = core.ls_parquet_column_get;
+pub const ls_parquet_row_group_get = core.ls_parquet_row_group_get;
 pub const ls_document_status = core.ls_document_status;
 pub const ls_window_set_columns = core.ls_window_set_columns;
 pub const ls_column_count = core.ls_column_count;
@@ -635,6 +659,14 @@ comptime {
         @compileError("signature drift: ls_close");
     if (@TypeOf(core.ls_document_is_parquet) != fn (*const Doc) callconv(.c) bool)
         @compileError("signature drift: ls_document_is_parquet");
+    if (@TypeOf(core.ls_parquet_info_get) != fn (*const Doc, *ParquetInfo) callconv(.c) bool)
+        @compileError("signature drift: ls_parquet_info_get");
+    if (@TypeOf(core.ls_parquet_column_get) != fn (*const Doc, u32, *ParquetColumn) callconv(.c) bool)
+        @compileError("signature drift: ls_parquet_column_get");
+    if (@TypeOf(core.ls_parquet_row_group_get) != fn (*const Doc, u64, *ParquetRowGroup) callconv(.c) bool)
+        @compileError("signature drift: ls_parquet_row_group_get");
+    if (@sizeOf(ParquetInfo) != 56 or @sizeOf(ParquetColumn) != 168 or @sizeOf(ParquetRowGroup) != 32)
+        @compileError("Parquet metadata ABI layout drift");
     if (@TypeOf(core.ls_document_status) != fn (*const Doc) callconv(.c) Status)
         @compileError("signature drift: ls_document_status");
     if (@TypeOf(core.ls_window_set_columns) != fn (*Doc, u64, u32, u32, u32) callconv(.c) RowRange)
