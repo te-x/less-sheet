@@ -357,6 +357,7 @@ typedef struct
   GtkMenuButton *sep_button;
   GtkMenuButton *quote_button;
   GtkMenuButton *primary_menu_button;
+  GtkWidget *metadata_button;
   GtkLabel *sep_glyph_label; /* the CHARACTER line of the stacked Sep button */
   GtkLabel
       *quote_glyph_label; /* the CHARACTER line of the stacked Quote button */
@@ -658,6 +659,8 @@ app_reset_document (App *app)
 {
   if (app->metadata_dialog != NULL)
     adw_dialog_force_close (app->metadata_dialog);
+  if (app->metadata_button != NULL)
+    gtk_widget_set_visible (app->metadata_button, FALSE);
   /* LEAF BEFORE ROOT: stop + join any copy worker (and close its job) BEFORE
    * the document is closed below — a job must never outlive its document. */
   copy_stop_and_join (app);
@@ -5835,6 +5838,7 @@ on_window_destroy (GtkWidget *widget, gpointer data)
   app->sep_button = NULL;
   app->quote_button = NULL;
   app->primary_menu_button = NULL;
+  app->metadata_button = NULL;
   app->toasts = NULL;
   app->prefs = NULL; /* the dialog is destroyed with the window */
   app->metadata_dialog = NULL;
@@ -6389,6 +6393,8 @@ dialect_sync_quick_controls (App *app)
     gtk_widget_set_visible (GTK_WIDGET (app->sep_button), text_format);
   if (app->quote_button != NULL)
     gtk_widget_set_visible (GTK_WIDGET (app->quote_button), text_format);
+  if (app->metadata_button != NULL)
+    gtk_widget_set_visible (app->metadata_button, !text_format);
   app->dialect_ui_guard = TRUE;
   if (app->header_toggle != NULL)
     gtk_toggle_button_set_active (app->header_toggle, d.header);
@@ -8372,6 +8378,21 @@ ensure_window (App *app, GtkApplication *gtk_app)
   gtk_menu_button_set_create_popup_func (GTK_MENU_BUTTON (quote_btn),
                                          dialect_popover_create, app, NULL);
 
+  GtkWidget *metadata = gtk_button_new ();
+  GtkWidget *metadata_label = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 6);
+  gtk_box_append (GTK_BOX (metadata_label),
+                  gtk_image_new_from_icon_name ("document-properties-symbolic"));
+  gtk_box_append (GTK_BOX (metadata_label), gtk_label_new ("Metadata"));
+  gtk_button_set_child (GTK_BUTTON (metadata), metadata_label);
+  gtk_widget_add_css_class (metadata, "flat");
+  gtk_widget_set_tooltip_text (metadata, "Parquet schema, row groups and file information");
+  gtk_accessible_update_property (GTK_ACCESSIBLE (metadata),
+                                  GTK_ACCESSIBLE_PROPERTY_LABEL,
+                                  "Parquet metadata", -1);
+  gtk_actionable_set_action_name (GTK_ACTIONABLE (metadata), "app.parquet-metadata");
+  gtk_widget_set_visible (metadata, FALSE);
+  app->metadata_button = metadata;
+
   /* Settings gear: the primary menu (Preferences + Keyboard Shortcuts +
    * About). */
   GtkWidget *settings_btn = gtk_menu_button_new ();
@@ -8396,6 +8417,7 @@ ensure_window (App *app, GtkApplication *gtk_app)
    * All controls occupy one compact, native header row. */
   adw_header_bar_pack_end (ADW_HEADER_BAR (header), settings_btn);
   adw_header_bar_pack_end (ADW_HEADER_BAR (header), columns);
+  adw_header_bar_pack_end (ADW_HEADER_BAR (header), metadata);
   adw_header_bar_pack_end (ADW_HEADER_BAR (header), quote_btn);
   adw_header_bar_pack_end (ADW_HEADER_BAR (header), sep_btn);
   adw_header_bar_pack_end (ADW_HEADER_BAR (header), hdr_toggle);
