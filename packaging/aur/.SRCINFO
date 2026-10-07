@@ -1,0 +1,25 @@
+pkgbase = less-sheet-bin
+	pkgdesc = Native GTK tabular data viewer for CSV and Parquet, including HTTP(S) files
+	pkgver = 0.1.9
+	pkgrel = 1
+	url = https://te-x.github.io/less-sheet/
+	arch = x86_64
+	arch = aarch64
+	license = MIT
+	depends = glibc
+	depends = glib2
+	depends = gtk4>=1:4.20
+	depends = libadwaita>=1:1.8
+	depends = pango
+	depends = cairo
+	depends = hicolor-icon-theme
+	provides = less-sheet=0.1.9
+	conflicts = less-sheet
+	options = !strip
+	options = !debug
+	source_x86_64 = https://github.com/te-x/less-sheet/releases/download/v0.1.9/less-sheet-0.1.9-linux-x86_64.tar.gz
+	sha256sums_x86_64 = 4ad7d7891bd921c14cad49a16e67731aadc0adee17eb9ea831d94f10c22c5f00
+	source_aarch64 = https://github.com/te-x/less-sheet/releases/download/v0.1.9/less-sheet-0.1.9-linux-aarch64.tar.gz
+	sha256sums_aarch64 = 664dcb37d96c07cd93be4f2d7771415fd7d0a744c63ae0132d942f5f9cbd4713
+
+pkgname = less-sheet-bin
