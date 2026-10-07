@@ -9,8 +9,8 @@ for everything that cannot read it: files that must carry a literal because they
 are consumed by something with no access to the repo. A download URL on a static
 page, a sha256 in a cask, a Flatpak manifest fetched by a stranger's machine.
 
-There are twenty-one such literals across three files, plus six digest/size
-pairs that change on every build. Editing them by hand is not slow, it is
+These include the website, Flatpak manifests and AUR recipe, along with their
+payload digests and sizes. Editing them by hand is not slow, it is
 UNCHECKABLE: miss one and you ship a download that 404s for everyone except you,
 and nothing anywhere complains.
 
@@ -36,6 +36,8 @@ SURFACE = (
     "site/index.html",
     "packaging/flatpak/com.lesssheet.LessSheet.yaml",
     "packaging/flatpak/com.lesssheet.LessSheet.Bundle.yaml",
+    "packaging/aur/PKGBUILD",
+    "packaging/aur/.SRCINFO",
 )
 
 # The metainfo is APPEND-ONLY and is handled separately. Its <release> entries
@@ -133,6 +135,27 @@ def add_release_entry(repo, want, today):
     print("  added %s to %s" % (want, METAINFO))
 
 
+def stamp_aur(body, want, resolved, srcinfo=False):
+    """Keep the AUR recipe and generated metadata on the same release payloads."""
+    for arch in ("x86_64", "aarch64"):
+        name = "less-sheet-%s-linux-%s.tar.gz" % (want, arch)
+        if name not in resolved:
+            die("AUR payload %s is absent from SHA256SUMS" % name)
+        sha = resolved[name][0]
+        key = "sha256sums_" + arch
+        pattern = (r"^(\s*" + key + r" = ).*$" if srcinfo
+                   else r"^(" + key + r"=).*$")
+        value = sha if srcinfo else "('%s')" % sha
+        body, count = re.subn(pattern, lambda m: m[1] + value, body, flags=re.M)
+        if count != 1:
+            die("expected one AUR %s field, found %d" % (key, count))
+    pattern = r"^(\s*pkgrel = ).*$" if srcinfo else r"^(pkgrel=).*$"
+    body, count = re.subn(pattern, lambda m: m[1] + "1", body, flags=re.M)
+    if count != 1:
+        die("expected one AUR pkgrel field, found %d" % count)
+    return body
+
+
 def unfilled_links(repo):
     """An href left as a NAMED PLACEHOLDER is a dead button on a live page.
 
@@ -197,6 +220,8 @@ def main():
         body = read(repo, rel)
         if rel.endswith(".yaml"):
             body = stamp_payloads(body, args.have, args.want, resolved)
+        elif rel.startswith("packaging/aur/"):
+            body = stamp_aur(body, args.want, resolved, rel.endswith(".SRCINFO"))
         body = body.replace(args.have, args.want)
         write(repo, rel, body)
         print("  stamped %s" % rel)
