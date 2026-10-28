@@ -9235,8 +9235,7 @@ main (int argc, char *argv[])
       g_print ("Usage: less-sheet [FILE_PATH]\n"
                "       less-sheet --version\n"
                "       less-sheet --update\n"
-               "       less-sheet --help, -h\n\n"
-               "Open a file, print the installed version, or check for updates.\n");
+               "       less-sheet --help, -h\n");
       return 0;
     }
   if (argc == 2 && g_str_equal (argv[1], "--version"))

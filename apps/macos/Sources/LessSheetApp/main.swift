@@ -12,8 +12,6 @@ if CommandLine.arguments.count == 2, ["--help", "-h", "--help-all"].contains(Com
            less-sheet --version
            less-sheet --update
            less-sheet --help, -h
-
-    Open a file, print the installed version, or check for updates.
     """)
     exit(0)
 }
