@@ -8,6 +8,8 @@ import Foundation
 
 if CommandLine.arguments.count == 2, ["--help", "-h", "--help-all"].contains(CommandLine.arguments[1]) {
     print("""
+    less-sheet — a fast viewer for CSV and Parquet files
+
     Usage: less-sheet [FILE_PATH]
            less-sheet --version
            less-sheet --update

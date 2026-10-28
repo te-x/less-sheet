@@ -9232,7 +9232,8 @@ main (int argc, char *argv[])
       && (g_str_equal (argv[1], "--help") || g_str_equal (argv[1], "-h")
           || g_str_equal (argv[1], "--help-all")))
     {
-      g_print ("Usage: less-sheet [FILE_PATH]\n"
+      g_print ("less-sheet — a fast viewer for CSV and Parquet files\n\n"
+               "Usage: less-sheet [FILE_PATH]\n"
                "       less-sheet --version\n"
                "       less-sheet --update\n"
                "       less-sheet --help, -h\n");
