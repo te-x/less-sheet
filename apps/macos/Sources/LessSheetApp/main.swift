@@ -6,12 +6,12 @@
 import AppKit
 import Foundation
 
-if CommandLine.arguments.count == 2, CommandLine.arguments[1] == "--help" {
+if CommandLine.arguments.count == 2, ["--help", "-h", "--help-all"].contains(CommandLine.arguments[1]) {
     print("""
     Usage: less-sheet [FILE_PATH]
            less-sheet --version
            less-sheet --update
-           less-sheet --help
+           less-sheet --help, -h
 
     Open a file, print the installed version, or check for updates.
     """)

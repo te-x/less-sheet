@@ -9228,12 +9228,14 @@ cli_check_updates (void)
 int
 main (int argc, char *argv[])
 {
-  if (argc == 2 && g_str_equal (argv[1], "--help"))
+  if (argc == 2
+      && (g_str_equal (argv[1], "--help") || g_str_equal (argv[1], "-h")
+          || g_str_equal (argv[1], "--help-all")))
     {
       g_print ("Usage: less-sheet [FILE_PATH]\n"
                "       less-sheet --version\n"
                "       less-sheet --update\n"
-               "       less-sheet --help\n\n"
+               "       less-sheet --help, -h\n\n"
                "Open a file, print the installed version, or check for updates.\n");
       return 0;
     }
