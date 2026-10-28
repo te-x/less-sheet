@@ -6,6 +6,35 @@
 import AppKit
 import Foundation
 
+if CommandLine.arguments.count == 2,
+   CommandLine.arguments[1] == "--version" {
+    let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+        ?? "unknown"
+    print("less-sheet \(version)")
+    exit(0)
+}
+
+if CommandLine.arguments.count == 2, CommandLine.arguments[1] == "--update" {
+    Task.detached {
+        do {
+            guard let text = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String,
+                  let current = ReleaseVersion(text) else { throw UpdateCheckError.invalidVersion }
+            let release = try await UpdateRelease.latest()
+            if release.version > current {
+                print("less-sheet \(release.version.text) is available (installed: \(current.text)).")
+                print("Download: \(release.downloadURL.absoluteString)")
+            } else {
+                print("less-sheet \(current.text) is up to date.")
+            }
+            exit(0)
+        } catch {
+            FileHandle.standardError.write(Data("Could not check for updates: \(error.localizedDescription)\n".utf8))
+            exit(1)
+        }
+    }
+    dispatchMain()
+}
+
 LaunchTiming.begin()
 LaunchTiming.phase("main_entry")
 

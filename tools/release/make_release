@@ -121,13 +121,14 @@ apps="$HOME/.local/share/applications"
 icons="$HOME/.local/share/icons/hicolor/scalable/apps"
 
 if [ "${1:-}" = "--uninstall" ]; then
-    rm -f "$bin/less-sheet-gtk" "$apps/{app_id}.desktop" "$icons/{app_id}.svg"
+    rm -f "$bin/less-sheet" "$bin/less-sheet-gtk" "$apps/{app_id}.desktop" "$icons/{app_id}.svg"
     echo "Removed less-sheet."
     exit 0
 fi
 
 mkdir -p "$bin" "$apps" "$icons"
 install -m 755 "$here/less-sheet-gtk" "$bin/less-sheet-gtk"
+ln -sf less-sheet-gtk "$bin/less-sheet"
 install -m 644 "$here/{app_id}.desktop" "$apps/{app_id}.desktop"
 install -m 644 "$here/{app_id}.svg" "$icons/{app_id}.svg"
 command -v update-desktop-database >/dev/null 2>&1 && \\

@@ -21,6 +21,7 @@ cask "less-sheet" do
   depends_on macos: :tahoe
 
   app "less-sheet.app"
+  binary "less-sheet.app/Contents/MacOS/LessSheet", target: "less-sheet"
 
   # NO postflight that strips com.apple.quarantine.
   #

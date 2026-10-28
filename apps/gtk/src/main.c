@@ -9184,9 +9184,57 @@ on_open (GApplication *gapp, GFile **files, gint n_files, const char *hint,
   gtk_window_present (app->window);
 }
 
+static int
+cli_check_updates (void)
+{
+  g_autoptr (GError) error = NULL;
+  g_autofree char *limit = g_strdup_printf ("%u", LSG_UPDATE_METADATA_LIMIT);
+  g_autoptr (GSubprocess) process = g_subprocess_new (
+      G_SUBPROCESS_FLAGS_STDOUT_PIPE | G_SUBPROCESS_FLAGS_STDERR_SILENCE,
+      &error, "curl", "-q", "--silent", "--fail", "--location", "--proto",
+      "=https", "--proto-redir", "=https", "--connect-timeout", "10",
+      "--max-time", "30", "--max-filesize", limit, LSG_UPDATE_CHECKSUMS_URL,
+      NULL);
+  g_autofree char *output = NULL;
+  if (process == NULL
+      || !g_subprocess_communicate_utf8 (process, NULL, NULL, &output, NULL,
+                                         &error)
+      || !g_subprocess_get_successful (process))
+    {
+      g_printerr ("Could not check for updates. Check your connection and "
+                  "ensure curl is installed.\n");
+      return 1;
+    }
+  g_autofree char *version = NULL;
+  g_autofree char *uri = NULL;
+  LsgUpdateVersion current, latest;
+  if (!lsg_update_release_parse (output, strlen (output),
+                                 update_asset_suffix (), &version, &uri)
+      || !lsg_update_version_parse (version, &latest)
+      || !lsg_update_version_parse (LSG_VERSION, &current))
+    {
+      g_printerr (
+          "Could not check for updates: invalid release information.\n");
+      return 1;
+    }
+  if (lsg_update_version_compare (&latest, &current) <= 0)
+    g_print ("less-sheet %s is up to date.\n", LSG_VERSION);
+  else
+    g_print ("less-sheet %s is available (installed: %s).\nDownload: %s\n",
+             version, LSG_VERSION, uri);
+  return 0;
+}
+
 int
 main (int argc, char *argv[])
 {
+  if (argc == 2 && g_str_equal (argv[1], "--version"))
+    {
+      g_print ("less-sheet %s\n", LSG_VERSION);
+      return 0;
+    }
+  if (argc == 2 && g_str_equal (argv[1], "--update"))
+    return cli_check_updates ();
   App app = { 0 };
   app.t_start = g_get_monotonic_time (); /* capture entry ASAP */
   /* Before GTK initialization; an explicit renderer choice always wins. */

@@ -15,6 +15,22 @@ page allocations are bounded; files exceeding those limits fail cleanly.
 
 Website, screenshots and downloads: <https://te-x.github.io/less-sheet/>
 
+## Command line
+
+The Linux tarball installer and Homebrew cask provide `less-sheet` on your PATH.
+The Linux executable can also be invoked as `less-sheet-gtk`. On macOS, a
+manually installed app can be run as `/Applications/less-sheet.app/Contents/MacOS/LessSheet`.
+
+```sh
+less-sheet --version        # print the installed version
+less-sheet data.csv         # open a file
+less-sheet --update         # check for updates in the terminal
+```
+
+The update check prints whether a release is available and its download link;
+it does not install updates. Flatpak users can launch the app with
+`flatpak run com.lesssheet.LessSheet` followed by the same arguments.
+
 ## Layout
 
 | Path         | What it is                                                    |
