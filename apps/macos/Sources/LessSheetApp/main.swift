@@ -6,6 +6,18 @@
 import AppKit
 import Foundation
 
+if CommandLine.arguments.count == 2, CommandLine.arguments[1] == "--help" {
+    print("""
+    Usage: less-sheet [FILE_PATH]
+           less-sheet --version
+           less-sheet --update
+           less-sheet --help
+
+    Open a file, print the installed version, or check for updates.
+    """)
+    exit(0)
+}
+
 if CommandLine.arguments.count == 2,
    CommandLine.arguments[1] == "--version" {
     let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String

@@ -9228,6 +9228,15 @@ cli_check_updates (void)
 int
 main (int argc, char *argv[])
 {
+  if (argc == 2 && g_str_equal (argv[1], "--help"))
+    {
+      g_print ("Usage: less-sheet [FILE_PATH]\n"
+               "       less-sheet --version\n"
+               "       less-sheet --update\n"
+               "       less-sheet --help\n\n"
+               "Open a file, print the installed version, or check for updates.\n");
+      return 0;
+    }
   if (argc == 2 && g_str_equal (argv[1], "--version"))
     {
       g_print ("less-sheet %s\n", LSG_VERSION);
