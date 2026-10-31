@@ -25,10 +25,6 @@ struct EmptyStateView: View {
 /// one rather than popping the file panel, which would assume "open" means a
 /// local file.
 struct LaunchStateView: View {
-    /// Matches what the GNOME status pages draw the app icon at, so both
-    /// frontends read alike.
-    private static let logoSize: CGFloat = 128
-
     /// The bundle's own icon — the one image AppKit already loads for the Dock
     /// and About, so no resource of ours is shipped or looked up. Outside an
     /// assembled bundle AppKit hands back its generic application icon.
@@ -37,35 +33,56 @@ struct LaunchStateView: View {
     }
 
     var body: some View {
-        VStack(spacing: 14) {
-            Image(nsImage: Self.logo)
-                .resizable()
-                .interpolation(.high)
-                .frame(width: Self.logoSize, height: Self.logoSize)
-                .accessibilityHidden(true) // the title below carries the meaning
-                .padding(.bottom, 8)
-            Text("Drop a file here or open a spreadsheet")
-                .font(.title3)
-                .foregroundStyle(.secondary)
-            VStack(alignment: .leading, spacing: 6) {
-                shortcut("⌘O", "Open a local file")
-                shortcut("⌘⇧O", "Open a URL")
+        GeometryReader { geometry in
+            ScrollView {
+                VStack(spacing: 24) {
+                    VStack(spacing: 12) {
+                        Image(nsImage: Self.logo)
+                            .resizable()
+                            .interpolation(.high)
+                            .frame(width: 96, height: 96)
+                            .accessibilityHidden(true)
+                        Text("less-sheet")
+                            .font(.largeTitle.weight(.semibold))
+                    }
+                    VStack(spacing: 10) {
+                        Button { AppDelegate.openViaPanel() } label: {
+                            openLabel("Open File…", symbol: "folder", shortcut: "⌘O")
+                        }
+                        .buttonStyle(.borderedProminent)
+                        Button { AppDelegate.openURLViaSheet() } label: {
+                            openLabel("Open URL…", symbol: "link", shortcut: "⇧⌘O")
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                    .controlSize(.large)
+                    .frame(width: 280)
+                    VStack(spacing: 8) {
+                        Text("Or drop a file anywhere in this window")
+                            .font(.callout)
+                        Text("CSV · TSV · CSV.gz · Parquet")
+                            .font(.caption)
+                    }
+                    .foregroundStyle(.secondary)
+                }
+                .padding(24)
+                .frame(maxWidth: .infinity)
+                .frame(minHeight: geometry.size.height)
             }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color(nsColor: .textBackgroundColor))
+        .background(Color(nsColor: .windowBackgroundColor))
     }
 
-    private func shortcut(_ keys: String, _ label: String) -> some View {
-        HStack(spacing: 10) {
-            Text(keys)
-                .font(.body.monospaced())
-                .foregroundStyle(.primary)
-                .frame(minWidth: 44, alignment: .trailing)
-            Text(label)
-                .font(.body)
-                .foregroundStyle(.secondary)
+    private func openLabel(_ title: String, symbol: String, shortcut: String) -> some View {
+        HStack {
+            Label(title, systemImage: symbol)
+            Spacer()
+            Text(shortcut)
+                .font(.callout)
+                .opacity(0.7)
+                .accessibilityHidden(true)
         }
+        .frame(maxWidth: .infinity)
     }
 }
 

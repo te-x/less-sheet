@@ -41,6 +41,7 @@ extension AppDelegate {
     private func appMenu(_ name: String) -> NSMenu {
         let menu = NSMenu(title: name)
         menu.addItem(item("About \(name)", #selector(NSApplication.orderFrontStandardAboutPanel(_:)), ""))
+        menu.addItem(item("App preferences…", #selector(menuAppPreferences(_:)), ",", target: self))
         menu.addItem(item("Check for Updates…", #selector(menuCheckForUpdates(_:)), "", target: self))
         menu.addItem(.separator())
         let services = NSMenu(title: "Services")
@@ -60,10 +61,14 @@ extension AppDelegate {
 
     private func fileMenu() -> NSMenu {
         let menu = NSMenu(title: "File")
+        menu.delegate = self
         menu.addItem(item("Open…", #selector(menuOpenFile(_:)), "o", target: self))
         menu.addItem(item("Open URL…", #selector(menuOpenURL(_:)), "o",
                           modifiers: [.command, .shift], target: self))
         menu.addItem(.separator())
+        let preferences = item("File preferences…", #selector(menuFilePreferences(_:)), "", target: self)
+        preferences.isHidden = DocumentModel.shared.session == nil
+        menu.addItem(preferences)
         menu.addItem(item("Parquet Metadata…", #selector(menuParquetMetadata(_:)), "", target: self))
         menu.addItem(item("Close", #selector(NSWindow.performClose(_:)), "w"))
         return menu
@@ -155,6 +160,8 @@ extension AppDelegate {
 
     // MARK: - Actions
 
+    @objc fileprivate func menuAppPreferences(_ sender: Any?) { presentAppPreferences() }
+    @objc fileprivate func menuFilePreferences(_ sender: Any?) { presentSettings() }
     @objc fileprivate func menuCheckForUpdates(_ sender: Any?) { checkForUpdates() }
     @objc fileprivate func menuParquetMetadata(_ sender: Any?) { presentParquetMetadata() }
     @objc fileprivate func menuOpenFile(_ sender: Any?) { AppDelegate.openViaPanel() }
@@ -172,5 +179,14 @@ extension AppDelegate: NSMenuItemValidation {
             return DocumentModel.shared.isParquet && DocumentModel.shared.session != nil
         }
         return true
+    }
+}
+
+// Hide the document-specific command, rather than leaving an inert menu item.
+extension AppDelegate: NSMenuDelegate {
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        for item in menu.items where item.action == #selector(menuFilePreferences(_:)) {
+            item.isHidden = DocumentModel.shared.session == nil
+        }
     }
 }

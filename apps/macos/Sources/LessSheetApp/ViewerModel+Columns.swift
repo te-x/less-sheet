@@ -49,6 +49,7 @@ extension DocumentModel {
         settingsOpen = true
         if let target {
             let targetInCurrentRows = ColumnDiscovery().mode(columnCount: columnCount) == .fullList
+                || settingsLifecycle.query.isEmpty
                 || settingsDiscoveryRows.contains(target)
             settingsLifecycle = reducer.headerAction(
                 settingsLifecycle, target: target, columnCount: columnCount,

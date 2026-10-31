@@ -28,6 +28,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var routedLaunchOpen = false
     private var mainWindow: NSWindow?
     private var settingsWindow: NSWindow?
+    private var appPreferencesWindow: NSWindow?
     var parquetMetadataWindow: NSWindow?
     private var updateChecker: UpdateChecker?
 
@@ -39,6 +40,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillFinishLaunching(_ notification: Notification) {
         LaunchTiming.phase("will_finish_launching")
         NSApp.setActivationPolicy(.regular)
+        AppAppearance.shared.apply()
         installMainMenu()
     }
 
@@ -177,9 +179,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    func presentAppPreferences() {
+        if let window = appPreferencesWindow {
+            window.makeKeyAndOrderFront(nil)
+            return
+        }
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 548, height: 320),
+            styleMask: [.titled, .closable], backing: .buffered, defer: false
+        )
+        window.title = "App preferences"
+        window.isReleasedWhenClosed = false
+        window.contentView = NSHostingView(rootView: AppPreferencesView(appearance: .shared))
+        window.center()
+        window.makeKeyAndOrderFront(nil)
+        appPreferencesWindow = window
+    }
+
     /// Raises the Settings window, optionally deep-linked from a grid header to
     /// one column.
     func presentSettings(selecting column: Int? = nil) {
+        guard DocumentModel.shared.session != nil else { return }
         DocumentModel.shared.beginSettings(selecting: column)
         if let window = settingsWindow {
             window.makeKeyAndOrderFront(nil)
@@ -191,7 +211,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             backing: .buffered,
             defer: false
         )
-        window.title = "Settings"
+        window.title = "File preferences"
         window.isReleasedWhenClosed = false
         window.contentMinSize = NSSize(width: 500, height: 620)
         window.contentView = NSHostingView(rootView: SettingsView(model: .shared))

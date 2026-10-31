@@ -301,8 +301,8 @@ struct SettingsButton: View {
         }
         .buttonStyle(.plain)
         .glassChrome(.regular.interactive(), in: Circle())
-        .help("Settings — header, separator, quote, text encoding, and column visibility")
-        .accessibilityLabel("Settings")
+        .help("File preferences — parsing and column settings")
+        .accessibilityLabel("File preferences")
     }
 }
 

@@ -18,7 +18,12 @@ cd "$macos_dir"
 # one. Measured cost, accepted when that wave was signed: ~19% index, ~10%
 # search/filter, ~20% copy; cold-start is ~40x under the 500 ms budget and
 # unaffected. Do not "optimize" this back.
-(cd ../../backend && zig build -Doptimize=ReleaseSafe)
+case "$(uname -m)" in
+    arm64) core_arch=aarch64 ;;
+    x86_64) core_arch=x86_64 ;;
+    *) echo "Unsupported Mac architecture" >&2; exit 1 ;;
+esac
+(cd ../../backend && zig build -Dtarget="$core_arch-macos.26.0" -Doptimize=ReleaseSafe)
 # SwiftPM doesn't track liblesssheet.a as a build input (it's linked via -L), so a stale link product can keep the previous archive; drop only the link products (not object caches) to force a relink against the fresh core.
 rm -f .build/*/release/LessSheet
 rm -rf .build/*/release/*.xctest
@@ -63,7 +68,9 @@ cp "$macos_dir/../../branding/generated/AppIcon.icns" "$app/Contents/Resources/A
 # 4) SwiftPM copies target resources (the empty-bundle case has none) next to
 #    the binary; mirror any LessSheet_*.bundle so the app finds them at runtime.
 for res in "$bin_dir"/*.bundle; do
-    [ -e "$res" ] && cp -R "$res" "$app/Contents/MacOS/" || true
+    [ -e "$res" ] || continue
+    case "$(basename "$res")" in *Tests.bundle) continue ;; esac
+    cp -R "$res" "$app/Contents/MacOS/"
 done
 
 # 4b) Legal text goes INSIDE the bundle, not beside it. A file sitting next to
@@ -100,6 +107,14 @@ done
 # "Developer ID Application: Name (TEAMID)"); notarization stays a separate,
 # deliberate publishing step and is intentionally NOT done here.
 identity="${LESSSHEET_CODESIGN_IDENTITY:--}"
+for res in "$app"/Contents/MacOS/*.bundle; do
+    [ -e "$res" ] || continue
+    if [ "$identity" = "-" ]; then
+        codesign --force --sign - --timestamp=none "$res"
+    else
+        codesign --force --sign "$identity" --timestamp --options runtime "$res"
+    fi
+done
 if [ "$identity" = "-" ]; then
     # Ad-hoc: a secure timestamp is not available for it, and --timestamp=none
     # keeps this build step offline.

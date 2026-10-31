@@ -69,7 +69,7 @@ struct GridView: View {
         _ = model.columnWidthRevision
         _ = model.columnConfigurationRevision
         return NativeGridRepresentable(model: model)
-            .background(Color(nsColor: .textBackgroundColor))
+            .background(Color(nsColor: AppPalette.current.background))
     }
 }
 
@@ -93,6 +93,11 @@ final class GridContainerView: NSView {
     override func layout() {
         super.layout()
         controller?.layoutContainer()
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        controller?.appearanceChanged()
     }
 
     override func viewDidMoveToWindow() {

@@ -190,11 +190,11 @@ extension NativeGridController {
         // bitmap context otherwise resolves dynamic catalog colors under the
         // ambient (light) one, leaving the band light in a dark capture.
         // `.sRGB` resolves here; `.deviceRGB` returns nil.
-        var bandFill = NSColor.windowBackgroundColor
-        var lineFill = NSColor.gridColor
+        var bandFill = AppPalette.current.header
+        var lineFill = AppPalette.current.line
         container.effectiveAppearance.performAsCurrentDrawingAppearance {
-            bandFill = NSColor.windowBackgroundColor.usingColorSpace(.sRGB) ?? bandFill
-            lineFill = NSColor.gridColor.usingColorSpace(.sRGB) ?? lineFill
+            bandFill = AppPalette.current.header.usingColorSpace(.sRGB) ?? bandFill
+            lineFill = AppPalette.current.line.usingColorSpace(.sRGB) ?? lineFill
         }
         bandFill.setFill()
         bandRect.fill()

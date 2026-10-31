@@ -37,6 +37,7 @@
 #include <lsg_window_poll.h>
 
 #include <string.h>
+#include <errno.h>
 
 /* Reverse-DNS application id — the single source of truth for it in this file.
  * It is simultaneously the AdwApplication id, the window/about icon NAME, and
@@ -93,6 +94,12 @@
  * renderer benchmark while keeping Adwaita animations smooth. GTK retains
  * its renderer fallback chain if OpenGL cannot be realized. */
 #define LSG_DEFAULT_GSK_RENDERER "gl"
+static guint appearance_mode; /* system, light, dark */
+static guint appearance_theme; /* neutral, high contrast, soft, custom */
+static GtkCssProvider *appearance_css;
+static GdkRGBA appearance_background = { 1, 1, 1, 1 };
+static GdkRGBA appearance_text = { 0.2, 0.2, 0.2, 1 };
+static gboolean appearance_stripes = TRUE;
 /* ------------------------------------------------------------------------- */
 /* Screenshot capture (LESSSHEET_GTK_CAPTURE) — the state types. The contract
  * is documented at the capture section near the bottom of this file; the types
@@ -1290,9 +1297,9 @@ grid_draw (GtkDrawingArea *area, cairo_t *cr, int width, int height,
 
   /* Subtle header / gutter tints and hairlines derived from the fg color. */
   GdkRGBA tint = fg;
-  tint.alpha = 0.04;
+  tint.alpha = appearance_theme == 1 ? 0.12 : 0.04;
   GdkRGBA line = fg;
-  line.alpha = 0.08;
+  line.alpha = appearance_theme == 1 ? 0.4 : 0.08;
 
   /* The live system accent (Adwaita), never a hardcoded color: find highlights
    * (subtle in scope, strong on the current match) and the keyboard cursor's
@@ -1301,13 +1308,23 @@ grid_draw (GtkDrawingArea *area, cairo_t *cr, int width, int height,
   gboolean have_accent = FALSE;
   if (app->find.display.active || app->sel_mode != SEL_NONE)
     {
-      GdkRGBA *a = adw_style_manager_get_accent_color_rgba (
-          adw_style_manager_get_default ());
-      if (a != NULL)
+      static const char *const accents[3][2] = {
+        { NULL, NULL }, { "#004ca3", "#75baff" },
+        { "#536f64", "#9ab4a4" }
+      };
+      AdwStyleManager *manager = adw_style_manager_get_default ();
+      if (appearance_theme != 0 && appearance_theme != 3)
+        have_accent = gdk_rgba_parse (&accent,
+            accents[appearance_theme][adw_style_manager_get_dark (manager) ? 1 : 0]);
+      else
         {
-          accent = *a;
-          gdk_rgba_free (a);
-          have_accent = TRUE;
+          GdkRGBA *a = adw_style_manager_get_accent_color_rgba (manager);
+          if (a != NULL)
+            {
+              accent = *a;
+              gdk_rgba_free (a);
+              have_accent = TRUE;
+            }
         }
     }
 
@@ -1334,10 +1351,10 @@ grid_draw (GtkDrawingArea *area, cairo_t *cr, int width, int height,
 
       /* A very light band makes wide rows easier to follow without adding
        * widgets or doing work outside the materialized viewport. */
-      if (view_row % 2 != 0)
+      if (view_row % 2 != 0 && (appearance_theme != 3 || appearance_stripes))
         {
           GdkRGBA stripe = fg;
-          stripe.alpha = 0.025;
+          stripe.alpha = appearance_theme == 3 ? 0.06 : 0.025;
           gdk_cairo_set_source_rgba (cr, &stripe);
           cairo_rectangle (cr, gutter, y, (double)width - gutter, row_h);
           cairo_fill (cr);
@@ -4015,8 +4032,15 @@ install_app_css (void)
             * Find/Jump popovers. Row hover-highlight is unaffected (it comes
             * from the activatable rows, not this background). */
            ".lsg-flat-list { background: none; }"
-           ".lsg-grid { background: @view_bg_color; }"
-           ".lsg-welcome-actions button { padding: 14px 20px; }");
+           ".lsg-grid { background: var(--view-bg-color); color: var(--view-fg-color); }"
+           ".lsg-welcome-actions button { padding: 14px 20px; }"
+           ".lsg-theme-preview { border: 1px solid alpha(currentColor, 0.08); border-radius: 5px; }"
+           ".lsg-theme-preview label { font-family: monospace; font-size: 11px; padding: 6px 8px; }"
+           ".lsg-theme-preview .preview-header { background: alpha(currentColor, 0.04); border-bottom: 1px solid alpha(currentColor, 0.08); }"
+           ".lsg-theme-preview .preview-first { border-right: 1px solid alpha(currentColor, 0.08); }"
+           ".lsg-theme-preview-1 { border-color: alpha(currentColor, 0.4); }"
+           ".lsg-theme-preview-1 .preview-header { background: alpha(currentColor, 0.12); border-bottom-color: alpha(currentColor, 0.4); }"
+           ".lsg-theme-preview-1 .preview-first { border-right-color: alpha(currentColor, 0.4); }");
   GdkDisplay *display = gdk_display_get_default ();
   if (display != NULL)
     gtk_style_context_add_provider_for_display (
@@ -5599,9 +5623,6 @@ build_launch_page (App *app)
    * its own identity. */
   adw_status_page_set_icon_name (ADW_STATUS_PAGE (status), LSG_APP_ID);
   adw_status_page_set_title (ADW_STATUS_PAGE (status), "less-sheet");
-  adw_status_page_set_description (ADW_STATUS_PAGE (status),
-                                   "Your data, at a glance.\nOpen large "
-                                   "tables instantly, wherever they live.");
 
   GtkWidget *box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 12);
   gtk_widget_set_halign (box, GTK_ALIGN_CENTER);
@@ -6881,13 +6902,303 @@ action_preferences (GSimpleAction *a, GVariant *p, gpointer data)
   settings_present ((App *)data);
 }
 
+/* Application appearance is independent of the current document. */
+static char *
+appearance_path (void)
+{
+  return g_build_filename (g_get_user_config_dir (), "less-sheet",
+                           "appearance.ini", NULL);
+}
+
+static void
+appearance_save (void)
+{
+  g_autoptr (GKeyFile) key = g_key_file_new ();
+  g_autofree char *path = appearance_path ();
+  g_autofree char *dir = g_path_get_dirname (path);
+  g_autoptr (GError) error = NULL;
+  g_key_file_set_integer (key, "Appearance", "mode", (gint)appearance_mode);
+  g_key_file_set_integer (key, "Appearance", "theme", (gint)appearance_theme);
+  g_autofree char *bg = gdk_rgba_to_string (&appearance_background);
+  g_autofree char *fg = gdk_rgba_to_string (&appearance_text);
+  g_key_file_set_string (key, "Appearance", "background", bg);
+  g_key_file_set_string (key, "Appearance", "text", fg);
+  g_key_file_set_boolean (key, "Appearance", "stripes", appearance_stripes);
+  if (g_mkdir_with_parents (dir, 0700) != 0
+      || !g_key_file_save_to_file (key, path, &error))
+    g_warning ("Could not save appearance preferences: %s",
+               error != NULL ? error->message : g_strerror (errno));
+}
+
+static void
+appearance_update_css (void)
+{
+  /* Keep the native named colors intact: Neutral previews must remain neutral
+   * while another theme is selected. Override Adwaita's CSS variables instead. */
+  static const char *const palettes[2][2][7] = {
+    { { "#ffffff", "#000000", "#ffffff", "#f0f0f0", "#004ca3", "#ffffff", "#000000" },
+      { "#000000", "#ffffff", "#000000", "#202020", "#75baff", "#000000", "#ffffff" } },
+    { { "#d3d6cd", "#575e59", "#dcded5", "#e1e3da", "#536f64", "#ffffff", "#575e59" },
+      { "#3d4541", "#b4c0b7", "#454e49", "#505a54", "#9ab4a4", "#18201d", "#b4c0b7" } },
+  };
+  gboolean dark = adw_style_manager_get_dark (adw_style_manager_get_default ());
+  g_autoptr (GString) css = g_string_new (
+      ".lsg-theme-preview-0 { background-color: @view_bg_color; color: @view_fg_color; }");
+  for (guint theme = 1; theme < 3; theme++)
+    {
+      const char *const *c = palettes[theme - 1][dark ? 1 : 0];
+      g_string_append_printf (css,
+          ".lsg-theme-preview-%u { background-color: %s; color: %s; }",
+          theme, c[2], c[6]);
+      if (theme == appearance_theme)
+        g_string_append_printf (css,
+            ":root { --window-bg-color: %s; --window-fg-color: %s;"
+            " --view-bg-color: %s; --view-fg-color: %s;"
+            " --card-bg-color: %s; --card-fg-color: %s;"
+            " --accent-bg-color: %s; --accent-color: %s; --accent-fg-color: %s; }",
+            c[0], c[1], c[2], c[6], c[3], c[1], c[4], c[4], c[5]);
+    }
+  g_autofree char *bg = gdk_rgba_to_string (&appearance_background);
+  g_autofree char *fg = gdk_rgba_to_string (&appearance_text);
+  g_string_append_printf (css,
+      ".lsg-theme-preview-3 { background-color: %s; color: %s; }", bg, fg);
+  if (appearance_stripes)
+    g_string_append (css, ".lsg-theme-preview-3 .preview-stripe { background: alpha(currentColor, 0.06); }");
+  if (appearance_theme == 3)
+    g_string_append_printf (css, ":root { --view-bg-color: %s; --view-fg-color: %s; }", bg, fg);
+  gtk_css_provider_load_from_string (appearance_css, css->str);
+}
+
+static void
+appearance_dark_changed (GObject *object, GParamSpec *pspec, gpointer data)
+{
+  (void)object; (void)pspec; (void)data;
+  appearance_update_css ();
+}
+
+static void
+appearance_init (void)
+{
+  if (appearance_css != NULL)
+    return;
+  g_autoptr (GKeyFile) key = g_key_file_new ();
+  g_autofree char *path = appearance_path ();
+  if (g_key_file_load_from_file (key, path, G_KEY_FILE_NONE, NULL))
+    {
+      gint mode = g_key_file_get_integer (key, "Appearance", "mode", NULL);
+      gint theme = g_key_file_get_integer (key, "Appearance", "theme", NULL);
+      if (mode >= 0 && mode < 3) appearance_mode = (guint)mode;
+      if (theme >= 0 && theme < 4) appearance_theme = (guint)theme;
+      g_autofree char *bg = g_key_file_get_string (key, "Appearance", "background", NULL);
+      g_autofree char *fg = g_key_file_get_string (key, "Appearance", "text", NULL);
+      GdkRGBA parsed;
+      if (bg != NULL && gdk_rgba_parse (&parsed, bg)) appearance_background = parsed;
+      if (fg != NULL && gdk_rgba_parse (&parsed, fg)) appearance_text = parsed;
+      appearance_background.alpha = appearance_text.alpha = 1;
+      if (g_key_file_has_key (key, "Appearance", "stripes", NULL))
+        appearance_stripes = g_key_file_get_boolean (key, "Appearance", "stripes", NULL);
+    }
+  appearance_css = gtk_css_provider_new ();
+  gtk_style_context_add_provider_for_display (gdk_display_get_default (),
+      GTK_STYLE_PROVIDER (appearance_css), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION + 1);
+  AdwStyleManager *manager = adw_style_manager_get_default ();
+  g_signal_connect (manager, "notify::dark", G_CALLBACK (appearance_dark_changed), NULL);
+  static const AdwColorScheme schemes[] = { ADW_COLOR_SCHEME_DEFAULT,
+    ADW_COLOR_SCHEME_FORCE_LIGHT, ADW_COLOR_SCHEME_FORCE_DARK };
+  adw_style_manager_set_color_scheme (manager, schemes[appearance_mode]);
+  appearance_update_css ();
+}
+
+static void
+appearance_selected (AdwToggleGroup *group, GParamSpec *pspec, gpointer data)
+{
+  (void)pspec;
+  guint selected = adw_toggle_group_get_active (group);
+  if (GPOINTER_TO_INT (data) == 0 && selected < 3)
+    {
+      static const AdwColorScheme schemes[] = { ADW_COLOR_SCHEME_DEFAULT,
+        ADW_COLOR_SCHEME_FORCE_LIGHT, ADW_COLOR_SCHEME_FORCE_DARK };
+      appearance_mode = selected;
+      adw_style_manager_set_color_scheme (adw_style_manager_get_default (), schemes[selected]);
+    }
+  else if (GPOINTER_TO_INT (data) == 1 && selected < 4)
+    appearance_theme = selected;
+  else
+    return;
+  appearance_update_css ();
+  appearance_save ();
+}
+
+/* Real GTK cells, using the same palette and line opacity as the data grid. */
+static GtkWidget *
+appearance_preview (guint theme)
+{
+  GtkWidget *grid = gtk_grid_new ();
+  gtk_grid_set_column_homogeneous (GTK_GRID (grid), TRUE);
+  gtk_widget_set_size_request (grid, 96, -1);
+  gtk_widget_set_overflow (grid, GTK_OVERFLOW_HIDDEN);
+  gtk_widget_add_css_class (grid, "lsg-theme-preview");
+  g_autofree char *name = g_strdup_printf ("lsg-theme-preview-%u", theme);
+  gtk_widget_add_css_class (grid, name);
+  const char *cells[] = { "A", "B", "12", "34", "56", "78" };
+  for (guint i = 0; i < G_N_ELEMENTS (cells); i++)
+    {
+      GtkWidget *cell = gtk_label_new (cells[i]);
+      if (i < 2) gtk_widget_add_css_class (cell, "preview-header");
+      if (i >= 4) gtk_widget_add_css_class (cell, "preview-stripe");
+      if (i % 2 == 0) gtk_widget_add_css_class (cell, "preview-first");
+      gtk_grid_attach (GTK_GRID (grid), cell, i % 2, i / 2, 1, 1);
+    }
+  return grid;
+}
+
+static GtkWidget *
+appearance_choices (const char *const *labels, const char *const *icons,
+                    guint selected, gboolean theme)
+{
+  GtkWidget *group = adw_toggle_group_new ();
+  adw_toggle_group_set_homogeneous (ADW_TOGGLE_GROUP (group), TRUE);
+  for (guint i = 0; i < (theme ? 4u : 3u); i++)
+    {
+      AdwToggle *toggle = adw_toggle_new ();
+      adw_toggle_set_label (toggle, labels[i]);
+      GtkWidget *content = gtk_box_new (GTK_ORIENTATION_VERTICAL, 8);
+      gtk_widget_set_halign (content, GTK_ALIGN_CENTER);
+      gtk_widget_set_margin_top (content, 12);
+      gtk_widget_set_margin_bottom (content, 12);
+      gtk_widget_set_margin_start (content, 10);
+      gtk_widget_set_margin_end (content, 10);
+      if (theme)
+        gtk_box_append (GTK_BOX (content), appearance_preview (i));
+      else
+        {
+          GtkWidget *icon = gtk_image_new_from_icon_name (icons[i]);
+          gtk_image_set_pixel_size (GTK_IMAGE (icon), 20);
+          gtk_box_append (GTK_BOX (content), icon);
+        }
+      GtkWidget *label = gtk_label_new (labels[i]);
+      gtk_label_set_wrap (GTK_LABEL (label), TRUE);
+      gtk_label_set_justify (GTK_LABEL (label), GTK_JUSTIFY_CENTER);
+      gtk_box_append (GTK_BOX (content), label);
+      adw_toggle_set_child (toggle, content);
+      adw_toggle_group_add (ADW_TOGGLE_GROUP (group), toggle);
+    }
+  /* Connect only after restoring the selection: opening preferences must not
+   * change the appearance or write settings. The native group supplies focus,
+   * keyboard navigation, selection semantics and the selected-state styling. */
+  adw_toggle_group_set_active (ADW_TOGGLE_GROUP (group), selected);
+  g_signal_connect (group, "notify::active", G_CALLBACK (appearance_selected),
+                    GINT_TO_POINTER (theme));
+  return group;
+}
+
+static void
+appearance_color_changed (GtkColorDialogButton *button, GParamSpec *pspec, gpointer data)
+{
+  (void)pspec;
+  if (g_object_get_data (G_OBJECT (button), "lsg-background") != NULL)
+    appearance_background = *gtk_color_dialog_button_get_rgba (button);
+  else
+    appearance_text = *gtk_color_dialog_button_get_rgba (button);
+  appearance_update_css ();
+  appearance_save ();
+  App *app = data;
+  if (app->area != NULL) gtk_widget_queue_draw (GTK_WIDGET (app->area));
+}
+
+static void
+appearance_stripes_changed (AdwSwitchRow *row, GParamSpec *pspec, gpointer data)
+{
+  (void)pspec;
+  appearance_stripes = adw_switch_row_get_active (row);
+  appearance_update_css ();
+  appearance_save ();
+  App *app = data;
+  if (app->area != NULL) gtk_widget_queue_draw (GTK_WIDGET (app->area));
+}
+
+static void
+appearance_custom_visible (AdwToggleGroup *group, GParamSpec *pspec, GtkWidget *custom)
+{
+  (void)pspec;
+  gboolean selected = adw_toggle_group_get_active (group) == 3;
+  gtk_widget_set_visible (custom, selected);
+  GtkWidget *dialog = gtk_widget_get_ancestor (custom, ADW_TYPE_DIALOG);
+  if (dialog != NULL) adw_dialog_set_content_height (ADW_DIALOG (dialog), selected ? 660 : 440);
+}
+
+static GtkWidget *
+appearance_color_row (const char *title, gboolean background, App *app)
+{
+  GtkWidget *row = adw_action_row_new ();
+  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (row), title);
+  GtkColorDialog *dialog = gtk_color_dialog_new ();
+  gtk_color_dialog_set_with_alpha (dialog, FALSE);
+  gtk_color_dialog_set_title (dialog, title);
+  GtkWidget *button = gtk_color_dialog_button_new (dialog);
+  gtk_widget_set_valign (button, GTK_ALIGN_CENTER);
+  gtk_accessible_update_property (GTK_ACCESSIBLE (button), GTK_ACCESSIBLE_PROPERTY_LABEL, title, -1);
+  gtk_color_dialog_button_set_rgba (GTK_COLOR_DIALOG_BUTTON (button),
+                                   background ? &appearance_background : &appearance_text);
+  g_object_set_data (G_OBJECT (button), "lsg-background", GINT_TO_POINTER (background));
+  g_signal_connect (button, "notify::rgba", G_CALLBACK (appearance_color_changed), app);
+  adw_action_row_add_suffix (ADW_ACTION_ROW (row), button);
+  adw_action_row_set_activatable_widget (ADW_ACTION_ROW (row), button);
+  return row;
+}
+
+static void
+action_app_preferences (GSimpleAction *action, GVariant *parameter, gpointer data)
+{
+  (void)action; (void)parameter;
+  App *app = data;
+  if (app->window == NULL) return;
+  AdwDialog *dialog = ADW_DIALOG (adw_preferences_dialog_new ());
+  adw_dialog_set_title (dialog, "App preferences");
+  adw_dialog_set_content_width (dialog, 560);
+  adw_dialog_set_content_height (dialog, appearance_theme == 3 ? 660 : 440);
+  adw_preferences_dialog_set_search_enabled (ADW_PREFERENCES_DIALOG (dialog), FALSE);
+  GtkWidget *page = adw_preferences_page_new ();
+  adw_preferences_page_set_title (ADW_PREFERENCES_PAGE (page), "Appearance");
+  static const char *const modes[] = { "System", "Light", "Dark" };
+  static const char *const mode_icons[] = { "video-display-symbolic", "weather-clear-symbolic",
+                                           "weather-clear-night-symbolic" };
+  static const char *const themes[] = { "Neutral", "High contrast", "Soft", "Custom" };
+  GtkWidget *mode_group = adw_preferences_group_new ();
+  adw_preferences_group_set_title (ADW_PREFERENCES_GROUP (mode_group), "Color mode");
+  adw_preferences_group_add (ADW_PREFERENCES_GROUP (mode_group),
+      appearance_choices (modes, mode_icons, appearance_mode, FALSE));
+  adw_preferences_page_add (ADW_PREFERENCES_PAGE (page), ADW_PREFERENCES_GROUP (mode_group));
+  GtkWidget *theme_group = adw_preferences_group_new ();
+  adw_preferences_group_set_title (ADW_PREFERENCES_GROUP (theme_group), "Theme");
+  GtkWidget *choices = appearance_choices (themes, NULL, appearance_theme, TRUE);
+  adw_preferences_group_add (ADW_PREFERENCES_GROUP (theme_group), choices);
+  adw_preferences_page_add (ADW_PREFERENCES_PAGE (page), ADW_PREFERENCES_GROUP (theme_group));
+  GtkWidget *custom = adw_preferences_group_new ();
+  adw_preferences_group_set_title (ADW_PREFERENCES_GROUP (custom), "Custom theme");
+  adw_preferences_group_add (ADW_PREFERENCES_GROUP (custom), appearance_color_row ("Background", TRUE, app));
+  adw_preferences_group_add (ADW_PREFERENCES_GROUP (custom), appearance_color_row ("Text", FALSE, app));
+  GtkWidget *stripes = adw_switch_row_new ();
+  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (stripes), "Alternating row shading");
+  adw_switch_row_set_active (ADW_SWITCH_ROW (stripes), appearance_stripes);
+  g_signal_connect (stripes, "notify::active", G_CALLBACK (appearance_stripes_changed), app);
+  adw_preferences_group_add (ADW_PREFERENCES_GROUP (custom), stripes);
+  gtk_widget_set_visible (custom, appearance_theme == 3);
+  g_signal_connect_object (choices, "notify::active", G_CALLBACK (appearance_custom_visible), custom, 0);
+  adw_preferences_page_add (ADW_PREFERENCES_PAGE (page), ADW_PREFERENCES_GROUP (custom));
+  adw_preferences_dialog_add (ADW_PREFERENCES_DIALOG (dialog), ADW_PREFERENCES_PAGE (page));
+  adw_dialog_present (dialog, GTK_WIDGET (app->window));
+}
+
 static GMenuModel *
 build_primary_menu (App *app)
 {
   /* Preferences / Shortcuts / About are APP-level GActions, so their
    * accelerators are real and the menu shares the one action set. */
   GMenu *menu = g_menu_new ();
-  g_menu_append (menu, "Preferences", "app.preferences");
+  g_menu_append (menu, "App preferences", "app.app-preferences");
+  if (app->doc != NULL)
+    g_menu_append (menu, "File preferences", "app.preferences");
   if (lsg_document_is_parquet (app->doc))
     g_menu_append (menu, "Parquet Metadata…", "app.parquet-metadata");
   g_menu_append (menu, "Keyboard Shortcuts", "app.shortcuts");
@@ -8188,6 +8499,7 @@ ensure_window (App *app, GtkApplication *gtk_app)
     return;
   app->app = ADW_APPLICATION (gtk_app);
   install_app_css ();
+  appearance_init ();
 
   GtkWidget *win = adw_application_window_new (gtk_app);
   app->window = GTK_WINDOW (win);
@@ -8496,6 +8808,7 @@ register_app_shortcuts (App *app, GApplication *gapp)
     { "find", act_find, NULL, NULL, NULL, { 0, 0, 0 } },
     { "jump", act_jump, NULL, NULL, NULL, { 0, 0, 0 } },
     { "preferences", action_preferences, NULL, NULL, NULL, { 0, 0, 0 } },
+    { "app-preferences", action_app_preferences, NULL, NULL, NULL, { 0, 0, 0 } },
     { "parquet-metadata", action_parquet_metadata, NULL, NULL, NULL, { 0, 0, 0 } },
     { "shortcuts", action_shortcuts, NULL, NULL, NULL, { 0, 0, 0 } },
     { "check-updates", action_check_updates, NULL, NULL, NULL, { 0, 0, 0 } },

@@ -219,7 +219,7 @@ final class GridHeaderView: NSView {
         guard let direction = indicator.direction else { return }
         let color: NSColor = indicator.didFail
             ? .systemRed
-            : (indicator.isPending ? .tertiaryLabelColor : .labelColor)
+            : (indicator.isPending ? .tertiaryLabelColor : AppPalette.current.foreground)
         let config = NSImage.SymbolConfiguration(pointSize: 9, weight: .semibold)
             .applying(.init(paletteColors: [color]))
         guard let base = NSImage(systemSymbolName: direction == .ascending ? "chevron.up" : "chevron.down",
@@ -235,11 +235,11 @@ final class GridHeaderView: NSView {
     override func draw(_ dirtyRect: NSRect) {
         guard let controller else { return }
         let height = bounds.height
-        if capturesBackground {
-            NSColor.windowBackgroundColor.setFill()
+        if capturesBackground || AppAppearance.shared.settings.theme != .neutral {
+            AppPalette.current.header.setFill()
             bounds.fill()
         }
-        let grid = NSColor.gridColor
+        let grid = AppPalette.current.line
         // `widths` is only the current column WINDOW: position it at its exact
         // prefix-sum offset, translated into this fixed view's local space by the
         // same scroll offset the data columns are drawn under.
@@ -250,7 +250,8 @@ final class GridHeaderView: NSView {
             if columnIndex < controller.headerLabels.count {
                 SheetRowView.drawText(controller.headerLabels[columnIndex],
                                       in: cell.insetBy(dx: GridMetrics.cellHPadding, dy: 0),
-                                      font: .systemFont(ofSize: NSFont.systemFontSize), color: .labelColor,
+                                      font: .systemFont(ofSize: NSFont.systemFontSize),
+                                      color: AppPalette.current.foreground,
                                       alignment: .left, weight: .semibold)
             }
             if columnIndex < controller.headerTruncated.count, controller.headerTruncated[columnIndex] {
@@ -321,14 +322,14 @@ final class GridGutterView: NSView, NSViewToolTipOwner {
     private static let markerSide: CGFloat = 12
 
     override func draw(_ dirtyRect: NSRect) {
-        NSColor.textBackgroundColor.setFill()
+        AppPalette.current.background.setFill()
         bounds.fill()
         removeAllToolTips() // re-registered below for whatever is visible now
         guard let controller else { return }
         let table = controller.table
         let visible = table.rows(in: table.visibleRect)
         let width = bounds.width
-        let grid = NSColor.gridColor
+        let grid = AppPalette.current.line
 
         if visible.length > 0 {
             for row in visible.location..<(visible.location + visible.length) where row < controller.dataRowCount {
@@ -340,7 +341,7 @@ final class GridGutterView: NSView, NSViewToolTipOwner {
                 let cell = NSRect(x: 0, y: local.minY,
                                   width: width - GridMetrics.rowNumberHPadding, height: local.height)
                 SheetRowView.drawText(String(source + 1), in: cell, font: GridGutterView.font,
-                                      color: .secondaryLabelColor, alignment: .right)
+                                      color: AppPalette.current.secondary, alignment: .right)
                 if controller.model.rowOversized(forRow: row), let marker = GridGutterView.markerImage {
                     let markerRect = NSRect(
                         x: 2, y: local.minY + (local.height - GridGutterView.markerSide) / 2,

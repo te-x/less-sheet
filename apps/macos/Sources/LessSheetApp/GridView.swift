@@ -50,7 +50,7 @@ struct SheetRow: View {
         // The header is transparent live, so the glass band behind it shows
         // through; it falls back to opaque only in a dump, where glass cannot be
         // captured at all.
-        .background(isHeader && dumpChrome ? Color(nsColor: .windowBackgroundColor) : Color.clear)
+        .background(isHeader && dumpChrome ? Color(nsColor: AppPalette.current.header) : Color.clear)
         .overlay(alignment: .bottom) { hairline.frame(height: 1) }   // hairline ON TOP of the glass
     }
 
@@ -65,7 +65,7 @@ struct SheetRow: View {
             .frame(width: rowNumberWidth, height: GridMetrics.rowHeight, alignment: .trailing)
             // The header corner stays transparent live, so the glass band is
             // continuous across the full header width.
-            .background(isHeader && !dumpChrome ? Color.clear : Color(nsColor: .windowBackgroundColor))
+            .background(isHeader && !dumpChrome ? Color.clear : Color(nsColor: AppPalette.current.header))
             .overlay(alignment: .trailing) { hairline.frame(width: 1) }
             .modifier(StickyLeading(enabled: stickyRowNumber))
             .accessibilityHidden(true)
@@ -77,10 +77,10 @@ struct SheetRow: View {
             .fontWeight(isHeader ? .semibold : .regular)
             .lineLimit(1)
             .truncationMode(.tail)
-            .foregroundStyle(.primary)
+            .foregroundStyle(Color(nsColor: AppPalette.current.foreground))
     }
 
-    private var hairline: some View { Rectangle().fill(Color(nsColor: .gridColor)) }
+    private var hairline: some View { Rectangle().fill(Color(nsColor: AppPalette.current.line)) }
 
     private func highlight(at index: Int) -> SheetCellHighlight {
         index < highlights.count ? highlights[index] : .none
@@ -95,11 +95,11 @@ struct SheetRow: View {
         case .none: Color.clear
         case .subtle:
             RoundedRectangle(cornerRadius: FindHighlightStyle.cornerRadius)
-                .fill(Color.accentColor.opacity(FindHighlightStyle.subtleAlpha))
+                .fill(Color(nsColor: AppPalette.current.accent).opacity(FindHighlightStyle.subtleAlpha))
                 .padding(FindHighlightStyle.inset)
         case .strong:
             RoundedRectangle(cornerRadius: FindHighlightStyle.cornerRadius)
-                .fill(Color.accentColor.opacity(FindHighlightStyle.strongAlpha))
+                .fill(Color(nsColor: AppPalette.current.accent).opacity(FindHighlightStyle.strongAlpha))
                 .padding(FindHighlightStyle.inset)
         }
     }
@@ -110,7 +110,7 @@ struct SheetRow: View {
     private func highlightBorder(at index: Int) -> some View {
         if highlight(at: index) == .strong {
             RoundedRectangle(cornerRadius: FindHighlightStyle.cornerRadius)
-                .strokeBorder(Color.accentColor, lineWidth: FindHighlightStyle.borderWidth)
+                .strokeBorder(Color(nsColor: AppPalette.current.accent), lineWidth: FindHighlightStyle.borderWidth)
                 .padding(FindHighlightStyle.inset)
         }
     }

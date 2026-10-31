@@ -38,7 +38,8 @@ struct ColumnSettingsSection: View {
 
     private var source: PanelRowSource {
         switch mode {
-        case .empty, .searchOnly: .matches(matches)
+        case .empty: .matches(matches)
+        case .searchOnly: query.isEmpty ? .all(model.columnCount) : .matches(matches)
         case .fullList: .all(model.columnCount)
         }
     }
@@ -127,7 +128,9 @@ struct ColumnSettingsSection: View {
         matches = []
         overflow = false
         noSuchColumn = false
-        model.setSettingsDiscoveryRows(mode == .fullList ? Array(0..<model.columnCount) : [])
+        let showingAll = mode == .fullList || (mode == .searchOnly && query.isEmpty)
+        model.setSettingsDiscoveryRows(showingAll
+            ? Array(0..<min(model.columnCount, columnDiscoveryResultMax)) : [])
         guard model.settingsOpen, mode == .searchOnly, !query.isEmpty else {
             searching = false
             return

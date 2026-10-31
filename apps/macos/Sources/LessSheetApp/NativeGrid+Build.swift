@@ -35,7 +35,7 @@ extension NativeGridController {
         scroll.hasHorizontalScroller = true
         scroll.autohidesScrollers = true
         scroll.drawsBackground = true
-        scroll.backgroundColor = .textBackgroundColor
+        scroll.backgroundColor = AppPalette.current.background
         scroll.automaticallyAdjustsContentInsets = false
         scroll.contentInsets = NSEdgeInsets(top: NativeGrid.contentInsetTop, left: 0, bottom: 0, right: 0)
         scroll.scrollerInsets = NSEdgeInsets(top: -NativeGrid.contentInsetTop, left: 0, bottom: 0, right: 0)
@@ -52,7 +52,7 @@ extension NativeGridController {
         table.addTableColumn(column)
         table.rowHeight = NativeGrid.rowHeight
         table.intercellSpacing = .zero
-        table.backgroundColor = .textBackgroundColor
+        table.backgroundColor = AppPalette.current.background
         table.headerView = nil                       // sticky header is drawn separately
         table.selectionHighlightStyle = .none        // our OWN cell selection overlay, not the table's
         table.allowsColumnResizing = false

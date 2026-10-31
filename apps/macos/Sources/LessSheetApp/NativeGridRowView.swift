@@ -11,6 +11,7 @@ private struct RowPalette {
     let accent: NSColor
     let selection: NSColor
     let grid: NSColor
+    let foreground: NSColor
 }
 
 /// One data or filler row: every visible-column cell, its trailing hairline, the
@@ -56,17 +57,25 @@ final class SheetRowView: NSTableRowView {
         // but an instrument that is only accidentally correct reports the wrong
         // number the moment it changes.
         if !isFiller, !pending, !cells.isEmpty { LaunchTiming.phaseOnce("first_row_pixels") }
-        NSColor.textBackgroundColor.setFill()
+        let colors = AppPalette.current
+        colors.background.setFill()
         bounds.fill()
         guard let controller else { return }
+        if AppAppearance.shared.settings.theme == .custom,
+           AppAppearance.shared.settings.zebraStripes,
+           controller.table.row(for: self) % 2 == 1 {
+            colors.foreground.withAlphaComponent(0.06).setFill()
+            bounds.fill()
+        }
         let height = bounds.height
-        let grid = NSColor.gridColor
-        let accent = NSColor.controlAccentColor
+        let grid = colors.line
+        let accent = colors.accent
         // Selection is a MUTED GRAY marquee, deliberately quieter than the
         // accent, so a selected cell and a find highlight stay distinct by both
         // colour and geometry. This one colour drives both the wash and the
         // marquee.
-        let palette = RowPalette(accent: accent, selection: NSColor.systemGray, grid: grid)
+        let palette = RowPalette(accent: accent, selection: NSColor.systemGray,
+                                 grid: grid, foreground: colors.foreground)
         // `widths` is only the current column WINDOW, so start at its exact
         // prefix-sum offset: an in-window column then lands at the same x a full
         // unwindowed draw would give it.
@@ -102,7 +111,7 @@ final class SheetRowView: NSTableRowView {
             palette.selection.withAlphaComponent(0.12).setFill()
             cell.fill()
         }
-        drawCellContent(index, in: cell, controller: controller)
+        drawCellContent(index, in: cell, controller: controller, foreground: palette.foreground)
         if highlight == .strong {
             palette.accent.setStroke()
             let chipPath = SheetRowView.highlightChipPath(in: cell)
@@ -137,10 +146,11 @@ final class SheetRowView: NSTableRowView {
 
     /// The cell's text, or the loading placeholder for a not-yet-servable empty
     /// one, then any warning markers.
-    private func drawCellContent(_ index: Int, in cell: NSRect, controller: NativeGridController) {
+    private func drawCellContent(_ index: Int, in cell: NSRect, controller: NativeGridController,
+                                 foreground: NSColor) {
         if index < cells.count, !cells[index].isEmpty {
             SheetRowView.drawText(cells[index], in: cell.insetBy(dx: GridMetrics.cellHPadding, dy: 0),
-                                  font: SheetRowView.font, color: .labelColor,
+                                  font: SheetRowView.font, color: foreground,
                                   alignment: textAlignment(index, controller: controller))
         } else if pending {
             SheetRowView.drawPendingPlaceholder(in: cell)
@@ -256,7 +266,7 @@ final class SheetRowView: NSTableRowView {
         let barHeight = min(9, inset.height * 0.4)
         let bar = NSRect(x: inset.minX, y: inset.minY + (inset.height - barHeight) / 2,
                          width: inset.width * 0.55, height: barHeight)
-        NSColor.labelColor.withAlphaComponent(0.08).setFill()
+        AppPalette.current.foreground.withAlphaComponent(0.08).setFill()
         NSBezierPath(roundedRect: bar, xRadius: barHeight / 2, yRadius: barHeight / 2).fill()
     }
 

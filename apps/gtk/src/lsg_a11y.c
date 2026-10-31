@@ -201,7 +201,7 @@ lsg_a11y_shortcuts (guint *out_n)
     { LSG_A11Y_CMD_OPEN_URL, LSG_A11Y_GROUP_GENERAL, LSG_A11Y_SCOPE_APP,
       "Open URL", "app.open-url", "<Control><Shift>o", NULL },
     { LSG_A11Y_CMD_PREFERENCES, LSG_A11Y_GROUP_GENERAL, LSG_A11Y_SCOPE_APP,
-      "Preferences", "app.preferences", "<Control>comma", NULL },
+      "File preferences", "app.preferences", "<Control>comma", NULL },
     { LSG_A11Y_CMD_SHORTCUTS, LSG_A11Y_GROUP_GENERAL, LSG_A11Y_SCOPE_APP,
       "Keyboard Shortcuts", "app.shortcuts", "<Control>question",
       "<Control>F1" },
