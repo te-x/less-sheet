@@ -1,0 +1,27 @@
+# Maintainer: te-x (https://github.com/te-x)
+pkgname=less-sheet-bin
+pkgver=0.1.9
+pkgrel=1
+pkgdesc='Native GTK tabular data viewer for CSV and Parquet, including HTTP(S) files'
+arch=('x86_64' 'aarch64')
+url='https://te-x.github.io/less-sheet/'
+license=('MIT')
+depends=('glibc' 'glib2' 'gtk4>=1:4.20' 'libadwaita>=1:1.8' 'pango' 'cairo' 'hicolor-icon-theme')
+provides=("less-sheet=$pkgver")
+conflicts=('less-sheet')
+options=('!strip' '!debug')
+source_x86_64=("https://github.com/te-x/less-sheet/releases/download/v${pkgver}/less-sheet-${pkgver}-linux-x86_64.tar.gz")
+source_aarch64=("https://github.com/te-x/less-sheet/releases/download/v${pkgver}/less-sheet-${pkgver}-linux-aarch64.tar.gz")
+sha256sums_x86_64=('4ad7d7891bd921c14cad49a16e67731aadc0adee17eb9ea831d94f10c22c5f00')
+sha256sums_aarch64=('664dcb37d96c07cd93be4f2d7771415fd7d0a744c63ae0132d942f5f9cbd4713')
+
+package() {
+  install -Dm755 less-sheet/less-sheet-gtk "$pkgdir/usr/bin/less-sheet-gtk"
+  install -Dm644 less-sheet/com.lesssheet.LessSheet.desktop \
+    "$pkgdir/usr/share/applications/com.lesssheet.LessSheet.desktop"
+  install -Dm644 less-sheet/com.lesssheet.LessSheet.svg \
+    "$pkgdir/usr/share/icons/hicolor/scalable/apps/com.lesssheet.LessSheet.svg"
+  install -Dm644 less-sheet/LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 less-sheet/THIRD-PARTY-NOTICES.md \
+    "$pkgdir/usr/share/licenses/$pkgname/THIRD-PARTY-NOTICES.md"
+}
